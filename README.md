@@ -1,60 +1,49 @@
 # Kasten Discovery Lite
+**Kasten Discovery Lite** is a lightweight discovery script for **Kubernetes** and **OpenShift** environments running **Kasten K10**.
 
-`kasten-discovery-lite.sh` is a **lightweight, read-only discovery script** for Kasten K10 deployments.
-It provides a **quick, portable inventory** of key Kasten features without requiring a compiled binary or platform-specific tooling.
+It provides a **factual, honest, and support-grade** view of the Kasten configuration:
+- core Kubernetes resources
+- storage profiles (detailed)
+- Kasten policies (detailed)
 
-This script is intended as a **companion** to the full Go-based Kasten Discovery tool, not a replacement.
-
----
-
-## Features
-
-- Platform detection (Kubernetes / OpenShift)
-- Kasten version detection
-- Core resource inventory
-- Profile discovery
-- Immutability configuration detection (**heuristic**)
-- Disaster Recovery (DR) detection
-- Human-readable **and JSON output**
-- Read-only, safe to run in production clusters
+⚠️ The script **does not attempt to infer or promise** capabilities that are not reliably exposed by the Kasten API (e.g. actual Disaster Recovery state or backend immutability).
 
 ---
 
-## Requirements
+## ✨ Script Goals
 
-### Required
+- ✅ Portable (POSIX `/bin/sh`)
+- ✅ Kubernetes & OpenShift compatible
+- ✅ No Go binaries or dependencies
+- ✅ Human-readable and JSON output
+- ✅ Audit- and support-defendable
+- ✅ Compatible with Kasten **5.x → 8.x**
 
-- `kubectl`
+---
+
+## 📋 Prerequisites
+
+- `kubectl` (or `oc`)
 - `jq`
-- Access to the Kubernetes API
-
-### Optional
-
-- OpenShift (detected automatically if present)
+- Read access to the Kasten namespace (default: `kasten-io`)
 
 ---
 
-## Usage
+## 🚀 Usage
 
-### Default (human-readable output)
-
-```bash
-./kasten-discovery-lite.sh
-```
-
-### Specify namespace
+### Standard execution
 
 ```bash
 ./kasten-discovery-lite.sh kasten-io
 ```
 
-### JSON output (for CI / automation)
+### Debug mode
 
 ```bash
-./kasten-discovery-lite.sh --json
+./kasten-discovery-lite.sh kasten-io --debug
 ```
 
-### Namespace + JSON
+### JSON output (CI / automation)
 
 ```bash
 ./kasten-discovery-lite.sh kasten-io --json
@@ -62,191 +51,198 @@ This script is intended as a **companion** to the full Go-based Kasten Discovery
 
 ---
 
-## Example Output
+## 🔍 What the Script Detects
 
-### Human-readable
+### 🏭 Platform
+
+- Kubernetes
+- OpenShift (detected via `clusterversion`)
+
+---
+
+### 📦 Kasten Version
+
+- Retrieved from the `k10-config` ConfigMap
+- Fields: `version` or `k10Version`
+
+---
+
+### 📊 Kubernetes Resources (Kasten namespace)
+
+- Pods
+- Services
+- ConfigMaps
+- Secrets
+
+---
+
+## 📦 Kasten Profiles (Detailed)
+
+The script detects **all Kasten profiles**, including:
+- legacy profiles
+- modern profiles
+- namespaced or cluster-scoped profiles
+
+### Exposed fields (facts only)
+
+Depending on the profile type:
+
+#### ObjectStore
+- Type
+- Backend (s3, azure, gcs, storj, minio…)
+- Region (if defined)
+- Endpoint (if defined)
+
+#### Volume
+- StorageClass
+
+#### File
+- Path
+
+### Example
 
 ```text
-🔍 Kasten Discovery Lite
-Namespace: kasten-io
+📦 Kasten Profiles
+  Profiles: 1
 
-🏭 Platform: OpenShift
-📦 Kasten Version: 8.0.8
-
-📊 Core Resources
-  Pods:       14
-  Services:   9
-  ConfigMaps: 12
-  Secrets:    18
-
-🔐 Profiles
-  Profiles: 3
-
-🔒 Immutability
-  Status: CONFIGURED (heuristic)
-  Source: detected in profile spec
-
-🔄 Disaster Recovery
-  Status: ENABLED
-  DR Policies: 2
-  DR Targets:  1
-  DR Actions:  5
-
-✅ Discovery Lite completed
+  - storj
+    Type: ObjectStore
+    Backend: s3
+    Region: unknown
+    Endpoint: default
 ```
 
-### JSON
+ℹ️ **Important note**  
+Immutability (Object Lock, WORM, etc.) **cannot be reliably detected via the Kasten API** and depends on the underlying storage backend.
+
+---
+
+## 📜 Kasten Policies (Detailed)
+
+For each policy, the script exposes:
+
+- Name
+- Frequency (`manual` if not defined)
+- Actions (snapshot, export, import…)
+- Target namespaces
+- Factual capabilities
+
+### Detected capabilities (no interpretation)
+
+- `scheduled` → scheduled policy
+- `export` → export action present
+- `import` → import action present
+- `multi-action` → multiple actions
+
+### Example
+
+```text
+📜 Kasten Policies
+  Policies: 5
+
+  - k10-disaster-recovery-policy
+    Frequency: hourly
+    Actions: snapshot, export
+    Namespaces: all
+    Capabilities:
+      - scheduled
+      - export
+      - multi-action
+```
+
+⚠️ **Important**  
+The presence of export actions or policies named “DR” **does not imply** that Disaster Recovery is configured or functional.
+
+---
+
+## 📄 JSON Output
+
+The `--json` mode provides structured output suitable for:
+- CI/CD pipelines
+- CMDB ingestion
+- automated audits
+
+Excerpt:
 
 ```json
 {
-  "timestamp": "2025-12-19T09:41:03Z",
-  "namespace": "kasten-io",
   "platform": "OpenShift",
-  "kastenVersion": "8.0.8",
-  "resources": {
-    "pods": 14,
-    "services": 9,
-    "configMaps": 12,
-    "secrets": 18
-  },
-  "kasten": {
-    "profiles": {
-      "count": 3
-    },
-    "immutability": {
-      "configured": true,
-      "confidence": "heuristic",
-      "reason": "detected in profile spec"
-    },
-    "disasterRecovery": {
-      "enabled": true,
-      "policyCount": 2,
-      "targetCount": 1,
-      "actionCount": 5
+  "kastenVersion": "8.0.14",
+  "profiles": [
+    {
+      "name": "storj",
+      "type": "ObjectStore",
+      "details": {
+        "backend": "s3",
+        "region": "unknown",
+        "endpoint": "default"
+      }
     }
-  }
+  ],
+  "policies": [
+    {
+      "name": "smoke-test",
+      "frequency": "manual",
+      "actions": ["snapshot"],
+      "namespaces": ["default"],
+      "capabilities": []
+    }
+  ]
 }
 ```
 
 ---
 
-## Immutability Detection (Important)
+## 🔐 Permissions (RBAC)
 
-Immutability detection in **Lite mode** is **heuristic-based**.
+The script requires **read-only permissions only**.
 
-The script inspects Kasten **Profiles** and searches for immutability-related keywords such as:
+### Accessed resources:
+- pods, services, configmaps, secrets
+- profiles (Kasten CRDs)
+- policies (Kasten CRDs)
+- `k10-config` ConfigMap
 
-- `immutable`
-- `immutability`
-- `objectLock`
-- `writeOnce`
-- `governance`
-- `compliance`
-
-This provides a **best-effort signal**, not a compliance guarantee.
-
-For authoritative validation, use the **full Go-based Kasten Discovery tool**.
+⚠️ **Cluster-admin privileges are NOT required**.
 
 ---
 
-## Disaster Recovery Detection
+## ⚠️ Known Limitations (By Design)
 
-Disaster Recovery (DR) is considered **enabled** if any of the following exist:
+The script **does not attempt** to:
 
-- DR Policies
-- DR Targets
-- DR Actions
+- detect actual immutability configuration (backend-dependent)
+- assert Disaster Recovery as “enabled”
+- validate external storage configuration
+- verify credentials
 
-The script does **not** validate:
-
-- DR health
-- Replication lag
-- Failover readiness
+👉 These elements are **not reliably exposed by the Kasten API**.
 
 ---
 
-## Security and Permissions
+## 🧠 “Honest Discovery” Philosophy
 
-### Does this script require `cluster-admin`?
+> This script reports **what can be proven** through the Kubernetes and Kasten APIs,  
+> and **never infers** what cannot be reliably verified.
 
-**No.**  
-`cluster-admin` is **not strictly required**.
-
-However, the script **does require more than namespace-only access**.
-
----
-
-### Required permissions (minimum)
-
-The user or service account must be able to:
-
-#### Namespace-scoped (Kasten namespace)
-
-- `get`, `list`
-  - Pods
-  - Services
-  - ConfigMaps
-  - Secrets
-  - Kasten CRDs:
-    - `profiles.config.kio.kasten.io`
-    - `drpolicies.config.kio.kasten.io`
-    - `drtargets.config.kio.kasten.io`
-    - `dractions.actions.kio.kasten.io`
-
-#### Cluster-scoped (read-only)
-
-- `get`, `list`
-  - API resources (used by `kubectl api-resources`)
-  - CustomResourceDefinitions
-
-> **Note**  
-> `kubectl api-resources` relies on cluster-scoped discovery access. Without it, feature detection may be incomplete.
+This is a deliberate design choice to:
+- avoid false positives
+- remain aligned with Kasten support practices
+- produce audit-ready outputs
 
 ---
 
-### Recommended RBAC (safe)
+## 📌 Versions
 
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: kasten-discovery-lite
-rules:
-- apiGroups: [""]
-  resources: ["pods", "services", "configmaps", "secrets"]
-  verbs: ["get", "list"]
-
-- apiGroups: ["config.kio.kasten.io", "actions.kio.kasten.io"]
-  resources: ["profiles", "drpolicies", "drtargets", "dractions"]
-  verbs: ["get", "list"]
-
-- apiGroups: ["apiextensions.k8s.io"]
-  resources: ["customresourcedefinitions"]
-  verbs: ["get", "list"]
-```
-
-Bind this role to a user, service account, or CI identity as needed.
+- **v1.0** – Schema-safe profile detection + detailed policies
+- Kasten support: 8.x**
+- Kubernetes & OpenShift compatible
 
 ---
 
-## When NOT to use this tool
+## 🤝 Contributions
 
-- Compliance audits
-- DR readiness validation
-- Security hardening assessments
-- Evidence generation
-
-Use the **full Go-based discovery tool** for these scenarios.
-
----
-
-## Disclaimer
-
-This script:
-
-- Is read-only
-- Makes no changes to the cluster
-- Provides best-effort signals only
-
-Use at your own discretion.
-
+Contributions and suggestions are welcome as long as they respect the core principles:
+- factual
+- defensible
+- no implicit promises
