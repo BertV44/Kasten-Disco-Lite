@@ -3,7 +3,7 @@ set -eu
 
 ##############################################################################
 # Kasten Discovery Lite v1.2
-Author: Bertrand CASTAGNET EMEA TAM
+# Author: Bertrand CASTAGNET EMEA TAM
 # - Add Axe 1: Policy Protection Coverage Matrix
 ##############################################################################
 
