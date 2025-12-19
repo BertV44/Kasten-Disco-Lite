@@ -18,7 +18,7 @@ DEBUG=false
 [ "${2:-}" = "--debug" ] && DEBUG=true
 [ "${3:-}" = "--debug" ] && DEBUG=true
 
-debug() { [ "$DEBUG" = true ] && echo "🐛 DEBUG: $*" >&2; }
+debug() { [ "$DEBUG" = true ] && echo "🐛 DEBUG: $*" >&2 || true; }
 
 ### -------------------------
 ### Platform detection
@@ -153,7 +153,7 @@ fi
 ### Human output
 ### -------------------------
 cat <<EOF
-🔍 Kasten Discovery Lite v6.5.2
+🔍 Kasten Discovery Lite v1.1
 Namespace: $NAMESPACE
 
 🏭 Platform: $PLATFORM
