@@ -1,58 +1,72 @@
-# Kasten-Disco-Lite
+# Kasten Discovery Lite
 
-Kasten Discovery Lite
+`kasten-discovery-lite.sh` is a **lightweight, read-only discovery script** for Kasten K10 deployments.
+It provides a **quick, portable inventory** of key Kasten features without requiring a compiled binary or platform-specific tooling.
 
-kasten-discovery-lite.sh is a lightweight, read-only discovery script for Kasten K10 deployments.
-It provides a quick, portable inventory of key Kasten features without requiring a compiled binary or platform-specific tooling.
+This script is intended as a **companion** to the full Go-based Kasten Discovery tool, not a replacement.
 
-This script is intended as a companion to the full Go-based Kasten Discovery tool, not a replacement.
+---
 
-Features
+## Features
 
-Platform detection (Kubernetes / OpenShift)
+- Platform detection (Kubernetes / OpenShift)
+- Kasten version detection
+- Core resource inventory
+- Profile discovery
+- Immutability configuration detection (**heuristic**)
+- Disaster Recovery (DR) detection
+- Human-readable **and JSON output**
+- Read-only, safe to run in production clusters
 
-Kasten version detection
+---
 
-Core resource inventory
+## Requirements
 
-Profile discovery
+### Required
 
-Immutability configuration detection (heuristic)
+- `kubectl`
+- `jq`
+- Access to the Kubernetes API
 
-Disaster Recovery (DR) detection
+### Optional
 
-Human-readable and JSON output
+- OpenShift (detected automatically if present)
 
-Read-only, safe to run in production clusters
+---
 
-Requirements
-Required
+## Usage
 
-kubectl
+### Default (human-readable output)
 
-jq
-
-Access to the Kubernetes API
-
-Optional
-
-OpenShift (detected automatically if present)
-
-Usage
-Default (human-readable output)
+```bash
 ./kasten-discovery-lite.sh
+```
 
-Specify namespace
+### Specify namespace
+
+```bash
 ./kasten-discovery-lite.sh kasten-io
+```
 
-JSON output (for CI / automation)
+### JSON output (for CI / automation)
+
+```bash
 ./kasten-discovery-lite.sh --json
+```
 
-Namespace + JSON
+### Namespace + JSON
+
+```bash
 ./kasten-discovery-lite.sh kasten-io --json
+```
 
-Example Output
-Human-readable
+---
+
+## Example Output
+
+### Human-readable
+
+```text
 🔍 Kasten Discovery Lite
 Namespace: kasten-io
 
@@ -79,8 +93,11 @@ Namespace: kasten-io
   DR Actions:  5
 
 ✅ Discovery Lite completed
+```
 
-JSON
+### JSON
+
+```json
 {
   "timestamp": "2025-12-19T09:41:03Z",
   "namespace": "kasten-io",
@@ -109,116 +126,87 @@ JSON
     }
   }
 }
+```
 
-Immutability Detection (Important)
+---
 
-Immutability detection in Lite mode is heuristic-based.
+## Immutability Detection (Important)
 
-The script inspects Kasten Profiles and searches for immutability-related keywords such as:
+Immutability detection in **Lite mode** is **heuristic-based**.
 
-immutable
+The script inspects Kasten **Profiles** and searches for immutability-related keywords such as:
 
-immutability
+- `immutable`
+- `immutability`
+- `objectLock`
+- `writeOnce`
+- `governance`
+- `compliance`
 
-objectLock
+This provides a **best-effort signal**, not a compliance guarantee.
 
-writeOnce
+For authoritative validation, use the **full Go-based Kasten Discovery tool**.
 
-governance
+---
 
-compliance
+## Disaster Recovery Detection
 
-This provides a best-effort signal, not a compliance guarantee.
+Disaster Recovery (DR) is considered **enabled** if any of the following exist:
 
-For authoritative validation, use the full Go-based Kasten Discovery tool.
+- DR Policies
+- DR Targets
+- DR Actions
 
-Disaster Recovery Detection
+The script does **not** validate:
 
-Disaster Recovery (DR) is considered enabled if any of the following exist:
+- DR health
+- Replication lag
+- Failover readiness
 
-DR Policies
+---
 
-DR Targets
+## Security and Permissions
 
-DR Actions
+### Does this script require `cluster-admin`?
 
-The script does not validate:
+**No.**  
+`cluster-admin` is **not strictly required**.
 
-DR health
+However, the script **does require more than namespace-only access**.
 
-Replication lag
+---
 
-Failover readiness
-
-Security and Permissions
-Does this script require cluster-admin?
-
-No.
-cluster-admin is not strictly required.
-
-However, the script does require more than namespace-only access.
-
-Required permissions (minimum)
+### Required permissions (minimum)
 
 The user or service account must be able to:
 
-Namespace-scoped (Kasten namespace)
+#### Namespace-scoped (Kasten namespace)
 
-get, list
+- `get`, `list`
+  - Pods
+  - Services
+  - ConfigMaps
+  - Secrets
+  - Kasten CRDs:
+    - `profiles.config.kio.kasten.io`
+    - `drpolicies.config.kio.kasten.io`
+    - `drtargets.config.kio.kasten.io`
+    - `dractions.actions.kio.kasten.io`
 
-Pods
+#### Cluster-scoped (read-only)
 
-Services
+- `get`, `list`
+  - API resources (used by `kubectl api-resources`)
+  - CustomResourceDefinitions
 
-ConfigMaps
+> **Note**  
+> `kubectl api-resources` relies on cluster-scoped discovery access. Without it, feature detection may be incomplete.
 
-Secrets
+---
 
-Kasten CRDs:
+### Recommended RBAC (safe)
 
-profiles.config.kio.kasten.io
-
-drpolicies.config.kio.kasten.io
-
-drtargets.config.kio.kasten.io
-
-dractions.actions.kio.kasten.io
-
-Cluster-scoped (read-only)
-
-get, list
-
-API resources (kubectl api-resources)
-
-CustomResourceDefinitions (implicit via discovery)
-
-⚠️ Important:
-kubectl api-resources requires read access to API discovery, which is cluster-scoped.
-
-Why cluster-wide read access is needed
-
-The script performs capability-based detection by querying:
-
-Available API groups
-
-Available resource types
-
-This is required to:
-
-Detect OpenShift vs Kubernetes
-
-Detect which Kasten features are supported
-
-Without this, the script will:
-
-Still run
-
-But skip feature detection and report less data
-
-Recommended RBAC (safe)
-
-Create a read-only ClusterRole:
-
+```yaml
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -235,34 +223,30 @@ rules:
 - apiGroups: ["apiextensions.k8s.io"]
   resources: ["customresourcedefinitions"]
   verbs: ["get", "list"]
+```
 
+Bind this role to a user, service account, or CI identity as needed.
 
-Bind it to:
+---
 
-A user
+## When NOT to use this tool
 
-A service account
+- Compliance audits
+- DR readiness validation
+- Security hardening assessments
+- Evidence generation
 
-A CI identity
+Use the **full Go-based discovery tool** for these scenarios.
 
-When NOT to use this tool
+---
 
-Compliance audits
-
-DR readiness validation
-
-Security hardening assessments
-
-Evidence generation
-
-License / Disclaimer
+## Disclaimer
 
 This script:
 
-Is read-only
-
-Makes no changes to the cluster
-
-Provides best-effort signals only
+- Is read-only
+- Makes no changes to the cluster
+- Provides best-effort signals only
 
 Use at your own discretion.
+
