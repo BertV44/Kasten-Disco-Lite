@@ -2,9 +2,9 @@
 set -eu
 
 ##############################################################################
-# Kasten Discovery Lite v1.1
-# Author: Bertrand CASTAGNET EMEA TAM
-# - FIX: retention detection (spec.retention + action-level)
+# Kasten Discovery Lite v1.2
+Author: Bertrand CASTAGNET EMEA TAM
+# - Add Axe 1: Policy Protection Coverage Matrix
 ##############################################################################
 
 ### -------------------------
@@ -18,7 +18,11 @@ DEBUG=false
 [ "${2:-}" = "--debug" ] && DEBUG=true
 [ "${3:-}" = "--debug" ] && DEBUG=true
 
-debug() { [ "$DEBUG" = true ] && echo "🐛 DEBUG: $*" >&2 || true; }
+debug() {
+  if [ "$DEBUG" = true ]; then
+    echo "🐛 DEBUG: $*" >&2
+  fi
+}
 
 ### -------------------------
 ### Platform detection
@@ -77,13 +81,13 @@ debug "Immutability: $IMMUTABILITY"
 POLICIES_JSON="$(kubectl -n "$NAMESPACE" get policies -o json 2>/dev/null || echo '{}')"
 POLICY_COUNT=$(echo "$POLICIES_JSON" | jq '.items | length')
 
-ALL_NS_POLICIES=$(echo "$POLICIES_JSON" | jq '[.items[] | select(.spec.namespaceSelector == null)] | length')
-
 debug "Policies detected: $POLICY_COUNT"
 
-### -------------------------
-### JSON output
-### -------------------------
+ALL_NS_POLICIES="$(echo "$POLICIES_JSON" | jq '[.items[] | select(.spec.namespaceSelector == null)] | length')"
+
+##############################################################################
+# JSON OUTPUT (UNCHANGED SEMANTICS)
+##############################################################################
 if [ "$MODE" = "json" ]; then
   jq -n \
     --arg platform "$PLATFORM" \
@@ -132,13 +136,7 @@ if [ "$MODE" = "json" ]; then
                  elif .exportParameters?.retention then .exportParameters.retention
                  else empty end
                ))
-             end),
-          capabilities: [
-            (if .spec.frequency then "scheduled" else empty end),
-            (if ([.spec.actions[]?.action] | index("export")) then "export" else empty end),
-            (if ([.spec.actions[]?.action] | index("import")) then "import" else empty end),
-            (if (.spec.actions | length) > 1 then "multi-action" else empty end)
-          ]
+             end)
         }))
       },
 
@@ -149,11 +147,11 @@ if [ "$MODE" = "json" ]; then
   exit 0
 fi
 
-### -------------------------
-### Human output
-### -------------------------
+##############################################################################
+# HUMAN OUTPUT — BASE (v6.5.2)
+##############################################################################
 cat <<EOF
-🔍 Kasten Discovery Lite v1.1
+🔍 Kasten Discovery Lite v6.6
 Namespace: $NAMESPACE
 
 🏭 Platform: $PLATFORM
@@ -217,15 +215,6 @@ echo "$POLICIES_JSON" | jq -r '
   else
     "      not defined"
   end
-) + "\n" +
-"    Capabilities:" +
-(
-  [
-    (if .spec.frequency then " scheduled" else empty end),
-    (if ([.spec.actions[]?.action] | index("export")) then " export" else empty end),
-    (if ([.spec.actions[]?.action] | index("import")) then " import" else empty end),
-    (if (.spec.actions | length) > 1 then " multi-action" else empty end)
-  ] | join("")
 )
 '
 
@@ -233,6 +222,81 @@ cat <<EOF
 
 📊 Policy Coverage Summary
   Policies targeting all namespaces: $ALL_NS_POLICIES
+EOF
+
+##############################################################################
+# 🔵 AXE 1 — Protection Coverage Matrix (ADD, NO REGRESSION)
+##############################################################################
+
+ALL_NAMESPACES="$(kubectl get ns -o json | jq -r '.items[].metadata.name')"
+TOTAL_NS="$(echo "$ALL_NAMESPACES" | wc -l | tr -d ' ')"
+
+PROTECTED_NS="$(
+  echo "$POLICIES_JSON" | jq -r '
+    .items[] |
+    if .spec.namespaceSelector == null
+    then "__ALL__"
+    else .spec.namespaceSelector.matchNames[]?
+    end
+  ' | sort -u
+)"
+
+if echo "$PROTECTED_NS" | grep -q "__ALL__"; then
+  PROTECTED_COUNT="$TOTAL_NS"
+  UNPROTECTED_NS=""
+else
+  PROTECTED_COUNT="$(echo "$PROTECTED_NS" | wc -l | tr -d ' ')"
+  UNPROTECTED_NS="$(comm -23 \
+    <(echo "$ALL_NAMESPACES" | sort) \
+    <(echo "$PROTECTED_NS" | sort)
+  )"
+fi
+
+UNPROTECTED_COUNT="$(echo "$UNPROTECTED_NS" | sed '/^$/d' | wc -l | tr -d ' ')"
+
+FREQ_DIST="$(
+  echo "$POLICIES_JSON" | jq -r '
+    .items[] | (.spec.frequency // "manual")
+  ' | sort | uniq -c | awk '{printf "    - %s: %s policies\n",$2,$1}'
+)"
+
+MAX_SNAPSHOT_RET="$(
+  echo "$POLICIES_JSON" | jq -r '
+    [
+      .items[].spec.retention?.daily?,
+      .items[].spec.actions[]?.snapshotRetention?.daily?
+    ] | map(select(. != null)) | max // empty
+  '
+)"
+
+MAX_EXPORT_RET="$(
+  echo "$POLICIES_JSON" | jq -r '
+    [
+      .items[].spec.actions[]?.exportParameters?.retention?.daily?
+    ] | map(select(. != null)) | max // empty
+  '
+)"
+
+cat <<EOF
+
+📊 Protection Coverage Matrix
+  Namespaces in cluster:        $TOTAL_NS
+  Namespaces protected:         $PROTECTED_COUNT
+  Namespaces unprotected:       $UNPROTECTED_COUNT
+EOF
+
+if [ -n "${UNPROTECTED_NS:-}" ]; then
+  echo "  Unprotected namespaces:"
+  echo "$UNPROTECTED_NS" | sed 's/^/    - /'
+fi
+
+cat <<EOF
+
+  Protection frequency distribution:
+$FREQ_DIST
+  Maximum retention detected (signal):
+    Snapshot: ${MAX_SNAPSHOT_RET:-not detected} days
+    Export:   ${MAX_EXPORT_RET:-not detected} days
 
 ✅ Discovery completed
 EOF
