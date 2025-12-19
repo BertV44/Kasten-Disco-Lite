@@ -1,260 +1,238 @@
 #!/bin/sh
-# Kasten Discovery Lite - FINAL v1.0
-# Author : Bertrand CASTAGNET EMEA TAM @Veeam
-# Profiles schema-safe + Policies detailed discovery
-# POSIX /bin/sh compatible
-
 set -eu
 
-#######################################
-# Arguments
-#######################################
+##############################################################################
+# Kasten Discovery Lite v1.1
+# Author: Bertrand CASTAGNET EMEA TAM
+# - FIX: retention detection (spec.retention + action-level)
+##############################################################################
 
-NS="kasten-io"
+### -------------------------
+### Args & flags
+### -------------------------
+NAMESPACE="${1:?Usage: $0 <namespace> [--debug|--json]}"
+MODE="human"
 DEBUG=false
-OUTPUT="text"
 
-for arg in "$@"; do
-  case "$arg" in
-    --debug) DEBUG=true ;;
-    --json) OUTPUT="json" ;;
-    *) NS="$arg" ;;
-  esac
-done
+[ "${2:-}" = "--json" ] && MODE="json"
+[ "${2:-}" = "--debug" ] && DEBUG=true
+[ "${3:-}" = "--debug" ] && DEBUG=true
 
-#######################################
-# Helpers
-#######################################
+debug() { [ "$DEBUG" = true ] && echo "🐛 DEBUG: $*" >&2; }
 
-debug() {
-  [ "$DEBUG" = true ] && echo "🐛 DEBUG: $*" >&2
-}
-
-require() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo "❌ missing dependency: $1"
-    exit 1
-  }
-}
-
-require kubectl
-require jq
-
-#######################################
-# Platform detection
-#######################################
-
-PLATFORM="Kubernetes"
-kubectl get clusterversion >/dev/null 2>&1 && PLATFORM="OpenShift"
-debug "Platform: $PLATFORM"
-
-#######################################
-# Kasten version
-#######################################
-
-KASTEN_VERSION="Unknown"
-if kubectl get cm k10-config -n "$NS" >/dev/null 2>&1; then
-  KASTEN_VERSION=$(kubectl get cm k10-config -n "$NS" -o json \
-    | jq -r '.data.version // .data.k10Version // "Unknown"')
+### -------------------------
+### Platform detection
+### -------------------------
+if kubectl get clusterversion >/dev/null 2>&1; then
+  PLATFORM="OpenShift"
+else
+  PLATFORM="Kubernetes"
 fi
+
+### -------------------------
+### Kasten version
+### -------------------------
+KASTEN_VERSION="$(kubectl -n "$NAMESPACE" get cm k10-config -o json 2>/dev/null \
+  | jq -r '.data.version // .data.k10Version // "unknown"')"
+
+debug "Platform: $PLATFORM"
 debug "Kasten version: $KASTEN_VERSION"
 
-#######################################
-# Core resources
-#######################################
+### -------------------------
+### Core resources
+### -------------------------
+count() { kubectl -n "$NAMESPACE" get "$1" --no-headers 2>/dev/null | wc -l | tr -d ' '; }
 
-count_ns() {
-  kubectl get "$1" -n "$NS" -o json --ignore-not-found 2>/dev/null \
-    | jq '.items | length'
-}
+PODS=$(count pods)
+SERVICES=$(count services)
+CONFIGMAPS=$(count configmaps)
+SECRETS=$(count secrets)
 
-PODS=$(count_ns pods)
-SERVICES=$(count_ns services)
-CONFIGMAPS=$(count_ns configmaps)
-SECRETS=$(count_ns secrets)
+### -------------------------
+### Profiles + Immutability signal
+### -------------------------
+PROFILES_JSON="$(kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json 2>/dev/null || echo '{}')"
+PROFILE_COUNT=$(echo "$PROFILES_JSON" | jq '.items | length')
 
-#######################################
-# Profiles discovery (SCHEMA SAFE)
-#######################################
+PROTECTION_HOURS="$(echo "$PROFILES_JSON" | jq -r '
+  .items[]?
+  | .spec.locationSpec.objectStore.protectionPeriod?
+  | capture("(?<h>[0-9]+)h").h
+' | head -n1)"
 
-PROFILE_JSON=""
-PROFILE_COUNT=0
-PROFILE_SCOPE=""
+IMMUTABILITY=false
+IMMUTABILITY_DAYS=""
 
-if kubectl get profiles -n "$NS" >/dev/null 2>&1; then
-  PROFILE_JSON=$(kubectl get profiles -n "$NS" -o json)
-  PROFILE_SCOPE="namespaced"
-elif kubectl get profiles.config.kio.kasten.io -n "$NS" >/dev/null 2>&1; then
-  PROFILE_JSON=$(kubectl get profiles.config.kio.kasten.io -n "$NS" -o json)
-  PROFILE_SCOPE="namespaced"
-elif kubectl get profiles >/dev/null 2>&1; then
-  PROFILE_JSON=$(kubectl get profiles -o json)
-  PROFILE_SCOPE="cluster"
-elif kubectl get profiles.config.kio.kasten.io >/dev/null 2>&1; then
-  PROFILE_JSON=$(kubectl get profiles.config.kio.kasten.io -o json)
-  PROFILE_SCOPE="cluster"
+if [ -n "${PROTECTION_HOURS:-}" ]; then
+  IMMUTABILITY=true
+  IMMUTABILITY_DAYS=$((PROTECTION_HOURS / 24))
 fi
 
-if [ -n "$PROFILE_JSON" ]; then
-  PROFILE_COUNT=$(echo "$PROFILE_JSON" | jq '.items | length')
-fi
+debug "Profiles: $PROFILE_COUNT"
+debug "Immutability: $IMMUTABILITY"
 
-debug "Profiles: $PROFILE_COUNT (scope=$PROFILE_SCOPE)"
+### -------------------------
+### Policies
+### -------------------------
+POLICIES_JSON="$(kubectl -n "$NAMESPACE" get policies -o json 2>/dev/null || echo '{}')"
+POLICY_COUNT=$(echo "$POLICIES_JSON" | jq '.items | length')
 
-#######################################
-# Policies discovery (detailed)
-#######################################
-
-POLICY_JSON=""
-POLICY_COUNT=0
-
-if kubectl get policies -n "$NS" >/dev/null 2>&1; then
-  POLICY_JSON=$(kubectl get policies -n "$NS" -o json)
-  POLICY_COUNT=$(echo "$POLICY_JSON" | jq '.items | length')
-fi
+ALL_NS_POLICIES=$(echo "$POLICIES_JSON" | jq '[.items[] | select(.spec.namespaceSelector == null)] | length')
 
 debug "Policies detected: $POLICY_COUNT"
 
-#######################################
-# JSON output
-#######################################
-
-if [ "$OUTPUT" = "json" ]; then
+### -------------------------
+### JSON output
+### -------------------------
+if [ "$MODE" = "json" ]; then
   jq -n \
-    --arg namespace "$NS" \
     --arg platform "$PLATFORM" \
-    --arg kastenVersion "$KASTEN_VERSION" \
-    --argjson pods "$PODS" \
-    --argjson services "$SERVICES" \
-    --argjson configMaps "$CONFIGMAPS" \
-    --argjson secrets "$SECRETS" \
-    --argjson profiles "$(echo "$PROFILE_JSON" | jq '
-      .items[] | {
-        name: .metadata.name,
-        scope: "'$PROFILE_SCOPE'",
-        type: (.spec.location.type // .spec.type // "unknown"),
-        details:
-          if ((.spec.location.type // .spec.type) == "ObjectStore") then
-            {
-              backend: (.spec.location.objectStore.name // .spec.objectStore.name // "unknown"),
-              region: (.spec.location.objectStore.region // .spec.objectStore.region // "unknown"),
-              endpoint: (.spec.location.objectStore.endpoint // .spec.objectStore.endpoint // "default")
-            }
-          elif ((.spec.location.type // .spec.type) == "Volume") then
-            {
-              storageClass: (.spec.location.volume.storageClass // .spec.volume.storageClass // "unknown")
-            }
-          elif ((.spec.location.type // .spec.type) == "File") then
-            {
-              path: (.spec.location.file.path // .spec.file.path // "unknown")
-            }
-          else {} end
-      }
-    ')" \
-    --argjson policies "$(echo "$POLICY_JSON" | jq '
-      .items[] | {
-        name: .metadata.name,
-        frequency: (.spec.frequency // "manual"),
-        actions: (.spec.actions | map(.type)),
-        namespaces:
-          (if .spec.selector.namespaces == null
-           then ["all"]
-           else .spec.selector.namespaces
-           end),
-        capabilities:
-          [
-            (if .spec.frequency != null then "scheduled" else empty end),
-            (if (.spec.actions | map(.type) | any(. == "export")) then "export" else empty end),
-            (if (.spec.actions | map(.type) | any(. == "import")) then "import" else empty end),
-            (if (.spec.actions | length > 1) then "multi-action" else empty end)
-          ]
-      }
-    ')" \
-    '{
-      timestamp: (now | todate),
-      namespace: $namespace,
+    --arg version "$KASTEN_VERSION" \
+    --argjson profiles "$PROFILES_JSON" \
+    --argjson policies "$POLICIES_JSON" \
+    --arg immutability "$IMMUTABILITY" \
+    --argjson immutabilityDays "${IMMUTABILITY_DAYS:-0}" \
+    --argjson allNs "$ALL_NS_POLICIES" \
+    '
+    {
       platform: $platform,
-      kastenVersion: $kastenVersion,
-      resources: {
-        pods: $pods,
-        services: $services,
-        configMaps: $configMaps,
-        secrets: $secrets
+      kastenVersion: $version,
+
+      profiles: {
+        count: ($profiles.items | length),
+        items: ($profiles.items | map({
+          name: .metadata.name,
+          backend: (.spec.locationSpec.objectStore.objectStoreType // "unknown"),
+          region: (.spec.locationSpec.objectStore.region // "unknown"),
+          endpoint: (.spec.locationSpec.objectStore.endpoint // "default"),
+          protectionPeriod: (.spec.locationSpec.objectStore.protectionPeriod // null)
+        }))
       },
-      profiles: $profiles,
-      policies: $policies
+
+      immutabilitySignal: ($immutability == "true"),
+      immutabilityDays: (if $immutabilityDays > 0 then $immutabilityDays else null end),
+
+      policies: {
+        count: ($policies.items | length),
+        items: ($policies.items | map({
+          name: .metadata.name,
+          frequency: (.spec.frequency // "manual"),
+          actions: [.spec.actions[]?.action],
+          namespaces:
+            (if .spec.namespaceSelector == null
+             then ["all"]
+             else [.spec.namespaceSelector.matchNames[]?]
+             end),
+          retention:
+            (if .spec.retention then
+               .spec.retention
+             else
+               (.spec.actions | map(
+                 if has("snapshotRetention") then .snapshotRetention
+                 elif .exportParameters?.retention then .exportParameters.retention
+                 else empty end
+               ))
+             end),
+          capabilities: [
+            (if .spec.frequency then "scheduled" else empty end),
+            (if ([.spec.actions[]?.action] | index("export")) then "export" else empty end),
+            (if ([.spec.actions[]?.action] | index("import")) then "import" else empty end),
+            (if (.spec.actions | length) > 1 then "multi-action" else empty end)
+          ]
+        }))
+      },
+
+      coverage: {
+        policiesTargetingAllNamespaces: $allNs
+      }
     }'
   exit 0
 fi
 
-#######################################
-# Human-readable output
-#######################################
+### -------------------------
+### Human output
+### -------------------------
+cat <<EOF
+🔍 Kasten Discovery Lite v6.5.2
+Namespace: $NAMESPACE
 
-echo "🔍 Kasten Discovery Lite"
-echo "Namespace: $NS"
-echo
-echo "🏭 Platform: $PLATFORM"
-echo "📦 Kasten Version: $KASTEN_VERSION"
-echo
+🏭 Platform: $PLATFORM
+📦 Kasten Version: $KASTEN_VERSION
 
-echo "📊 Core Resources"
-echo "  Pods:       $PODS"
-echo "  Services:   $SERVICES"
-echo "  ConfigMaps: $CONFIGMAPS"
-echo "  Secrets:    $SECRETS"
-echo
+📊 Core Resources
+  Pods:       $PODS
+  Services:   $SERVICES
+  ConfigMaps: $CONFIGMAPS
+  Secrets:    $SECRETS
 
-echo "📦 Kasten Profiles"
-echo "  Profiles: $PROFILE_COUNT"
-echo
+📦 Kasten Profiles
+  Profiles: $PROFILE_COUNT
+EOF
 
-if [ "$PROFILE_COUNT" -gt 0 ]; then
-  echo "$PROFILE_JSON" | jq -r '
-    .items[] |
-    "  - \(.metadata.name)\n" +
-    "    Type: \(.spec.location.type // .spec.type // "unknown")\n" +
+echo "$PROFILES_JSON" | jq -r '
+.items[] |
+"  - \(.metadata.name)\n" +
+"    Backend: \(.spec.locationSpec.objectStore.objectStoreType // "unknown")\n" +
+"    Region: \(.spec.locationSpec.objectStore.region // "unknown")\n" +
+"    Endpoint: \(.spec.locationSpec.objectStore.endpoint // "default")\n" +
+"    Protection period: \(.spec.locationSpec.objectStore.protectionPeriod // "not set")\n"
+'
+
+cat <<EOF
+🔒 Immutability (Kasten-level signal)
+  Status: $( [ "$IMMUTABILITY" = true ] && echo "DETECTED" || echo "NOT DETECTED" )
+$( [ "$IMMUTABILITY" = true ] && echo "  Protection period: ${IMMUTABILITY_DAYS} days" )
+
+📜 Kasten Policies
+  Policies: $POLICY_COUNT
+EOF
+
+echo "$POLICIES_JSON" | jq -r '
+.items[] |
+"  - \(.metadata.name)\n" +
+"    Frequency: \(.spec.frequency // "manual")\n" +
+"    Actions: \([.spec.actions[]?.action] | join(", "))\n" +
+"    Namespaces: " +
+  (if .spec.namespaceSelector == null
+   then "all"
+   else (.spec.namespaceSelector.matchNames | join(", "))
+   end) + "\n" +
+"    Retention:\n" +
+(
+  if .spec.retention then
+    (.spec.retention | to_entries[] |
+      "      \(.key | ascii_upcase): \(.value)")
+  elif (.spec.actions[]? | has("snapshotRetention") or has("exportParameters"))
+  then
     (
-      if ((.spec.location.type // .spec.type) == "ObjectStore") then
-        "    Backend: \(.spec.location.objectStore.name // .spec.objectStore.name // "unknown")\n" +
-        "    Region: \(.spec.location.objectStore.region // .spec.objectStore.region // "unknown")\n" +
-        "    Endpoint: \(.spec.location.objectStore.endpoint // .spec.objectStore.endpoint // "default")\n"
-      elif ((.spec.location.type // .spec.type) == "Volume") then
-        "    StorageClass: \(.spec.location.volume.storageClass // .spec.volume.storageClass // "unknown")\n"
-      elif ((.spec.location.type // .spec.type) == "File") then
-        "    Path: \(.spec.location.file.path // .spec.file.path // "unknown")\n"
-      else ""
-      end
+      .spec.actions[]? |
+      if .snapshotRetention then
+        (.snapshotRetention | to_entries[] |
+          "      Snapshot \(.key): \(.value)")
+      elif .exportParameters?.retention then
+        (.exportParameters.retention | to_entries[] |
+          "      Export \(.key): \(.value)")
+      else empty end
     )
-  '
-fi
+  else
+    "      not defined"
+  end
+) + "\n" +
+"    Capabilities:" +
+(
+  [
+    (if .spec.frequency then " scheduled" else empty end),
+    (if ([.spec.actions[]?.action] | index("export")) then " export" else empty end),
+    (if ([.spec.actions[]?.action] | index("import")) then " import" else empty end),
+    (if (.spec.actions | length) > 1 then " multi-action" else empty end)
+  ] | join("")
+)
+'
 
-echo "📜 Kasten Policies"
-echo "  Policies: $POLICY_COUNT"
-echo
+cat <<EOF
 
-if [ "$POLICY_COUNT" -gt 0 ]; then
-  echo "$POLICY_JSON" | jq -r '
-    .items[] |
-    "  - \(.metadata.name)\n" +
-    "    Frequency: \(.spec.frequency // "manual")\n" +
-    "    Actions: \(.spec.actions | map(.type) | join(", "))\n" +
-    "    Namespaces: \(
-      if .spec.selector.namespaces == null
-      then "all"
-      else (.spec.selector.namespaces | join(", "))
-      end
-    )\n" +
-    "    Capabilities:\n" +
-    (
-      [
-        (if .spec.frequency != null then "scheduled" else empty end),
-        (if (.spec.actions | map(.type) | any(. == "export")) then "export" else empty end),
-        (if (.spec.actions | map(.type) | any(. == "import")) then "import" else empty end),
-        (if (.spec.actions | length > 1) then "multi-action" else empty end)
-      ] | map("      - " + .) | join("\n")
-    ) + "\n"
-  '
-fi
+📊 Policy Coverage Summary
+  Policies targeting all namespaces: $ALL_NS_POLICIES
 
-echo "✅ Discovery Lite completed"
+✅ Discovery completed
+EOF
