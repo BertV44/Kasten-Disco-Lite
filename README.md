@@ -1,8 +1,11 @@
 # Kasten Discovery Lite
 
-**Version:** v1.1  
+**Version:** v1.2  
 **Scope:** Read-only discovery of a Kasten K10 installation on Kubernetes or OpenShift
-
+Tested on:
+- Kasten 8.0.14 and Openshift 4.18
+- WIP K3S
+- ARO Kasten 8.X
 ---
 
 ## Overview
