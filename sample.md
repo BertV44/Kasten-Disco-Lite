@@ -14,7 +14,8 @@ Namespace: kasten-io
 
 💚 Health Status
   Pods:       21/35 ready (21 running)
-  Backups:    0 completed, 0 failed (0% success)
+  Actions:    No backup/export actions found
+  RestorePoints: 24
 
 📊 Core Resources
   Pods:       35
@@ -39,31 +40,31 @@ Namespace: kasten-io
   - k10-disaster-recovery-policy
     Frequency: @hourly
     Actions: backup
-    Namespace selector: all namespaces
+    Namespace selector: namespaces: kasten-io
     Retention:
       Policy-level DAILY: 1
   - k10-disaster-recovery-policy
     Frequency: @hourly
     Actions: backup
-    Namespace selector: all namespaces
+    Namespace selector: namespaces: kasten-io
     Retention:
       Policy-level HOURLY: 4
   - k10-disaster-recovery-policy
     Frequency: @hourly
     Actions: backup
-    Namespace selector: all namespaces
+    Namespace selector: namespaces: kasten-io
     Retention:
       Policy-level MONTHLY: 1
   - k10-disaster-recovery-policy
     Frequency: @hourly
     Actions: backup
-    Namespace selector: all namespaces
+    Namespace selector: namespaces: kasten-io
     Retention:
       Policy-level WEEKLY: 1
   - k10-disaster-recovery-policy
     Frequency: @hourly
     Actions: backup
-    Namespace selector: all namespaces
+    Namespace selector: namespaces: kasten-io
     Retention:
       Policy-level YEARLY: 1
   - k10-system-reports-policy
@@ -75,13 +76,13 @@ Namespace: kasten-io
   - smoke-test
     Frequency: @daily
     Actions: backup, export
-    Namespace selector: all namespaces
+    Namespace selector: namespaces: smoketest
     Retention:
       Policy-level DAILY: 7
   - test1
     Frequency: @daily
     Actions: backup, export
-    Namespace selector: all namespaces
+    Namespace selector: namespaces: openshift-operators
     Retention:
       Policy-level DAILY: 7
   - test1-import
@@ -92,19 +93,4 @@ Namespace: kasten-io
       not defined
 
 📊 Policy Coverage Summary
-  Policies targeting all namespaces: 5
-
-📊 Protection Coverage Matrix
-  Namespaces in cluster:        79
-  Namespaces explicitly protected: 79 (100.0%)
-  Protection method:               all (catch-all policy)
-  Namespaces unprotected:          0 (all covered)
-
-  Protection frequency distribution:
-    - @daily: 4 policies
-    - @hourly: 1 policies
-  Maximum retention detected:
-    Snapshot: 7 days
-    Export:   7 days
-
-✅ Discovery completed
+  Policies targeting all namespaces: 2
