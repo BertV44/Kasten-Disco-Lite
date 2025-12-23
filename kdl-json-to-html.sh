@@ -2,10 +2,12 @@
 set -eu
 
 ##############################################################################
-# KDL JSON → HTML Report Generator
+# KDL JSON → HTML Report Generator v1.3
 #
 # Usage:
 #   ./kdl-json-to-html.sh input.json output.html
+#
+# Compatible with Kasten Discovery Lite v1.3 JSON output
 ##############################################################################
 
 INPUT_JSON="${1:?Usage: $0 <input.json> <output.html>}"
@@ -23,137 +25,529 @@ command -v jq >/dev/null 2>&1 || {
 
 jq -r '
 def badge(v):
-  if v == true then "<span class=\"badge ok\">Detected</span>"
-  else "<span class=\"badge warn\">Not detected</span>" end;
+  if v == true or v == "VALID" then "<span class=\"badge ok\">✓ " + (v | tostring) + "</span>"
+  elif v == "EXPIRED" or v == "Failed" then "<span class=\"badge error\">✗ " + (v | tostring) + "</span>"
+  elif v == "NOT_FOUND" then "<span class=\"badge warn\">⚠ Not Found</span>"
+  else "<span class=\"badge warn\">⚠ " + (v | tostring) + "</span>" end;
+
+def statusBadge(v):
+  if v == "VALID" then "<span class=\"badge ok\">✓ Valid</span>"
+  elif v == "EXPIRED" then "<span class=\"badge error\">✗ Expired</span>"
+  elif v == "NOT_FOUND" then "<span class=\"badge warn\">⚠ Not Found</span>"
+  else "<span class=\"badge warn\">⚠ Unknown</span>" end;
 
 def card(title; value):
-  "<div class=\"card\"><strong>" + title + "</strong><br>" + value + "</div>";
+  "<div class=\"card\"><strong>" + title + "</strong><br><span class=\"card-value\">" + value + "</span></div>";
+
+def progressBar(completed; total):
+  if total > 0 then
+    ((completed * 100 / total * 10 | floor) / 10 | tostring) + "%"
+  else "N/A" end;
 
 "<!DOCTYPE html>
 <html lang=\"en\">
 <head>
 <meta charset=\"UTF-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
 <title>Kasten Discovery Lite Report</title>
 <style>
-body {
-  font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Arial, sans-serif;
-  background: #f6f8fa;
-  color: #24292e;
-  margin: 2rem;
+* {
+  box-sizing: border-box;
 }
-h1, h2 {
-  border-bottom: 1px solid #e1e4e8;
-  padding-bottom: .3rem;
+body {
+  font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, \"Helvetica Neue\", Arial, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #24292e;
+  margin: 0;
+  padding: 2rem;
+  min-height: 100vh;
+}
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  background: #ffffff;
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  padding: 2rem;
+}
+h1 {
+  font-size: 2rem;
+  margin: 0 0 0.5rem 0;
+  color: #667eea;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+h1::before {
+  content: \"🔍\";
+  font-size: 2.5rem;
+}
+.subtitle {
+  color: #57606a;
+  font-size: 0.9rem;
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 2px solid #e1e4e8;
+}
+h2 {
+  font-size: 1.4rem;
+  margin: 2rem 0 1rem 0;
+  color: #24292e;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 2px solid #e1e4e8;
+  padding-bottom: 0.5rem;
 }
 .grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 1rem;
-  margin-bottom: 1rem;
+  margin-bottom: 2rem;
+}
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
 }
 .card {
-  background: #ffffff;
+  background: linear-gradient(135deg, #f6f8fa 0%, #ffffff 100%);
   border: 1px solid #e1e4e8;
-  border-radius: 8px;
-  padding: 1rem;
+  border-radius: 12px;
+  padding: 1.2rem;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.card strong {
+  font-size: 0.85rem;
+  color: #57606a;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.card-value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: #24292e;
+  display: block;
+  margin-top: 0.5rem;
+}
+.health-card {
+  background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+  border-color: #bae6fd;
+}
+.license-card {
+  background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+  border-color: #fcd34d;
+}
+.coverage-card {
+  background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
+  border-color: #6ee7b7;
 }
 table {
   width: 100%;
   border-collapse: collapse;
-  margin-top: .5rem;
+  margin-top: 0.5rem;
+  background: #ffffff;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
 }
 th, td {
   border: 1px solid #e1e4e8;
-  padding: .5rem;
+  padding: 0.75rem;
   text-align: left;
 }
 th {
-  background: #f0f3f6;
+  background: linear-gradient(180deg, #f6f8fa 0%, #eaeef2 100%);
+  font-weight: 600;
+  color: #24292e;
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.5px;
+}
+tr:hover {
+  background: #f6f8fa;
 }
 .badge {
-  padding: .2rem .6rem;
-  border-radius: 6px;
-  font-size: .85rem;
+  display: inline-block;
+  padding: 0.3rem 0.8rem;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
 }
-.ok { background: #dafbe1; }
-.warn { background: #fff8c5; }
-.footer {
-  margin-top: 2rem;
-  font-size: .8rem;
+.ok {
+  background: #d1fae5;
+  color: #065f46;
+  border: 1px solid #6ee7b7;
+}
+.warn {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
+.error {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fca5a5;
+}
+.info-box {
+  background: #f0f9ff;
+  border-left: 4px solid #3b82f6;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.warning-box {
+  background: #fffbeb;
+  border-left: 4px solid #f59e0b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  margin: 0.5rem 0;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #e1e4e8;
+}
+.stat-row:last-child {
+  border-bottom: none;
+}
+.stat-label {
   color: #57606a;
+  font-size: 0.9rem;
+}
+.stat-value {
+  font-weight: 600;
+  color: #24292e;
+}
+.progress-bar {
+  background: #e1e4e8;
+  border-radius: 8px;
+  height: 8px;
+  overflow: hidden;
+  margin-top: 0.5rem;
+}
+.progress-fill {
+  background: linear-gradient(90deg, #10b981 0%, #059669 100%);
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.footer {
+  margin-top: 3rem;
+  padding-top: 2rem;
+  border-top: 2px solid #e1e4e8;
+  text-align: center;
+  font-size: 0.85rem;
+  color: #57606a;
+}
+.section-description {
+  color: #57606a;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+code {
+  background: #f6f8fa;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-family: \"SFMono-Regular\", Consolas, \"Liberation Mono\", Menlo, monospace;
+  font-size: 0.85rem;
+}
+.namespace-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.5rem;
+}
+.namespace-tag {
+  background: #f0f3f6;
+  padding: 0.3rem 0.6rem;
+  border-radius: 6px;
+  font-size: 0.8rem;
+  border: 1px solid #d0d7de;
+}
+@media (max-width: 768px) {
+  body {
+    padding: 1rem;
+  }
+  .container {
+    padding: 1rem;
+  }
+  h1 {
+    font-size: 1.5rem;
+  }
+  .grid, .grid-2 {
+    grid-template-columns: 1fr;
+  }
+  table {
+    font-size: 0.85rem;
+  }
+  th, td {
+    padding: 0.5rem;
+  }
 }
 </style>
 </head>
 <body>
 
-<h1>🔍 Kasten Discovery Lite</h1>
+<div class=\"container\">
+
+<h1>Kasten Discovery Lite Report</h1>
+<div class=\"subtitle\">
+  Generated: " + (now | strftime("%Y-%m-%d %H:%M:%S UTC")) + " | 
+  Platform: " + .platform + " | 
+  Version: " + .kastenVersion + "
+</div>
 
 <div class=\"grid\">"
-+
-card("Platform"; .platform)
-+
-card("Kasten Version"; .kastenVersion)
 +
 card("Profiles"; (.profiles.count | tostring))
 +
 card("Policies"; (.policies.count | tostring))
 +
+card("Total Pods"; (if .health.pods.total then (.health.pods.total | tostring) else "N/A" end))
++
+card("Restore Points"; (if .health.backups.restorePoints then (.health.backups.restorePoints | tostring) else "N/A" end))
++
 "</div>
 
-<h2>🔒 Immutability</h2>
-<div class=\"card\">
-Status: " + badge(.immutabilitySignal) +
-(if .immutabilityDays != null then
-  "<br>Protection period: " + (.immutabilityDays | tostring) + " days"
- else "" end) +
-"</div>
-
-<h2>📦 Profiles</h2>
-<table>
-<tr>
-<th>Name</th><th>Backend</th><th>Region</th><th>Endpoint</th><th>Protection</th>
-</tr>"
+<h2>📜 License Information</h2>"
 +
-(.profiles.items | map(
-  "<tr><td>" + .name +
-  "</td><td>" + .backend +
-  "</td><td>" + .region +
-  "</td><td>" + .endpoint +
-  "</td><td>" + (.protectionPeriod // "not set") +
-  "</td></tr>"
-) | join(""))
+(if .license.status == "NOT_FOUND" then
+  "<div class=\"warning-box\">
+    ⚠️ <strong>License not found</strong><br>
+    No k10-license secret detected in the namespace.
+  </div>"
+else
+  "<div class=\"card license-card\">
+    <div class=\"stat-row\">
+      <span class=\"stat-label\">Customer</span>
+      <span class=\"stat-value\">" + .license.customer + "</span>
+    </div>
+    <div class=\"stat-row\">
+      <span class=\"stat-label\">License ID</span>
+      <span class=\"stat-value\"><code>" + .license.id + "</code></span>
+    </div>
+    <div class=\"stat-row\">
+      <span class=\"stat-label\">Status</span>
+      <span class=\"stat-value\">" + statusBadge(.license.status) + "</span>
+    </div>
+    <div class=\"stat-row\">
+      <span class=\"stat-label\">Valid Period</span>
+      <span class=\"stat-value\">" + .license.dateStart + " → " + .license.dateEnd + "</span>
+    </div>
+    <div class=\"stat-row\">
+      <span class=\"stat-label\">Node Limit</span>
+      <span class=\"stat-value\">" + 
+        (if .license.restrictions.nodes == "unlimited" or .license.restrictions.nodes == "0" 
+         then "<span class=\"badge ok\">∞ Unlimited</span>"
+         else .license.restrictions.nodes + " nodes" end) + 
+      "</span>
+    </div>
+  </div>"
+end)
 +
-"</table>
-
-<h2>📜 Policies</h2>
-<table>
-<tr>
-<th>Name</th><th>Frequency</th><th>Namespaces</th><th>Retention</th>
-</tr>"
+"
+<h2>💚 Health Status</h2>"
 +
-(.policies.items | map(
-  "<tr><td>" + .name +
-  "</td><td>" + .frequency +
-  "</td><td>" + (.namespaces | join(", ")) +
-  "</td><td>" +
-    (if (.retention | type) == "object" then
-      (.retention | to_entries | map("\(.key): \(.value)") | join(", "))
-     else
-      "not defined"
-     end) +
-  "</td></tr>"
-) | join(""))
+(if .health then
+  "<div class=\"grid-2\">
+    <div class=\"card health-card\">
+      <strong>Pod Health</strong>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Total Pods</span>
+        <span class=\"stat-value\">" + (.health.pods.total | tostring) + "</span>
+      </div>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Running</span>
+        <span class=\"stat-value\">" + (.health.pods.running | tostring) + "</span>
+      </div>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Ready</span>
+        <span class=\"stat-value\">" + (.health.pods.ready | tostring) + " / " + (.health.pods.total | tostring) + "</span>
+      </div>
+      <div class=\"progress-bar\">
+        <div class=\"progress-fill\" style=\"width: " + 
+          progressBar(.health.pods.ready; .health.pods.total) + 
+        "\"></div>
+      </div>
+    </div>
+    <div class=\"card health-card\">
+      <strong>Backup Health</strong>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Total Restore Points</span>
+        <span class=\"stat-value\">" + (.health.backups.restorePoints | tostring) + "</span>
+      </div>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Completed</span>
+        <span class=\"stat-value\" style=\"color: #059669;\">" + (.health.backups.completed | tostring) + "</span>
+      </div>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Failed</span>
+        <span class=\"stat-value\" style=\"color: #dc2626;\">" + (.health.backups.failed | tostring) + "</span>
+      </div>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Success Rate</span>
+        <span class=\"stat-value\">" + .health.backups.successRate + "%</span>
+      </div>
+      <div class=\"progress-bar\">
+        <div class=\"progress-fill\" style=\"width: " + .health.backups.successRate + "%\"></div>
+      </div>
+    </div>
+  </div>"
+else
+  "<div class=\"info-box\">Health metrics not available in this report version.</div>"
+end)
 +
-"</table>
-
-<h2>📊 Coverage Summary</h2>
-<div class=\"card\">
-Policies targeting all namespaces:
-<strong>" + (.coverage.policiesTargetingAllNamespaces | tostring) + "</strong>
+"
+<h2>🔒 Immutability Signal</h2>
+<div class=\"section-description\">
+  Kasten-level immutability detection based on profile protection periods.
 </div>
+<div class=\"card\">
+  <div class=\"stat-row\">
+    <span class=\"stat-label\">Detection Status</span>
+    <span class=\"stat-value\">" + badge(.immutabilitySignal) + "</span>
+  </div>"
++
+(if .immutabilityDays != null and .immutabilityDays > 0 then
+  "  <div class=\"stat-row\">
+    <span class=\"stat-label\">Protection Period</span>
+    <span class=\"stat-value\">" + (.immutabilityDays | tostring) + " days</span>
+  </div>"
+else "" end)
++
+"</div>
+
+<h2>📦 Location Profiles</h2>
+<div class=\"section-description\">
+  Configured backup destinations and their settings.
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Backend</th>
+<th>Region</th>
+<th>Endpoint</th>
+<th>Protection Period</th>
+</tr>
+</thead>
+<tbody>"
++
+(if (.profiles.items | length) > 0 then
+  (.profiles.items | map(
+    "<tr>
+      <td><strong>" + .name + "</strong></td>
+      <td>" + .backend + "</td>
+      <td>" + .region + "</td>
+      <td><code>" + .endpoint + "</code></td>
+      <td>" + (if .protectionPeriod then .protectionPeriod else "<span class=\"badge warn\">Not Set</span>" end) + "</td>
+    </tr>"
+  ) | join(""))
+else
+  "<tr><td colspan=\"5\" style=\"text-align:center;color:#57606a;\">No profiles found</td></tr>"
+end)
++
+"</tbody>
+</table>
+
+<h2>📜 Backup Policies</h2>
+<div class=\"section-description\">
+  Configured policies with retention schedules and namespace selectors.
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Frequency</th>
+<th>Actions</th>
+<th>Namespace Selector</th>
+<th>Retention</th>
+</tr>
+</thead>
+<tbody>"
++
+(if (.policies.items | length) > 0 then
+  (.policies.items | map(
+    "<tr>
+      <td><strong>" + .name + "</strong></td>
+      <td><code>" + .frequency + "</code></td>
+      <td>" + (.actions | join(", ")) + "</td>
+      <td>" + 
+        (if (.namespaceSelector | type) == "string" then
+          if .namespaceSelector == "all" then "<span class=\"badge ok\">All Namespaces</span>"
+          else .namespaceSelector end
+        elif (.namespaceSelector | type) == "object" then
+          if .namespaceSelector.matchNames then
+            (.namespaceSelector.matchNames | join(", "))
+          elif .namespaceSelector.matchExpressions then
+            "<span class=\"badge info\">Expression-based</span>"
+          elif .namespaceSelector.matchLabels then
+            "<span class=\"badge info\">Label-based</span>"
+          else "<span class=\"badge ok\">All Namespaces</span>" end
+        else "<span class=\"badge ok\">All Namespaces</span>" end
+      + "</td>
+      <td>" +
+        (if (.retention | type) == "array" and (.retention | length) > 0 then
+          (.retention[] | 
+            if (. | type) == "object" then
+              (. | to_entries | map("<strong>\(.key):</strong> \(.value)") | join("<br>"))
+            else
+              (. | tostring)
+            end
+          )
+        elif (.retention | type) == "object" then
+          (.retention | to_entries | map("<strong>\(.key):</strong> \(.value)") | join("<br>"))
+        else
+          "<span class=\"badge warn\">Not defined</span>"
+        end) +
+      "</td>
+    </tr>"
+  ) | join(""))
+else
+  "<tr><td colspan=\"5\" style=\"text-align:center;color:#57606a;\">No policies found</td></tr>"
+end)
++
+"</tbody>
+</table>
+
+<h2>📊 Protection Coverage Summary</h2>
+<div class=\"section-description\">
+  Overview of namespace protection across the cluster.
+</div>
+<div class=\"card coverage-card\">
+  <div class=\"stat-row\">
+    <span class=\"stat-label\">Policies Targeting All Namespaces</span>
+    <span class=\"stat-value\">" + (.coverage.policiesTargetingAllNamespaces | tostring) + "</span>
+  </div>"
++
+(if .coverage.policiesTargetingAllNamespaces > 0 then
+  "  <div class=\"info-box\" style=\"margin-top: 1rem;\">
+    ✓ <strong>Cluster-wide protection enabled</strong><br>
+    At least one policy protects all namespaces in the cluster.
+  </div>"
+else
+  "  <div class=\"warning-box\" style=\"margin-top: 1rem;\">
+    ⚠️ <strong>No cluster-wide protection</strong><br>
+    Consider adding a catch-all policy for comprehensive coverage.
+  </div>"
+end)
++
+"</div>
 
 <div class=\"footer\">
-Generated by Kasten Discovery Lite
+  <strong>Kasten Discovery Lite v1.3</strong><br>
+  This report provides observational signals only and does not assert compliance.<br>
+  Generated from JSON output of Kasten Discovery Lite script.
+</div>
+
 </div>
 
 </body>
@@ -161,3 +555,4 @@ Generated by Kasten Discovery Lite
 ' "$INPUT_JSON" > "$OUTPUT_HTML"
 
 echo "✅ HTML report generated: $OUTPUT_HTML"
+echo "   Open with: open $OUTPUT_HTML (macOS) or xdg-open $OUTPUT_HTML (Linux)"
