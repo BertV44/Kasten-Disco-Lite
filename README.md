@@ -417,7 +417,7 @@ rules:
   resources: ["profiles", "policies"]
   verbs: ["get", "list"]
 - apiGroups: ["actions.kio.kasten.io"]
-  resources: ["restorepoints"]
+  resources: ["restorepoints", "backupactions", "exportactions"]
   verbs: ["get", "list"]
 ```
 
@@ -455,9 +455,9 @@ The script includes comprehensive error handling:
 
 ## Version History
 
-- **v1.3** (Current)
+- **v1.3** (Current - Stable)
   - Added license information extraction
-  - Added health status monitoring
+  - Added health status monitoring (Actions-based metrics)
   - Added backup success rate tracking
   - Enhanced namespace selector detection (matchExpressions, matchLabels)
   - Fixed export retention detection (all GFS periods)
@@ -465,6 +465,7 @@ The script includes comprehensive error handling:
   - Improved portability (removed grep -P dependency)
   - Added color-coded output with --no-color option
   - Added comprehensive error handling
+  - Fixed policy selector detection (spec.selector instead of spec.namespaceSelector)
 
 - **v1.2**
   - Added Policy Protection Coverage Matrix
@@ -517,6 +518,7 @@ If using a different secret name, the script will show "NOT_FOUND".
 5. **Coverage analysis** - Identify unprotected namespaces
 6. **Support tickets** - Provide detailed environment information
 7. **Automation** - JSON output for CI/CD pipelines
+8. **Documentation** - Generate HTML reports for stakeholders
 
 ---
 
