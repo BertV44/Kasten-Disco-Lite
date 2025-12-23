@@ -44,6 +44,37 @@ def progressBar(completed; total):
     ((completed * 100 / total * 10 | floor) / 10 | tostring) + "%"
   else "N/A" end;
 
+def formatNamespaceSelector:
+  if type == "string" then
+    if . == "all" then "<span class=\"badge ok\">All Namespaces</span>"
+    else . end
+  elif type == "object" then
+    if .matchNames then
+      (.matchNames | join(", "))
+    elif .namespaces then
+      (.namespaces | join(", "))
+    elif .matchExpressions then
+      "<span class=\"badge info\">Expression-based</span>"
+    elif .matchLabels then
+      "<span class=\"badge info\">Label-based</span>"
+    else "<span class=\"badge ok\">All Namespaces</span>" end
+  else "<span class=\"badge ok\">All Namespaces</span>" end;
+
+def formatRetention:
+  if type == "array" and length > 0 then
+    (.[0] | 
+      if type == "object" then
+        (to_entries | map("<strong>" + .key + ":</strong> " + (.value | tostring)) | join("<br>"))
+      else
+        tostring
+      end
+    )
+  elif type == "object" then
+    (to_entries | map("<strong>" + .key + ":</strong> " + (.value | tostring)) | join("<br>"))
+  else
+    "<span class=\"badge warn\">Not defined</span>"
+  end;
+
 "<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -195,6 +226,11 @@ tr:hover {
   color: #991b1b;
   border: 1px solid #fca5a5;
 }
+.info {
+  background: #dbeafe;
+  color: #1e40af;
+  border: 1px solid #93c5fd;
+}
 .info-box {
   background: #f0f9ff;
   border-left: 4px solid #3b82f6;
@@ -259,19 +295,6 @@ code {
   font-family: \"SFMono-Regular\", Consolas, \"Liberation Mono\", Menlo, monospace;
   font-size: 0.85rem;
 }
-.namespace-list {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.5rem;
-  margin-top: 0.5rem;
-}
-.namespace-tag {
-  background: #f0f3f6;
-  padding: 0.3rem 0.6rem;
-  border-radius: 6px;
-  font-size: 0.8rem;
-  border: 1px solid #d0d7de;
-}
 @media (max-width: 768px) {
   body {
     padding: 1rem;
@@ -313,7 +336,7 @@ card("Policies"; (.policies.count | tostring))
 +
 card("Total Pods"; (if .health.pods.total then (.health.pods.total | tostring) else "N/A" end))
 +
-card("Restore Points"; (if .health.backups.restorePoints then (.health.backups.restorePoints | tostring) else "N/A" end))
+card("Actions"; (if .health.backups.totalActions then (.health.backups.totalActions | tostring) else "N/A" end))
 +
 "</div>
 
@@ -381,16 +404,20 @@ end)
     <div class=\"card health-card\">
       <strong>Backup Health</strong>
       <div class=\"stat-row\">
-        <span class=\"stat-label\">Total Restore Points</span>
-        <span class=\"stat-value\">" + (.health.backups.restorePoints | tostring) + "</span>
+        <span class=\"stat-label\">Total Actions</span>
+        <span class=\"stat-value\">" + (.health.backups.totalActions | tostring) + "</span>
       </div>
       <div class=\"stat-row\">
         <span class=\"stat-label\">Completed</span>
-        <span class=\"stat-value\" style=\"color: #059669;\">" + (.health.backups.completed | tostring) + "</span>
+        <span class=\"stat-value\" style=\"color: #059669;\">" + (.health.backups.completedActions | tostring) + "</span>
       </div>
       <div class=\"stat-row\">
         <span class=\"stat-label\">Failed</span>
-        <span class=\"stat-value\" style=\"color: #dc2626;\">" + (.health.backups.failed | tostring) + "</span>
+        <span class=\"stat-value\" style=\"color: #dc2626;\">" + (.health.backups.failedActions | tostring) + "</span>
+      </div>
+      <div class=\"stat-row\">
+        <span class=\"stat-label\">Restore Points</span>
+        <span class=\"stat-value\">" + (.health.backups.restorePoints | tostring) + "</span>
       </div>
       <div class=\"stat-row\">
         <span class=\"stat-label\">Success Rate</span>
@@ -480,35 +507,8 @@ end)
       <td><strong>" + .name + "</strong></td>
       <td><code>" + .frequency + "</code></td>
       <td>" + (.actions | join(", ")) + "</td>
-      <td>" + 
-        (if (.namespaceSelector | type) == "string" then
-          if .namespaceSelector == "all" then "<span class=\"badge ok\">All Namespaces</span>"
-          else .namespaceSelector end
-        elif (.namespaceSelector | type) == "object" then
-          if .namespaceSelector.matchNames then
-            (.namespaceSelector.matchNames | join(", "))
-          elif .namespaceSelector.matchExpressions then
-            "<span class=\"badge info\">Expression-based</span>"
-          elif .namespaceSelector.matchLabels then
-            "<span class=\"badge info\">Label-based</span>"
-          else "<span class=\"badge ok\">All Namespaces</span>" end
-        else "<span class=\"badge ok\">All Namespaces</span>" end
-      + "</td>
-      <td>" +
-        (if (.retention | type) == "array" and (.retention | length) > 0 then
-          (.retention[] | 
-            if (. | type) == "object" then
-              (. | to_entries | map("<strong>\(.key):</strong> \(.value)") | join("<br>"))
-            else
-              (. | tostring)
-            end
-          )
-        elif (.retention | type) == "object" then
-          (.retention | to_entries | map("<strong>\(.key):</strong> \(.value)") | join("<br>"))
-        else
-          "<span class=\"badge warn\">Not defined</span>"
-        end) +
-      "</td>
+      <td>" + (.selector | formatNamespaceSelector) + "</td>
+      <td>" + (.retention | formatRetention) + "</td>
     </tr>"
   ) | join(""))
 else
