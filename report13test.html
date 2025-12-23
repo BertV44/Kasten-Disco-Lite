@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kasten Discovery Lite Report</title>
+<style>
+* {
+  box-sizing: border-box;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #24292e;
+  margin: 0;
+  padding: 2rem;
+  min-height: 100vh;
+}
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  background: #ffffff;
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  padding: 2rem;
+}
+h1 {
+  font-size: 2rem;
+  margin: 0 0 0.5rem 0;
+  color: #667eea;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+h1::before {
+  content: "🔍";
+  font-size: 2.5rem;
+}
+.subtitle {
+  color: #57606a;
+  font-size: 0.9rem;
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 2px solid #e1e4e8;
+}
+h2 {
+  font-size: 1.4rem;
+  margin: 2rem 0 1rem 0;
+  color: #24292e;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 2px solid #e1e4e8;
+  padding-bottom: 0.5rem;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.card {
+  background: linear-gradient(135deg, #f6f8fa 0%, #ffffff 100%);
+  border: 1px solid #e1e4e8;
+  border-radius: 12px;
+  padding: 1.2rem;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.card strong {
+  font-size: 0.85rem;
+  color: #57606a;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.card-value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: #24292e;
+  display: block;
+  margin-top: 0.5rem;
+}
+.health-card {
+  background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+  border-color: #bae6fd;
+}
+.license-card {
+  background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+  border-color: #fcd34d;
+}
+.coverage-card {
+  background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
+  border-color: #6ee7b7;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5rem;
+  background: #ffffff;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+th, td {
+  border: 1px solid #e1e4e8;
+  padding: 0.75rem;
+  text-align: left;
+}
+th {
+  background: linear-gradient(180deg, #f6f8fa 0%, #eaeef2 100%);
+  font-weight: 600;
+  color: #24292e;
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.5px;
+}
+tr:hover {
+  background: #f6f8fa;
+}
+.badge {
+  display: inline-block;
+  padding: 0.3rem 0.8rem;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ok {
+  background: #d1fae5;
+  color: #065f46;
+  border: 1px solid #6ee7b7;
+}
+.warn {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
+.error {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fca5a5;
+}
+.info {
+  background: #dbeafe;
+  color: #1e40af;
+  border: 1px solid #93c5fd;
+}
+.info-box {
+  background: #f0f9ff;
+  border-left: 4px solid #3b82f6;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.warning-box {
+  background: #fffbeb;
+  border-left: 4px solid #f59e0b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  margin: 0.5rem 0;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #e1e4e8;
+}
+.stat-row:last-child {
+  border-bottom: none;
+}
+.stat-label {
+  color: #57606a;
+  font-size: 0.9rem;
+}
+.stat-value {
+  font-weight: 600;
+  color: #24292e;
+}
+.progress-bar {
+  background: #e1e4e8;
+  border-radius: 8px;
+  height: 8px;
+  overflow: hidden;
+  margin-top: 0.5rem;
+}
+.progress-fill {
+  background: linear-gradient(90deg, #10b981 0%, #059669 100%);
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.footer {
+  margin-top: 3rem;
+  padding-top: 2rem;
+  border-top: 2px solid #e1e4e8;
+  text-align: center;
+  font-size: 0.85rem;
+  color: #57606a;
+}
+.section-description {
+  color: #57606a;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+code {
+  background: #f6f8fa;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.85rem;
+}
+@media (max-width: 768px) {
+  body {
+    padding: 1rem;
+  }
+  .container {
+    padding: 1rem;
+  }
+  h1 {
+    font-size: 1.5rem;
+  }
+  .grid, .grid-2 {
+    grid-template-columns: 1fr;
+  }
+  table {
+    font-size: 0.85rem;
+  }
+  th, td {
+    padding: 0.5rem;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<h1>Kasten Discovery Lite Report</h1>
+<div class="subtitle">
+  Generated: 2025-12-23 17:06:41 UTC | 
+  Platform: OpenShift | 
+  Version: 8.0.15
+</div>
+
+<div class="grid"><div class="card"><strong>Profiles</strong><br><span class="card-value">1</span></div><div class="card"><strong>Policies</strong><br><span class="card-value">5</span></div><div class="card"><strong>Total Pods</strong><br><span class="card-value">36</span></div><div class="card"><strong>Actions</strong><br><span class="card-value">0</span></div></div>
+
+<h2>📜 License Information</h2><div class="card license-card">
+    <div class="stat-row">
+      <span class="stat-label">Customer</span>
+      <span class="stat-value">starter-license</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">License ID</span>
+      <span class="stat-value"><code>starter-4f1842c0-0745-41a5-aaa7-a01d748b1c30</code></span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Status</span>
+      <span class="stat-value"><span class="badge ok">✓ Valid</span></span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Valid Period</span>
+      <span class="stat-value">2020-01-01T00:00:00.000Z → 2100-01-01T00:00:00.000Z</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Node Limit</span>
+      <span class="stat-value">10 nodes</span>
+    </div>
+  </div>
+<h2>💚 Health Status</h2><div class="grid-2">
+    <div class="card health-card">
+      <strong>Pod Health</strong>
+      <div class="stat-row">
+        <span class="stat-label">Total Pods</span>
+        <span class="stat-value">36</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Running</span>
+        <span class="stat-value">22</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Ready</span>
+        <span class="stat-value">21 / 36</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" style="width: 58.3%"></div>
+      </div>
+    </div>
+    <div class="card health-card">
+      <strong>Backup Health</strong>
+      <div class="stat-row">
+        <span class="stat-label">Total Actions</span>
+        <span class="stat-value">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Completed</span>
+        <span class="stat-value" style="color: #059669;">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Failed</span>
+        <span class="stat-value" style="color: #dc2626;">0</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Restore Points</span>
+        <span class="stat-value">24</span>
+      </div>
+      <div class="stat-row">
+        <span class="stat-label">Success Rate</span>
+        <span class="stat-value">N/A%</span>
+      </div>
+      <div class="progress-bar">
+        <div class="progress-fill" style="width: N/A%"></div>
+      </div>
+    </div>
+  </div>
+<h2>🔒 Immutability Signal</h2>
+<div class="section-description">
+  Kasten-level immutability detection based on profile protection periods.
+</div>
+<div class="card">
+  <div class="stat-row">
+    <span class="stat-label">Detection Status</span>
+    <span class="stat-value"><span class="badge ok">✓ true</span></span>
+  </div>  <div class="stat-row">
+    <span class="stat-label">Protection Period</span>
+    <span class="stat-value">7 days</span>
+  </div></div>
+
+<h2>📦 Location Profiles</h2>
+<div class="section-description">
+  Configured backup destinations and their settings.
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Backend</th>
+<th>Region</th>
+<th>Endpoint</th>
+<th>Protection Period</th>
+</tr>
+</thead>
+<tbody><tr>
+      <td><strong>storj</strong></td>
+      <td>S3</td>
+      <td>us-east-1</td>
+      <td><code>https://gateway.storjshare.io</code></td>
+      <td>168h0m0s</td>
+    </tr></tbody>
+</table>
+
+<h2>📜 Backup Policies</h2>
+<div class="section-description">
+  Configured policies with retention schedules and namespace selectors.
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Frequency</th>
+<th>Actions</th>
+<th>Namespace Selector</th>
+<th>Retention</th>
+</tr>
+</thead>
+<tbody><tr>
+      <td><strong>k10-disaster-recovery-policy</strong></td>
+      <td><code>@hourly</code></td>
+      <td>backup</td>
+      <td>kasten-io</td>
+      <td><strong>daily:</strong> 1<br><strong>hourly:</strong> 4<br><strong>monthly:</strong> 1<br><strong>weekly:</strong> 1<br><strong>yearly:</strong> 1</td>
+    </tr><tr>
+      <td><strong>k10-system-reports-policy</strong></td>
+      <td><code>@daily</code></td>
+      <td>report</td>
+      <td><span class="badge ok">All Namespaces</span></td>
+      <td><strong>daily:</strong> 5</td>
+    </tr><tr>
+      <td><strong>smoke-test</strong></td>
+      <td><code>@daily</code></td>
+      <td>backup, export</td>
+      <td>smoketest</td>
+      <td><strong>daily:</strong> 7</td>
+    </tr><tr>
+      <td><strong>test1</strong></td>
+      <td><code>@daily</code></td>
+      <td>backup, export</td>
+      <td>openshift-operators</td>
+      <td><strong>daily:</strong> 7</td>
+    </tr><tr>
+      <td><strong>test1-import</strong></td>
+      <td><code>@daily</code></td>
+      <td>import</td>
+      <td><span class="badge ok">All Namespaces</span></td>
+      <td><span class="badge warn">Not defined</span></td>
+    </tr></tbody>
+</table>
+
+<h2>📊 Protection Coverage Summary</h2>
+<div class="section-description">
+  Overview of namespace protection across the cluster.
+</div>
+<div class="card coverage-card">
+  <div class="stat-row">
+    <span class="stat-label">Policies Targeting All Namespaces</span>
+    <span class="stat-value">2</span>
+  </div>  <div class="info-box" style="margin-top: 1rem;">
+    ✓ <strong>Cluster-wide protection enabled</strong><br>
+    At least one policy protects all namespaces in the cluster.
+  </div></div>
+
+<div class="footer">
+  <strong>Kasten Discovery Lite v1.3</strong><br>
+  This report provides observational signals only and does not assert compliance.<br>
+  Generated from JSON output of Kasten Discovery Lite script.
+</div>
+
+</div>
+
+</body>
+</html>
