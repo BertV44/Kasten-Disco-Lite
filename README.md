@@ -98,7 +98,7 @@ Example:
 
 ```text
 📜 License Information
-  Customer:    starter-license
+  Customer:    ACME Corporation
   License ID:  starter-4f1842c0-0745-41a5-aaa7-a01d748b1c30
   Status:      VALID
   Valid from:  2020-01-01T00:00:00.000Z
@@ -108,17 +108,24 @@ Example:
 
 ### 3. Health Status ✨ NEW
 
-Provides operational health metrics:
+Provides operational health metrics (last 14 days):
 - Pod readiness and running status
-- Backup success rate (from RestorePoints)
-- Failed backup count
+- Backup Actions statistics (total, completed, failed)
+- Export Actions statistics (total, completed, failed)
+- Overall success rate
+- RestorePoints count
 
 Example:
 
 ```text
 💚 Health Status
   Pods:       15/15 ready (15 running)
-  Backups:    23 completed, 1 failed (95.8% success)
+  Actions (last 14 days):
+    - Total:          156
+    - Backup Actions: 140 (138 completed, 2 failed)
+    - Export Actions: 16 (15 completed, 1 failed)
+  Overall Success:   98.1%
+  RestorePoints:     24
 ```
 
 ### 4. Core Resources
@@ -181,9 +188,29 @@ Example:
 Each policy includes:
 - Name
 - Frequency (@hourly, @daily, @weekly, etc.)
+- **Detailed scheduling** (subFrequency: minutes, hours, weekdays, days, months)
 - Actions (backup, export, etc.)
 - **Namespace selector** (improved accuracy)
 - **Retention** (comprehensive detection)
+
+### Policy Scheduling ✨ NEW
+
+The script now extracts detailed scheduling information from `spec.subFrequency`:
+
+```text
+📜 Kasten Policies
+  - prod-daily-backup
+    Frequency: @daily
+    Schedule:
+      Minutes: 0
+      Hours: 2
+    Actions: backup, export
+    Namespace selector: namespaces: production
+    Retention:
+      Policy-level DAILY: 7
+```
+
+This shows exactly when policies run (e.g., daily at 02:00).
 
 ### Namespace Selector Detection ✨ IMPROVED
 
@@ -251,12 +278,41 @@ Example output:
   Policies: 3
   - prod-backup
     Frequency: @daily
+    Schedule:
+      Hours: 2
+      Minutes: 0
     Actions: backup, export
     Namespace selector: matchNames: production
     Retention:
       Policy-level DAILY: 7
       Export daily: 30
 ```
+
+---
+
+## Data Usage Analysis ✨ NEW
+
+Provides storage and backup data statistics:
+
+- Total PVCs in the cluster
+- Total storage capacity under management
+- Snapshot data size (if available from RestorePoints)
+
+Example output:
+
+```text
+💾 Data Usage
+  Total PVCs:           127
+  Total Capacity:       2450 Gi
+  Snapshot Data:        1850.25 GB
+```
+
+This helps understand:
+- How much data is under Kasten protection
+- Storage growth trends
+- Backup data footprint
+
+**Note:** Snapshot data is extracted from RestorePoint statistics when available.
 
 ---
 
@@ -359,16 +415,17 @@ Output:
 
 - Platform information
 - License details (customer, dates, restrictions)
-- Health metrics (pods, backup success rate)
+- Health metrics (pods, backup/export actions with 14-day window, success rate)
 - Full profiles inventory
-- Policies with namespace selectors and retention
+- Policies with detailed scheduling, namespace selectors and retention
 - Coverage summary
+- **Data usage statistics** (PVCs, capacity, snapshot data)
 
 **New JSON fields in v1.3:**
 ```json
 {
   "license": {
-    "customer": "starter-license",
+    "customer": "ACME Corporation",
     "id": "starter-...",
     "status": "VALID",
     "dateStart": "2020-01-01T00:00:00.000Z",
@@ -379,16 +436,47 @@ Output:
   },
   "health": {
     "pods": {
-      "total": 15,
-      "running": 15,
-      "ready": 15
+      "total": 35,
+      "running": 32,
+      "ready": 32
     },
     "backups": {
+      "totalActions": 156,
+      "completedActions": 153,
+      "failedActions": 3,
+      "backupActions": {
+        "total": 140,
+        "completed": 138,
+        "failed": 2
+      },
+      "exportActions": {
+        "total": 16,
+        "completed": 15,
+        "failed": 1
+      },
       "restorePoints": 24,
-      "completed": 23,
-      "failed": 1,
-      "successRate": "95.8"
+      "successRate": "98.1"
     }
+  },
+  "policies": {
+    "items": [{
+      "name": "prod-backup",
+      "frequency": "@daily",
+      "subFrequency": {
+        "minutes": [0],
+        "hours": [2],
+        "weekdays": [],
+        "days": [],
+        "months": []
+      },
+      "selector": {"namespaces": ["production"]},
+      "retention": {"daily": 7, "weekly": 4}
+    }]
+  },
+  "dataUsage": {
+    "totalPvcs": 127,
+    "totalCapacityGi": "2450",
+    "snapshotDataBytes": 1987654321
   }
 }
 ```
