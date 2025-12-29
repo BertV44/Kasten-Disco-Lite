@@ -75,6 +75,16 @@ def formatRetention:
     "<span class=\"badge warn\">Not defined</span>"
   end;
 
+def formatSchedule:
+  if . == null then ""
+  else
+    (if .minutes and (.minutes | length) > 0 then "<br><em>Minutes:</em> " + (.minutes | map(tostring) | join(", ")) else "" end) +
+    (if .hours and (.hours | length) > 0 then "<br><em>Hours:</em> " + (.hours | map(tostring) | join(", ")) else "" end) +
+    (if .weekdays and (.weekdays | length) > 0 then "<br><em>Weekdays:</em> " + (.weekdays | map(tostring) | join(", ")) else "" end) +
+    (if .days and (.days | length) > 0 then "<br><em>Days:</em> " + (.days | map(tostring) | join(", ")) else "" end) +
+    (if .months and (.months | length) > 0 then "<br><em>Months:</em> " + (.months | map(tostring) | join(", ")) else "" end)
+  end;
+
 "<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -402,18 +412,34 @@ end)
       </div>
     </div>
     <div class=\"card health-card\">
-      <strong>Backup Health</strong>
+      <strong>Backup Health (Last 14 Days)</strong>
       <div class=\"stat-row\">
         <span class=\"stat-label\">Total Actions</span>
         <span class=\"stat-value\">" + (.health.backups.totalActions | tostring) + "</span>
       </div>
       <div class=\"stat-row\">
-        <span class=\"stat-label\">Completed</span>
-        <span class=\"stat-value\" style=\"color: #059669;\">" + (.health.backups.completedActions | tostring) + "</span>
+        <span class=\"stat-label\">Backup Actions</span>
+        <span class=\"stat-value\">" + 
+          (if .health.backups.backupActions then
+            (.health.backups.backupActions.total | tostring) + " (" + 
+            (.health.backups.backupActions.completed | tostring) + " ok, " + 
+            (.health.backups.backupActions.failed | tostring) + " failed)"
+          else
+            (.health.backups.completedActions | tostring) + " completed"
+          end) + 
+        "</span>
       </div>
       <div class=\"stat-row\">
-        <span class=\"stat-label\">Failed</span>
-        <span class=\"stat-value\" style=\"color: #dc2626;\">" + (.health.backups.failedActions | tostring) + "</span>
+        <span class=\"stat-label\">Export Actions</span>
+        <span class=\"stat-value\">" + 
+          (if .health.backups.exportActions then
+            (.health.backups.exportActions.total | tostring) + " (" + 
+            (.health.backups.exportActions.completed | tostring) + " ok, " + 
+            (.health.backups.exportActions.failed | tostring) + " failed)"
+          else
+            "N/A"
+          end) + 
+        "</span>
       </div>
       <div class=\"stat-row\">
         <span class=\"stat-label\">Restore Points</span>
@@ -494,6 +520,7 @@ end)
 <tr>
 <th>Name</th>
 <th>Frequency</th>
+<th>Schedule</th>
 <th>Actions</th>
 <th>Namespace Selector</th>
 <th>Retention</th>
@@ -506,13 +533,14 @@ end)
     "<tr>
       <td><strong>" + .name + "</strong></td>
       <td><code>" + .frequency + "</code></td>
+      <td>" + (if .subFrequency then (.subFrequency | formatSchedule) else "—" end) + "</td>
       <td>" + (.actions | join(", ")) + "</td>
       <td>" + (.selector | formatNamespaceSelector) + "</td>
       <td>" + (.retention | formatRetention) + "</td>
     </tr>"
   ) | join(""))
 else
-  "<tr><td colspan=\"5\" style=\"text-align:center;color:#57606a;\">No policies found</td></tr>"
+  "<tr><td colspan=\"6\" style=\"text-align:center;color:#57606a;\">No policies found</td></tr>"
 end)
 +
 "</tbody>
