@@ -1,0 +1,634 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kasten Discovery Lite Report v1.4</title>
+<style>
+* {
+  box-sizing: border-box;
+}
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: #24292e;
+  margin: 0;
+  padding: 2rem;
+  min-height: 100vh;
+}
+.container {
+  max-width: 1400px;
+  margin: 0 auto;
+  background: #ffffff;
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+  padding: 2rem;
+}
+h1 {
+  font-size: 2rem;
+  margin: 0 0 0.5rem 0;
+  color: #667eea;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+h1::before {
+  content: "🔍";
+  font-size: 2.5rem;
+}
+.subtitle {
+  color: #57606a;
+  font-size: 0.9rem;
+  margin-bottom: 2rem;
+  padding-bottom: 1rem;
+  border-bottom: 2px solid #e1e4e8;
+}
+h2 {
+  font-size: 1.4rem;
+  margin: 2rem 0 1rem 0;
+  color: #24292e;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-bottom: 2px solid #e1e4e8;
+  padding-bottom: 0.5rem;
+}
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+}
+.grid-2 {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1rem;
+  margin-bottom: 1.5rem;
+}
+.card {
+  background: linear-gradient(135deg, #f6f8fa 0%, #ffffff 100%);
+  border: 1px solid #e1e4e8;
+  border-radius: 12px;
+  padding: 1.2rem;
+  transition: transform 0.2s, box-shadow 0.2s;
+}
+.card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+}
+.card strong {
+  font-size: 0.85rem;
+  color: #57606a;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.card-value {
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: #24292e;
+  display: block;
+  margin-top: 0.5rem;
+}
+.health-card {
+  background: linear-gradient(135deg, #f0f9ff 0%, #e0f2fe 100%);
+  border-color: #bae6fd;
+}
+.license-card {
+  background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%);
+  border-color: #fcd34d;
+}
+.coverage-card {
+  background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%);
+  border-color: #6ee7b7;
+}
+.dr-card {
+  background: linear-gradient(135deg, #fce7f3 0%, #fbcfe8 100%);
+  border-color: #f9a8d4;
+}
+.bp-card {
+  background: linear-gradient(135deg, #e0e7ff 0%, #c7d2fe 100%);
+  border-color: #a5b4fc;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 0.5rem;
+  background: #ffffff;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+}
+th, td {
+  border: 1px solid #e1e4e8;
+  padding: 0.75rem;
+  text-align: left;
+}
+th {
+  background: linear-gradient(180deg, #f6f8fa 0%, #eaeef2 100%);
+  font-weight: 600;
+  color: #24292e;
+  text-transform: uppercase;
+  font-size: 0.75rem;
+  letter-spacing: 0.5px;
+}
+tr:hover {
+  background: #f6f8fa;
+}
+.badge {
+  display: inline-block;
+  padding: 0.3rem 0.8rem;
+  border-radius: 12px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.ok {
+  background: #d1fae5;
+  color: #065f46;
+  border: 1px solid #6ee7b7;
+}
+.warn {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fcd34d;
+}
+.error {
+  background: #fee2e2;
+  color: #991b1b;
+  border: 1px solid #fca5a5;
+}
+.info {
+  background: #dbeafe;
+  color: #1e40af;
+  border: 1px solid #93c5fd;
+}
+.info-box {
+  background: #f0f9ff;
+  border-left: 4px solid #3b82f6;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.warning-box {
+  background: #fffbeb;
+  border-left: 4px solid #f59e0b;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.success-box {
+  background: #f0fdf4;
+  border-left: 4px solid #22c55e;
+  border-radius: 8px;
+  padding: 1rem;
+  margin: 1rem 0;
+}
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  margin: 0.5rem 0;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid #e1e4e8;
+}
+.stat-row:last-child {
+  border-bottom: none;
+}
+.stat-label {
+  color: #57606a;
+  font-size: 0.9rem;
+}
+.stat-value {
+  font-weight: 600;
+  color: #24292e;
+}
+.progress-bar {
+  background: #e1e4e8;
+  border-radius: 8px;
+  height: 8px;
+  overflow: hidden;
+  margin-top: 0.5rem;
+}
+.progress-fill {
+  background: linear-gradient(90deg, #10b981 0%, #059669 100%);
+  height: 100%;
+  transition: width 0.3s ease;
+}
+.section-description {
+  color: #57606a;
+  font-size: 0.9rem;
+  margin-bottom: 1rem;
+}
+.footer {
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+  border-top: 2px solid #e1e4e8;
+  color: #57606a;
+  font-size: 0.85rem;
+  text-align: center;
+}
+code {
+  background: #f6f8fa;
+  padding: 0.2rem 0.4rem;
+  border-radius: 4px;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  font-size: 0.85rem;
+}
+.bp-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 0.5rem;
+}
+.bp-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem;
+  background: #f6f8fa;
+  border-radius: 8px;
+}
+@media (max-width: 768px) {
+  body {
+    padding: 1rem;
+  }
+  .container {
+    padding: 1rem;
+  }
+  h1 {
+    font-size: 1.5rem;
+  }
+  .grid, .grid-2 {
+    grid-template-columns: 1fr;
+  }
+  table {
+    font-size: 0.85rem;
+  }
+  th, td {
+    padding: 0.5rem;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<h1>Kasten Discovery Lite Report</h1>
+<div class="subtitle">
+  Generated: 2024-12-30 15:30:00 UTC | 
+  Platform: OpenShift | 
+  Version: 7.5.3
+</div>
+
+<div class="grid">
+  <div class="card"><strong>Profiles</strong><br><span class="card-value">3</span></div>
+  <div class="card"><strong>Policies</strong><br><span class="card-value">5</span></div>
+  <div class="card"><strong>Total Pods</strong><br><span class="card-value">18</span></div>
+  <div class="card"><strong>RestorePoints</strong><br><span class="card-value">89</span></div>
+</div>
+
+<!-- Best Practices Summary -->
+<h2>📋 Best Practices Compliance</h2>
+<div class="section-description">
+  Quick assessment of Kasten best practices implementation.
+</div>
+<div class="card bp-card">
+  <div class="bp-grid">
+    <div class="bp-item"><span class="badge ok">✓ ENABLED</span> Disaster Recovery</div>
+    <div class="bp-item"><span class="badge ok">✓ ENABLED</span> Immutability</div>
+    <div class="bp-item"><span class="badge ok">✓ IN_USE</span> Policy Presets</div>
+    <div class="bp-item"><span class="badge ok">✓ ENABLED</span> Monitoring</div>
+  </div>
+</div>
+
+<!-- Disaster Recovery Section -->
+<h2>🛡️ Disaster Recovery (KDR)</h2>
+<div class="section-description">
+  Kasten Disaster Recovery configuration for platform resilience.
+</div>
+<div class="card dr-card">
+  <div class="stat-row">
+    <span class="stat-label">Status</span>
+    <span class="stat-value"><span class="badge ok">✓ ENABLED</span></span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Mode</span>
+    <span class="stat-value">Quick DR (Local Snapshot)</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Frequency</span>
+    <span class="stat-value"><code>@hourly</code></span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Profile</span>
+    <span class="stat-value">s3-immutable-dr</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Local Catalog Snapshot</span>
+    <span class="stat-value"><span class="badge ok">✓ Yes</span></span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Export Catalog Snapshot</span>
+    <span class="stat-value"><span class="badge warn">✗ No</span></span>
+  </div>
+</div>
+
+<h2>📜 License Information</h2>
+<div class="card license-card">
+  <div class="stat-row">
+    <span class="stat-label">Customer</span>
+    <span class="stat-value">Acme Corporation</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">License ID</span>
+    <span class="stat-value"><code>a1b2c3d4-e5f6-7890-abcd-ef1234567890</code></span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Status</span>
+    <span class="stat-value"><span class="badge ok">✓ Valid</span></span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Valid Period</span>
+    <span class="stat-value">2024-01-15 → 2025-12-31</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Node Limit</span>
+    <span class="stat-value"><span class="badge ok">∞ Unlimited</span></span>
+  </div>
+</div>
+
+<h2>💚 Health Status</h2>
+<div class="grid-2">
+  <div class="card health-card">
+    <strong>Pod Health</strong>
+    <div class="stat-row">
+      <span class="stat-label">Total Pods</span>
+      <span class="stat-value">18</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Running</span>
+      <span class="stat-value">18</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Ready</span>
+      <span class="stat-value">18 / 18</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" style="width: 100%"></div>
+    </div>
+  </div>
+  <div class="card health-card">
+    <strong>Backup Health (Last 14 Days)</strong>
+    <div class="stat-row">
+      <span class="stat-label">Total Actions</span>
+      <span class="stat-value">342</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Backup Actions</span>
+      <span class="stat-value">186 (182 ok, 4 failed)</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Export Actions</span>
+      <span class="stat-value">156 (154 ok, 2 failed)</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Restore Points</span>
+      <span class="stat-value">89</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Success Rate</span>
+      <span class="stat-value">98.2%</span>
+    </div>
+    <div class="progress-bar">
+      <div class="progress-fill" style="width: 98.2%"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Monitoring Section -->
+<h2>📈 Monitoring</h2>
+<div class="grid-2">
+  <div class="card">
+    <div class="stat-row">
+      <span class="stat-label">Prometheus</span>
+      <span class="stat-value"><span class="badge ok">✓ Yes</span></span>
+    </div>
+  </div>
+  <div class="card">
+    <div class="stat-row">
+      <span class="stat-label">Grafana</span>
+      <span class="stat-value"><span class="badge ok">✓ Yes</span></span>
+    </div>
+  </div>
+</div>
+
+<h2>🔒 Immutability Signal</h2>
+<div class="section-description">
+  Kasten-level immutability detection based on profile protection periods.
+</div>
+<div class="card">
+  <div class="stat-row">
+    <span class="stat-label">Detection Status</span>
+    <span class="stat-value"><span class="badge ok">✓ true</span></span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Protection Period</span>
+    <span class="stat-value">14 days</span>
+  </div>
+  <div class="stat-row">
+    <span class="stat-label">Profiles with Immutability</span>
+    <span class="stat-value">2</span>
+  </div>
+</div>
+
+<h2>📦 Location Profiles</h2>
+<div class="section-description">
+  Configured backup destinations and their settings.
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Backend</th>
+<th>Region</th>
+<th>Endpoint</th>
+<th>Protection Period</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>s3-primary</strong></td>
+  <td>S3</td>
+  <td>eu-west-1</td>
+  <td><code>s3.eu-west-1.amazonaws.com</code></td>
+  <td><span class="badge warn">Not Set</span></td>
+</tr>
+<tr>
+  <td><strong>s3-immutable-dr</strong></td>
+  <td>S3</td>
+  <td>eu-central-1</td>
+  <td><code>s3.eu-central-1.amazonaws.com</code></td>
+  <td><span class="badge ok">14d</span></td>
+</tr>
+<tr>
+  <td><strong>azure-archive</strong></td>
+  <td>Azure</td>
+  <td>westeurope</td>
+  <td><code>blob.core.windows.net</code></td>
+  <td><span class="badge ok">30d</span></td>
+</tr>
+</tbody>
+</table>
+
+<!-- PolicyPresets Section -->
+<h2>📋 Policy Presets</h2>
+<div class="section-description">
+  Standardized policy templates for consistent SLAs.
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Frequency</th>
+<th>Retention</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>gold-sla</strong></td>
+  <td><code>@hourly</code></td>
+  <td>hourly=24, daily=7, weekly=4, monthly=12</td>
+</tr>
+<tr>
+  <td><strong>silver-sla</strong></td>
+  <td><code>@daily</code></td>
+  <td>daily=7, weekly=4</td>
+</tr>
+</tbody>
+</table>
+
+<h2>📜 Backup Policies</h2>
+<div class="section-description">
+  Configured policies with retention schedules and namespace selectors.
+  <span class="badge ok">3 with export</span>
+  <span class="badge info">2 using presets</span>
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Frequency</th>
+<th>Actions</th>
+<th>Namespace Selector</th>
+<th>Retention</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>daily-backup-all</strong></td>
+  <td><code>@daily</code></td>
+  <td>backup, export</td>
+  <td><span class="badge ok">All Namespaces</span></td>
+  <td><strong>daily:</strong> 7<br><strong>weekly:</strong> 4<br><strong>monthly:</strong> 12</td>
+</tr>
+<tr>
+  <td><strong>hourly-critical-apps</strong><br><small>📋 gold-sla</small></td>
+  <td><code>@hourly</code></td>
+  <td>backup, export</td>
+  <td><span class="badge info">Label-based</span></td>
+  <td><strong>hourly:</strong> 24<br><strong>daily:</strong> 7</td>
+</tr>
+<tr>
+  <td><strong>weekly-dev-namespaces</strong><br><small>📋 silver-sla</small></td>
+  <td><code>@weekly</code></td>
+  <td>backup</td>
+  <td>dev-*, test-*, staging</td>
+  <td><strong>weekly:</strong> 4</td>
+</tr>
+<tr>
+  <td><strong>databases-backup</strong></td>
+  <td><code>@daily</code></td>
+  <td>backup, export</td>
+  <td><span class="badge info">Label-based</span></td>
+  <td><strong>daily:</strong> 14<br><strong>weekly:</strong> 8<br><strong>monthly:</strong> 6</td>
+</tr>
+<tr>
+  <td><strong>compliance-monthly</strong></td>
+  <td><code>@monthly</code></td>
+  <td>backup</td>
+  <td><span class="badge ok">All Namespaces</span></td>
+  <td><strong>monthly:</strong> 12<br><strong>yearly:</strong> 7</td>
+</tr>
+</tbody>
+</table>
+
+<!-- Kanister Section -->
+<h2>🔧 Kanister Blueprints</h2>
+<div class="section-description">
+  Application-consistent backup configurations using Kanister.
+</div>
+<div class="grid-2">
+  <div class="card">
+    <strong>Blueprints</strong>
+    <div class="card-value">3</div>
+    <ul style="margin-top: 0.5rem; padding-left: 1.5rem;">
+      <li>postgres-bp</li>
+      <li>mysql-bp</li>
+      <li>mongodb-bp</li>
+    </ul>
+  </div>
+  <div class="card">
+    <strong>Blueprint Bindings</strong>
+    <div class="card-value">2</div>
+    <ul style="margin-top: 0.5rem; padding-left: 1.5rem;">
+      <li>postgres-prod-binding → postgres-bp</li>
+      <li>mysql-orders-binding → mysql-bp</li>
+    </ul>
+  </div>
+</div>
+
+<!-- TransformSets Section -->
+<h2>🔄 Transform Sets</h2>
+<div class="section-description">
+  Resource transformations for DR and cross-cluster migrations.
+</div>
+<table>
+<thead>
+<tr>
+<th>Name</th>
+<th>Transforms Count</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <td><strong>dr-transforms</strong></td>
+  <td>3</td>
+</tr>
+</tbody>
+</table>
+
+<h2>📊 Protection Coverage Summary</h2>
+<div class="section-description">
+  Overview of namespace protection across the cluster.<br>
+  <em>Note: Excludes system policies (DR, reporting)</em>
+</div>
+<div class="card coverage-card">
+  <div class="stat-row">
+    <span class="stat-label">App Policies Targeting All Namespaces</span>
+    <span class="stat-value">2</span>
+  </div>
+  <div class="success-box" style="margin-top: 1rem;">
+    ✓ <strong>Cluster-wide protection enabled</strong><br>
+    At least one app policy protects all namespaces in the cluster.
+  </div>
+</div>
+
+<div class="footer">
+  <strong>Kasten Discovery Lite v1.4</strong><br>
+  This report provides observational signals only and does not assert compliance.<br>
+  Generated from JSON output of Kasten Discovery Lite script.
+</div>
+
+</div>
+
+</body>
+</html>
