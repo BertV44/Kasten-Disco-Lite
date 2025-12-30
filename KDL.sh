@@ -2,10 +2,17 @@
 set -eu
 
 ##############################################################################
-# Kasten Discovery Lite v1.3 - Stable
+# Kasten Discovery Lite v1.4
 # Author: Bertrand CASTAGNET EMEA TAM
 # 
-# Version stable sans détection PVCs
+# New in v1.4:
+# - Disaster Recovery (KDR) status detection
+# - PolicyPresets inventory
+# - Blueprints & BlueprintBindings detection
+# - TransformSets inventory
+# - Multi-cluster configuration detection
+# - Prometheus/Grafana monitoring status
+# - Best Practices compliance summary
 ##############################################################################
 
 ### -------------------------
@@ -142,7 +149,10 @@ if [ -n "${PROTECTION_HOURS:-}" ]; then
   IMMUTABILITY_DAYS=$((PROTECTION_HOURS / 24))
 fi
 
-debug "Profiles: $PROFILE_COUNT"
+# Count profiles with immutability
+IMMUTABLE_PROFILES=$(echo "$PROFILES_JSON" | jq '[.items[] | select(.spec.locationSpec.objectStore.protectionPeriod != null)] | length')
+
+debug "Profiles: $PROFILE_COUNT (Immutable: $IMMUTABLE_PROFILES)"
 debug "Immutability: $IMMUTABILITY"
 
 ### -------------------------
@@ -159,9 +169,18 @@ POLICIES_JSON="$(kubectl -n "$NAMESPACE" get policies -o json 2>/dev/null | jq -
 ' || echo '{"items":[]}')"
 POLICY_COUNT=$(echo "$POLICIES_JSON" | jq '.items | length')
 
-debug "Policies detected: $POLICY_COUNT"
+# Filter out system policies (DR and reporting) for app coverage analysis
+SYSTEM_POLICY_PATTERNS="k10-disaster-recovery-policy|k10-system-reports|report"
+APP_POLICIES_JSON="$(echo "$POLICIES_JSON" | jq -c --arg patterns "$SYSTEM_POLICY_PATTERNS" '
+  .items |= map(select(.metadata.name | test($patterns; "i") | not))
+')"
+APP_POLICY_COUNT=$(echo "$APP_POLICIES_JSON" | jq '.items | length')
+SYSTEM_POLICY_COUNT=$((POLICY_COUNT - APP_POLICY_COUNT))
 
-ALL_NS_POLICIES="$(echo "$POLICIES_JSON" | jq '[
+debug "Policies detected: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)"
+
+# Count app policies targeting all namespaces (excluding system policies)
+ALL_NS_POLICIES="$(echo "$APP_POLICIES_JSON" | jq '[
   .items[] | 
   select(
     .spec.selector == null or
@@ -174,7 +193,156 @@ ALL_NS_POLICIES="$(echo "$POLICIES_JSON" | jq '[
   )
 ] | length')"
 
-debug "Policies targeting all namespaces: $ALL_NS_POLICIES"
+# Count policies with export action
+POLICIES_WITH_EXPORT=$(echo "$POLICIES_JSON" | jq '[.items[] | select(.spec.actions[]?.action == "export")] | length')
+POLICIES_BACKUP_ONLY=$(echo "$POLICIES_JSON" | jq '[.items[] | select((.spec.actions | map(.action) | contains(["export"]) | not) and (.spec.actions | map(.action) | contains(["backup"])))] | length')
+
+# Count policies using presets
+POLICIES_WITH_PRESETS=$(echo "$POLICIES_JSON" | jq '[.items[] | select(.spec.presetRef != null)] | length')
+
+debug "App policies targeting all namespaces: $ALL_NS_POLICIES"
+debug "Policies with export: $POLICIES_WITH_EXPORT"
+debug "Policies using presets: $POLICIES_WITH_PRESETS"
+
+### -------------------------
+### Disaster Recovery (KDR)
+### -------------------------
+KDR_POLICY_JSON="$(kubectl -n "$NAMESPACE" get policy k10-disaster-recovery-policy -o json 2>/dev/null || echo '{}')"
+
+if [ "$(echo "$KDR_POLICY_JSON" | jq 'has("metadata")')" = "true" ]; then
+  KDR_ENABLED=true
+  KDR_FREQUENCY=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "unknown"')
+  KDR_PROFILE=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.actions[0].backupParameters.profile.name // "none"')
+  
+  # Detect KDR mode
+  KDR_SNAPSHOT_CONFIG=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration // empty')
+  if [ -n "$KDR_SNAPSHOT_CONFIG" ]; then
+    KDR_LOCAL_SNAPSHOT=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.takeLocalCatalogSnapshot // false')
+    KDR_EXPORT_CATALOG=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.exportCatalogSnapshot // false')
+    
+    if [ "$KDR_LOCAL_SNAPSHOT" = "true" ] && [ "$KDR_EXPORT_CATALOG" = "true" ]; then
+      KDR_MODE="Quick DR (Exported Catalog)"
+    elif [ "$KDR_LOCAL_SNAPSHOT" = "true" ]; then
+      KDR_MODE="Quick DR (Local Snapshot)"
+    else
+      KDR_MODE="Quick DR (No Snapshot)"
+    fi
+  else
+    KDR_MODE="Legacy DR"
+    KDR_LOCAL_SNAPSHOT="false"
+    KDR_EXPORT_CATALOG="false"
+  fi
+  
+  # Check if export action exists
+  KDR_HAS_EXPORT=$(echo "$KDR_POLICY_JSON" | jq '[.spec.actions[]? | select(.action == "export")] | length > 0')
+else
+  KDR_ENABLED=false
+  KDR_FREQUENCY="N/A"
+  KDR_PROFILE="N/A"
+  KDR_MODE="NOT CONFIGURED"
+  KDR_LOCAL_SNAPSHOT="false"
+  KDR_EXPORT_CATALOG="false"
+  KDR_HAS_EXPORT="false"
+fi
+
+debug "KDR Enabled: $KDR_ENABLED"
+debug "KDR Mode: $KDR_MODE"
+debug "KDR Profile: $KDR_PROFILE"
+
+### -------------------------
+### PolicyPresets
+### -------------------------
+PRESETS_JSON="$(kubectl -n "$NAMESPACE" get policypresets -o json 2>/dev/null || echo '{"items":[]}')"
+PRESET_COUNT=$(echo "$PRESETS_JSON" | jq '.items | length')
+
+debug "PolicyPresets: $PRESET_COUNT"
+
+### -------------------------
+### Blueprints & BlueprintBindings
+### -------------------------
+BLUEPRINTS_JSON="$(kubectl -n "$NAMESPACE" get blueprints -o json 2>/dev/null || echo '{"items":[]}')"
+BLUEPRINT_COUNT=$(echo "$BLUEPRINTS_JSON" | jq '.items | length')
+
+BINDINGS_JSON="$(kubectl -n "$NAMESPACE" get blueprintbindings -o json 2>/dev/null || echo '{"items":[]}')"
+BINDING_COUNT=$(echo "$BINDINGS_JSON" | jq '.items | length')
+
+# Extract blueprint names and their actions
+BLUEPRINT_NAMES=$(echo "$BLUEPRINTS_JSON" | jq -r '[.items[].metadata.name] | join(", ")' | head -c 200)
+
+debug "Blueprints: $BLUEPRINT_COUNT"
+debug "BlueprintBindings: $BINDING_COUNT"
+
+### -------------------------
+### TransformSets
+### -------------------------
+TRANSFORMSETS_JSON="$(kubectl -n "$NAMESPACE" get transformsets -o json 2>/dev/null || echo '{"items":[]}')"
+TRANSFORMSET_COUNT=$(echo "$TRANSFORMSETS_JSON" | jq '.items | length')
+
+debug "TransformSets: $TRANSFORMSET_COUNT"
+
+### -------------------------
+### Prometheus & Grafana
+### -------------------------
+# Check for Prometheus
+PROMETHEUS_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --no-headers 2>/dev/null | grep -c "Running" || true)
+PROMETHEUS_PODS=$(echo "${PROMETHEUS_PODS:-0}" | tr -d '[:space:]')
+PROMETHEUS_RUNNING=$(echo "${PROMETHEUS_RUNNING:-0}" | tr -d '[:space:]')
+[ -z "$PROMETHEUS_PODS" ] && PROMETHEUS_PODS=0
+[ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
+
+# Also check for prometheus-server (common label)
+if [ "$PROMETHEUS_PODS" -eq 0 ]; then
+  PROMETHEUS_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus" --no-headers 2>/dev/null | grep -c "Running" || true)
+  PROMETHEUS_PODS=$(echo "${PROMETHEUS_PODS:-0}" | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$(echo "${PROMETHEUS_RUNNING:-0}" | tr -d '[:space:]')
+  [ -z "$PROMETHEUS_PODS" ] && PROMETHEUS_PODS=0
+  [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
+fi
+
+# Check component label
+if [ "$PROMETHEUS_PODS" -eq 0 ]; then
+  PROMETHEUS_PODS=$(kubectl -n "$NAMESPACE" get pods -l "component=prometheus" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "component=prometheus" --no-headers 2>/dev/null | grep -c "Running" || true)
+  PROMETHEUS_PODS=$(echo "${PROMETHEUS_PODS:-0}" | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$(echo "${PROMETHEUS_RUNNING:-0}" | tr -d '[:space:]')
+  [ -z "$PROMETHEUS_PODS" ] && PROMETHEUS_PODS=0
+  [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
+fi
+
+if [ "$PROMETHEUS_RUNNING" -gt 0 ] 2>/dev/null; then
+  PROMETHEUS_ENABLED="true"
+else
+  PROMETHEUS_ENABLED="false"
+fi
+
+# Check for Grafana
+GRAFANA_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=grafana" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+GRAFANA_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=grafana" --no-headers 2>/dev/null | grep -c "Running" || true)
+GRAFANA_PODS=$(echo "${GRAFANA_PODS:-0}" | tr -d '[:space:]')
+GRAFANA_RUNNING=$(echo "${GRAFANA_RUNNING:-0}" | tr -d '[:space:]')
+[ -z "$GRAFANA_PODS" ] && GRAFANA_PODS=0
+[ -z "$GRAFANA_RUNNING" ] && GRAFANA_RUNNING=0
+
+# Alternative label check
+if [ "$GRAFANA_PODS" -eq 0 ]; then
+  GRAFANA_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app=grafana" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  GRAFANA_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=grafana" --no-headers 2>/dev/null | grep -c "Running" || true)
+  GRAFANA_PODS=$(echo "${GRAFANA_PODS:-0}" | tr -d '[:space:]')
+  GRAFANA_RUNNING=$(echo "${GRAFANA_RUNNING:-0}" | tr -d '[:space:]')
+  [ -z "$GRAFANA_PODS" ] && GRAFANA_PODS=0
+  [ -z "$GRAFANA_RUNNING" ] && GRAFANA_RUNNING=0
+fi
+
+if [ "$GRAFANA_RUNNING" -gt 0 ] 2>/dev/null; then
+  GRAFANA_ENABLED="true"
+else
+  GRAFANA_ENABLED="false"
+fi
+
+debug "Prometheus: $PROMETHEUS_ENABLED (pods: $PROMETHEUS_RUNNING)"
+debug "Grafana: $GRAFANA_ENABLED (pods: $GRAFANA_RUNNING)"
 
 ### -------------------------
 ### License Information
@@ -215,19 +383,14 @@ else
 fi
 
 debug "License: $LICENSE_CUSTOMER (Status: $LICENSE_STATUS)"
-debug "License valid until: $LICENSE_END"
-debug "Licensed nodes: $LICENSE_NODES"
 
 ### -------------------------
 ### Backup statistics (last 14 days)
 ### -------------------------
-# Calculate date threshold (14 days ago)
 DAYS_AGO=14
 if date -v-${DAYS_AGO}d >/dev/null 2>&1; then
-  # BSD/macOS date
   DATE_THRESHOLD=$(date -u -v-${DAYS_AGO}d +"%Y-%m-%dT%H:%M:%SZ")
 else
-  # GNU date
   DATE_THRESHOLD=$(date -u -d "${DAYS_AGO} days ago" +"%Y-%m-%dT%H:%M:%SZ")
 fi
 
@@ -265,16 +428,14 @@ else
   SUCCESS_RATE="N/A"
 fi
 
-debug "Total Actions (last $DAYS_AGO days): $TOTAL_ACTIONS (Completed: $COMPLETED_ACTIONS, Failed: $FAILED_ACTIONS, Success: ${SUCCESS_RATE}%)"
+debug "Total Actions (last $DAYS_AGO days): $TOTAL_ACTIONS (Success: ${SUCCESS_RATE}%)"
 debug "RestorePoints: $RESTORE_POINTS_COUNT"
 
 ### -------------------------
 ### Data Usage Analysis
 ### -------------------------
-# Get all PVCs to calculate data under protection
 ALL_PVCS_JSON="$(kubectl get pvc -A -o json 2>/dev/null || echo '{"items":[]}')"
 
-# Calculate total capacity
 TOTAL_PVC_CAPACITY=$(echo "$ALL_PVCS_JSON" | jq -r '
   [.items[].spec.resources.requests.storage] | 
   map(
@@ -282,16 +443,13 @@ TOTAL_PVC_CAPACITY=$(echo "$ALL_PVCS_JSON" | jq -r '
   ) | add // 0
 ')
 
-# Count PVCs
 TOTAL_PVCS=$(echo "$ALL_PVCS_JSON" | jq '.items | length')
 
-# Get snapshot size from RestorePoints (if available)
 SNAPSHOT_DATA=$(echo "$RESTORE_POINTS_JSON" | jq -r '
   [.items[].status.stats.logicalSize // "0"] | 
   map(tonumber) | add // 0
 ')
 
-# Convert to GB for display (approximation from Gi)
 if [ "$TOTAL_PVC_CAPACITY" -gt 0 ]; then
   TOTAL_CAPACITY_GB=$(echo "scale=1; $TOTAL_PVC_CAPACITY" | bc 2>/dev/null || echo "$TOTAL_PVC_CAPACITY")
 else
@@ -299,7 +457,39 @@ else
 fi
 
 debug "Total PVCs: $TOTAL_PVCS with capacity: ${TOTAL_CAPACITY_GB}Gi"
-debug "Snapshot data: ${SNAPSHOT_DATA} bytes"
+
+### -------------------------
+### Best Practices Assessment
+### -------------------------
+# DR Assessment
+if [ "$KDR_ENABLED" = true ]; then
+  BP_DR_STATUS="ENABLED"
+else
+  BP_DR_STATUS="NOT_ENABLED"
+fi
+
+# Immutability Assessment
+if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
+  BP_IMMUTABILITY_STATUS="ENABLED"
+else
+  BP_IMMUTABILITY_STATUS="NOT_CONFIGURED"
+fi
+
+# PolicyPresets Assessment
+if [ "$PRESET_COUNT" -gt 0 ]; then
+  BP_PRESETS_STATUS="IN_USE"
+else
+  BP_PRESETS_STATUS="NOT_USED"
+fi
+
+# Monitoring Assessment
+if [ "$PROMETHEUS_ENABLED" = "true" ]; then
+  BP_MONITORING_STATUS="ENABLED"
+else
+  BP_MONITORING_STATUS="NOT_ENABLED"
+fi
+
+debug "Best Practices - DR: $BP_DR_STATUS, Immutability: $BP_IMMUTABILITY_STATUS"
 
 ##############################################################################
 # JSON OUTPUT
@@ -312,7 +502,10 @@ if [ "$MODE" = "json" ]; then
     --argjson policies "$(echo "$POLICIES_JSON" | jq -c '.')" \
     --arg immutability "$IMMUTABILITY" \
     --argjson immutabilityDays "${IMMUTABILITY_DAYS:-0}" \
+    --argjson immutableProfiles "$IMMUTABLE_PROFILES" \
     --argjson allNs "$ALL_NS_POLICIES" \
+    --argjson policiesWithExport "$POLICIES_WITH_EXPORT" \
+    --argjson policiesWithPresets "$POLICIES_WITH_PRESETS" \
     --argjson pods "$PODS" \
     --argjson podsRunning "$PODS_RUNNING" \
     --argjson podsReady "$PODS_READY" \
@@ -336,6 +529,26 @@ if [ "$MODE" = "json" ]; then
     --arg licenseNodes "$LICENSE_NODES" \
     --arg licenseId "$LICENSE_ID" \
     --arg licenseStatus "$LICENSE_STATUS" \
+    --argjson kdrEnabled "$KDR_ENABLED" \
+    --arg kdrMode "$KDR_MODE" \
+    --arg kdrFrequency "$KDR_FREQUENCY" \
+    --arg kdrProfile "$KDR_PROFILE" \
+    --arg kdrLocalSnapshot "$KDR_LOCAL_SNAPSHOT" \
+    --arg kdrExportCatalog "$KDR_EXPORT_CATALOG" \
+    --argjson presetCount "$PRESET_COUNT" \
+    --argjson presets "$(echo "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})')" \
+    --argjson blueprintCount "$BLUEPRINT_COUNT" \
+    --argjson blueprints "$(echo "$BLUEPRINTS_JSON" | jq -c '.items | map({name: .metadata.name, actions: (.spec.actions | keys)})')" \
+    --argjson bindingCount "$BINDING_COUNT" \
+    --argjson bindings "$(echo "$BINDINGS_JSON" | jq -c '.items | map({name: .metadata.name, blueprint: .spec.blueprintRef.name})')" \
+    --argjson transformsetCount "$TRANSFORMSET_COUNT" \
+    --argjson transformsets "$(echo "$TRANSFORMSETS_JSON" | jq -c '.items | map({name: .metadata.name, transformCount: (.spec.transforms | length)})')" \
+    --arg prometheusEnabled "$PROMETHEUS_ENABLED" \
+    --arg grafanaEnabled "$GRAFANA_ENABLED" \
+    --arg bpDr "$BP_DR_STATUS" \
+    --arg bpImmutability "$BP_IMMUTABILITY_STATUS" \
+    --arg bpPresets "$BP_PRESETS_STATUS" \
+    --arg bpMonitoring "$BP_MONITORING_STATUS" \
     '
     {
       platform: $platform,
@@ -377,12 +590,22 @@ if [ "$MODE" = "json" ]; then
         }
       },
 
+      disasterRecovery: {
+        enabled: $kdrEnabled,
+        mode: $kdrMode,
+        frequency: $kdrFrequency,
+        profile: $kdrProfile,
+        localCatalogSnapshot: ($kdrLocalSnapshot == "true"),
+        exportCatalogSnapshot: ($kdrExportCatalog == "true")
+      },
+
       profiles: {
         count: ($profiles.items | length),
+        immutableCount: $immutableProfiles,
         items: ($profiles.items | map({
           name: .metadata.name,
-          backend: (.spec.locationSpec.objectStore.objectStoreType // "unknown"),
-          region: (.spec.locationSpec.objectStore.region // "unknown"),
+          backend: (.spec.locationSpec.objectStore.objectStoreType // .spec.locationSpec.type // "unknown"),
+          region: (.spec.locationSpec.objectStore.region // "N/A"),
           endpoint: (.spec.locationSpec.objectStore.endpoint // "default"),
           protectionPeriod: (.spec.locationSpec.objectStore.protectionPeriod // null)
         }))
@@ -391,8 +614,16 @@ if [ "$MODE" = "json" ]; then
       immutabilitySignal: ($immutability == "true"),
       immutabilityDays: (if $immutabilityDays > 0 then $immutabilityDays else null end),
 
+      policyPresets: {
+        count: $presetCount,
+        items: $presets
+      },
+
       policies: {
         count: ($policies.items | length),
+        withExport: $policiesWithExport,
+        withPresets: $policiesWithPresets,
+        targetingAllNamespaces: $allNs,
         items: ($policies.items | map({
           name: .metadata.name,
           frequency: (.spec.frequency // "manual"),
@@ -406,6 +637,7 @@ if [ "$MODE" = "json" ]; then
             } else null end
           ),
           actions: [.spec.actions[]?.action],
+          presetRef: (.spec.presetRef.name // null),
           selector: (
             if .spec.selector == null then "all"
             elif .spec.selector.matchNames then {matchNames: .spec.selector.matchNames}
@@ -432,14 +664,43 @@ if [ "$MODE" = "json" ]; then
         }))
       },
 
+      kanister: {
+        blueprints: {
+          count: $blueprintCount,
+          items: $blueprints
+        },
+        bindings: {
+          count: $bindingCount,
+          items: $bindings
+        }
+      },
+
+      transformSets: {
+        count: $transformsetCount,
+        items: $transformsets
+      },
+
+      monitoring: {
+        prometheus: ($prometheusEnabled == "true"),
+        grafana: ($grafanaEnabled == "true")
+      },
+
       coverage: {
-        policiesTargetingAllNamespaces: $allNs
+        policiesTargetingAllNamespaces: $allNs,
+        note: "Excludes system policies (DR, reporting)"
       },
 
       dataUsage: {
         totalPvcs: $totalPvcs,
         totalCapacityGi: $totalCapacity,
         snapshotDataBytes: $snapshotData
+      },
+
+      bestPractices: {
+        disasterRecovery: $bpDr,
+        immutability: $bpImmutability,
+        policyPresets: $bpPresets,
+        monitoring: $bpMonitoring
       }
     }'
   exit 0
@@ -448,12 +709,13 @@ fi
 ##############################################################################
 # HUMAN OUTPUT
 ##############################################################################
-printf "${COLOR_BOLD}${COLOR_CYAN}🔍 Kasten Discovery Lite v1.3${COLOR_RESET}\n"
+printf "${COLOR_BOLD}${COLOR_CYAN}🔍 Kasten Discovery Lite v1.4${COLOR_RESET}\n"
 printf "Namespace: ${COLOR_BOLD}$NAMESPACE${COLOR_RESET}\n\n"
 
 printf "${COLOR_BOLD}🏭 Platform:${COLOR_RESET} $PLATFORM\n"
 printf "${COLOR_BOLD}📦 Kasten Version:${COLOR_RESET} $KASTEN_VERSION\n\n"
 
+### License Information
 printf "${COLOR_BOLD}📜 License Information${COLOR_RESET}\n"
 if [ "$LICENSE_STATUS" != "NOT_FOUND" ]; then
   printf "  Customer:    $LICENSE_CUSTOMER\n"
@@ -485,6 +747,7 @@ else
 fi
 printf "\n"
 
+### Health Status
 printf "${COLOR_BOLD}${COLOR_BLUE}💚 Health Status${COLOR_RESET}\n"
 printf "  Pods:       $PODS_READY/$PODS ready ($PODS_RUNNING running)\n"
 if [ "$TOTAL_ACTIONS" -gt 0 ]; then
@@ -500,26 +763,55 @@ else
 fi
 printf "\n"
 
+### Disaster Recovery (NEW)
+printf "${COLOR_BOLD}🛡️  Disaster Recovery (KDR)${COLOR_RESET}\n"
+if [ "$KDR_ENABLED" = true ]; then
+  printf "  Status:     ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+  printf "  Mode:       ${COLOR_BOLD}$KDR_MODE${COLOR_RESET}\n"
+  printf "  Frequency:  $KDR_FREQUENCY\n"
+  printf "  Profile:    $KDR_PROFILE\n"
+  if [ "$KDR_LOCAL_SNAPSHOT" = "true" ]; then
+    printf "  Local Catalog Snapshot:  ${COLOR_GREEN}Yes${COLOR_RESET}\n"
+  else
+    printf "  Local Catalog Snapshot:  ${COLOR_YELLOW}No${COLOR_RESET}\n"
+  fi
+  if [ "$KDR_EXPORT_CATALOG" = "true" ]; then
+    printf "  Export Catalog Snapshot: ${COLOR_GREEN}Yes${COLOR_RESET}\n"
+  fi
+else
+  printf "  Status:     ${COLOR_RED}NOT CONFIGURED${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}⚠️  WARNING: Disaster Recovery is not enabled!${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}   This is critical for Kasten resilience.${COLOR_RESET}\n"
+fi
+printf "\n"
+
+### Core Resources
 printf "${COLOR_BOLD}📊 Core Resources${COLOR_RESET}\n"
 printf "  Pods:       $PODS\n"
 printf "  Services:   $SERVICES\n"
 printf "  ConfigMaps: $CONFIGMAPS\n"
 printf "  Secrets:    $SECRETS\n\n"
 
+### Profiles
 printf "${COLOR_BOLD}📦 Kasten Profiles${COLOR_RESET}\n"
-printf "  Profiles: $PROFILE_COUNT\n"
+printf "  Profiles: $PROFILE_COUNT"
+if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
+  printf " (${COLOR_GREEN}$IMMUTABLE_PROFILES with immutability${COLOR_RESET})"
+fi
+printf "\n"
 
 if [ "$PROFILE_COUNT" -gt 0 ]; then
   echo "$PROFILES_JSON" | jq -r '
 .items[] |
 "  - \(.metadata.name)\n" +
-"    Backend: \(.spec.locationSpec.objectStore.objectStoreType // "unknown")\n" +
-"    Region: \(.spec.locationSpec.objectStore.region // "unknown")\n" +
+"    Backend: \(.spec.locationSpec.objectStore.objectStoreType // .spec.locationSpec.type // "unknown")\n" +
+"    Region: \(.spec.locationSpec.objectStore.region // "N/A")\n" +
 "    Endpoint: \(.spec.locationSpec.objectStore.endpoint // "default")\n" +
 "    Protection period: \(.spec.locationSpec.objectStore.protectionPeriod // "not set")\n"
 '
 fi
 
+### Immutability
 printf "${COLOR_BOLD}🔒 Immutability${COLOR_RESET} (Kasten-level signal)\n"
 if [ "$IMMUTABILITY" = true ]; then
   printf "  Status: ${COLOR_GREEN}DETECTED${COLOR_RESET}\n"
@@ -529,14 +821,40 @@ else
 fi
 printf "\n"
 
+### PolicyPresets (NEW)
+printf "${COLOR_BOLD}📋 Policy Presets${COLOR_RESET}\n"
+if [ "$PRESET_COUNT" -gt 0 ]; then
+  printf "  Presets: ${COLOR_GREEN}$PRESET_COUNT${COLOR_RESET}\n"
+  echo "$PRESETS_JSON" | jq -r '
+.items[] |
+"  - \(.metadata.name)\n" +
+"    Frequency: \(.spec.frequency // "not set")\n" +
+(if .spec.retention then
+  "    Retention: " + ([.spec.retention | to_entries[] | "\(.key)=\(.value)"] | join(", ")) + "\n"
+else "" end)
+'
+  if [ "$POLICIES_WITH_PRESETS" -gt 0 ]; then
+    printf "  Policies using presets: ${COLOR_GREEN}$POLICIES_WITH_PRESETS${COLOR_RESET}\n"
+  fi
+else
+  printf "  Presets: ${COLOR_YELLOW}0 (consider using presets to standardize SLAs)${COLOR_RESET}\n"
+fi
+printf "\n"
+
+### Policies
 printf "${COLOR_BOLD}📜 Kasten Policies${COLOR_RESET}\n"
-printf "  Policies: $POLICY_COUNT\n"
+printf "  Policies: $POLICY_COUNT"
+if [ "$POLICIES_WITH_EXPORT" -gt 0 ]; then
+  printf " (${COLOR_GREEN}$POLICIES_WITH_EXPORT with export${COLOR_RESET})"
+fi
+printf "\n"
 
 if [ "$POLICY_COUNT" -gt 0 ]; then
   echo "$POLICIES_JSON" | jq -r '
 .items[] |
 "  - \(.metadata.name)\n" +
 "    Frequency: \(.spec.frequency // "manual")\n" +
+(if .spec.presetRef then "    Preset: \(.spec.presetRef.name)\n" else "" end) +
 (if .spec.subFrequency then
   "    Schedule:\n" +
   (if .spec.subFrequency.minutes then "      Minutes: \(.spec.subFrequency.minutes | join(", "))\n" else "" end) +
@@ -587,9 +905,51 @@ else "" end) +
 fi
 
 printf "\n${COLOR_BOLD}📊 Policy Coverage Summary${COLOR_RESET}\n"
-printf "  Policies targeting all namespaces: $ALL_NS_POLICIES\n"
+printf "  ${COLOR_CYAN}(Excludes system policies: DR, reporting)${COLOR_RESET}\n"
+printf "  App policies targeting all namespaces: $ALL_NS_POLICIES\n"
 
-printf "\n${COLOR_BOLD}${COLOR_BLUE}💾 Data Usage${COLOR_RESET}\n"
+### Blueprints & Bindings (NEW)
+printf "\n${COLOR_BOLD}🔧 Kanister Blueprints${COLOR_RESET}\n"
+printf "  Blueprints: $BLUEPRINT_COUNT\n"
+if [ "$BLUEPRINT_COUNT" -gt 0 ]; then
+  echo "$BLUEPRINTS_JSON" | jq -r '.items[] | "  - \(.metadata.name)"'
+fi
+printf "  Blueprint Bindings: $BINDING_COUNT\n"
+if [ "$BINDING_COUNT" -gt 0 ]; then
+  echo "$BINDINGS_JSON" | jq -r '.items[] | "  - \(.metadata.name) → \(.spec.blueprintRef.name)"'
+fi
+if [ "$BLUEPRINT_COUNT" -eq 0 ] && [ "$BINDING_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_YELLOW}ℹ️  Consider using Blueprints for database-consistent backups${COLOR_RESET}\n"
+fi
+printf "\n"
+
+### TransformSets (NEW)
+printf "${COLOR_BOLD}🔄 Transform Sets${COLOR_RESET}\n"
+if [ "$TRANSFORMSET_COUNT" -gt 0 ]; then
+  printf "  TransformSets: ${COLOR_GREEN}$TRANSFORMSET_COUNT${COLOR_RESET}\n"
+  echo "$TRANSFORMSETS_JSON" | jq -r '.items[] | "  - \(.metadata.name) (\(.spec.transforms | length) transforms)"'
+else
+  printf "  TransformSets: 0\n"
+  printf "  ${COLOR_YELLOW}ℹ️  TransformSets are useful for DR and cross-cluster migrations${COLOR_RESET}\n"
+fi
+printf "\n"
+
+### Monitoring (NEW)
+printf "${COLOR_BOLD}📈 Monitoring${COLOR_RESET}\n"
+if [ "$PROMETHEUS_ENABLED" = "true" ]; then
+  printf "  Prometheus: ${COLOR_GREEN}ENABLED${COLOR_RESET} ($PROMETHEUS_RUNNING pods running)\n"
+else
+  printf "  Prometheus: ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
+fi
+if [ "$GRAFANA_ENABLED" = "true" ]; then
+  printf "  Grafana:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($GRAFANA_RUNNING pods running)\n"
+else
+  printf "  Grafana:    ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
+fi
+printf "\n"
+
+### Data Usage
+printf "${COLOR_BOLD}${COLOR_BLUE}💾 Data Usage${COLOR_RESET}\n"
 printf "  Total PVCs:           $TOTAL_PVCS\n"
 printf "  Total Capacity:       ${TOTAL_CAPACITY_GB} Gi\n"
 if [ "$SNAPSHOT_DATA" -gt 0 ]; then
@@ -597,6 +957,45 @@ if [ "$SNAPSHOT_DATA" -gt 0 ]; then
   printf "  Snapshot Data:        ${SNAPSHOT_GB} GB\n"
 else
   printf "  Snapshot Data:        Not available\n"
+fi
+printf "\n"
+
+### Best Practices Summary (NEW)
+printf "${COLOR_BOLD}${COLOR_CYAN}📋 Best Practices Compliance${COLOR_RESET}\n"
+
+# Disaster Recovery
+if [ "$BP_DR_STATUS" = "ENABLED" ]; then
+  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($KDR_MODE)\n"
+else
+  printf "  ${COLOR_RED}❌${COLOR_RESET} Disaster Recovery:    ${COLOR_RED}NOT ENABLED${COLOR_RESET}\n"
+fi
+
+# Immutability
+if [ "$BP_IMMUTABILITY_STATUS" = "ENABLED" ]; then
+  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Immutability:         ${COLOR_GREEN}ENABLED${COLOR_RESET} ($IMMUTABLE_PROFILES profiles)\n"
+else
+  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Immutability:         ${COLOR_YELLOW}NOT CONFIGURED${COLOR_RESET}\n"
+fi
+
+# PolicyPresets
+if [ "$BP_PRESETS_STATUS" = "IN_USE" ]; then
+  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Policy Presets:       ${COLOR_GREEN}IN USE${COLOR_RESET} ($PRESET_COUNT presets)\n"
+else
+  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Policy Presets:       ${COLOR_YELLOW}NOT USED${COLOR_RESET}\n"
+fi
+
+# Monitoring
+if [ "$BP_MONITORING_STATUS" = "ENABLED" ]; then
+  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Monitoring:           ${COLOR_YELLOW}NOT ENABLED${COLOR_RESET}\n"
+fi
+
+# Blueprints (informational)
+if [ "$BLUEPRINT_COUNT" -gt 0 ]; then
+  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Kanister Blueprints:  ${COLOR_GREEN}$BLUEPRINT_COUNT configured${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}ℹ️${COLOR_RESET}  Kanister Blueprints:  None (optional for app-consistent backups)\n"
 fi
 
 printf "\n${COLOR_GREEN}✅ Discovery completed${COLOR_RESET}\n"
