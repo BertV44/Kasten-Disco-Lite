@@ -1,6 +1,6 @@
 # Kasten Discovery Lite
 
-**Version:** v1.3  
+**Version:** v1.4  
 **Scope:** Read-only discovery of a Kasten K10 installation on Kubernetes or OpenShift
 
 **Tested on:**
@@ -20,13 +20,109 @@ It provides an accurate snapshot of:
 - Kasten version
 - **License information** (customer, validity, node limits)
 - **Health status** (pods, backup success rate)
+- **Disaster Recovery (KDR) status** ✨ NEW
 - Core namespace resources
 - Kasten Profiles (detailed)
 - Immutability signal (based on protection period)
+- **PolicyPresets inventory** ✨ NEW
 - Policies with **comprehensive retention detection**
-- **Protection coverage matrix** (namespace-level analysis)
+- **Kanister Blueprints & BlueprintBindings** ✨ NEW
+- **TransformSets inventory** ✨ NEW
+- **Prometheus/Grafana monitoring status** ✨ NEW
+- **Protection coverage matrix** (namespace-level analysis, excludes system policies)
+- **Best Practices compliance summary** ✨ NEW
 
 The script is designed to be **portable**, **POSIX-compliant**, and **support-grade**.
+
+---
+
+## What's New in v1.4
+
+### 🛡️ Disaster Recovery (KDR) Detection
+
+The script now detects and reports on Kasten Disaster Recovery configuration:
+
+- **KDR Status**: Enabled/Not Configured
+- **KDR Mode**: Quick DR (Local Snapshot), Quick DR (Exported Catalog), Quick DR (No Snapshot), or Legacy DR
+- **Frequency**: Backup schedule
+- **Profile**: Target location profile
+- **Catalog snapshot options**: Local and/or exported
+
+```text
+🛡️  Disaster Recovery (KDR)
+  Status:     ENABLED
+  Mode:       Quick DR (Local Snapshot)
+  Frequency:  @hourly
+  Profile:    s3-immutable-backup
+  Local Catalog Snapshot:  Yes
+```
+
+⚠️ **Warning displayed if KDR is not configured** - This is critical for Kasten resilience.
+
+### 📋 PolicyPresets
+
+Detects and displays PolicyPresets used to standardize backup SLAs:
+
+```text
+📋 Policy Presets
+  Presets: 2
+  - gold-sla
+    Frequency: @hourly
+    Retention: hourly=24, daily=7, weekly=4
+  - silver-sla
+    Frequency: @daily
+    Retention: daily=7, weekly=4
+  Policies using presets: 5
+```
+
+### 🔧 Kanister Blueprints & Bindings
+
+Inventories Blueprints and BlueprintBindings for application-consistent backups:
+
+```text
+🔧 Kanister Blueprints
+  Blueprints: 3
+  - mysql-blueprint
+  - postgresql-blueprint
+  - mongodb-blueprint
+  Blueprint Bindings: 2
+  - mysql-binding → mysql-blueprint
+  - postgres-binding → postgresql-blueprint
+```
+
+### 🔄 TransformSets
+
+Lists TransformSets used for DR and cross-cluster migrations:
+
+```text
+🔄 Transform Sets
+  TransformSets: 2
+  - dr-transforms (4 transforms)
+  - migration-transforms (2 transforms)
+```
+
+### 📈 Monitoring Status
+
+Checks for Prometheus and Grafana deployment:
+
+```text
+📈 Monitoring
+  Prometheus: ENABLED (2 pods running)
+  Grafana:    ENABLED (1 pod running)
+```
+
+### 📋 Best Practices Compliance Summary
+
+New comprehensive compliance check against Kasten best practices:
+
+```text
+📋 Best Practices Compliance
+  ✅ Disaster Recovery:    ENABLED (Quick DR (Local Snapshot))
+  ✅ Immutability:         ENABLED (2 profiles)
+  ⚠️  Policy Presets:       NOT USED
+  ✅ Monitoring:           ENABLED
+  ✅ Kanister Blueprints:  3 configured
+```
 
 ---
 
@@ -80,7 +176,7 @@ chmod +x kasten-discovery-lite.sh
 - Falls back to **Kubernetes** otherwise
 - Displays Kasten K10 version
 
-### 2. License Information ✨ NEW
+### 2. License Information
 
 Extracts and displays:
 - Customer name
@@ -89,24 +185,7 @@ Extracts and displays:
 - Validity period (start/end dates)
 - Node restrictions
 
-**Visual indicators:**
-- 🟢 Green = Valid license / Unlimited nodes
-- 🔴 Red = Expired license
-- 🟡 Yellow = Unknown status / Not found
-
-Example:
-
-```text
-📜 License Information
-  Customer:    ACME Corporation
-  License ID:  starter-4f1842c0-0745-41a5-aaa7-a01d748b1c30
-  Status:      VALID
-  Valid from:  2020-01-01T00:00:00.000Z
-  Valid until: 2100-01-01T00:00:00.000Z
-  Node limit:  10 nodes
-```
-
-### 3. Health Status ✨ NEW
+### 3. Health Status
 
 Provides operational health metrics (last 14 days):
 - Pod readiness and running status
@@ -115,20 +194,16 @@ Provides operational health metrics (last 14 days):
 - Overall success rate
 - RestorePoints count
 
-Example:
+### 4. Disaster Recovery (KDR) ✨ NEW
 
-```text
-💚 Health Status
-  Pods:       15/15 ready (15 running)
-  Actions (last 14 days):
-    - Total:          156
-    - Backup Actions: 140 (138 completed, 2 failed)
-    - Export Actions: 16 (15 completed, 1 failed)
-  Overall Success:   98.1%
-  RestorePoints:     24
-```
+Displays KDR configuration:
+- Enabled status
+- Mode (Quick DR variants or Legacy DR)
+- Frequency
+- Target profile
+- Catalog snapshot configuration
 
-### 4. Core Resources
+### 5. Core Resources
 
 Displays counts for:
 - Pods
@@ -136,9 +211,7 @@ Displays counts for:
 - ConfigMaps
 - Secrets
 
----
-
-## Kasten Profiles
+### 6. Kasten Profiles
 
 Each profile is listed with:
 - Name
@@ -146,342 +219,152 @@ Each profile is listed with:
 - Region
 - Endpoint
 - Protection period (if defined)
+- **Count of profiles with immutability** ✨ NEW
 
-Example:
+### 7. Immutability (Kasten-level signal)
 
-```text
-📦 Kasten Profiles
-  Profiles: 2
-  - s3-backup
-    Backend: S3
-    Region: eu-west-1
-    Endpoint: default
-    Protection period: 168h0m0s
-```
+Detection based on `protectionPeriod` configuration in profiles.
 
----
+### 8. PolicyPresets ✨ NEW
 
-## Immutability (Kasten-level signal)
+Lists all PolicyPresets with:
+- Name
+- Frequency
+- Retention settings
+- Count of policies using presets
 
-Immutability is **not asserted**, only **signaled**.
-
-**Detection rule:**
-- If a profile defines `spec.locationSpec.objectStore.protectionPeriod`  
-  → immutability is **DETECTED**
-
-The script converts hours to days for readability.
-
-Example:
-
-```text
-🔒 Immutability (Kasten-level signal)
-  Status: DETECTED
-  Protection period: 7 days
-```
-
-> ⚠️ This is an **indirect signal**, not a compliance guarantee.
-
----
-
-## Kasten Policies
+### 9. Kasten Policies
 
 Each policy includes:
 - Name
-- Frequency (@hourly, @daily, @weekly, etc.)
-- **Detailed scheduling** (subFrequency: minutes, hours, weekdays, days, months)
+- Frequency
+- Detailed scheduling (subFrequency)
 - Actions (backup, export, etc.)
-- **Namespace selector** (improved accuracy)
-- **Retention** (comprehensive detection)
+- **Preset reference** (if applicable) ✨ NEW
+- Namespace selector
+- Retention settings
 
-### Policy Scheduling ✨ NEW
+### 10. Kanister Blueprints ✨ NEW
 
-The script now extracts detailed scheduling information from `spec.subFrequency`:
+Lists:
+- Blueprints with their names
+- BlueprintBindings with target blueprint mapping
 
-```text
-📜 Kasten Policies
-  - prod-daily-backup
-    Frequency: @daily
-    Schedule:
-      Minutes: 0
-      Hours: 2
-    Actions: backup, export
-    Namespace selector: namespaces: production
-    Retention:
-      Policy-level DAILY: 7
-```
+### 11. TransformSets ✨ NEW
 
-This shows exactly when policies run (e.g., daily at 02:00).
+Lists TransformSets with:
+- Name
+- Number of transforms defined
 
-### Namespace Selector Detection ✨ IMPROVED
+### 12. Monitoring ✨ NEW
 
-The script now accurately detects all selector types:
+Shows:
+- Prometheus status (enabled/not detected)
+- Grafana status (enabled/not detected)
+- Pod counts for each
 
-1. **matchNames** - Explicit namespace list
-   ```text
-   Namespace selector: matchNames: prod-app, staging-app
-   ```
+### 13. Data Usage
 
-2. **matchExpressions** - Operator-based selection
-   ```text
-   Namespace selector: matchExpressions (operator-based)
-   ```
-
-3. **matchLabels** - Label-based selection
-   ```text
-   Namespace selector: matchLabels: env=production
-   ```
-
-4. **All namespaces** - Null or empty selector
-   ```text
-   Namespace selector: all namespaces
-   ```
-
-### Retention Detection ✨ ENHANCED
-
-Kasten supports **multiple retention models** and locations. The script detects retention in **all possible locations**:
-
-1. **Policy-level retention** (classic model):
-   ```yaml
-   spec:
-     retention:
-       hourly: 24
-       daily: 7
-       weekly: 4
-   ```
-
-2. **Action-level snapshot retention**:
-   ```yaml
-   spec:
-     actions:
-       - action: backup
-         snapshotRetention:
-           daily: 7
-   ```
-
-3. **Export-specific retention**:
-   ```yaml
-   spec:
-     actions:
-       - action: export
-         exportParameters:
-           retention:
-             daily: 30
-             weekly: 8
-   ```
-
-All retention periods are checked: **hourly, daily, weekly, monthly, yearly**
-
-Example output:
-
-```text
-📜 Kasten Policies
-  Policies: 3
-  - prod-backup
-    Frequency: @daily
-    Schedule:
-      Hours: 2
-      Minutes: 0
-    Actions: backup, export
-    Namespace selector: matchNames: production
-    Retention:
-      Policy-level DAILY: 7
-      Export daily: 30
-```
-
----
-
-## Data Usage Analysis ✨ NEW
-
-Provides storage and backup data statistics:
-
+Provides storage statistics:
 - Total PVCs in the cluster
-- Total storage capacity under management
-- Snapshot data size (if available from RestorePoints)
+- Total storage capacity
+- Snapshot data size
 
-Example output:
+### 14. Best Practices Compliance ✨ NEW
 
-```text
-💾 Data Usage
-  Total PVCs:           127
-  Total Capacity:       2450 Gi
-  Snapshot Data:        1850.25 GB
-```
+Comprehensive assessment against Kasten best practices:
 
-This helps understand:
-- How much data is under Kasten protection
-- Storage growth trends
-- Backup data footprint
-
-**Note:** Snapshot data is extracted from RestorePoint statistics when available.
-
----
-
-## Protection Coverage Matrix ✨ NEW
-
-Provides comprehensive namespace protection analysis:
-
-- Total namespaces in cluster
-- Explicitly protected namespaces
-- **Coverage percentage**
-- Unprotected namespaces (listed)
-- Protection frequency distribution
-- Maximum retention detected
-
-### Coverage Accuracy
-
-The script distinguishes between:
-- **Explicit protection** (matchNames) - exact count available
-- **Expression-based protection** (matchExpressions/matchLabels) - warns that actual coverage may be higher
-- **Catch-all policies** (null selector) - all namespaces protected
-
-Example output:
-
-```text
-📊 Protection Coverage Matrix
-  Namespaces in cluster:        45
-  Namespaces explicitly protected: 38 (84.4%)
-  Protection method:               explicit (matchNames)
-  Namespaces unprotected:          7
-  Unprotected namespaces:
-    - temp-test
-    - dev-scratch
-    - kube-system
-
-  Protection frequency distribution:
-    - @daily: 5 policies
-    - @hourly: 2 policies
-    
-  Maximum retention detected:
-    Snapshot: 30 days
-    Export:   90 days
-```
-
-### Expression-Based Selector Warning
-
-When policies use `matchExpressions` or `matchLabels`:
-
-```text
-⚠ Note: Some policies use matchExpressions or matchLabels
-  Actual coverage may be higher than shown below
-```
-
----
-
-## Policy Coverage Summary
-
-Provides a high-level coverage signal:
-- Number of policies targeting **all namespaces**
-
-This helps quickly assess baseline protection posture.
-
----
-
-## Debug Mode
-
-`--debug` prints internal discovery signals to stderr:
-
-- Namespace validation
-- Platform detection
-- Version resolution
-- Profile count
-- Immutability signal
-- Policy count
-- License status
-- RestorePoint statistics
-- Retention detection results
-
-Useful for troubleshooting and validation.
-
-Example:
-
-```bash
-./kasten-discovery-lite.sh kasten-io --debug
-```
-
-Output:
-```text
-🛠 DEBUG: Namespace 'kasten-io' validated
-🛠 DEBUG: Platform: OpenShift
-🛠 DEBUG: Kasten version: 8.0.15
-🛠 DEBUG: Profiles: 2
-🛠 DEBUG: License: my-company (Status: VALID)
-```
+| Check | Status Values |
+|-------|---------------|
+| Disaster Recovery | ✅ ENABLED / ❌ NOT ENABLED |
+| Immutability | ✅ ENABLED / ⚠️ NOT CONFIGURED |
+| Policy Presets | ✅ IN USE / ⚠️ NOT USED |
+| Monitoring | ✅ ENABLED / ⚠️ NOT ENABLED |
+| Kanister Blueprints | ✅ X configured / ℹ️ None |
 
 ---
 
 ## JSON Output
 
-`--json` emits a structured JSON document containing:
+`--json` emits a structured JSON document containing all discovered information.
 
-- Platform information
-- License details (customer, dates, restrictions)
-- Health metrics (pods, backup/export actions with 14-day window, success rate)
-- Full profiles inventory
-- Policies with detailed scheduling, namespace selectors and retention
-- Coverage summary
-- **Data usage statistics** (PVCs, capacity, snapshot data)
+**New JSON fields in v1.4:**
 
-**New JSON fields in v1.3:**
 ```json
 {
-  "license": {
-    "customer": "ACME Corporation",
-    "id": "starter-...",
-    "status": "VALID",
-    "dateStart": "2020-01-01T00:00:00.000Z",
-    "dateEnd": "2100-01-01T00:00:00.000Z",
-    "restrictions": {
-      "nodes": "10"
-    }
+  "disasterRecovery": {
+    "enabled": true,
+    "mode": "Quick DR (Local Snapshot)",
+    "frequency": "@hourly",
+    "profile": "s3-immutable",
+    "localCatalogSnapshot": true,
+    "exportCatalogSnapshot": false
   },
-  "health": {
-    "pods": {
-      "total": 35,
-      "running": 32,
-      "ready": 32
+  
+  "policyPresets": {
+    "count": 2,
+    "items": [
+      {
+        "name": "gold-sla",
+        "frequency": "@hourly",
+        "retention": {"hourly": 24, "daily": 7}
+      }
+    ]
+  },
+  
+  "kanister": {
+    "blueprints": {
+      "count": 3,
+      "items": [
+        {"name": "mysql-blueprint", "actions": ["backup", "restore"]}
+      ]
     },
-    "backups": {
-      "totalActions": 156,
-      "completedActions": 153,
-      "failedActions": 3,
-      "backupActions": {
-        "total": 140,
-        "completed": 138,
-        "failed": 2
-      },
-      "exportActions": {
-        "total": 16,
-        "completed": 15,
-        "failed": 1
-      },
-      "restorePoints": 24,
-      "successRate": "98.1"
+    "bindings": {
+      "count": 2,
+      "items": [
+        {"name": "mysql-binding", "blueprint": "mysql-blueprint"}
+      ]
     }
   },
-  "policies": {
-    "items": [{
-      "name": "prod-backup",
-      "frequency": "@daily",
-      "subFrequency": {
-        "minutes": [0],
-        "hours": [2],
-        "weekdays": [],
-        "days": [],
-        "months": []
-      },
-      "selector": {"namespaces": ["production"]},
-      "retention": {"daily": 7, "weekly": 4}
-    }]
+  
+  "transformSets": {
+    "count": 1,
+    "items": [
+      {"name": "dr-transforms", "transformCount": 4}
+    ]
   },
-  "dataUsage": {
-    "totalPvcs": 127,
-    "totalCapacityGi": "2450",
-    "snapshotDataBytes": 1987654321
+  
+  "monitoring": {
+    "prometheus": true,
+    "grafana": true
+  },
+  
+  "coverage": {
+    "policiesTargetingAllNamespaces": 2,
+    "note": "Excludes system policies (DR, reporting)"
+  },
+  
+  "bestPractices": {
+    "disasterRecovery": "ENABLED",
+    "immutability": "ENABLED",
+    "policyPresets": "IN_USE",
+    "monitoring": "ENABLED"
+  },
+  
+  "policies": {
+    "count": 5,
+    "withExport": 3,
+    "withPresets": 2,
+    "items": [...]
+  },
+  
+  "profiles": {
+    "count": 2,
+    "immutableCount": 1,
+    "items": [...]
   }
 }
 ```
-
-Designed for automation and ingestion by monitoring/CMDB tools.
 
 ---
 
@@ -502,7 +385,13 @@ rules:
   resources: ["pods", "services", "configmaps", "secrets"]
   verbs: ["get", "list"]
 - apiGroups: ["config.kio.kasten.io"]
-  resources: ["profiles", "policies"]
+  resources: ["profiles", "policies", "policypresets", "transformsets"]
+  verbs: ["get", "list"]
+- apiGroups: ["cr.kanister.io"]
+  resources: ["blueprints"]
+  verbs: ["get", "list"]
+- apiGroups: ["config.kio.kasten.io"]
+  resources: ["blueprintbindings"]
   verbs: ["get", "list"]
 - apiGroups: ["actions.kio.kasten.io"]
   resources: ["restorepoints", "backupactions", "exportactions"]
@@ -512,48 +401,44 @@ rules:
 **Additional cluster-level permissions** (optional, for full coverage analysis):
 - `get`, `list` on `namespaces` (cluster-scoped)
 
-Cluster-admin privileges are **not required**.
-
 ---
 
-## Portability
+## Best Practices Reference
 
-The script is **POSIX-compliant** and works across:
+The Best Practices Compliance section is based on the official [Veeam Kasten Best Practices Guide](https://docs.kasten.io/latest/references/best-practices):
 
-- ✅ Linux (RHEL, Ubuntu, Debian, etc.)
-- ✅ macOS (BSD userland)
-- ✅ OpenShift (restricted environments)
-- ✅ Alpine Linux (minimal base images)
-
-**No GNU-specific features** (no `grep -P`, no bash-isms)
-
----
-
-## Error Handling
-
-The script includes comprehensive error handling:
-
-- ✅ Namespace existence validation
-- ✅ Kasten installation check (k10-config ConfigMap)
-- ✅ Graceful fallbacks for missing resources
-- ✅ Safe license parsing (handles missing secrets)
-- ✅ Non-zero exit codes on critical failures
+| Best Practice | What We Check | Why It Matters |
+|---------------|---------------|----------------|
+| **Disaster Recovery** | k10-disaster-recovery-policy exists | Critical for recovering Kasten itself |
+| **Immutability** | Profiles with protectionPeriod | Protection against ransomware |
+| **PolicyPresets** | PolicyPresets defined and used | Standardizes SLAs across teams |
+| **Monitoring** | Prometheus/Grafana pods running | Visibility into backup operations |
+| **Blueprints** | Kanister Blueprints configured | App-consistent backups for databases |
 
 ---
 
 ## Version History
 
-- **v1.3** (Current - Stable)
+- **v1.4** (Current)
+  - Added Disaster Recovery (KDR) status detection
+  - Added PolicyPresets inventory
+  - Added Kanister Blueprints & BlueprintBindings detection
+  - Added TransformSets inventory
+  - Added Prometheus/Grafana monitoring status
+  - Added Best Practices compliance summary
+  - Added profiles immutability count
+  - Added policies with export count
+  - Added policies using presets count
+  - Policy Coverage now excludes system policies (DR, reporting)
+  - Enhanced JSON output with new fields
+
+- **v1.3** (Stable)
   - Added license information extraction
-  - Added health status monitoring (Actions-based metrics)
-  - Added backup success rate tracking
-  - Enhanced namespace selector detection (matchExpressions, matchLabels)
-  - Fixed export retention detection (all GFS periods)
-  - Added protection coverage matrix with percentage
-  - Improved portability (removed grep -P dependency)
-  - Added color-coded output with --no-color option
-  - Added comprehensive error handling
-  - Fixed policy selector detection (spec.selector instead of spec.namespaceSelector)
+  - Added health status monitoring
+  - Enhanced namespace selector detection
+  - Fixed export retention detection
+  - Added protection coverage matrix
+  - Improved portability
 
 - **v1.2**
   - Added Policy Protection Coverage Matrix
@@ -563,7 +448,7 @@ The script includes comprehensive error handling:
   - Fixed retention detection (policy-level + action-level)
 
 - **v1.0**
-  - Initial release with action-level retention support
+  - Initial release
 
 ---
 
@@ -582,18 +467,16 @@ Verify the namespace name:
 kubectl get namespaces | grep kasten
 ```
 
-### "grep: invalid option -- P"
+### KDR shows "NOT CONFIGURED" but I enabled it
 
-This has been fixed in v1.3. Update to the latest version.
-
-### License not detected
-
-Check if the secret exists:
+Verify the policy exists:
 ```bash
-kubectl get secret -n kasten-io k10-license
+kubectl -n kasten-io get policy k10-disaster-recovery-policy
 ```
 
-If using a different secret name, the script will show "NOT_FOUND".
+### Blueprints not detected
+
+Ensure you have the correct RBAC permissions for the `cr.kanister.io` API group.
 
 ---
 
@@ -607,6 +490,7 @@ If using a different secret name, the script will show "NOT_FOUND".
 6. **Support tickets** - Provide detailed environment information
 7. **Automation** - JSON output for CI/CD pipelines
 8. **Documentation** - Generate HTML reports for stakeholders
+9. **Best Practices validation** - Ensure compliance with Kasten recommendations ✨ NEW
 
 ---
 
@@ -652,4 +536,4 @@ For issues or questions:
 ---
 
 **Author:** Bertrand CASTAGNET - EMEA TAM  
-**Latest Update:** v1.3 - December 2024
+**Latest Update:** v1.4 - December 2024
