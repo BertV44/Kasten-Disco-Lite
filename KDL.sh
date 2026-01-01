@@ -2,16 +2,26 @@
 set -eu
 
 ##############################################################################
-# Kasten Discovery Lite v1.4
-# Author: Bertrand CASTAGNET EMEA TAM
+# Kasten Discovery Lite v1.5.1
+# Author: Bertrand CASTAGNET - EMEA TAM
 # 
-# New in v1.4:
+# New in v1.5:
+# - Policy Last Run Status (date, status, duration)
+# - Unprotected Namespaces detection
+# - Restore Actions History
+# - K10 Resource Limits (CPU/RAM) with Deployment Replicas
+# - Catalog Size
+# - Orphaned RestorePoints detection
+# - Average Policy Run Duration
+# - Grafana removed (deprecated in recent K10)
+# - Improved immutability detection (168h0m0s format)
+#
+# Previous features (v1.4):
 # - Disaster Recovery (KDR) status detection
 # - PolicyPresets inventory
 # - Blueprints & BlueprintBindings detection
 # - TransformSets inventory
-# - Multi-cluster configuration detection
-# - Prometheus/Grafana monitoring status
+# - Prometheus monitoring status
 # - Best Practices compliance summary
 ##############################################################################
 
@@ -81,290 +91,52 @@ debug "Namespace '$NAMESPACE' validated"
 ### -------------------------
 ### Platform detection
 ### -------------------------
-if kubectl get clusterversion >/dev/null 2>&1; then
+if kubectl api-resources 2>/dev/null | grep -q "route.*openshift"; then
   PLATFORM="OpenShift"
 else
   PLATFORM="Kubernetes"
 fi
-
-### -------------------------
-### Kasten installation check
-### -------------------------
-if ! kubectl -n "$NAMESPACE" get cm k10-config >/dev/null 2>&1; then
-  error "Kasten K10 does not appear to be installed in namespace '$NAMESPACE'"
-  error "ConfigMap 'k10-config' not found"
-  exit 1
-fi
+debug "Platform: $PLATFORM"
 
 ### -------------------------
 ### Kasten version
 ### -------------------------
-KASTEN_VERSION="$(kubectl -n "$NAMESPACE" get cm k10-config -o json 2>/dev/null \
-  | jq -r '.data.version // .data.k10Version // "unknown"')"
-
-debug "Platform: $PLATFORM"
+KASTEN_IMAGE=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+# Extract version - handle both tag format (gcr.io/image:7.5.3) and digest format (gcr.io/image@sha256:...)
+if echo "$KASTEN_IMAGE" | grep -q '@sha256:'; then
+  # Digest format - try to get version from labels
+  KASTEN_VERSION=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o jsonpath='{.items[0].metadata.labels.app\.kubernetes\.io/version}' 2>/dev/null || echo "unknown")
+  [ -z "$KASTEN_VERSION" ] && KASTEN_VERSION="digest-based"
+else
+  KASTEN_VERSION=$(echo "$KASTEN_IMAGE" | sed 's/.*://')
+fi
+[ -z "$KASTEN_VERSION" ] && KASTEN_VERSION="unknown"
 debug "Kasten version: $KASTEN_VERSION"
 
 ### -------------------------
-### Core resources
+### License info
 ### -------------------------
-count() { 
-  kubectl -n "$NAMESPACE" get "$1" --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0"
-}
-
-PODS=$(count pods)
-SERVICES=$(count services)
-CONFIGMAPS=$(count configmaps)
-SECRETS=$(count secrets)
-
-PODS_RUNNING=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | grep -c "Running" || echo "0")
-PODS_READY=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | \
-  awk '{split($2,a,"/"); if(a[1]==a[2]) print}' | wc -l | tr -d ' ' || echo "0")
-
-debug "Pods: $PODS (Running: $PODS_RUNNING, Ready: $PODS_READY)"
-
-### -------------------------
-### Profiles + Immutability
-### -------------------------
-PROFILES_JSON="$(kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json 2>/dev/null | jq -c '
-  .items |= map(
-    if .spec.locationSpec.credential then
-      .spec.locationSpec.credential |= {secretType: .secretType}
-    else . end
-  )
-' || echo '{"items":[]}')"
-PROFILE_COUNT=$(echo "$PROFILES_JSON" | jq '.items | length')
-
-PROTECTION_HOURS="$(echo "$PROFILES_JSON" | jq -r '
-  .items[]?
-  | .spec.locationSpec.objectStore.protectionPeriod?
-  | capture("(?<h>[0-9]+)h").h
-' | head -n1)"
-
-IMMUTABILITY=false
-IMMUTABILITY_DAYS=""
-
-if [ -n "${PROTECTION_HOURS:-}" ]; then
-  IMMUTABILITY=true
-  IMMUTABILITY_DAYS=$((PROTECTION_HOURS / 24))
-fi
-
-# Count profiles with immutability
-IMMUTABLE_PROFILES=$(echo "$PROFILES_JSON" | jq '[.items[] | select(.spec.locationSpec.objectStore.protectionPeriod != null)] | length')
-
-debug "Profiles: $PROFILE_COUNT (Immutable: $IMMUTABLE_PROFILES)"
-debug "Immutability: $IMMUTABILITY"
-
-### -------------------------
-### Policies
-### -------------------------
-POLICIES_JSON="$(kubectl -n "$NAMESPACE" get policies -o json 2>/dev/null | jq -c '
-  .items |= map(
-    .spec.actions |= map(
-      if .exportParameters then
-        .exportParameters |= (del(.receiveString) | del(.migrationToken))
-      else . end
-    )
-  )
-' || echo '{"items":[]}')"
-POLICY_COUNT=$(echo "$POLICIES_JSON" | jq '.items | length')
-
-# Filter out system policies (DR and reporting) for app coverage analysis
-SYSTEM_POLICY_PATTERNS="k10-disaster-recovery-policy|k10-system-reports|report"
-APP_POLICIES_JSON="$(echo "$POLICIES_JSON" | jq -c --arg patterns "$SYSTEM_POLICY_PATTERNS" '
-  .items |= map(select(.metadata.name | test($patterns; "i") | not))
-')"
-APP_POLICY_COUNT=$(echo "$APP_POLICIES_JSON" | jq '.items | length')
-SYSTEM_POLICY_COUNT=$((POLICY_COUNT - APP_POLICY_COUNT))
-
-debug "Policies detected: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)"
-
-# Count app policies targeting all namespaces (excluding system policies)
-ALL_NS_POLICIES="$(echo "$APP_POLICIES_JSON" | jq '[
-  .items[] | 
-  select(
-    .spec.selector == null or
-    (.spec.selector.matchExpressions == null and 
-     .spec.selector.matchNames == null and
-     .spec.selector.matchLabels == null) or
-    (.spec.selector.matchExpressions == [] and 
-     .spec.selector.matchNames == [] and
-     (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
-  )
-] | length')"
-
-# Count policies with export action
-POLICIES_WITH_EXPORT=$(echo "$POLICIES_JSON" | jq '[.items[] | select(.spec.actions[]?.action == "export")] | length')
-POLICIES_BACKUP_ONLY=$(echo "$POLICIES_JSON" | jq '[.items[] | select((.spec.actions | map(.action) | contains(["export"]) | not) and (.spec.actions | map(.action) | contains(["backup"])))] | length')
-
-# Count policies using presets
-POLICIES_WITH_PRESETS=$(echo "$POLICIES_JSON" | jq '[.items[] | select(.spec.presetRef != null)] | length')
-
-debug "App policies targeting all namespaces: $ALL_NS_POLICIES"
-debug "Policies with export: $POLICIES_WITH_EXPORT"
-debug "Policies using presets: $POLICIES_WITH_PRESETS"
-
-### -------------------------
-### Disaster Recovery (KDR)
-### -------------------------
-KDR_POLICY_JSON="$(kubectl -n "$NAMESPACE" get policy k10-disaster-recovery-policy -o json 2>/dev/null || echo '{}')"
-
-if [ "$(echo "$KDR_POLICY_JSON" | jq 'has("metadata")')" = "true" ]; then
-  KDR_ENABLED=true
-  KDR_FREQUENCY=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "unknown"')
-  KDR_PROFILE=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.actions[0].backupParameters.profile.name // "none"')
-  
-  # Detect KDR mode
-  KDR_SNAPSHOT_CONFIG=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration // empty')
-  if [ -n "$KDR_SNAPSHOT_CONFIG" ]; then
-    KDR_LOCAL_SNAPSHOT=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.takeLocalCatalogSnapshot // false')
-    KDR_EXPORT_CATALOG=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.exportCatalogSnapshot // false')
-    
-    if [ "$KDR_LOCAL_SNAPSHOT" = "true" ] && [ "$KDR_EXPORT_CATALOG" = "true" ]; then
-      KDR_MODE="Quick DR (Exported Catalog)"
-    elif [ "$KDR_LOCAL_SNAPSHOT" = "true" ]; then
-      KDR_MODE="Quick DR (Local Snapshot)"
-    else
-      KDR_MODE="Quick DR (No Snapshot)"
-    fi
-  else
-    KDR_MODE="Legacy DR"
-    KDR_LOCAL_SNAPSHOT="false"
-    KDR_EXPORT_CATALOG="false"
-  fi
-  
-  # Check if export action exists
-  KDR_HAS_EXPORT=$(echo "$KDR_POLICY_JSON" | jq '[.spec.actions[]? | select(.action == "export")] | length > 0')
-else
-  KDR_ENABLED=false
-  KDR_FREQUENCY="N/A"
-  KDR_PROFILE="N/A"
-  KDR_MODE="NOT CONFIGURED"
-  KDR_LOCAL_SNAPSHOT="false"
-  KDR_EXPORT_CATALOG="false"
-  KDR_HAS_EXPORT="false"
-fi
-
-debug "KDR Enabled: $KDR_ENABLED"
-debug "KDR Mode: $KDR_MODE"
-debug "KDR Profile: $KDR_PROFILE"
-
-### -------------------------
-### PolicyPresets
-### -------------------------
-PRESETS_JSON="$(kubectl -n "$NAMESPACE" get policypresets -o json 2>/dev/null || echo '{"items":[]}')"
-PRESET_COUNT=$(echo "$PRESETS_JSON" | jq '.items | length')
-
-debug "PolicyPresets: $PRESET_COUNT"
-
-### -------------------------
-### Blueprints & BlueprintBindings
-### -------------------------
-BLUEPRINTS_JSON="$(kubectl -n "$NAMESPACE" get blueprints -o json 2>/dev/null || echo '{"items":[]}')"
-BLUEPRINT_COUNT=$(echo "$BLUEPRINTS_JSON" | jq '.items | length')
-
-BINDINGS_JSON="$(kubectl -n "$NAMESPACE" get blueprintbindings -o json 2>/dev/null || echo '{"items":[]}')"
-BINDING_COUNT=$(echo "$BINDINGS_JSON" | jq '.items | length')
-
-# Extract blueprint names and their actions
-BLUEPRINT_NAMES=$(echo "$BLUEPRINTS_JSON" | jq -r '[.items[].metadata.name] | join(", ")' | head -c 200)
-
-debug "Blueprints: $BLUEPRINT_COUNT"
-debug "BlueprintBindings: $BINDING_COUNT"
-
-### -------------------------
-### TransformSets
-### -------------------------
-TRANSFORMSETS_JSON="$(kubectl -n "$NAMESPACE" get transformsets -o json 2>/dev/null || echo '{"items":[]}')"
-TRANSFORMSET_COUNT=$(echo "$TRANSFORMSETS_JSON" | jq '.items | length')
-
-debug "TransformSets: $TRANSFORMSET_COUNT"
-
-### -------------------------
-### Prometheus & Grafana
-### -------------------------
-# Check for Prometheus
-PROMETHEUS_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --no-headers 2>/dev/null | grep -c "Running" || true)
-PROMETHEUS_PODS=$(echo "${PROMETHEUS_PODS:-0}" | tr -d '[:space:]')
-PROMETHEUS_RUNNING=$(echo "${PROMETHEUS_RUNNING:-0}" | tr -d '[:space:]')
-[ -z "$PROMETHEUS_PODS" ] && PROMETHEUS_PODS=0
-[ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
-
-# Also check for prometheus-server (common label)
-if [ "$PROMETHEUS_PODS" -eq 0 ]; then
-  PROMETHEUS_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus" --no-headers 2>/dev/null | grep -c "Running" || true)
-  PROMETHEUS_PODS=$(echo "${PROMETHEUS_PODS:-0}" | tr -d '[:space:]')
-  PROMETHEUS_RUNNING=$(echo "${PROMETHEUS_RUNNING:-0}" | tr -d '[:space:]')
-  [ -z "$PROMETHEUS_PODS" ] && PROMETHEUS_PODS=0
-  [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
-fi
-
-# Check component label
-if [ "$PROMETHEUS_PODS" -eq 0 ]; then
-  PROMETHEUS_PODS=$(kubectl -n "$NAMESPACE" get pods -l "component=prometheus" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "component=prometheus" --no-headers 2>/dev/null | grep -c "Running" || true)
-  PROMETHEUS_PODS=$(echo "${PROMETHEUS_PODS:-0}" | tr -d '[:space:]')
-  PROMETHEUS_RUNNING=$(echo "${PROMETHEUS_RUNNING:-0}" | tr -d '[:space:]')
-  [ -z "$PROMETHEUS_PODS" ] && PROMETHEUS_PODS=0
-  [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
-fi
-
-if [ "$PROMETHEUS_RUNNING" -gt 0 ] 2>/dev/null; then
-  PROMETHEUS_ENABLED="true"
-else
-  PROMETHEUS_ENABLED="false"
-fi
-
-# Check for Grafana
-GRAFANA_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=grafana" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-GRAFANA_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=grafana" --no-headers 2>/dev/null | grep -c "Running" || true)
-GRAFANA_PODS=$(echo "${GRAFANA_PODS:-0}" | tr -d '[:space:]')
-GRAFANA_RUNNING=$(echo "${GRAFANA_RUNNING:-0}" | tr -d '[:space:]')
-[ -z "$GRAFANA_PODS" ] && GRAFANA_PODS=0
-[ -z "$GRAFANA_RUNNING" ] && GRAFANA_RUNNING=0
-
-# Alternative label check
-if [ "$GRAFANA_PODS" -eq 0 ]; then
-  GRAFANA_PODS=$(kubectl -n "$NAMESPACE" get pods -l "app=grafana" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-  GRAFANA_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=grafana" --no-headers 2>/dev/null | grep -c "Running" || true)
-  GRAFANA_PODS=$(echo "${GRAFANA_PODS:-0}" | tr -d '[:space:]')
-  GRAFANA_RUNNING=$(echo "${GRAFANA_RUNNING:-0}" | tr -d '[:space:]')
-  [ -z "$GRAFANA_PODS" ] && GRAFANA_PODS=0
-  [ -z "$GRAFANA_RUNNING" ] && GRAFANA_RUNNING=0
-fi
-
-if [ "$GRAFANA_RUNNING" -gt 0 ] 2>/dev/null; then
-  GRAFANA_ENABLED="true"
-else
-  GRAFANA_ENABLED="false"
-fi
-
-debug "Prometheus: $PROMETHEUS_ENABLED (pods: $PROMETHEUS_RUNNING)"
-debug "Grafana: $GRAFANA_ENABLED (pods: $GRAFANA_RUNNING)"
-
-### -------------------------
-### License Information
-### -------------------------
-LICENSE_RAW="$(kubectl -n "$NAMESPACE" get secret k10-license -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null || echo '')"
+LICENSE_RAW=$(kubectl -n "$NAMESPACE" get secret k10-license -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null || echo '')
 
 if [ -n "$LICENSE_RAW" ]; then
-  LICENSE_CUSTOMER="$(echo "$LICENSE_RAW" | awk '/^customerName:/ {print $2}' | tr -d "'" | head -n1)"
-  LICENSE_START="$(echo "$LICENSE_RAW" | awk '/^dateStart:/ {print $2}' | tr -d "'" | head -n1)"
-  LICENSE_END="$(echo "$LICENSE_RAW" | awk '/^dateEnd:/ {print $2}' | tr -d "'" | head -n1)"
-  LICENSE_NODES="$(echo "$LICENSE_RAW" | awk '/nodes:/ {print $2}' | tr -d "'" | head -n1)"
-  LICENSE_ID="$(echo "$LICENSE_RAW" | awk '/^id:/ {print $2}' | tr -d "'" | head -n1)"
+  # License is YAML format, use awk to extract values
+  LICENSE_CUSTOMER=$(echo "$LICENSE_RAW" | awk -F': ' '/^customerName:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
+  LICENSE_START=$(echo "$LICENSE_RAW" | awk -F': ' '/^dateStart:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
+  LICENSE_END=$(echo "$LICENSE_RAW" | awk -F': ' '/^dateEnd:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
+  LICENSE_NODES=$(echo "$LICENSE_RAW" | awk -F': ' '/^[[:space:]]*nodes:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
+  LICENSE_ID=$(echo "$LICENSE_RAW" | awk -F': ' '/^id:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
   
-  [ -z "$LICENSE_CUSTOMER" ] && LICENSE_CUSTOMER="unknown"
-  [ -z "$LICENSE_START" ] && LICENSE_START="unknown"
-  [ -z "$LICENSE_END" ] && LICENSE_END="unknown"
+  # Set defaults if empty
+  [ -z "$LICENSE_CUSTOMER" ] && LICENSE_CUSTOMER="N/A"
+  [ -z "$LICENSE_START" ] && LICENSE_START="N/A"
+  [ -z "$LICENSE_END" ] && LICENSE_END="N/A"
   [ -z "$LICENSE_NODES" ] && LICENSE_NODES="unlimited"
-  [ -z "$LICENSE_ID" ] && LICENSE_ID="unknown"
+  [ -z "$LICENSE_ID" ] && LICENSE_ID="N/A"
   
-  if [ "$LICENSE_END" != "unknown" ] && [ "$LICENSE_END" != "null" ]; then
-    LICENSE_END_DATE="$(echo "$LICENSE_END" | cut -d'T' -f1)"
-    CURRENT_DATE="$(date +%Y-%m-%d)"
+  # Check if license is valid
+  if [ "$LICENSE_END" != "N/A" ] && [ "$LICENSE_END" != "null" ]; then
+    LICENSE_END_DATE=$(echo "$LICENSE_END" | cut -d'T' -f1)
+    CURRENT_DATE=$(date +%Y-%m-%d)
     if [ "$LICENSE_END_DATE" \< "$CURRENT_DATE" ]; then
       LICENSE_STATUS="EXPIRED"
     else
@@ -374,89 +146,719 @@ if [ -n "$LICENSE_RAW" ]; then
     LICENSE_STATUS="UNKNOWN"
   fi
 else
-  LICENSE_CUSTOMER="not found"
-  LICENSE_START="not found"
-  LICENSE_END="not found"
-  LICENSE_NODES="not found"
-  LICENSE_ID="not found"
+  LICENSE_CUSTOMER="N/A"
+  LICENSE_START="N/A"
+  LICENSE_END="N/A"
+  LICENSE_NODES="N/A"
+  LICENSE_ID="N/A"
   LICENSE_STATUS="NOT_FOUND"
 fi
 
 debug "License: $LICENSE_CUSTOMER (Status: $LICENSE_STATUS)"
+debug "License status: $LICENSE_STATUS"
 
 ### -------------------------
-### Backup statistics (last 14 days)
+### Profiles
 ### -------------------------
-DAYS_AGO=14
-if date -v-${DAYS_AGO}d >/dev/null 2>&1; then
-  DATE_THRESHOLD=$(date -u -v-${DAYS_AGO}d +"%Y-%m-%dT%H:%M:%SZ")
+PROFILES_JSON=$(kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+# Validate JSON
+if ! echo "$PROFILES_JSON" | jq -e '.' >/dev/null 2>&1; then
+  debug "Invalid profiles JSON, using empty"
+  PROFILES_JSON='{"items":[]}'
+fi
+PROFILE_COUNT=$(echo "$PROFILES_JSON" | jq '.items | length // 0')
+[ -z "$PROFILE_COUNT" ] && PROFILE_COUNT=0
+
+# Detect immutability - search for protectionPeriod anywhere in spec
+# Use recursive descent to find it regardless of exact path
+PROTECTION_PERIOD_RAW=$(echo "$PROFILES_JSON" | jq -r '
+  [.items[]? | .. | .protectionPeriod? // empty | select(. != null and . != "")] | first // empty
+')
+
+if [ -n "$PROTECTION_PERIOD_RAW" ]; then
+  IMMUTABILITY="true"
+  # Extract hours from format like "168h0m0s" or "168h" or "14d"
+  if echo "$PROTECTION_PERIOD_RAW" | grep -q 'd'; then
+    IMMUTABILITY_DAYS=$(echo "$PROTECTION_PERIOD_RAW" | sed 's/d.*//' | grep -o '[0-9]*')
+  elif echo "$PROTECTION_PERIOD_RAW" | grep -q 'h'; then
+    PROTECTION_HOURS=$(echo "$PROTECTION_PERIOD_RAW" | sed 's/h.*//' | grep -o '[0-9]*')
+    IMMUTABILITY_DAYS=$((PROTECTION_HOURS / 24))
+  else
+    IMMUTABILITY_DAYS=0
+  fi
 else
-  DATE_THRESHOLD=$(date -u -d "${DAYS_AGO} days ago" +"%Y-%m-%dT%H:%M:%SZ")
+  IMMUTABILITY="false"
+  IMMUTABILITY_DAYS=0
+fi
+[ -z "$IMMUTABILITY_DAYS" ] && IMMUTABILITY_DAYS=0
+
+# Count profiles with protection period
+IMMUTABLE_PROFILES=$(echo "$PROFILES_JSON" | jq '
+  [.items[]? | select(.. | .protectionPeriod? // empty | . != null and . != "")] | length // 0
+')
+[ -z "$IMMUTABLE_PROFILES" ] && IMMUTABLE_PROFILES=0
+
+debug "Profiles: $PROFILE_COUNT (Immutable: $IMMUTABLE_PROFILES, Days: $IMMUTABILITY_DAYS, Raw: $PROTECTION_PERIOD_RAW)"
+
+### -------------------------
+### Policies
+### -------------------------
+POLICIES_RAW=$(kubectl -n "$NAMESPACE" get policies -o json 2>/dev/null || echo '{"items":[]}')
+# Validate and sanitize JSON - remove control characters that can break parsing
+POLICIES_JSON=$(echo "$POLICIES_RAW" | tr -d '\000-\011\013-\037' | jq -c '
+  .items |= (. // [] | map(
+    .spec.actions |= (. // [] | map(
+      if .exportParameters then
+        .exportParameters |= (del(.receiveString) | del(.migrationToken))
+      else . end
+    ))
+  ))
+' 2>/dev/null || echo '{"items":[]}')
+
+# Validate JSON
+if ! echo "$POLICIES_JSON" | jq -e '.' >/dev/null 2>&1; then
+  debug "Invalid policies JSON, using empty"
+  POLICIES_JSON='{"items":[]}'
 fi
 
-debug "Analyzing actions since: $DATE_THRESHOLD (last $DAYS_AGO days)"
+POLICY_COUNT=$(echo "$POLICIES_JSON" | jq '.items | length // 0')
+[ -z "$POLICY_COUNT" ] && POLICY_COUNT=0
 
-# Get BackupActions (last 14 days)
-BACKUP_ACTIONS_JSON="$(kubectl get backupactions -A -o json 2>/dev/null || echo '{"items":[]}')"
-BACKUP_ACTIONS_TOTAL=$(echo "$BACKUP_ACTIONS_JSON" | jq --arg threshold "$DATE_THRESHOLD" '[.items[] | select(.metadata.creationTimestamp >= $threshold)] | length')
-BACKUP_ACTIONS_COMPLETED=$(echo "$BACKUP_ACTIONS_JSON" | jq --arg threshold "$DATE_THRESHOLD" '[.items[] | select(.metadata.creationTimestamp >= $threshold and .status.state == "Complete")] | length')
-BACKUP_ACTIONS_FAILED=$(echo "$BACKUP_ACTIONS_JSON" | jq --arg threshold "$DATE_THRESHOLD" '[.items[] | select(.metadata.creationTimestamp >= $threshold and .status.state == "Failed")] | length')
+# Filter out system policies (DR and reporting) for app coverage analysis
+# Be specific to avoid excluding user policies with "report" in name
+SYSTEM_POLICY_PATTERNS="^k10-disaster-recovery-policy$|^k10-system-reports-policy$|^k10-system-reports$"
+APP_POLICIES_JSON="$(echo "$POLICIES_JSON" | jq -c --arg patterns "$SYSTEM_POLICY_PATTERNS" '
+  .items |= (. // [] | map(select(.metadata.name | test($patterns) | not)))
+' 2>/dev/null || echo '{"items":[]}')"
+APP_POLICY_COUNT=$(echo "$APP_POLICIES_JSON" | jq '.items | length // 0')
+[ -z "$APP_POLICY_COUNT" ] && APP_POLICY_COUNT=0
+SYSTEM_POLICY_COUNT=$((POLICY_COUNT - APP_POLICY_COUNT))
 
-debug "BackupActions (last $DAYS_AGO days): $BACKUP_ACTIONS_TOTAL (Completed: $BACKUP_ACTIONS_COMPLETED, Failed: $BACKUP_ACTIONS_FAILED)"
+debug "Policies detected: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)"
+debug "App policy names: $(echo "$APP_POLICIES_JSON" | jq -r '[.items[]?.metadata.name] | join(", ")')"
 
-# Get ExportActions (last 14 days)
-EXPORT_ACTIONS_JSON="$(kubectl get exportactions -A -o json 2>/dev/null || echo '{"items":[]}')"
-EXPORT_ACTIONS_TOTAL=$(echo "$EXPORT_ACTIONS_JSON" | jq --arg threshold "$DATE_THRESHOLD" '[.items[] | select(.metadata.creationTimestamp >= $threshold)] | length')
-EXPORT_ACTIONS_COMPLETED=$(echo "$EXPORT_ACTIONS_JSON" | jq --arg threshold "$DATE_THRESHOLD" '[.items[] | select(.metadata.creationTimestamp >= $threshold and .status.state == "Complete")] | length')
-EXPORT_ACTIONS_FAILED=$(echo "$EXPORT_ACTIONS_JSON" | jq --arg threshold "$DATE_THRESHOLD" '[.items[] | select(.metadata.creationTimestamp >= $threshold and .status.state == "Failed")] | length')
+# Count app policies targeting all namespaces (excluding system policies)
+ALL_NS_POLICIES="$(echo "$APP_POLICIES_JSON" | jq '[
+  .items[]? | 
+  select(
+    .spec.selector == null or
+    (.spec.selector.matchExpressions == null and 
+     .spec.selector.matchNames == null and
+     .spec.selector.matchLabels == null) or
+    (.spec.selector.matchExpressions == [] and 
+     .spec.selector.matchNames == [] and
+     (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
+  )
+] | length // 0')"
+[ -z "$ALL_NS_POLICIES" ] && ALL_NS_POLICIES=0
 
-debug "ExportActions (last $DAYS_AGO days): $EXPORT_ACTIONS_TOTAL (Completed: $EXPORT_ACTIONS_COMPLETED, Failed: $EXPORT_ACTIONS_FAILED)"
+# Count policies with export action
+POLICIES_WITH_EXPORT=$(echo "$POLICIES_JSON" | jq '[.items[]? | select(.spec.actions[]?.action == "export")] | length // 0')
+[ -z "$POLICIES_WITH_EXPORT" ] && POLICIES_WITH_EXPORT=0
+POLICIES_BACKUP_ONLY=$(echo "$POLICIES_JSON" | jq '[.items[]? | select((.spec.actions | map(.action) | contains(["export"]) | not) and (.spec.actions | map(.action) | contains(["backup"])))] | length // 0')
 
-# Combined totals
+# Count policies using presets
+POLICIES_WITH_PRESETS=$(echo "$POLICIES_JSON" | jq '[.items[]? | select(.spec.presetRef != null)] | length // 0')
+[ -z "$POLICIES_WITH_PRESETS" ] && POLICIES_WITH_PRESETS=0
+
+debug "App policies targeting all namespaces: $ALL_NS_POLICIES"
+debug "Policies with export: $POLICIES_WITH_EXPORT"
+debug "Policies using presets: $POLICIES_WITH_PRESETS"
+
+### -------------------------
+### Disaster Recovery (KDR)
+### -------------------------
+KDR_POLICY_JSON=$(kubectl -n "$NAMESPACE" get policy k10-disaster-recovery-policy -o json 2>/dev/null || echo '{}')
+if echo "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
+  KDR_ENABLED=true
+  KDR_FREQUENCY=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "N/A"')
+  KDR_PROFILE=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.actions[0].exportParameters.profile.name // "N/A"')
+  
+  # Detect KDR mode from kdrSnapshotConfiguration
+  KDR_SNAPSHOT_CONFIG=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration // empty')
+  if [ -n "$KDR_SNAPSHOT_CONFIG" ]; then
+    KDR_LOCAL_SNAPSHOT=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.enabled // false')
+    KDR_EXPORT_CATALOG=$(echo "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.exportData.enabled // false')
+    if [ "$KDR_LOCAL_SNAPSHOT" = "true" ]; then
+      KDR_MODE="Quick DR (Local Snapshot)"
+    elif [ "$KDR_EXPORT_CATALOG" = "true" ]; then
+      KDR_MODE="Quick DR (Exported Catalog)"
+    else
+      KDR_MODE="Quick DR (No Snapshot)"
+    fi
+  else
+    KDR_MODE="Legacy DR"
+    KDR_LOCAL_SNAPSHOT="false"
+    KDR_EXPORT_CATALOG="false"
+  fi
+else
+  KDR_ENABLED=false
+  KDR_MODE="Not Configured"
+  KDR_FREQUENCY="N/A"
+  KDR_PROFILE="N/A"
+  KDR_LOCAL_SNAPSHOT="false"
+  KDR_EXPORT_CATALOG="false"
+fi
+
+debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE"
+
+### -------------------------
+### Policy Last Run Status (NEW v1.5)
+### -------------------------
+# Get RunActions to determine last run for each policy
+RUNACTIONS_RAW=$(kubectl -n "$NAMESPACE" get runactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+RUNACTIONS_JSON=$(echo "$RUNACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+
+# Validate JSON
+if ! echo "$RUNACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  debug "Invalid runactions JSON, using empty"
+  RUNACTIONS_JSON='{"items":[]}'
+fi
+
+# Build policy last run info
+POLICY_LAST_RUN=$(echo "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON" '
+  [.items[]? | . as $policy | {
+    name: .metadata.name,
+    lastRun: (
+      ($runs.items // [])
+      | map(select(.spec.subject.name == $policy.metadata.name))
+      | sort_by(.metadata.creationTimestamp)
+      | last
+      | if . then {
+          timestamp: .metadata.creationTimestamp,
+          state: (.status.state // "Unknown"),
+          duration: (
+            if .status.endTime and .status.startTime then
+              ((.status.endTime | fromdateiso8601) - (.status.startTime | fromdateiso8601))
+            else null end
+          )
+        }
+        else null
+      end
+    )
+  }]
+' 2>/dev/null || echo '[]')
+
+# Validate result
+if ! echo "$POLICY_LAST_RUN" | jq -e '.' >/dev/null 2>&1; then
+  POLICY_LAST_RUN='[]'
+fi
+
+debug "Policy last run info collected"
+
+### -------------------------
+### Average Policy Run Duration (NEW v1.5)
+### -------------------------
+# Calculate average duration from completed RunActions (last 14 days)
+FOURTEEN_DAYS_AGO=$(date -d '14 days ago' -Iseconds 2>/dev/null || date -v-14d -Iseconds 2>/dev/null || echo "")
+if [ -n "$FOURTEEN_DAYS_AGO" ]; then
+  AVG_DURATION_STATS=$(echo "$RUNACTIONS_JSON" | jq --arg cutoff "$FOURTEEN_DAYS_AGO" '
+    [(.items // [])[] 
+      | select(.metadata.creationTimestamp >= $cutoff)
+      | select(.status.state == "Complete")
+      | select(.status.endTime and .status.startTime)
+      | ((.status.endTime | fromdateiso8601) - (.status.startTime | fromdateiso8601))
+    ] | if length > 0 then {
+      count: length,
+      avg: (add / length | floor),
+      min: min,
+      max: max
+    } else {
+      count: 0,
+      avg: 0,
+      min: 0,
+      max: 0
+    } end
+  ' 2>/dev/null || echo '{"count":0,"avg":0,"min":0,"max":0}')
+else
+  AVG_DURATION_STATS='{"count":0,"avg":0,"min":0,"max":0}'
+fi
+
+# Extract values with defaults
+AVG_DURATION=$(echo "$AVG_DURATION_STATS" | jq '.avg // 0')
+MIN_DURATION=$(echo "$AVG_DURATION_STATS" | jq '.min // 0')
+MAX_DURATION=$(echo "$AVG_DURATION_STATS" | jq '.max // 0')
+DURATION_SAMPLE_COUNT=$(echo "$AVG_DURATION_STATS" | jq '.count // 0')
+
+# Sanitize values
+[ -z "$AVG_DURATION" ] && AVG_DURATION=0
+[ -z "$MIN_DURATION" ] && MIN_DURATION=0
+[ -z "$MAX_DURATION" ] && MAX_DURATION=0
+[ -z "$DURATION_SAMPLE_COUNT" ] && DURATION_SAMPLE_COUNT=0
+
+debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT runs)"
+
+### -------------------------
+### Unprotected Namespaces (NEW v1.5)
+### -------------------------
+# Get all namespaces
+ALL_NAMESPACES=$(kubectl get namespaces -o json 2>/dev/null | jq -r '[.items[].metadata.name] // []' 2>/dev/null || echo '[]')
+
+# Validate JSON
+if ! echo "$ALL_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
+  ALL_NAMESPACES='[]'
+fi
+
+# System namespaces to exclude from analysis (extended for OpenShift)
+SYSTEM_NS_PATTERNS="kube-system|kube-public|kube-node-lease|openshift-|openshift$|default|kasten-io|calico-|tigera-|cattle-|fleet-|rancher-|ingress-|cert-manager|istio-|linkerd|gatekeeper-|falco|velero|longhorn-|rook-|portworx|metallb|nvidia-|gpu-operator|local-storage|assisted-installer|multicluster-|hive|rhacs-|stackrox|acs-|sso|keycloak|vault|external-secrets|argocd|gitops|tekton-|pipelines|cicd|monitoring|logging|tracing|jaeger|elastic|splunk|datadog|dynatrace|newrelic|prometheus|grafana|alertmanager|thanos"
+
+debug "Analyzing namespace protection using APP policies only (excluding DR/report system policies)"
+debug "App policies count for analysis: $APP_POLICY_COUNT"
+debug "App policies JSON items count: $(echo "$APP_POLICIES_JSON" | jq '.items | length')"
+
+# Check if there's a catch-all policy in APP policies (not system policies)
+# A catch-all is a policy with no selector or empty selector
+HAS_CATCHALL_POLICY="false"
+CATCHALL_POLICIES=""
+HAS_COMPLEX_SELECTOR="false"
+COMPLEX_SELECTOR_POLICIES=""
+
+if [ "$APP_POLICY_COUNT" -gt 0 ]; then
+  # Find catch-all policies (no selector)
+  CATCHALL_POLICIES=$(echo "$APP_POLICIES_JSON" | jq -r '
+    [.items[]? | select(
+      .spec.selector == null or
+      .spec.selector == {} or
+      (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
+      (.spec.selector | keys | length == 0)
+    ) | .metadata.name] | join(", ")
+  ')
+  CATCHALL_COUNT=$(echo "$APP_POLICIES_JSON" | jq '
+    [.items[]? | select(
+      .spec.selector == null or
+      .spec.selector == {} or
+      (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
+      (.spec.selector | keys | length == 0)
+    )] | length
+  ')
+  
+  # Find policies with complex selectors (matchLabels or matchExpressions not targeting namespaces directly)
+  # Simplified logic to avoid jq iteration errors
+  COMPLEX_SELECTOR_POLICIES=$(echo "$APP_POLICIES_JSON" | jq -r '
+    [.items[]? | select(
+      .spec.selector != null and
+      (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0)
+    ) | .metadata.name] | join(", ")
+  ' 2>/dev/null || echo "")
+  COMPLEX_COUNT=$(echo "$APP_POLICIES_JSON" | jq '
+    [.items[]? | select(
+      .spec.selector != null and
+      (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0)
+    )] | length
+  ' 2>/dev/null || echo "0")
+  
+  debug "Catch-all policies count: $CATCHALL_COUNT"
+  debug "Catch-all policy names: $CATCHALL_POLICIES"
+  debug "Complex selector policies count: $COMPLEX_COUNT"
+  debug "Complex selector policy names: $COMPLEX_SELECTOR_POLICIES"
+  
+  if [ "$CATCHALL_COUNT" -gt 0 ] 2>/dev/null; then
+    HAS_CATCHALL_POLICY="true"
+  fi
+  if [ "$COMPLEX_COUNT" -gt 0 ] 2>/dev/null; then
+    HAS_COMPLEX_SELECTOR="true"
+  fi
+fi
+
+debug "Has catch-all app policy: $HAS_CATCHALL_POLICY"
+debug "Has complex selector: $HAS_COMPLEX_SELECTOR"
+
+# Get namespaces explicitly targeted by app policies (matchNames or matchExpressions with namespace values)
+PROTECTED_NAMESPACES=$(echo "$APP_POLICIES_JSON" | jq -c '
+  [.items[]? | 
+    if .spec.selector.matchNames then
+      .spec.selector.matchNames[]?
+    elif .spec.selector.matchExpressions then
+      (.spec.selector.matchExpressions[]? | 
+        select(.key == "k10.kasten.io/appNamespace" and .operator == "In") | 
+        .values[]?
+      )
+    else
+      empty
+    end
+  ] | unique // []
+' 2>/dev/null || echo '[]')
+
+# Validate
+if ! echo "$PROTECTED_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
+  PROTECTED_NAMESPACES='[]'
+fi
+
+PROTECTED_NS_COUNT=$(echo "$PROTECTED_NAMESPACES" | jq 'length // 0')
+[ -z "$PROTECTED_NS_COUNT" ] || [ "$PROTECTED_NS_COUNT" = "null" ] && PROTECTED_NS_COUNT=0
+debug "Protected namespaces list ($PROTECTED_NS_COUNT): $PROTECTED_NAMESPACES"
+
+# Get all non-system namespaces
+APP_NAMESPACES=$(echo "$ALL_NAMESPACES" | jq -c --arg patterns "$SYSTEM_NS_PATTERNS" '
+  [.[]? | select(. | test($patterns; "i") | not)] // []
+' 2>/dev/null || echo '[]')
+APP_NS_COUNT=$(echo "$APP_NAMESPACES" | jq 'length // 0')
+[ -z "$APP_NS_COUNT" ] || [ "$APP_NS_COUNT" = "null" ] && APP_NS_COUNT=0
+debug "Application namespaces (excluding system): $APP_NS_COUNT"
+debug "Application namespaces: $APP_NAMESPACES"
+
+# Calculate unprotected namespaces (only if no catch-all policy)
+if [ "$HAS_CATCHALL_POLICY" = "true" ]; then
+  UNPROTECTED_NS_JSON='[]'
+  UNPROTECTED_COUNT=0
+else
+  UNPROTECTED_NS_JSON=$(echo "$APP_NAMESPACES" | jq -c --argjson protected "$PROTECTED_NAMESPACES" '
+    [.[]? | select(. as $ns | 
+      (($protected // []) | index($ns) | not)
+    )] // []
+  ' 2>/dev/null || echo '[]')
+  UNPROTECTED_COUNT=$(echo "$UNPROTECTED_NS_JSON" | jq 'length // 0')
+  [ -z "$UNPROTECTED_COUNT" ] && UNPROTECTED_COUNT=0
+fi
+
+debug "Unprotected namespaces: $UNPROTECTED_COUNT"
+debug "Unprotected list: $UNPROTECTED_NS_JSON"
+
+### -------------------------
+### Restore Actions History (NEW v1.5)
+### -------------------------
+RESTORE_ACTIONS_RAW=$(kubectl -n "$NAMESPACE" get restoreactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+RESTORE_ACTIONS_JSON=$(echo "$RESTORE_ACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+
+# Validate JSON
+if ! echo "$RESTORE_ACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  RESTORE_ACTIONS_JSON='{"items":[]}'
+fi
+
+RESTORE_ACTIONS_TOTAL=$(echo "$RESTORE_ACTIONS_JSON" | jq '.items | length // 0')
+[ -z "$RESTORE_ACTIONS_TOTAL" ] && RESTORE_ACTIONS_TOTAL=0
+RESTORE_ACTIONS_COMPLETED=$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')
+[ -z "$RESTORE_ACTIONS_COMPLETED" ] && RESTORE_ACTIONS_COMPLETED=0
+RESTORE_ACTIONS_FAILED=$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Failed")] | length // 0')
+[ -z "$RESTORE_ACTIONS_FAILED" ] && RESTORE_ACTIONS_FAILED=0
+RESTORE_ACTIONS_RUNNING=$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Running")] | length // 0')
+[ -z "$RESTORE_ACTIONS_RUNNING" ] && RESTORE_ACTIONS_RUNNING=0
+
+# Get last 5 restore actions summary
+RESTORE_ACTIONS_RECENT=$(echo "$RESTORE_ACTIONS_JSON" | jq -c '
+  [(.items // []) | sort_by(.metadata.creationTimestamp) | reverse | .[:5][]? | {
+    name: .metadata.name,
+    timestamp: .metadata.creationTimestamp,
+    state: (.status.state // "Unknown"),
+    targetNamespace: (.spec.subject.namespace // "N/A")
+  }] // []
+' 2>/dev/null || echo '[]')
+
+debug "Restore actions: $RESTORE_ACTIONS_TOTAL (Completed: $RESTORE_ACTIONS_COMPLETED, Failed: $RESTORE_ACTIONS_FAILED)"
+
+### -------------------------
+### K10 Resource Limits (NEW v1.5)
+### -------------------------
+# Get ALL pods in the Kasten namespace using simple approach first
+K10_PODS_TOTAL=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[ -z "$K10_PODS_TOTAL" ] && K10_PODS_TOTAL=0
+
+debug "K10 pods count (simple): $K10_PODS_TOTAL"
+
+# Get pod details with JSON
+K10_PODS_RAW=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null)
+
+if [ -z "$K10_PODS_RAW" ]; then
+  debug "No pods JSON retrieved"
+  K10_PODS_RAW='{"items":[]}'
+fi
+
+# Write to temp file to avoid shell escaping issues with large JSON
+K10_TEMP_FILE="/tmp/k10_pods_$$.json"
+printf '%s' "$K10_PODS_RAW" > "$K10_TEMP_FILE"
+
+# Validate JSON file
+if ! jq -e '.items' "$K10_TEMP_FILE" >/dev/null 2>&1; then
+  debug "Invalid K10 pods JSON file"
+  echo '{"items":[]}' > "$K10_TEMP_FILE"
+fi
+
+# Count containers - using safe accessor with error handling
+K10_CONTAINERS_TOTAL=$(jq '[.items[]? | .spec.containers[]?] | length // 0' "$K10_TEMP_FILE" 2>/dev/null)
+if [ -z "$K10_CONTAINERS_TOTAL" ] || [ "$K10_CONTAINERS_TOTAL" = "null" ]; then
+  K10_CONTAINERS_TOTAL=0
+fi
+
+debug "K10 containers count: $K10_CONTAINERS_TOTAL"
+
+# Count containers with limits (either cpu or memory limit set)
+K10_CONTAINERS_WITH_LIMITS=$(jq '
+  [.items[]? | .spec.containers[]? | 
+    select(.resources.limits != null and .resources.limits != {} and 
+           (.resources.limits.cpu != null or .resources.limits.memory != null))
+  ] | length // 0
+' "$K10_TEMP_FILE" 2>/dev/null)
+if [ -z "$K10_CONTAINERS_WITH_LIMITS" ] || [ "$K10_CONTAINERS_WITH_LIMITS" = "null" ]; then
+  K10_CONTAINERS_WITH_LIMITS=0
+fi
+
+K10_CONTAINERS_WITHOUT_LIMITS=$((K10_CONTAINERS_TOTAL - K10_CONTAINERS_WITH_LIMITS))
+[ "$K10_CONTAINERS_WITHOUT_LIMITS" -lt 0 ] && K10_CONTAINERS_WITHOUT_LIMITS=0
+
+debug "K10 containers with limits: $K10_CONTAINERS_WITH_LIMITS, without: $K10_CONTAINERS_WITHOUT_LIMITS"
+
+# Build detailed summary for display - simplified approach
+K10_RESOURCES_SUMMARY=$(jq -c '
+  {
+    pods: [.items[]? | {
+      name: .metadata.name,
+      component: (.metadata.labels.component // .metadata.labels."app.kubernetes.io/component" // .metadata.labels.app // "unknown"),
+      status: .status.phase,
+      containers: [.spec.containers[]? | {
+        name: .name,
+        requests_cpu: (.resources.requests.cpu // "not set"),
+        requests_mem: (.resources.requests.memory // "not set"),
+        limits_cpu: (.resources.limits.cpu // "not set"),
+        limits_mem: (.resources.limits.memory // "not set")
+      }]
+    }]
+  }
+' "$K10_TEMP_FILE" 2>/dev/null)
+
+if [ -z "$K10_RESOURCES_SUMMARY" ] || [ "$K10_RESOURCES_SUMMARY" = "null" ]; then
+  K10_RESOURCES_SUMMARY='{"pods":[]}'
+fi
+
+# Cleanup temp file
+rm -f "$K10_TEMP_FILE"
+
+debug "K10 summary built successfully"
+
+# Get K10 Deployments with replicas
+K10_DEPLOYMENTS_RAW=$(kubectl -n "$NAMESPACE" get deployments -o json 2>/dev/null || echo '{"items":[]}')
+
+# Write to temp file for safer jq processing
+K10_DEPLOY_TEMP="/tmp/k10_deploy_$$.json"
+printf '%s' "$K10_DEPLOYMENTS_RAW" > "$K10_DEPLOY_TEMP"
+
+K10_DEPLOYMENTS_SUMMARY=$(jq -c '
+  {
+    total: (.items | length),
+    deployments: [.items[]? | {
+      name: .metadata.name,
+      replicas: (.spec.replicas // 1),
+      ready: (.status.readyReplicas // 0),
+      available: (.status.availableReplicas // 0)
+    }] | sort_by(.name)
+  }
+' "$K10_DEPLOY_TEMP" 2>/dev/null || echo '{"total":0,"deployments":[]}')
+
+rm -f "$K10_DEPLOY_TEMP"
+
+K10_DEPLOYMENTS_TOTAL=$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '.total // 0' 2>/dev/null)
+if [ -z "$K10_DEPLOYMENTS_TOTAL" ] || [ "$K10_DEPLOYMENTS_TOTAL" = "null" ]; then
+  K10_DEPLOYMENTS_TOTAL=0
+fi
+
+# Count deployments with multiple replicas
+K10_MULTI_REPLICA=$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '[.deployments[]? | select(.replicas > 1)] | length // 0' 2>/dev/null)
+if [ -z "$K10_MULTI_REPLICA" ] || [ "$K10_MULTI_REPLICA" = "null" ]; then
+  K10_MULTI_REPLICA=0
+fi
+
+debug "K10 deployments: $K10_DEPLOYMENTS_TOTAL (multi-replica: $K10_MULTI_REPLICA)"
+debug "K10 deployments summary: $K10_DEPLOYMENTS_SUMMARY"
+
+### -------------------------
+### Catalog Size (NEW v1.5)
+### -------------------------
+# Try multiple methods to find catalog PVC
+CATALOG_PVC=$(kubectl -n "$NAMESPACE" get pvc -l component=catalog -o json 2>/dev/null || echo '{"items":[]}')
+if [ "$(echo "$CATALOG_PVC" | jq '.items | length')" -eq 0 ]; then
+  # Try by name pattern
+  CATALOG_PVC=$(kubectl -n "$NAMESPACE" get pvc -o json 2>/dev/null | jq '{items: [.items[]? | select(.metadata.name | test("catalog"; "i"))]}' 2>/dev/null || echo '{"items":[]}')
+fi
+CATALOG_SIZE=$(echo "$CATALOG_PVC" | jq -r '.items[0].status.capacity.storage // .items[0].spec.resources.requests.storage // "N/A"')
+CATALOG_PVC_NAME=$(echo "$CATALOG_PVC" | jq -r '.items[0].metadata.name // "N/A"')
+
+debug "Catalog PVC: $CATALOG_PVC_NAME, Size: $CATALOG_SIZE"
+
+### -------------------------
+### Orphaned RestorePoints (NEW v1.5)
+### -------------------------
+RESTORE_POINTS_RAW=$(kubectl -n "$NAMESPACE" get restorepoints.apps.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+RESTORE_POINTS_JSON=$(echo "$RESTORE_POINTS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+
+# Validate JSON
+if ! echo "$RESTORE_POINTS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  RESTORE_POINTS_JSON='{"items":[]}'
+fi
+
+RESTORE_POINTS_COUNT=$(echo "$RESTORE_POINTS_JSON" | jq '.items | length // 0')
+[ -z "$RESTORE_POINTS_COUNT" ] && RESTORE_POINTS_COUNT=0
+
+# Get policy names for comparison
+POLICY_NAMES=$(echo "$POLICIES_JSON" | jq '[.items[]?.metadata.name] // []' 2>/dev/null || echo '[]')
+if ! echo "$POLICY_NAMES" | jq -e '.' >/dev/null 2>&1; then
+  POLICY_NAMES='[]'
+fi
+
+# Find RestorePoints where the source policy no longer exists
+ORPHANED_RP=$(echo "$RESTORE_POINTS_JSON" | jq -c --argjson policies "$POLICY_NAMES" '
+  [(.items // [])[]? | 
+    select(.spec.source.actionName as $action | 
+      ($action | split("-") | .[:-3] | join("-")) as $policyName |
+      (($policies // []) | index($policyName) | not)
+    ) |
+    {
+      name: .metadata.name,
+      namespace: (.spec.subject.namespace // "unknown"),
+      created: .metadata.creationTimestamp,
+      actions: [.spec.source.actionName]
+    }
+  ] | unique_by(.name) // []
+' 2>/dev/null || echo '[]')
+
+# Validate result
+if ! echo "$ORPHANED_RP" | jq -e '.' >/dev/null 2>&1; then
+  ORPHANED_RP='[]'
+fi
+
+ORPHANED_RP_COUNT=$(echo "$ORPHANED_RP" | jq 'length // 0')
+[ -z "$ORPHANED_RP_COUNT" ] && ORPHANED_RP_COUNT=0
+
+debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT"
+
+### -------------------------
+### PolicyPresets
+### -------------------------
+PRESETS_RAW=$(kubectl -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+PRESETS_JSON=$(echo "$PRESETS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+if ! echo "$PRESETS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  PRESETS_JSON='{"items":[]}'
+fi
+PRESET_COUNT=$(echo "$PRESETS_JSON" | jq '.items | length // 0')
+[ -z "$PRESET_COUNT" ] && PRESET_COUNT=0
+
+debug "PolicyPresets: $PRESET_COUNT"
+
+### -------------------------
+### Blueprints & Bindings
+### -------------------------
+BLUEPRINTS_RAW=$(kubectl -n "$NAMESPACE" get blueprints.cr.kanister.io -o json 2>/dev/null || echo '{"items":[]}')
+BLUEPRINTS_JSON=$(echo "$BLUEPRINTS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+if ! echo "$BLUEPRINTS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  BLUEPRINTS_JSON='{"items":[]}'
+fi
+BLUEPRINT_COUNT=$(echo "$BLUEPRINTS_JSON" | jq '.items | length // 0')
+[ -z "$BLUEPRINT_COUNT" ] && BLUEPRINT_COUNT=0
+
+BINDINGS_RAW=$(kubectl -n "$NAMESPACE" get blueprintbindings.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+BINDINGS_JSON=$(echo "$BINDINGS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+if ! echo "$BINDINGS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  BINDINGS_JSON='{"items":[]}'
+fi
+BINDING_COUNT=$(echo "$BINDINGS_JSON" | jq '.items | length // 0')
+[ -z "$BINDING_COUNT" ] && BINDING_COUNT=0
+
+debug "Blueprints: $BLUEPRINT_COUNT, Bindings: $BINDING_COUNT"
+
+### -------------------------
+### TransformSets
+### -------------------------
+TRANSFORMSETS_RAW=$(kubectl -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+TRANSFORMSETS_JSON=$(echo "$TRANSFORMSETS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+if ! echo "$TRANSFORMSETS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  TRANSFORMSETS_JSON='{"items":[]}'
+fi
+TRANSFORMSET_COUNT=$(echo "$TRANSFORMSETS_JSON" | jq '.items | length // 0')
+[ -z "$TRANSFORMSET_COUNT" ] && TRANSFORMSET_COUNT=0
+
+debug "TransformSets: $TRANSFORMSET_COUNT"
+
+### -------------------------
+### Prometheus Monitoring
+### -------------------------
+# Check for Prometheus in common namespaces/labels
+PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
+if [ "$PROMETHEUS_RUNNING" -eq 0 ]; then
+  PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app.kubernetes.io/name=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
+fi
+
+# Sanitize
+PROMETHEUS_RUNNING=$(echo "${PROMETHEUS_RUNNING:-0}" | tr -d '[:space:]')
+[ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
+
+if [ "$PROMETHEUS_RUNNING" -gt 0 ] 2>/dev/null; then
+  PROMETHEUS_ENABLED="true"
+else
+  PROMETHEUS_ENABLED="false"
+fi
+
+debug "Prometheus: $PROMETHEUS_ENABLED ($PROMETHEUS_RUNNING pods)"
+
+### -------------------------
+### Health metrics
+### -------------------------
+PODS=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+PODS_RUNNING=$(kubectl -n "$NAMESPACE" get pods --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+K10_PODS_JSON=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null || echo '{"items":[]}')
+PODS_READY=$(echo "$K10_PODS_JSON" | jq '[.items[]? | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length // 0' 2>/dev/null || echo "0")
+
+# Sanitize
+PODS=$(echo "${PODS:-0}" | tr -d '[:space:]')
+PODS_RUNNING=$(echo "${PODS_RUNNING:-0}" | tr -d '[:space:]')
+PODS_READY=$(echo "${PODS_READY:-0}" | tr -d '[:space:]')
+[ -z "$PODS" ] && PODS=0
+[ -z "$PODS_RUNNING" ] && PODS_RUNNING=0
+[ -z "$PODS_READY" ] && PODS_READY=0
+
+debug "Pods: $PODS (Running: $PODS_RUNNING, Ready: $PODS_READY)"
+
+### -------------------------
+### Backup/Export Actions
+### -------------------------
+BACKUP_ACTIONS_RAW=$(kubectl -n "$NAMESPACE" get backupactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+BACKUP_ACTIONS_JSON=$(echo "$BACKUP_ACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+if ! echo "$BACKUP_ACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  BACKUP_ACTIONS_JSON='{"items":[]}'
+fi
+
+EXPORT_ACTIONS_RAW=$(kubectl -n "$NAMESPACE" get exportactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+EXPORT_ACTIONS_JSON=$(echo "$EXPORT_ACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+if ! echo "$EXPORT_ACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  EXPORT_ACTIONS_JSON='{"items":[]}'
+fi
+
+BACKUP_ACTIONS_TOTAL=$(echo "$BACKUP_ACTIONS_JSON" | jq '.items | length // 0')
+[ -z "$BACKUP_ACTIONS_TOTAL" ] && BACKUP_ACTIONS_TOTAL=0
+BACKUP_ACTIONS_COMPLETED=$(echo "$BACKUP_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')
+[ -z "$BACKUP_ACTIONS_COMPLETED" ] && BACKUP_ACTIONS_COMPLETED=0
+BACKUP_ACTIONS_FAILED=$(echo "$BACKUP_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Failed")] | length // 0')
+[ -z "$BACKUP_ACTIONS_FAILED" ] && BACKUP_ACTIONS_FAILED=0
+
+EXPORT_ACTIONS_TOTAL=$(echo "$EXPORT_ACTIONS_JSON" | jq '.items | length // 0')
+[ -z "$EXPORT_ACTIONS_TOTAL" ] && EXPORT_ACTIONS_TOTAL=0
+EXPORT_ACTIONS_COMPLETED=$(echo "$EXPORT_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')
+[ -z "$EXPORT_ACTIONS_COMPLETED" ] && EXPORT_ACTIONS_COMPLETED=0
+EXPORT_ACTIONS_FAILED=$(echo "$EXPORT_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Failed")] | length // 0')
+[ -z "$EXPORT_ACTIONS_FAILED" ] && EXPORT_ACTIONS_FAILED=0
+
 TOTAL_ACTIONS=$((BACKUP_ACTIONS_TOTAL + EXPORT_ACTIONS_TOTAL))
 COMPLETED_ACTIONS=$((BACKUP_ACTIONS_COMPLETED + EXPORT_ACTIONS_COMPLETED))
 FAILED_ACTIONS=$((BACKUP_ACTIONS_FAILED + EXPORT_ACTIONS_FAILED))
 
-# RestorePoints
-RESTORE_POINTS_JSON="$(kubectl get restorepoints -A -o json 2>/dev/null || echo '{"items":[]}')"
-RESTORE_POINTS_COUNT=$(echo "$RESTORE_POINTS_JSON" | jq '.items | length')
-
-# Calculate success rate
 if [ "$TOTAL_ACTIONS" -gt 0 ]; then
-  SUCCESS_RATE=$(echo "scale=1; $COMPLETED_ACTIONS * 100 / $TOTAL_ACTIONS" | bc 2>/dev/null || echo "N/A")
+  SUCCESS_RATE=$(awk "BEGIN {printf \"%.1f\", ($COMPLETED_ACTIONS / $TOTAL_ACTIONS) * 100}")
 else
   SUCCESS_RATE="N/A"
 fi
 
-debug "Total Actions (last $DAYS_AGO days): $TOTAL_ACTIONS (Success: ${SUCCESS_RATE}%)"
-debug "RestorePoints: $RESTORE_POINTS_COUNT"
+debug "Actions - Total: $TOTAL_ACTIONS, Completed: $COMPLETED_ACTIONS, Failed: $FAILED_ACTIONS, Success: $SUCCESS_RATE%"
 
 ### -------------------------
-### Data Usage Analysis
+### Data usage
 ### -------------------------
-ALL_PVCS_JSON="$(kubectl get pvc -A -o json 2>/dev/null || echo '{"items":[]}')"
+TOTAL_PVCS=$(kubectl get pvc --all-namespaces --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[ -z "$TOTAL_PVCS" ] && TOTAL_PVCS=0
+TOTAL_CAPACITY_GB=$(kubectl get pvc --all-namespaces -o json 2>/dev/null | jq '[.items[]?.spec.resources.requests.storage | select(. != null) | gsub("Gi";"") | gsub("G";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+[ -z "$TOTAL_CAPACITY_GB" ] && TOTAL_CAPACITY_GB=0
+SNAPSHOT_DATA=$(kubectl get volumesnapshots --all-namespaces -o json 2>/dev/null | jq '[.items[]?.status.restoreSize // "0" | gsub("Gi";"") | gsub("G";"") | gsub("Mi";"") | gsub("M";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+[ -z "$SNAPSHOT_DATA" ] && SNAPSHOT_DATA=0
 
-TOTAL_PVC_CAPACITY=$(echo "$ALL_PVCS_JSON" | jq -r '
-  [.items[].spec.resources.requests.storage] | 
-  map(
-    gsub("Gi"; "") | gsub("Mi"; "") | gsub("Ti"; "") | gsub("Ki"; "") | tonumber
-  ) | add // 0
-')
-
-TOTAL_PVCS=$(echo "$ALL_PVCS_JSON" | jq '.items | length')
-
-SNAPSHOT_DATA=$(echo "$RESTORE_POINTS_JSON" | jq -r '
-  [.items[].status.stats.logicalSize // "0"] | 
-  map(tonumber) | add // 0
-')
-
-if [ "$TOTAL_PVC_CAPACITY" -gt 0 ]; then
-  TOTAL_CAPACITY_GB=$(echo "scale=1; $TOTAL_PVC_CAPACITY" | bc 2>/dev/null || echo "$TOTAL_PVC_CAPACITY")
-else
-  TOTAL_CAPACITY_GB="0"
-fi
-
-debug "Total PVCs: $TOTAL_PVCS with capacity: ${TOTAL_CAPACITY_GB}Gi"
+debug "PVCs: $TOTAL_PVCS, Capacity: ${TOTAL_CAPACITY_GB}Gi"
 
 ### -------------------------
 ### Best Practices Assessment
@@ -489,7 +891,21 @@ else
   BP_MONITORING_STATUS="NOT_ENABLED"
 fi
 
-debug "Best Practices - DR: $BP_DR_STATUS, Immutability: $BP_IMMUTABILITY_STATUS"
+# Resource Limits Assessment (NEW v1.5)
+if [ "$K10_CONTAINERS_WITHOUT_LIMITS" -eq 0 ] 2>/dev/null && [ "$K10_CONTAINERS_WITH_LIMITS" -gt 0 ] 2>/dev/null; then
+  BP_RESOURCES_STATUS="CONFIGURED"
+else
+  BP_RESOURCES_STATUS="PARTIAL"
+fi
+
+# Namespace Protection Assessment (NEW v1.5)
+if [ "$HAS_CATCHALL_POLICY" = "true" ] || [ "$UNPROTECTED_COUNT" -eq 0 ]; then
+  BP_COVERAGE_STATUS="COMPLETE"
+else
+  BP_COVERAGE_STATUS="GAPS_DETECTED"
+fi
+
+debug "Best Practices - DR: $BP_DR_STATUS, Immutability: $BP_IMMUTABILITY_STATUS, Resources: $BP_RESOURCES_STATUS"
 
 ##############################################################################
 # JSON OUTPUT
@@ -518,6 +934,11 @@ if [ "$MODE" = "json" ]; then
     --argjson exportActionsTotal "$EXPORT_ACTIONS_TOTAL" \
     --argjson exportActionsCompleted "$EXPORT_ACTIONS_COMPLETED" \
     --argjson exportActionsFailed "$EXPORT_ACTIONS_FAILED" \
+    --argjson restoreActionsTotal "$RESTORE_ACTIONS_TOTAL" \
+    --argjson restoreActionsCompleted "$RESTORE_ACTIONS_COMPLETED" \
+    --argjson restoreActionsFailed "$RESTORE_ACTIONS_FAILED" \
+    --argjson restoreActionsRunning "$RESTORE_ACTIONS_RUNNING" \
+    --argjson restoreActionsRecent "$RESTORE_ACTIONS_RECENT" \
     --argjson restorePoints "$RESTORE_POINTS_COUNT" \
     --arg successRate "$SUCCESS_RATE" \
     --argjson totalPvcs "$TOTAL_PVCS" \
@@ -544,11 +965,29 @@ if [ "$MODE" = "json" ]; then
     --argjson transformsetCount "$TRANSFORMSET_COUNT" \
     --argjson transformsets "$(echo "$TRANSFORMSETS_JSON" | jq -c '.items | map({name: .metadata.name, transformCount: (.spec.transforms | length)})')" \
     --arg prometheusEnabled "$PROMETHEUS_ENABLED" \
-    --arg grafanaEnabled "$GRAFANA_ENABLED" \
     --arg bpDr "$BP_DR_STATUS" \
     --arg bpImmutability "$BP_IMMUTABILITY_STATUS" \
     --arg bpPresets "$BP_PRESETS_STATUS" \
     --arg bpMonitoring "$BP_MONITORING_STATUS" \
+    --arg bpResources "$BP_RESOURCES_STATUS" \
+    --arg bpCoverage "$BP_COVERAGE_STATUS" \
+    --argjson policyLastRun "$POLICY_LAST_RUN" \
+    --argjson avgDuration "$AVG_DURATION" \
+    --argjson minDuration "$MIN_DURATION" \
+    --argjson maxDuration "$MAX_DURATION" \
+    --argjson durationSampleCount "$DURATION_SAMPLE_COUNT" \
+    --argjson unprotectedNs "$UNPROTECTED_NS_JSON" \
+    --argjson unprotectedCount "$UNPROTECTED_COUNT" \
+    --arg hasCatchallPolicy "$HAS_CATCHALL_POLICY" \
+    --argjson k10Resources "$K10_RESOURCES_SUMMARY" \
+    --argjson k10Deployments "$K10_DEPLOYMENTS_SUMMARY" \
+    --argjson k10ContainersTotal "$K10_CONTAINERS_TOTAL" \
+    --argjson k10ContainersWithLimits "$K10_CONTAINERS_WITH_LIMITS" \
+    --argjson k10ContainersWithoutLimits "$K10_CONTAINERS_WITHOUT_LIMITS" \
+    --arg catalogSize "$CATALOG_SIZE" \
+    --arg catalogPvcName "$CATALOG_PVC_NAME" \
+    --argjson orphanedRp "$ORPHANED_RP" \
+    --argjson orphanedRpCount "$ORPHANED_RP_COUNT" \
     '
     {
       platform: $platform,
@@ -585,6 +1024,13 @@ if [ "$MODE" = "json" ]; then
             completed: $exportActionsCompleted,
             failed: $exportActionsFailed
           },
+          restoreActions: {
+            total: $restoreActionsTotal,
+            completed: $restoreActionsCompleted,
+            failed: $restoreActionsFailed,
+            running: $restoreActionsRunning,
+            recent: $restoreActionsRecent
+          },
           restorePoints: $restorePoints,
           successRate: $successRate
         }
@@ -599,69 +1045,9 @@ if [ "$MODE" = "json" ]; then
         exportCatalogSnapshot: ($kdrExportCatalog == "true")
       },
 
-      profiles: {
-        count: ($profiles.items | length),
-        immutableCount: $immutableProfiles,
-        items: ($profiles.items | map({
-          name: .metadata.name,
-          backend: (.spec.locationSpec.objectStore.objectStoreType // .spec.locationSpec.type // "unknown"),
-          region: (.spec.locationSpec.objectStore.region // "N/A"),
-          endpoint: (.spec.locationSpec.objectStore.endpoint // "default"),
-          protectionPeriod: (.spec.locationSpec.objectStore.protectionPeriod // null)
-        }))
-      },
-
-      immutabilitySignal: ($immutability == "true"),
-      immutabilityDays: (if $immutabilityDays > 0 then $immutabilityDays else null end),
-
       policyPresets: {
         count: $presetCount,
         items: $presets
-      },
-
-      policies: {
-        count: ($policies.items | length),
-        withExport: $policiesWithExport,
-        withPresets: $policiesWithPresets,
-        targetingAllNamespaces: $allNs,
-        items: ($policies.items | map({
-          name: .metadata.name,
-          frequency: (.spec.frequency // "manual"),
-          subFrequency: (
-            if .spec.subFrequency then {
-              minutes: (.spec.subFrequency.minutes // []),
-              hours: (.spec.subFrequency.hours // []),
-              weekdays: (.spec.subFrequency.weekdays // []),
-              days: (.spec.subFrequency.days // []),
-              months: (.spec.subFrequency.months // [])
-            } else null end
-          ),
-          actions: [.spec.actions[]?.action],
-          presetRef: (.spec.presetRef.name // null),
-          selector: (
-            if .spec.selector == null then "all"
-            elif .spec.selector.matchNames then {matchNames: .spec.selector.matchNames}
-            elif .spec.selector.matchExpressions then 
-              (if (.spec.selector.matchExpressions | length) == 1 and
-                  .spec.selector.matchExpressions[0].key == "k10.kasten.io/appNamespace" and
-                  .spec.selector.matchExpressions[0].operator == "In"
-               then {namespaces: .spec.selector.matchExpressions[0].values}
-               else {matchExpressions: .spec.selector.matchExpressions}
-               end)
-            elif .spec.selector.matchLabels then {matchLabels: .spec.selector.matchLabels}
-            else "all"
-            end
-          ),
-          retention: (
-            if .spec.retention then .spec.retention
-            else (.spec.actions | map(
-              if has("snapshotRetention") then .snapshotRetention
-              elif .exportParameters?.retention then .exportParameters.retention
-              else empty end
-            ))
-            end
-          )
-        }))
       },
 
       kanister: {
@@ -681,13 +1067,50 @@ if [ "$MODE" = "json" ]; then
       },
 
       monitoring: {
-        prometheus: ($prometheusEnabled == "true"),
-        grafana: ($grafanaEnabled == "true")
+        prometheus: ($prometheusEnabled == "true")
       },
 
       coverage: {
         policiesTargetingAllNamespaces: $allNs,
-        note: "Excludes system policies (DR, reporting)"
+        hasCatchallPolicy: ($hasCatchallPolicy == "true"),
+        unprotectedNamespaces: {
+          count: $unprotectedCount,
+          items: $unprotectedNs
+        },
+        note: "Excludes system policies (DR, reporting) and system namespaces"
+      },
+
+      policyRunStats: {
+        lastRuns: $policyLastRun,
+        averageDuration: {
+          seconds: $avgDuration,
+          min: $minDuration,
+          max: $maxDuration,
+          sampleCount: $durationSampleCount
+        }
+      },
+
+      k10Resources: {
+        summary: {
+          totalPods: ($k10Resources.pods | length),
+          totalContainers: $k10ContainersTotal,
+          withLimits: $k10ContainersWithLimits,
+          withoutLimits: $k10ContainersWithoutLimits,
+          totalDeployments: $k10Deployments.total,
+          multiReplicaDeployments: ([$k10Deployments.deployments[]? | select(.replicas > 1)] | length)
+        },
+        deployments: $k10Deployments.deployments,
+        pods: $k10Resources.pods
+      },
+
+      catalog: {
+        pvcName: $catalogPvcName,
+        size: $catalogSize
+      },
+
+      orphanedRestorePoints: {
+        count: $orphanedRpCount,
+        items: $orphanedRp
       },
 
       dataUsage: {
@@ -700,7 +1123,56 @@ if [ "$MODE" = "json" ]; then
         disasterRecovery: $bpDr,
         immutability: $bpImmutability,
         policyPresets: $bpPresets,
-        monitoring: $bpMonitoring
+        monitoring: $bpMonitoring,
+        resourceLimits: $bpResources,
+        namespaceProtection: $bpCoverage
+      },
+
+      immutabilitySignal: ($immutability == "true"),
+      immutabilityDays: $immutabilityDays,
+
+      policies: {
+        count: ($policies.items | length),
+        withExport: $policiesWithExport,
+        withPresets: $policiesWithPresets,
+        items: [
+          $policies.items[] | {
+            name: .metadata.name,
+            frequency: .spec.frequency,
+            subFrequency: .spec.subFrequency,
+            actions: [.spec.actions[].action],
+            selector: (
+              if .spec.selector == null or .spec.selector == {} then "all"
+              elif .spec.selector.matchNames then {matchNames: .spec.selector.matchNames}
+              elif .spec.selector.matchLabels then {matchLabels: .spec.selector.matchLabels}
+              elif .spec.selector.matchExpressions then {matchExpressions: .spec.selector.matchExpressions}
+              else "all"
+              end
+            ),
+            retention: (.spec.retention // {}),
+            exportRetention: (.spec.actions[] | select(.action == "export") | .exportParameters.retention // null),
+            presetRef: .spec.presetRef.name
+          }
+        ]
+      },
+
+      profiles: {
+        count: ($profiles.items | length),
+        immutableCount: $immutableProfiles,
+        items: [
+          $profiles.items[] | {
+            name: .metadata.name,
+            backend: (
+              if .spec.infrastoreBlobStore then "S3"
+              elif .spec.locationSpec.type then .spec.locationSpec.type
+              else "Unknown"
+              end
+            ),
+            region: (.spec.infrastoreBlobStore.region // .spec.locationSpec.region // "N/A"),
+            endpoint: (.spec.infrastoreBlobStore.endpoint // .spec.locationSpec.endpoint // "N/A"),
+            protectionPeriod: .spec.infrastoreBlobStore.protectionPeriod
+          }
+        ]
       }
     }'
   exit 0
@@ -709,91 +1181,98 @@ fi
 ##############################################################################
 # HUMAN OUTPUT
 ##############################################################################
-printf "${COLOR_BOLD}${COLOR_CYAN}🔍 Kasten Discovery Lite v1.4${COLOR_RESET}\n"
-printf "Namespace: ${COLOR_BOLD}$NAMESPACE${COLOR_RESET}\n\n"
 
-printf "${COLOR_BOLD}🏭 Platform:${COLOR_RESET} $PLATFORM\n"
-printf "${COLOR_BOLD}📦 Kasten Version:${COLOR_RESET} $KASTEN_VERSION\n\n"
+printf "\n${COLOR_BOLD}${COLOR_BLUE}🔍 Kasten Discovery Lite v1.5.1${COLOR_RESET}\n"
+printf "==============================\n"
+printf "Platform: $PLATFORM\n"
+printf "Namespace: $NAMESPACE\n"
+printf "Kasten Version: $KASTEN_VERSION\n"
 
-### License Information
-printf "${COLOR_BOLD}📜 License Information${COLOR_RESET}\n"
-if [ "$LICENSE_STATUS" != "NOT_FOUND" ]; then
+### License
+printf "\n${COLOR_BOLD}📜 License Information${COLOR_RESET}\n"
+if [ "$LICENSE_STATUS" = "NOT_FOUND" ]; then
+  printf "  ${COLOR_YELLOW}⚠️  No license detected${COLOR_RESET}\n"
+else
   printf "  Customer:    $LICENSE_CUSTOMER\n"
   printf "  License ID:  $LICENSE_ID\n"
-  
   if [ "$LICENSE_STATUS" = "VALID" ]; then
-    printf "  Status:      ${COLOR_GREEN}${LICENSE_STATUS}${COLOR_RESET}\n"
+    printf "  Status:      ${COLOR_GREEN}✅ VALID${COLOR_RESET}\n"
   elif [ "$LICENSE_STATUS" = "EXPIRED" ]; then
-    printf "  Status:      ${COLOR_RED}${LICENSE_STATUS}${COLOR_RESET}\n"
+    printf "  Status:      ${COLOR_RED}❌ EXPIRED${COLOR_RESET}\n"
   else
-    printf "  Status:      ${COLOR_YELLOW}${LICENSE_STATUS}${COLOR_RESET}\n"
+    printf "  Status:      ${COLOR_YELLOW}⚠️  UNKNOWN${COLOR_RESET}\n"
   fi
-  
-  printf "  Valid from:  $LICENSE_START\n"
-  
-  if [ "$LICENSE_STATUS" = "EXPIRED" ]; then
-    printf "  Valid until: ${COLOR_RED}$LICENSE_END${COLOR_RESET}\n"
+  printf "  Valid From:  $LICENSE_START\n"
+  printf "  Valid Until: $LICENSE_END\n"
+  if [ "$LICENSE_NODES" = "0" ] || [ "$LICENSE_NODES" = "unlimited" ]; then
+    printf "  Node Limit:  Unlimited\n"
   else
-    printf "  Valid until: $LICENSE_END\n"
+    printf "  Node Limit:  $LICENSE_NODES\n"
   fi
-  
-  if [ "$LICENSE_NODES" = "unlimited" ] || [ "$LICENSE_NODES" = "0" ]; then
-    printf "  Node limit:  ${COLOR_GREEN}unlimited${COLOR_RESET}\n"
-  else
-    printf "  Node limit:  $LICENSE_NODES nodes\n"
-  fi
-else
-  printf "  ${COLOR_YELLOW}Status:      License not found${COLOR_RESET}\n"
 fi
-printf "\n"
 
 ### Health Status
-printf "${COLOR_BOLD}${COLOR_BLUE}💚 Health Status${COLOR_RESET}\n"
-printf "  Pods:       $PODS_READY/$PODS ready ($PODS_RUNNING running)\n"
-if [ "$TOTAL_ACTIONS" -gt 0 ]; then
-  printf "  Actions (last 14 days):\n"
-  printf "    - Total:          $TOTAL_ACTIONS\n"
-  printf "    - Backup Actions: $BACKUP_ACTIONS_TOTAL ($BACKUP_ACTIONS_COMPLETED completed, $BACKUP_ACTIONS_FAILED failed)\n"
-  printf "    - Export Actions: $EXPORT_ACTIONS_TOTAL ($EXPORT_ACTIONS_COMPLETED completed, $EXPORT_ACTIONS_FAILED failed)\n"
-  printf "  Overall Success:   ${SUCCESS_RATE}%%\n"
-  printf "  RestorePoints:     $RESTORE_POINTS_COUNT\n"
-else
-  printf "  Actions (last 14 days): No backup/export actions found\n"
-  printf "  RestorePoints:     $RESTORE_POINTS_COUNT\n"
-fi
-printf "\n"
-
-### Disaster Recovery (NEW)
-printf "${COLOR_BOLD}🛡️  Disaster Recovery (KDR)${COLOR_RESET}\n"
-if [ "$KDR_ENABLED" = true ]; then
-  printf "  Status:     ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
-  printf "  Mode:       ${COLOR_BOLD}$KDR_MODE${COLOR_RESET}\n"
-  printf "  Frequency:  $KDR_FREQUENCY\n"
-  printf "  Profile:    $KDR_PROFILE\n"
-  if [ "$KDR_LOCAL_SNAPSHOT" = "true" ]; then
-    printf "  Local Catalog Snapshot:  ${COLOR_GREEN}Yes${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}💚 Health Status${COLOR_RESET}\n"
+printf "  Pods:\n"
+printf "    Total:   $PODS\n"
+printf "    Running: $PODS_RUNNING\n"
+printf "    Ready:   $PODS_READY\n"
+printf "\n  Backup Health (Last 14 Days):\n"
+printf "    Total Actions:  $TOTAL_ACTIONS\n"
+printf "    Backup Actions: $BACKUP_ACTIONS_TOTAL (${COLOR_GREEN}$BACKUP_ACTIONS_COMPLETED ok${COLOR_RESET}, ${COLOR_RED}$BACKUP_ACTIONS_FAILED failed${COLOR_RESET})\n"
+printf "    Export Actions: $EXPORT_ACTIONS_TOTAL (${COLOR_GREEN}$EXPORT_ACTIONS_COMPLETED ok${COLOR_RESET}, ${COLOR_RED}$EXPORT_ACTIONS_FAILED failed${COLOR_RESET})\n"
+printf "    Restore Points: $RESTORE_POINTS_COUNT\n"
+if [ "$SUCCESS_RATE" != "N/A" ]; then
+  if [ "$(echo "$SUCCESS_RATE > 95" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+    printf "    Success Rate:   ${COLOR_GREEN}$SUCCESS_RATE%%${COLOR_RESET}\n"
+  elif [ "$(echo "$SUCCESS_RATE > 80" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+    printf "    Success Rate:   ${COLOR_YELLOW}$SUCCESS_RATE%%${COLOR_RESET}\n"
   else
-    printf "  Local Catalog Snapshot:  ${COLOR_YELLOW}No${COLOR_RESET}\n"
-  fi
-  if [ "$KDR_EXPORT_CATALOG" = "true" ]; then
-    printf "  Export Catalog Snapshot: ${COLOR_GREEN}Yes${COLOR_RESET}\n"
+    printf "    Success Rate:   ${COLOR_RED}$SUCCESS_RATE%%${COLOR_RESET}\n"
   fi
 else
-  printf "  Status:     ${COLOR_RED}NOT CONFIGURED${COLOR_RESET}\n"
-  printf "  ${COLOR_YELLOW}⚠️  WARNING: Disaster Recovery is not enabled!${COLOR_RESET}\n"
-  printf "  ${COLOR_YELLOW}   This is critical for Kasten resilience.${COLOR_RESET}\n"
+  printf "    Success Rate:   N/A\n"
 fi
-printf "\n"
 
-### Core Resources
-printf "${COLOR_BOLD}📊 Core Resources${COLOR_RESET}\n"
-printf "  Pods:       $PODS\n"
-printf "  Services:   $SERVICES\n"
-printf "  ConfigMaps: $CONFIGMAPS\n"
-printf "  Secrets:    $SECRETS\n\n"
+### Restore Actions History (NEW v1.5)
+printf "\n${COLOR_BOLD}🔄 Restore Actions History${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "  Total:     $RESTORE_ACTIONS_TOTAL\n"
+printf "  Completed: ${COLOR_GREEN}$RESTORE_ACTIONS_COMPLETED${COLOR_RESET}\n"
+printf "  Failed:    ${COLOR_RED}$RESTORE_ACTIONS_FAILED${COLOR_RESET}\n"
+printf "  Running:   $RESTORE_ACTIONS_RUNNING\n"
+if [ "$RESTORE_ACTIONS_TOTAL" -gt 0 ]; then
+  printf "  Recent restores:\n"
+  echo "$RESTORE_ACTIONS_RECENT" | jq -r '.[] | "    - \(.timestamp | split("T")[0]) | \(.state) | \(.targetNamespace)"' 2>/dev/null | head -5
+fi
+
+### Disaster Recovery
+printf "\n${COLOR_BOLD}🛡️ Disaster Recovery (KDR)${COLOR_RESET}\n"
+if [ "$KDR_ENABLED" = true ]; then
+  printf "  Status:    ${COLOR_GREEN}✅ ENABLED${COLOR_RESET}\n"
+  printf "  Mode:      $KDR_MODE\n"
+  printf "  Frequency: $KDR_FREQUENCY\n"
+  printf "  Profile:   $KDR_PROFILE\n"
+else
+  printf "  ${COLOR_RED}❌ NOT CONFIGURED${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}⚠️  This is critical for Kasten platform resilience${COLOR_RESET}\n"
+fi
+
+### Immutability
+printf "\n${COLOR_BOLD}🔒 Immutability Signal${COLOR_RESET}\n"
+if [ "$IMMUTABILITY" = "true" ]; then
+  printf "  Detected:  ${COLOR_GREEN}✅ Yes${COLOR_RESET}\n"
+  if [ "$IMMUTABILITY_DAYS" -gt 0 ]; then
+    printf "  Max Protection Period: ${IMMUTABILITY_DAYS} days\n"
+  else
+    printf "  Max Protection Period: $PROTECTION_PERIOD_RAW\n"
+  fi
+  printf "  Profiles with immutability: $IMMUTABLE_PROFILES\n"
+else
+  printf "  Detected:  ${COLOR_YELLOW}⚠️  No${COLOR_RESET}\n"
+fi
 
 ### Profiles
-printf "${COLOR_BOLD}📦 Kasten Profiles${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}📦 Location Profiles${COLOR_RESET}\n"
 printf "  Profiles: $PROFILE_COUNT"
 if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
   printf " (${COLOR_GREEN}$IMMUTABLE_PROFILES with immutability${COLOR_RESET})"
@@ -802,66 +1281,52 @@ printf "\n"
 
 if [ "$PROFILE_COUNT" -gt 0 ]; then
   echo "$PROFILES_JSON" | jq -r '
-.items[] |
+.items[]? |
 "  - \(.metadata.name)\n" +
-"    Backend: \(.spec.locationSpec.objectStore.objectStoreType // .spec.locationSpec.type // "unknown")\n" +
-"    Region: \(.spec.locationSpec.objectStore.region // "N/A")\n" +
-"    Endpoint: \(.spec.locationSpec.objectStore.endpoint // "default")\n" +
-"    Protection period: \(.spec.locationSpec.objectStore.protectionPeriod // "not set")\n"
-'
+"    Backend: \(.spec.locationSpec.objectStore.objectStoreType // .spec.infrastoreBlobStore.objectStoreType // .spec.locationSpec.type // "unknown")\n" +
+"    Region: \(.spec.locationSpec.objectStore.region // .spec.infrastoreBlobStore.region // "N/A")\n" +
+"    Endpoint: \(.spec.locationSpec.objectStore.endpoint // .spec.infrastoreBlobStore.endpoint // "default")\n" +
+"    Protection period: \(first(.. | .protectionPeriod? // empty) // "not set")\n"
+' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse profile details${COLOR_RESET}\n"
 fi
 
-### Immutability
-printf "${COLOR_BOLD}🔒 Immutability${COLOR_RESET} (Kasten-level signal)\n"
-if [ "$IMMUTABILITY" = true ]; then
-  printf "  Status: ${COLOR_GREEN}DETECTED${COLOR_RESET}\n"
-  printf "  Protection period: ${COLOR_BOLD}${IMMUTABILITY_DAYS} days${COLOR_RESET}\n"
-else
-  printf "  Status: ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
-fi
-printf "\n"
-
-### PolicyPresets (NEW)
-printf "${COLOR_BOLD}📋 Policy Presets${COLOR_RESET}\n"
+### PolicyPresets
+printf "\n${COLOR_BOLD}📋 Policy Presets${COLOR_RESET}\n"
 if [ "$PRESET_COUNT" -gt 0 ]; then
   printf "  Presets: ${COLOR_GREEN}$PRESET_COUNT${COLOR_RESET}\n"
   echo "$PRESETS_JSON" | jq -r '
-.items[] |
+.items[]? |
 "  - \(.metadata.name)\n" +
 "    Frequency: \(.spec.frequency // "not set")\n" +
 (if .spec.retention then
   "    Retention: " + ([.spec.retention | to_entries[] | "\(.key)=\(.value)"] | join(", ")) + "\n"
 else "" end)
-'
+' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse preset details${COLOR_RESET}\n"
   if [ "$POLICIES_WITH_PRESETS" -gt 0 ]; then
     printf "  Policies using presets: ${COLOR_GREEN}$POLICIES_WITH_PRESETS${COLOR_RESET}\n"
   fi
 else
   printf "  Presets: ${COLOR_YELLOW}0 (consider using presets to standardize SLAs)${COLOR_RESET}\n"
 fi
-printf "\n"
 
-### Policies
-printf "${COLOR_BOLD}📜 Kasten Policies${COLOR_RESET}\n"
-printf "  Policies: $POLICY_COUNT"
-if [ "$POLICIES_WITH_EXPORT" -gt 0 ]; then
-  printf " (${COLOR_GREEN}$POLICIES_WITH_EXPORT with export${COLOR_RESET})"
-fi
-printf "\n"
+### Policy Last Run Status (NEW v1.5)
+printf "\n${COLOR_BOLD}📜 Kasten Policies${COLOR_RESET}\n"
+printf "  Total: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)\n"
+printf "  With export: $POLICIES_WITH_EXPORT | Using presets: $POLICIES_WITH_PRESETS\n"
 
 if [ "$POLICY_COUNT" -gt 0 ]; then
   echo "$POLICIES_JSON" | jq -r '
-.items[] |
+.items[]? |
 "  - \(.metadata.name)\n" +
 "    Frequency: \(.spec.frequency // "manual")\n" +
 (if .spec.presetRef then "    Preset: \(.spec.presetRef.name)\n" else "" end) +
 (if .spec.subFrequency then
   "    Schedule:\n" +
-  (if .spec.subFrequency.minutes then "      Minutes: \(.spec.subFrequency.minutes | join(", "))\n" else "" end) +
-  (if .spec.subFrequency.hours then "      Hours: \(.spec.subFrequency.hours | join(", "))\n" else "" end) +
-  (if .spec.subFrequency.weekdays then "      Weekdays: \(.spec.subFrequency.weekdays | join(", "))\n" else "" end) +
-  (if .spec.subFrequency.days then "      Days: \(.spec.subFrequency.days | join(", "))\n" else "" end) +
-  (if .spec.subFrequency.months then "      Months: \(.spec.subFrequency.months | join(", "))\n" else "" end)
+  (if .spec.subFrequency.minutes and (.spec.subFrequency.minutes | length) > 0 then "      Minutes: \(.spec.subFrequency.minutes | join(", "))\n" else "" end) +
+  (if .spec.subFrequency.hours and (.spec.subFrequency.hours | length) > 0 then "      Hours: \(.spec.subFrequency.hours | join(", "))\n" else "" end) +
+  (if .spec.subFrequency.weekdays and (.spec.subFrequency.weekdays | length) > 0 then "      Weekdays: \(.spec.subFrequency.weekdays | join(", "))\n" else "" end) +
+  (if .spec.subFrequency.days and (.spec.subFrequency.days | length) > 0 then "      Days: \(.spec.subFrequency.days | join(", "))\n" else "" end) +
+  (if .spec.subFrequency.months and (.spec.subFrequency.months | length) > 0 then "      Months: \(.spec.subFrequency.months | join(", "))\n" else "" end)
 else "" end) +
 "    Actions: \([.spec.actions[]?.action] | join(", "))\n" +
 "    Namespace selector: " +
@@ -901,14 +1366,141 @@ else "" end) +
     "      not defined"
   end
 )
-'
+' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse policy details${COLOR_RESET}\n"
 fi
 
-printf "\n${COLOR_BOLD}📊 Policy Coverage Summary${COLOR_RESET}\n"
-printf "  ${COLOR_CYAN}(Excludes system policies: DR, reporting)${COLOR_RESET}\n"
-printf "  App policies targeting all namespaces: $ALL_NS_POLICIES\n"
+### Policy Last Run Summary (NEW v1.5)
+printf "\n${COLOR_BOLD}⏱️ Policy Last Run Status${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+echo "$POLICY_LAST_RUN" | jq -r '.[]? | 
+  "  \(.name): \(if .lastRun then .lastRun.timestamp else "Never" end) | \(if .lastRun then .lastRun.state else "N/A" end)\(if .lastRun.duration then " | \(.lastRun.duration)s" else "" end)"
+' 2>/dev/null || printf "  ${COLOR_YELLOW}No run data available${COLOR_RESET}\n"
 
-### Blueprints & Bindings (NEW)
+### Average Policy Run Duration (NEW v1.5)
+printf "\n${COLOR_BOLD}⏱️ Policy Run Duration${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "  Sample size: $DURATION_SAMPLE_COUNT runs (last 14 days)\n"
+if [ "$DURATION_SAMPLE_COUNT" -gt 0 ]; then
+  printf "  Average: ${COLOR_GREEN}${AVG_DURATION}s${COLOR_RESET}\n"
+  printf "  Min: ${MIN_DURATION}s | Max: ${MAX_DURATION}s\n"
+else
+  printf "  ${COLOR_YELLOW}ℹ️  No completed runs in the last 14 days${COLOR_RESET}\n"
+fi
+
+### Unprotected Namespaces (NEW v1.5)
+printf "\n${COLOR_BOLD}🛡️ Namespace Protection${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "  ${COLOR_CYAN}(Based on $APP_POLICY_COUNT app policies, excludes DR/report system policies)${COLOR_RESET}\n"
+printf "  Total namespaces in cluster: $(echo "$ALL_NAMESPACES" | jq 'length')\n"
+printf "  Application namespaces (non-system): $APP_NS_COUNT\n"
+printf "  Explicitly targeted by policies: $PROTECTED_NS_COUNT\n"
+
+if [ "$APP_POLICY_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_RED}⚠️  No application backup policies found!${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    Only system policies (DR/report) detected.${COLOR_RESET}\n"
+elif [ "$HAS_CATCHALL_POLICY" = "true" ]; then
+  printf "  ${COLOR_GREEN}✅ Catch-all policy detected${COLOR_RESET} - All namespaces protected\n"
+  printf "  ${COLOR_CYAN}    Policy: $CATCHALL_POLICIES${COLOR_RESET}\n"
+elif [ "$APP_NS_COUNT" -eq 0 ] 2>/dev/null; then
+  printf "  ${COLOR_YELLOW}ℹ️  No application namespaces found${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    All namespaces match system patterns (openshift-*, kube-*, etc.)${COLOR_RESET}\n"
+  if [ "$PROTECTED_NS_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_CYAN}    Policies target system namespaces: $(echo "$PROTECTED_NAMESPACES" | jq -r 'join(", ")')${COLOR_RESET}\n"
+  fi
+elif [ "$HAS_COMPLEX_SELECTOR" = "true" ] && [ "$PROTECTED_NS_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_YELLOW}⚠️  Cannot determine coverage${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    Policies use label-based selectors: $COMPLEX_SELECTOR_POLICIES${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    Coverage depends on namespace labels matching policy selectors${COLOR_RESET}\n"
+  if [ "$UNPROTECTED_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_RED}    $UNPROTECTED_COUNT namespace(s) not matching any explicit selector:${COLOR_RESET}\n"
+    echo "$UNPROTECTED_NS_JSON" | jq -r '.[:10][] | "      - \(.)"' 2>/dev/null
+  fi
+elif [ "$UNPROTECTED_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_GREEN}✅ All application namespaces are protected${COLOR_RESET}\n"
+  if [ "$PROTECTED_NS_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_CYAN}    Targeted: $(echo "$PROTECTED_NAMESPACES" | jq -r 'join(", ")')${COLOR_RESET}\n"
+  fi
+else
+  printf "  ${COLOR_RED}⚠️  $UNPROTECTED_COUNT unprotected namespace(s) detected:${COLOR_RESET}\n"
+  echo "$UNPROTECTED_NS_JSON" | jq -r '.[:10][] | "    - \(.)"' 2>/dev/null
+  if [ "$UNPROTECTED_COUNT" -gt 10 ]; then
+    printf "    ... and $((UNPROTECTED_COUNT - 10)) more\n"
+  fi
+  if [ "$PROTECTED_NS_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_GREEN}  Protected: $(echo "$PROTECTED_NAMESPACES" | jq -r 'join(", ")')${COLOR_RESET}\n"
+  fi
+fi
+
+# Show complex selector info if applicable
+if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
+  printf "  ${COLOR_YELLOW}ℹ️  Policies with label selectors: $COMPLEX_SELECTOR_POLICIES${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    (May protect additional namespaces based on labels)${COLOR_RESET}\n"
+fi
+
+### K10 Resource Limits (NEW v1.5)
+printf "\n${COLOR_BOLD}📊 K10 Resource Limits${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "  K10 Pods: $K10_PODS_TOTAL\n"
+printf "  K10 Deployments: $K10_DEPLOYMENTS_TOTAL"
+if [ "${K10_MULTI_REPLICA:-0}" -gt 0 ] 2>/dev/null; then
+  printf " (${COLOR_GREEN}$K10_MULTI_REPLICA with multiple replicas${COLOR_RESET})"
+fi
+printf "\n"
+printf "  Total Containers: $K10_CONTAINERS_TOTAL\n"
+printf "  Containers with limits: "
+if [ "${K10_CONTAINERS_WITH_LIMITS:-0}" -gt 0 ] 2>/dev/null; then
+  printf "${COLOR_GREEN}$K10_CONTAINERS_WITH_LIMITS${COLOR_RESET}\n"
+else
+  printf "${COLOR_YELLOW}$K10_CONTAINERS_WITH_LIMITS${COLOR_RESET}\n"
+fi
+printf "  Containers without limits: "
+if [ "${K10_CONTAINERS_WITHOUT_LIMITS:-0}" -eq 0 ] 2>/dev/null; then
+  printf "${COLOR_GREEN}0${COLOR_RESET}\n"
+else
+  printf "${COLOR_YELLOW}$K10_CONTAINERS_WITHOUT_LIMITS${COLOR_RESET}\n"
+fi
+
+# Show deployments with replicas
+if [ "${K10_DEPLOYMENTS_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+  printf "\n  Deployment Replicas:\n"
+  echo "$K10_DEPLOYMENTS_SUMMARY" | jq -r '
+    .deployments[]? | 
+    "  - \(.name): \(.ready)/\(.replicas) ready" + (if .replicas > 1 then " ★" else "" end)
+  ' 2>/dev/null | head -30
+  DEPLOY_COUNT=$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '.deployments | length' 2>/dev/null || echo "0")
+  if [ "${DEPLOY_COUNT:-0}" -gt 30 ] 2>/dev/null; then
+    printf "  ... and $((DEPLOY_COUNT - 30)) more deployments\n"
+  fi
+else
+  printf "\n  ${COLOR_YELLOW}No deployments found${COLOR_RESET}\n"
+fi
+
+# Show details per pod (top 15)
+if [ "$K10_PODS_TOTAL" -gt 0 ] 2>/dev/null; then
+  printf "\n  Pod Resource Details:\n"
+  echo "$K10_RESOURCES_SUMMARY" | jq -r '
+    .pods[:15][]? | 
+    "  - \(.name) [\(.status)]",
+    (.containers[]? | 
+      "      \(.name): CPU \(.requests_cpu)/\(.limits_cpu) | MEM \(.requests_mem)/\(.limits_mem)"
+    )
+  ' 2>/dev/null | head -60
+  if [ "$K10_PODS_TOTAL" -gt 15 ] 2>/dev/null; then
+    printf "  ... and $((K10_PODS_TOTAL - 15)) more pods\n"
+  fi
+fi
+
+### Catalog Size (NEW v1.5)
+printf "\n${COLOR_BOLD}📁 Catalog${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "  PVC Name: $CATALOG_PVC_NAME\n"
+printf "  Size:     $CATALOG_SIZE\n"
+
+### Orphaned RestorePoints (NEW v1.5)
+printf "\n${COLOR_BOLD}🗑️ Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+if [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_GREEN}✅ No orphaned RestorePoints detected${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}⚠️  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
+  echo "$ORPHANED_RP" | jq -r '.[:5][] | "    - \(.name) [\(.namespace)]"' 2>/dev/null
+fi
+
+### Blueprints & Bindings
 printf "\n${COLOR_BOLD}🔧 Kanister Blueprints${COLOR_RESET}\n"
 printf "  Blueprints: $BLUEPRINT_COUNT\n"
 if [ "$BLUEPRINT_COUNT" -gt 0 ]; then
@@ -921,10 +1513,9 @@ fi
 if [ "$BLUEPRINT_COUNT" -eq 0 ] && [ "$BINDING_COUNT" -eq 0 ]; then
   printf "  ${COLOR_YELLOW}ℹ️  Consider using Blueprints for database-consistent backups${COLOR_RESET}\n"
 fi
-printf "\n"
 
-### TransformSets (NEW)
-printf "${COLOR_BOLD}🔄 Transform Sets${COLOR_RESET}\n"
+### TransformSets
+printf "\n${COLOR_BOLD}🔄 Transform Sets${COLOR_RESET}\n"
 if [ "$TRANSFORMSET_COUNT" -gt 0 ]; then
   printf "  TransformSets: ${COLOR_GREEN}$TRANSFORMSET_COUNT${COLOR_RESET}\n"
   echo "$TRANSFORMSETS_JSON" | jq -r '.items[] | "  - \(.metadata.name) (\(.spec.transforms | length) transforms)"'
@@ -932,36 +1523,28 @@ else
   printf "  TransformSets: 0\n"
   printf "  ${COLOR_YELLOW}ℹ️  TransformSets are useful for DR and cross-cluster migrations${COLOR_RESET}\n"
 fi
-printf "\n"
 
-### Monitoring (NEW)
-printf "${COLOR_BOLD}📈 Monitoring${COLOR_RESET}\n"
+### Monitoring
+printf "\n${COLOR_BOLD}📈 Monitoring${COLOR_RESET}\n"
 if [ "$PROMETHEUS_ENABLED" = "true" ]; then
   printf "  Prometheus: ${COLOR_GREEN}ENABLED${COLOR_RESET} ($PROMETHEUS_RUNNING pods running)\n"
 else
   printf "  Prometheus: ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
 fi
-if [ "$GRAFANA_ENABLED" = "true" ]; then
-  printf "  Grafana:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($GRAFANA_RUNNING pods running)\n"
-else
-  printf "  Grafana:    ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
-fi
-printf "\n"
+
+### Policy Coverage Summary
+printf "\n${COLOR_BOLD}📊 Policy Coverage Summary${COLOR_RESET}\n"
+printf "  ${COLOR_CYAN}(Excludes system policies: DR, reporting)${COLOR_RESET}\n"
+printf "  App policies targeting all namespaces: $ALL_NS_POLICIES\n"
 
 ### Data Usage
-printf "${COLOR_BOLD}${COLOR_BLUE}💾 Data Usage${COLOR_RESET}\n"
-printf "  Total PVCs:           $TOTAL_PVCS\n"
-printf "  Total Capacity:       ${TOTAL_CAPACITY_GB} Gi\n"
-if [ "$SNAPSHOT_DATA" -gt 0 ]; then
-  SNAPSHOT_GB=$(echo "scale=2; $SNAPSHOT_DATA / 1073741824" | bc 2>/dev/null || echo "0")
-  printf "  Snapshot Data:        ${SNAPSHOT_GB} GB\n"
-else
-  printf "  Snapshot Data:        Not available\n"
-fi
-printf "\n"
+printf "\n${COLOR_BOLD}${COLOR_BLUE}💾 Data Usage${COLOR_RESET}\n"
+printf "  Total PVCs: $TOTAL_PVCS\n"
+printf "  Total Capacity: ${TOTAL_CAPACITY_GB} GiB\n"
+printf "  Snapshot Data: ~${SNAPSHOT_DATA} GiB\n"
 
-### Best Practices Summary (NEW)
-printf "${COLOR_BOLD}${COLOR_CYAN}📋 Best Practices Compliance${COLOR_RESET}\n"
+### Best Practices Compliance
+printf "\n${COLOR_BOLD}📋 Best Practices Compliance${COLOR_RESET}\n"
 
 # Disaster Recovery
 if [ "$BP_DR_STATUS" = "ENABLED" ]; then
@@ -996,6 +1579,20 @@ if [ "$BLUEPRINT_COUNT" -gt 0 ]; then
   printf "  ${COLOR_GREEN}✅${COLOR_RESET} Kanister Blueprints:  ${COLOR_GREEN}$BLUEPRINT_COUNT configured${COLOR_RESET}\n"
 else
   printf "  ${COLOR_YELLOW}ℹ️${COLOR_RESET}  Kanister Blueprints:  None (optional for app-consistent backups)\n"
+fi
+
+# Resource Limits (NEW v1.5)
+if [ "$BP_RESOURCES_STATUS" = "CONFIGURED" ]; then
+  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Resource Limits:      ${COLOR_GREEN}CONFIGURED${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Resource Limits:      ${COLOR_YELLOW}PARTIAL${COLOR_RESET} ($K10_CONTAINERS_WITHOUT_LIMITS containers without limits)\n"
+fi
+
+# Namespace Protection (NEW v1.5)
+if [ "$BP_COVERAGE_STATUS" = "COMPLETE" ]; then
+  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Namespace Protection: ${COLOR_GREEN}COMPLETE${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Namespace Protection: ${COLOR_YELLOW}GAPS DETECTED${COLOR_RESET} ($UNPROTECTED_COUNT unprotected)\n"
 fi
 
 printf "\n${COLOR_GREEN}✅ Discovery completed${COLOR_RESET}\n"
