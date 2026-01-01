@@ -1,141 +1,205 @@
-================================================================================
-                        KASTEN DISCOVERY LITE v1.4
-                     Sample Output - Human Readable
-================================================================================
-
-🔍 Kasten Discovery Lite v1.4
-==============================
-Platform: OpenShift
+🔍 Kasten Discovery Lite v1.5
 Namespace: kasten-io
-Kasten Version: 8.0.15
+
+🏭 Platform: OpenShift
+📦 Kasten Version: 8.0.15
 
 📜 License Information
   Customer:    Acme Corporation
-  License ID:  a1b2c3d4-e5f6-7890-abcd-ef1234567890
-  Status:      ✅ VALID
-  Valid From:  2024-01-15
-  Valid Until: 2025-12-31
-  Node Limit:  Unlimited
+  License ID:  lic-abc123-def456
+  Status:      VALID
+  Valid from:  2024-01-01
+  Valid until: 2025-12-31
+  Node limit:  unlimited
 
 💚 Health Status
-  Pods:
-    Total:   18
-    Running: 18
-    Ready:   18/18
+  Pods:       21/21 ready (21 running)
+  Actions (last 14 days):
+    - Total:          156
+    - Backup Actions: 98 (96 completed, 2 failed)
+    - Export Actions: 58 (56 completed, 2 failed)
+  Overall Success:   97.4%
+  RestorePoints:     245
 
-  Backup Health (Last 14 Days):
-    Total Actions:  342
-    Backup Actions: 186 (182 completed, 4 failed)
-    Export Actions: 156 (154 completed, 2 failed)
-    Restore Points: 89
-    Success Rate:   98.2%
+🔄 Restore Actions History (NEW)
+  Total:     12
+  Completed: 10
+  Failed:    1
+  Running:   1
+  Recent restores:
+    - 2024-12-30 | Complete | production
+    - 2024-12-28 | Complete | staging
+    - 2024-12-25 | Failed | dev-old
 
 🛡️ Disaster Recovery (KDR)
-  Status:    ✅ ENABLED
-  Mode:      Quick DR (Local Snapshot)
-  Frequency: @hourly
-  Profile:   s3-immutable-dr
+  Status:     ENABLED
+  Mode:       Quick DR (Exported Catalog)
+  Frequency:  @daily
+  Profile:    minio-immutable
   Local Catalog Snapshot:  Yes
-  Export Catalog Snapshot: No
+  Export Catalog Snapshot: Yes
 
-🔒 Immutability Signal
-  Detected:  ✅ true
-  Max Protection Period: 14 days
+📊 Core Resources
+  Pods:       21
+  Services:   18
+  ConfigMaps: 45
+  Secrets:    32
 
-📦 Location Profiles (3)
-  1. s3-primary
-     Backend: S3 | Region: eu-west-1
-     Endpoint: s3.eu-west-1.amazonaws.com
-     Protection Period: Not Set
+📦 Kasten Profiles
+  Profiles: 2 (1 with immutability)
+  - minio-immutable
+    Backend: S3
+    Region: us-east-1
+    Endpoint: minio.kasten-io.svc:9000
+    Protection period: 168h0m0s
+  - aws-backup
+    Backend: S3
+    Region: eu-west-1
+    Endpoint: default
+    Protection period: not set
 
-  2. s3-immutable-dr
-     Backend: S3 | Region: eu-central-1
-     Endpoint: s3.eu-central-1.amazonaws.com
-     Protection Period: 14d ✅
+🔒 Immutability (Kasten-level signal)
+  Status: DETECTED
+  Protection period: 7 days
 
-  3. azure-archive
-     Backend: Azure | Region: westeurope
-     Endpoint: blob.core.windows.net
-     Protection Period: 30d ✅
+📋 Policy Presets
+  Presets: 2
+  - gold-sla
+    Frequency: @hourly
+    Retention: hourly=24, daily=7, weekly=4, monthly=12
+  - silver-sla
+    Frequency: @daily
+    Retention: daily=7, weekly=4
+  Policies using presets: 1
 
-📋 Policy Presets (2)
-  1. gold-sla
-     Frequency: @hourly
-     Retention: hourly=24, daily=7, weekly=4, monthly=12
+📜 Kasten Policies
+  Policies: 4 (2 with export)
+  - smoke-test-labels
+    Frequency: @daily
+    Actions: backup, export
+    Namespace selector: matchLabels: backup=enabled
+    Retention:
+      Policy-level DAILY: 7
+  - smoke-test1
+    Frequency: @daily
+    Schedule:
+      Minutes: 0
+      Hours: 1
+      Weekdays: 0
+      Days: 1
+      Months: 1
+    Actions: backup, export
+    Namespace selector: namespaces: openshift-etcd
+    Retention:
+      Policy-level DAILY: 7
+      Policy-level WEEKLY: 4
+      Policy-level MONTHLY: 12
+      Policy-level YEARLY: 7
+  - k10-disaster-recovery-policy
+    Frequency: @daily
+    Actions: backup
+    Namespace selector: namespaces: kasten-io
+    Retention:
+      Policy-level DAILY: 7
+  - k10-system-reports-policy
+    Frequency: @daily
+    Actions: report
+    Namespace selector: all namespaces
+    Retention:
+      not defined
 
-  2. silver-sla
-     Frequency: @daily
-     Retention: daily=7, weekly=4
+⏱️ Policy Last Run Status (NEW)
+  smoke-test-labels: 2024-12-31T02:00:00Z | Complete | 145s
+  smoke-test1: 2024-12-31T01:00:00Z | Complete | 89s
+  k10-disaster-recovery-policy: 2024-12-31T00:00:00Z | Complete | 23s
 
-📜 Backup Policies (5)
-  Note: 3 with export, 2 using presets
+⏱️ Policy Run Duration (NEW)
+  Sample size: 8 runs (last 14 days)
+  Average: 60s
+  Min: 23s | Max: 245s
 
-  1. daily-backup-all
-     Frequency: @daily (02:00)
-     Actions: backup, export
-     Selector: All Namespaces
-     Retention: daily=7, weekly=4, monthly=12
-     Export Retention: daily=30
+🛡️ Namespace Protection (NEW)
+  (Based on 2 app policies, excludes DR/report system policies)
+  Total namespaces in cluster: 45
+  Application namespaces (non-system): 0
+  Explicitly targeted by policies: 1
+  ℹ️  No application namespaces found
+      All namespaces match system patterns (openshift-*, kube-*, etc.)
+      Policies target system namespaces: openshift-etcd
+  ℹ️  Policies with label selectors: smoke-test-labels
+      (May protect additional namespaces based on labels)
 
-  2. hourly-critical-apps
-     Frequency: @hourly (:00)
-     Actions: backup, export
-     Selector: tier=critical
-     Retention: hourly=24, daily=7
-     Export Retention: hourly=48
-     Preset: gold-sla 📋
+📊 K10 Resource Limits (NEW)
+  K10 Pods: 21
+  K10 Deployments: 18 (3 with multiple replicas)
+  Total Containers: 35
+  Containers with limits: 35
+  Containers without limits: 0
 
-  3. weekly-dev-namespaces
-     Frequency: @weekly (Sun 03:00)
-     Actions: backup
-     Selector: dev-*, test-*, staging
-     Retention: weekly=4
-     Preset: silver-sla 📋
+  Deployment Replicas:
+  - aggregatedapis-svc: 1/1 ready
+  - auth-svc: 1/1 ready
+  - catalog-svc: 1/1 ready
+  - controllermanager-svc: 1/1 ready
+  - crypto-svc: 1/1 ready
+  - dashboardbff-svc: 1/1 ready
+  - executor-svc: 3/3 ready ★
+  - frontend-svc: 2/2 ready ★
+  - gateway: 2/2 ready ★
+  - jobs-svc: 1/1 ready
+  - kanister-svc: 1/1 ready
+  - logging-svc: 1/1 ready
+  - metering-svc: 1/1 ready
+  - prometheus-svc: 1/1 ready
+  - state-svc: 1/1 ready
+  - upgrade-svc: 1/1 ready
 
-  4. databases-backup
-     Frequency: @daily (01:30)
-     Actions: backup, export
-     Selector: app.kubernetes.io/component=database
-     Retention: daily=14, weekly=8, monthly=6
-     Export Retention: daily=30, weekly=12
+  Pod Resource Details:
+  - aggregatedapis-svc-7f8d9c5b6d-abc12 [Running]
+      aggregatedapis: CPU 100m/1000m | MEM 128Mi/1Gi
+  - catalog-svc-0 [Running]
+      catalog: CPU 200m/2000m | MEM 256Mi/2Gi
+      kanister-sidecar: CPU 50m/500m | MEM 64Mi/512Mi
+  ... and 19 more pods
 
-  5. compliance-monthly
-     Frequency: @monthly (1st 04:00)
-     Actions: backup
-     Selector: All Namespaces
-     Retention: monthly=12, yearly=7
+📁 Catalog (NEW)
+  PVC Name: catalog-pvc-catalog-svc-0
+  Size:     20Gi
 
-📊 Policy Coverage Summary
-  (Excludes system policies: DR, reporting)
-  App policies targeting all namespaces: 2
+🗑️ Orphaned RestorePoints (NEW)
+  ✅ No orphaned RestorePoints detected
 
 🔧 Kanister Blueprints
-  Blueprints: 3
-  - postgres-bp
-  - mysql-bp
-  - mongodb-bp
+  Blueprints: 2
+  - mysql-blueprint
+  - postgres-blueprint
   Blueprint Bindings: 2
-  - postgres-prod-binding → postgres-bp
-  - mysql-orders-binding → mysql-bp
+  - mysql-binding → mysql-blueprint
+  - postgres-binding → postgres-blueprint
 
 🔄 Transform Sets
   TransformSets: 1
   - dr-transforms (3 transforms)
 
 📈 Monitoring
-  Prometheus: ✅ ENABLED
-  Grafana:    ✅ ENABLED
+  Prometheus: ENABLED (2 pods running)
+
+📊 Policy Coverage Summary
+  (Excludes system policies: DR, reporting)
+  App policies targeting all namespaces: 0
 
 💾 Data Usage
-  Total PVCs: 47
-  Total Capacity: 1250 GiB
-  Snapshot Data: ~831 GiB
+  Total PVCs:           45
+  Total Capacity:       850 Gi
+  Snapshot Data:        117.22 GB
 
 📋 Best Practices Compliance
-  ✅ Disaster Recovery:    ENABLED (Quick DR (Local Snapshot))
-  ✅ Immutability:         ENABLED (2 profiles)
+  ✅ Disaster Recovery:    ENABLED (Quick DR (Exported Catalog))
+  ✅ Immutability:         ENABLED (1 profiles)
   ✅ Policy Presets:       IN USE (2 presets)
   ✅ Monitoring:           ENABLED
-  ✅ Kanister Blueprints:  3 configured
+  ✅ Kanister Blueprints:  2 configured
+  ✅ Resource Limits:      CONFIGURED
+  ✅ Namespace Protection: COMPLETE
 
 ✅ Discovery completed
