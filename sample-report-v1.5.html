@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kasten Discovery Report - OpenShift</title>
+  <style>
+    :root{--bg:#0f172a;--card:#1e293b;--text:#e2e8f0;--muted:#94a3b8;--border:#334155;--ok:#059669;--warn:#f59e0b;--error:#dc2626;--info:#2563eb;--accent:#8b5cf6}
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.6;padding:2rem}
+    .container{max-width:1200px;margin:0 auto}
+    h1{font-size:2rem;margin-bottom:0.5rem;color:#fff}
+    h2{font-size:1.25rem;margin:2rem 0 1rem;padding-bottom:0.5rem;border-bottom:1px solid var(--border);color:#fff}
+    h3{font-size:1rem;margin:1.5rem 0 0.75rem;color:var(--muted)}
+    .subtitle{color:var(--muted);margin-bottom:1rem;font-size:0.9rem}
+    .meta{color:var(--muted);margin-bottom:2rem}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem;margin-bottom:1rem}
+    .grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:1rem;margin-bottom:1rem}
+    .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1rem}
+    .card{background:var(--card);border-radius:8px;padding:1rem;border:1px solid var(--border)}
+    .card strong{display:block;color:var(--muted);font-size:0.85rem;margin-bottom:0.25rem}
+    .card-value{font-size:1.5rem;font-weight:600}
+    .stat-row{display:flex;justify-content:space-between;padding:0.5rem 0;border-bottom:1px solid var(--border)}
+    .stat-row:last-child{border-bottom:none}
+    .stat-label{color:var(--muted)}
+    .badge{display:inline-block;padding:0.25rem 0.75rem;border-radius:9999px;font-size:0.85rem;font-weight:500}
+    .badge.ok{background:rgba(5,150,105,0.2);color:#34d399}
+    .badge.warn{background:rgba(245,158,11,0.2);color:#fbbf24}
+    .badge.error{background:rgba(220,38,38,0.2);color:#f87171}
+    .badge.info{background:rgba(37,99,235,0.2);color:#60a5fa}
+    table{width:100%;border-collapse:collapse;margin:1rem 0;background:var(--card);border-radius:8px;overflow:hidden}
+    th,td{padding:0.75rem 1rem;text-align:left;border-bottom:1px solid var(--border)}
+    th{background:rgba(0,0,0,0.2);color:var(--muted);font-weight:500;font-size:0.85rem;text-transform:uppercase}
+    tr:last-child td{border-bottom:none}
+    .success-box{background:rgba(5,150,105,0.15);border:1px solid rgba(5,150,105,0.3);border-radius:8px;padding:1rem;margin:1rem 0}
+    .warning-box{background:rgba(245,158,11,0.15);border:1px solid rgba(245,158,11,0.3);border-radius:8px;padding:1rem;margin:1rem 0}
+    .info-box{background:rgba(37,99,235,0.15);border:1px solid rgba(37,99,235,0.3);border-radius:8px;padding:1rem;margin:1rem 0}
+    .new-badge{background:var(--accent);color:white;font-size:0.7rem;padding:0.15rem 0.5rem;border-radius:4px;margin-left:0.5rem;vertical-align:middle}
+    .new-feature{border:1px solid var(--accent) !important}
+    .star{color:#fbbf24;font-weight:bold}
+    footer{margin-top:3rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--muted);font-size:0.85rem;text-align:center}
+  </style>
+</head>
+<body>
+<div class="container">
+
+<h1>🔍 Kasten Discovery Report</h1>
+<p class="meta">Platform: <strong>OpenShift</strong> | Kasten Version: <strong>8.0.15</strong> | Generated: 2024-12-31</p>
+
+<h2>📜 License Information</h2>
+<div class="card">
+  <div class="stat-row"><span class="stat-label">Customer</span><span class="stat-value">Acme Corporation</span></div>
+  <div class="stat-row"><span class="stat-label">License ID</span><span class="stat-value">lic-abc123-def456</span></div>
+  <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value"><span class="badge ok">✓ VALID</span></span></div>
+  <div class="stat-row"><span class="stat-label">Valid From</span><span class="stat-value">2024-01-01</span></div>
+  <div class="stat-row"><span class="stat-label">Valid Until</span><span class="stat-value">2025-12-31</span></div>
+  <div class="stat-row"><span class="stat-label">Node Limit</span><span class="stat-value">unlimited</span></div>
+</div>
+
+<h2>🛡️ Disaster Recovery</h2>
+<div class="card">
+  <div class="stat-row"><span class="stat-label">Status</span><span class="stat-value"><span class="badge ok">✓ ENABLED</span></span></div>
+  <div class="stat-row"><span class="stat-label">Mode</span><span class="stat-value">Quick DR (Exported Catalog)</span></div>
+  <div class="stat-row"><span class="stat-label">Frequency</span><span class="stat-value">@daily</span></div>
+  <div class="stat-row"><span class="stat-label">Profile</span><span class="stat-value">minio-immutable</span></div>
+  <div class="stat-row"><span class="stat-label">Local Catalog Snapshot</span><span class="stat-value"><span class="badge ok">✓ true</span></span></div>
+  <div class="stat-row"><span class="stat-label">Export Catalog Snapshot</span><span class="stat-value"><span class="badge ok">✓ true</span></span></div>
+</div>
+
+<h2>💚 Health Status</h2>
+<div class="grid">
+  <div class="card"><strong>Pods</strong><div class="card-value">21/21</div></div>
+  <div class="card"><strong>Running</strong><div class="card-value" style="color:#059669">21</div></div>
+  <div class="card"><strong>Ready</strong><div class="card-value" style="color:#059669">21</div></div>
+</div>
+<div class="grid">
+  <div class="card"><strong>Backup Actions (14d)</strong><div class="card-value">98</div><small style="color:var(--muted)">96 completed, 2 failed</small></div>
+  <div class="card"><strong>Export Actions (14d)</strong><div class="card-value">58</div><small style="color:var(--muted)">56 completed, 2 failed</small></div>
+  <div class="card"><strong>Success Rate</strong><div class="card-value" style="color:#059669">97.4%</div></div>
+  <div class="card"><strong>RestorePoints</strong><div class="card-value">245</div></div>
+</div>
+
+<h2>⏱️ Policy Run Duration<span class="new-badge">NEW</span></h2>
+<div class="grid new-feature">
+  <div class="card"><strong>Average Duration</strong><div class="card-value">60s</div></div>
+  <div class="card"><strong>Min / Max</strong><div class="card-value">23s / 245s</div></div>
+  <div class="card"><strong>Sample Size</strong><div class="card-value">8 runs</div></div>
+</div>
+
+<h2>⏱️ Policy Last Run Status<span class="new-badge">NEW</span></h2>
+<table>
+<thead><tr><th>Policy</th><th>Last Run</th><th>Status</th><th>Duration</th></tr></thead>
+<tbody>
+<tr><td><strong>smoke-test-labels</strong></td><td>2024-12-31</td><td><span class="badge ok">✓ Complete</span></td><td>145s</td></tr>
+<tr><td><strong>smoke-test1</strong></td><td>2024-12-31</td><td><span class="badge ok">✓ Complete</span></td><td>89s</td></tr>
+<tr><td><strong>k10-disaster-recovery-policy</strong></td><td>2024-12-31</td><td><span class="badge ok">✓ Complete</span></td><td>23s</td></tr>
+</tbody>
+</table>
+
+<h2>🛡️ Namespace Protection<span class="new-badge">NEW</span></h2>
+<p class="subtitle">Based on app policies only (excludes DR/report system policies)</p>
+<div class="success-box">✓ <strong>All application namespaces are protected</strong></div>
+
+<h2>🔄 Restore Actions History<span class="new-badge">NEW</span></h2>
+<div class="grid">
+  <div class="card new-feature"><strong>Total</strong><div class="card-value">12</div></div>
+  <div class="card"><strong>Completed</strong><div class="card-value" style="color:#059669">10</div></div>
+  <div class="card"><strong>Failed</strong><div class="card-value" style="color:#dc2626">1</div></div>
+  <div class="card"><strong>Running</strong><div class="card-value" style="color:#2563eb">1</div></div>
+</div>
+<table>
+<thead><tr><th>Date</th><th>Status</th><th>Target Namespace</th></tr></thead>
+<tbody>
+<tr><td>2024-12-30</td><td><span class="badge ok">✓ Complete</span></td><td>production</td></tr>
+<tr><td>2024-12-28</td><td><span class="badge ok">✓ Complete</span></td><td>staging</td></tr>
+<tr><td>2024-12-25</td><td><span class="badge error">✗ Failed</span></td><td>dev-old</td></tr>
+</tbody>
+</table>
+
+<h2>📊 K10 Resource Limits<span class="new-badge">NEW</span></h2>
+<div class="grid">
+  <div class="card new-feature"><strong>K10 Pods</strong><div class="card-value">21</div></div>
+  <div class="card"><strong>K10 Deployments</strong><div class="card-value">18</div></div>
+  <div class="card"><strong>Total Containers</strong><div class="card-value">35</div></div>
+  <div class="card"><strong>With Limits</strong><div class="card-value" style="color:#059669">35</div></div>
+  <div class="card"><strong>Without Limits</strong><div class="card-value" style="color:#059669">0</div></div>
+  <div class="card"><strong>Multi-Replica</strong><div class="card-value" style="color:#059669">3</div></div>
+</div>
+
+<h3>Deployment Replicas</h3>
+<table>
+<thead><tr><th>Deployment</th><th>Replicas</th><th>Ready</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><strong>aggregatedapis-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>auth-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>catalog-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>controllermanager-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>crypto-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>dashboardbff-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>executor-svc</strong> <span class="star">★</span></td><td>3</td><td>3/3</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>frontend-svc</strong> <span class="star">★</span></td><td>2</td><td>2/2</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>gateway</strong> <span class="star">★</span></td><td>2</td><td>2/2</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>jobs-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>kanister-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>logging-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>metering-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+<tr><td><strong>state-svc</strong></td><td>1</td><td>1/1</td><td><span class="badge ok">Ready</span></td></tr>
+</tbody>
+</table>
+
+<h2>📁 Catalog<span class="new-badge">NEW</span></h2>
+<div class="card new-feature">
+  <div class="stat-row"><span class="stat-label">PVC Name</span><span class="stat-value">catalog-pvc-catalog-svc-0</span></div>
+  <div class="stat-row"><span class="stat-label">Size</span><span class="stat-value">20Gi</span></div>
+</div>
+
+<h2>🗑️ Orphaned RestorePoints<span class="new-badge">NEW</span></h2>
+<div class="success-box">✓ <strong>No orphaned RestorePoints detected</strong></div>
+
+<h2>📈 Monitoring</h2>
+<div class="grid-2">
+  <div class="card"><div class="stat-row"><span class="stat-label">Prometheus</span><span class="stat-value"><span class="badge ok">✓ true</span></span></div></div>
+</div>
+
+<h2>📦 Location Profiles</h2>
+<table>
+<thead><tr><th>Name</th><th>Backend</th><th>Region</th><th>Protection Period</th></tr></thead>
+<tbody>
+<tr><td><strong>minio-immutable</strong></td><td>S3</td><td>us-east-1</td><td><span class="badge ok">168h0m0s</span></td></tr>
+<tr><td><strong>aws-backup</strong></td><td>S3</td><td>eu-west-1</td><td><span class="badge warn">Not Set</span></td></tr>
+</tbody>
+</table>
+
+<h2>🔒 Immutability Signal</h2>
+<div class="card">
+  <div class="stat-row"><span class="stat-label">Detected</span><span class="stat-value"><span class="badge ok">✓ Yes</span></span></div>
+  <div class="stat-row"><span class="stat-label">Max Protection Period</span><span class="stat-value">7 days</span></div>
+  <div class="stat-row"><span class="stat-label">Profiles with Immutability</span><span class="stat-value">1</span></div>
+</div>
+
+<h2>📋 Policy Presets</h2>
+<table>
+<thead><tr><th>Name</th><th>Frequency</th><th>Retention</th></tr></thead>
+<tbody>
+<tr><td><strong>gold-sla</strong></td><td>@hourly</td><td>hourly=24, daily=7, weekly=4, monthly=12</td></tr>
+<tr><td><strong>silver-sla</strong></td><td>@daily</td><td>daily=7, weekly=4</td></tr>
+</tbody>
+</table>
+
+<h2>📜 Policies</h2>
+<p class="subtitle">4 total (2 app, 2 system) | 2 with export | 1 using presets</p>
+<table>
+<thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th></tr></thead>
+<tbody>
+<tr><td><strong>smoke-test-labels</strong></td><td>@daily</td><td>backup, export</td><td>matchLabels</td></tr>
+<tr><td><strong>smoke-test1</strong></td><td>@daily</td><td>backup, export</td><td>namespaces: openshift-etcd</td></tr>
+<tr><td><strong>k10-disaster-recovery-policy</strong></td><td>@daily</td><td>backup</td><td>namespaces: kasten-io</td></tr>
+<tr><td><strong>k10-system-reports-policy</strong></td><td>@daily</td><td>report</td><td>all</td></tr>
+</tbody>
+</table>
+
+<h2>🔧 Kanister</h2>
+<div class="grid-2">
+  <div class="card"><strong>Blueprints</strong><div class="card-value">2</div><small style="color:var(--muted)">mysql-blueprint, postgres-blueprint</small></div>
+  <div class="card"><strong>Bindings</strong><div class="card-value">2</div><small style="color:var(--muted)">mysql-binding, postgres-binding</small></div>
+</div>
+
+<h2>🔄 TransformSets</h2>
+<table>
+<thead><tr><th>Name</th><th>Transforms</th></tr></thead>
+<tbody>
+<tr><td><strong>dr-transforms</strong></td><td>3</td></tr>
+</tbody>
+</table>
+
+<h2>💾 Data Usage</h2>
+<div class="grid-3">
+  <div class="card"><strong>Total PVCs</strong><div class="card-value">45</div></div>
+  <div class="card"><strong>Total Capacity</strong><div class="card-value">850 Gi</div></div>
+  <div class="card"><strong>Snapshot Data</strong><div class="card-value">117.22 GB</div></div>
+</div>
+
+<h2>📋 Best Practices Compliance</h2>
+<table>
+<thead><tr><th>Check</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>Disaster Recovery</td><td><span class="badge ok">✓ ENABLED</span></td></tr>
+<tr><td>Immutability</td><td><span class="badge ok">✓ ENABLED</span></td></tr>
+<tr><td>Policy Presets</td><td><span class="badge ok">✓ IN USE</span></td></tr>
+<tr><td>Monitoring</td><td><span class="badge ok">✓ ENABLED</span></td></tr>
+<tr><td>Resource Limits</td><td><span class="badge ok">✓ CONFIGURED</span></td></tr>
+<tr><td>Namespace Protection</td><td><span class="badge ok">✓ COMPLETE</span></td></tr>
+</tbody>
+</table>
+
+<footer>
+  Generated by Kasten Discovery Lite v1.5.1 | Bertrand CASTAGNET - EMEA TAM
+</footer>
+
+</div>
+</body>
+</html>

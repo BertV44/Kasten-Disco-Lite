@@ -1,0 +1,382 @@
+{
+  "platform": "OpenShift",
+  "kastenVersion": "8.0.15",
+  
+  "license": {
+    "customer": "Acme Corporation",
+    "id": "lic-abc123-def456",
+    "status": "VALID",
+    "dateStart": "2024-01-01",
+    "dateEnd": "2025-12-31",
+    "restrictions": {
+      "nodes": "unlimited"
+    }
+  },
+
+  "health": {
+    "pods": {
+      "total": 21,
+      "running": 21,
+      "ready": 21
+    },
+    "backups": {
+      "totalActions": 156,
+      "completedActions": 152,
+      "failedActions": 4,
+      "backupActions": {
+        "total": 98,
+        "completed": 96,
+        "failed": 2
+      },
+      "exportActions": {
+        "total": 58,
+        "completed": 56,
+        "failed": 2
+      },
+      "restorePoints": 245,
+      "successRate": "97.4",
+      "restoreActions": {
+        "total": 12,
+        "completed": 10,
+        "failed": 1,
+        "running": 1,
+        "recent": [
+          {
+            "name": "restore-mysql-20241230",
+            "timestamp": "2024-12-30T14:30:00Z",
+            "state": "Complete",
+            "targetNamespace": "production"
+          },
+          {
+            "name": "restore-postgres-20241228",
+            "timestamp": "2024-12-28T09:15:00Z",
+            "state": "Complete",
+            "targetNamespace": "staging"
+          },
+          {
+            "name": "restore-redis-20241225",
+            "timestamp": "2024-12-25T11:00:00Z",
+            "state": "Failed",
+            "targetNamespace": "dev-old"
+          }
+        ]
+      }
+    }
+  },
+
+  "disasterRecovery": {
+    "enabled": true,
+    "mode": "Quick DR (Exported Catalog)",
+    "frequency": "@daily",
+    "profile": "minio-immutable",
+    "localCatalogSnapshot": true,
+    "exportCatalogSnapshot": true
+  },
+
+  "profiles": {
+    "count": 2,
+    "immutableCount": 1,
+    "items": [
+      {
+        "name": "minio-immutable",
+        "backend": "S3",
+        "region": "us-east-1",
+        "endpoint": "minio.kasten-io.svc:9000",
+        "protectionPeriod": "168h0m0s"
+      },
+      {
+        "name": "aws-backup",
+        "backend": "S3",
+        "region": "eu-west-1",
+        "endpoint": "default",
+        "protectionPeriod": null
+      }
+    ]
+  },
+
+  "immutabilitySignal": true,
+  "immutabilityDays": 7,
+
+  "policyPresets": {
+    "count": 2,
+    "items": [
+      {
+        "name": "gold-sla",
+        "frequency": "@hourly",
+        "retention": {
+          "hourly": 24,
+          "daily": 7,
+          "weekly": 4,
+          "monthly": 12
+        }
+      },
+      {
+        "name": "silver-sla",
+        "frequency": "@daily",
+        "retention": {
+          "daily": 7,
+          "weekly": 4
+        }
+      }
+    ]
+  },
+
+  "policies": {
+    "count": 4,
+    "appCount": 2,
+    "systemCount": 2,
+    "withExport": 2,
+    "withPresets": 1,
+    "targetingAllNamespaces": 0,
+    "items": [
+      {
+        "name": "smoke-test-labels",
+        "frequency": "@daily",
+        "actions": ["backup", "export"],
+        "presetRef": null,
+        "selector": {
+          "matchLabels": {
+            "backup": "enabled"
+          }
+        },
+        "retention": {
+          "daily": 7
+        }
+      },
+      {
+        "name": "smoke-test1",
+        "frequency": "@daily",
+        "actions": ["backup", "export"],
+        "presetRef": null,
+        "selector": {
+          "namespaces": ["openshift-etcd"]
+        },
+        "retention": {
+          "daily": 7,
+          "weekly": 4,
+          "monthly": 12,
+          "yearly": 7
+        }
+      },
+      {
+        "name": "k10-disaster-recovery-policy",
+        "frequency": "@daily",
+        "actions": ["backup"],
+        "presetRef": null,
+        "selector": {
+          "namespaces": ["kasten-io"]
+        },
+        "retention": {
+          "daily": 7
+        }
+      },
+      {
+        "name": "k10-system-reports-policy",
+        "frequency": "@daily",
+        "actions": ["report"],
+        "presetRef": null,
+        "selector": "all",
+        "retention": null
+      }
+    ]
+  },
+
+  "policyRunStats": {
+    "lastRuns": [
+      {
+        "name": "smoke-test-labels",
+        "lastRun": {
+          "timestamp": "2024-12-31T02:00:00Z",
+          "state": "Complete",
+          "duration": 145
+        }
+      },
+      {
+        "name": "smoke-test1",
+        "lastRun": {
+          "timestamp": "2024-12-31T01:00:00Z",
+          "state": "Complete",
+          "duration": 89
+        }
+      },
+      {
+        "name": "k10-disaster-recovery-policy",
+        "lastRun": {
+          "timestamp": "2024-12-31T00:00:00Z",
+          "state": "Complete",
+          "duration": 23
+        }
+      }
+    ],
+    "averageDuration": {
+      "seconds": 60,
+      "min": 23,
+      "max": 245,
+      "sampleCount": 8
+    }
+  },
+
+  "kanister": {
+    "blueprints": {
+      "count": 2,
+      "items": [
+        {
+          "name": "mysql-blueprint",
+          "actions": ["backup", "restore"]
+        },
+        {
+          "name": "postgres-blueprint",
+          "actions": ["backup", "restore", "delete"]
+        }
+      ]
+    },
+    "bindings": {
+      "count": 2,
+      "items": [
+        {
+          "name": "mysql-binding",
+          "blueprint": "mysql-blueprint"
+        },
+        {
+          "name": "postgres-binding",
+          "blueprint": "postgres-blueprint"
+        }
+      ]
+    }
+  },
+
+  "transformSets": {
+    "count": 1,
+    "items": [
+      {
+        "name": "dr-transforms",
+        "transformCount": 3
+      }
+    ]
+  },
+
+  "monitoring": {
+    "prometheus": true
+  },
+
+  "coverage": {
+    "policiesTargetingAllNamespaces": 0,
+    "hasCatchallPolicy": false,
+    "unprotectedNamespaces": {
+      "count": 0,
+      "items": []
+    },
+    "note": "Excludes system policies (DR, reporting) and system namespaces"
+  },
+
+  "k10Resources": {
+    "summary": {
+      "totalPods": 21,
+      "totalContainers": 35,
+      "withLimits": 35,
+      "withoutLimits": 0,
+      "totalDeployments": 18,
+      "multiReplicaDeployments": 3
+    },
+    "deployments": [
+      {
+        "name": "aggregatedapis-svc",
+        "replicas": 1,
+        "ready": 1,
+        "available": 1
+      },
+      {
+        "name": "auth-svc",
+        "replicas": 1,
+        "ready": 1,
+        "available": 1
+      },
+      {
+        "name": "catalog-svc",
+        "replicas": 1,
+        "ready": 1,
+        "available": 1
+      },
+      {
+        "name": "executor-svc",
+        "replicas": 3,
+        "ready": 3,
+        "available": 3
+      },
+      {
+        "name": "frontend-svc",
+        "replicas": 2,
+        "ready": 2,
+        "available": 2
+      },
+      {
+        "name": "gateway",
+        "replicas": 2,
+        "ready": 2,
+        "available": 2
+      }
+    ],
+    "pods": [
+      {
+        "name": "aggregatedapis-svc-7f8d9c5b6d-abc12",
+        "component": "aggregatedapis",
+        "status": "Running",
+        "containers": [
+          {
+            "name": "aggregatedapis",
+            "requests_cpu": "100m",
+            "requests_mem": "128Mi",
+            "limits_cpu": "1000m",
+            "limits_mem": "1Gi"
+          }
+        ]
+      },
+      {
+        "name": "catalog-svc-0",
+        "component": "catalog",
+        "status": "Running",
+        "containers": [
+          {
+            "name": "catalog",
+            "requests_cpu": "200m",
+            "requests_mem": "256Mi",
+            "limits_cpu": "2000m",
+            "limits_mem": "2Gi"
+          },
+          {
+            "name": "kanister-sidecar",
+            "requests_cpu": "50m",
+            "requests_mem": "64Mi",
+            "limits_cpu": "500m",
+            "limits_mem": "512Mi"
+          }
+        ]
+      }
+    ]
+  },
+
+  "catalog": {
+    "pvcName": "catalog-pvc-catalog-svc-0",
+    "size": "20Gi"
+  },
+
+  "orphanedRestorePoints": {
+    "count": 0,
+    "items": []
+  },
+
+  "dataUsage": {
+    "totalPvcs": 45,
+    "totalCapacityGi": "850",
+    "snapshotDataBytes": 125829120000
+  },
+
+  "bestPractices": {
+    "disasterRecovery": "ENABLED",
+    "immutability": "ENABLED",
+    "policyPresets": "IN_USE",
+    "monitoring": "ENABLED",
+    "resourceLimits": "CONFIGURED",
+    "namespaceProtection": "COMPLETE"
+  }
+}
