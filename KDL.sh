@@ -2,10 +2,19 @@
 set -eu
 
 ##############################################################################
-# Kasten Discovery Lite v1.5.1
+# Kasten Discovery Lite v1.6
 # Author: Bertrand CASTAGNET - EMEA TAM
 # 
-# New in v1.5:
+# Changes in v1.6:
+# - Fixed Success Rate calculation (based on finished actions only)
+# - Fixed Blueprints detection (cluster-wide check)
+# - Fixed Policy retention display (consolidated on single line)
+# - Added License Consumption (node usage vs limit)
+# - Added Export Storage usage metric with Deduplication ratio
+# - Added Multi-Cluster detection (primary/secondary/none)
+# - Added Catalog Free Space percentage (via pod exec)
+#
+# Previous features (v1.5):
 # - Policy Last Run Status (date, status, duration)
 # - Unprotected Namespaces detection
 # - Restore Actions History
@@ -99,6 +108,37 @@ fi
 debug "Platform: $PLATFORM"
 
 ### -------------------------
+### Multi-Cluster Detection (NEW v1.6)
+### -------------------------
+# Check if this is a multi-cluster setup
+# - Primary: namespace kasten-io-mc exists
+# - Secondary: configmap mc-join-config exists in kasten namespace
+# - None: not part of any multi-cluster setup
+
+MC_ROLE="none"
+MC_PRIMARY_NAME=""
+MC_CLUSTER_ID=""
+
+if kubectl get namespace kasten-io-mc >/dev/null 2>&1; then
+  MC_ROLE="primary"
+  # Try to get cluster info from mc namespace
+  MC_CLUSTER_COUNT=$(kubectl -n kasten-io-mc get clusters.dist.kio.kasten.io --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  [ -z "$MC_CLUSTER_COUNT" ] && MC_CLUSTER_COUNT=0
+elif kubectl -n "$NAMESPACE" get configmap mc-join-config >/dev/null 2>&1; then
+  MC_ROLE="secondary"
+  # Try to extract primary info from join config
+  MC_JOIN_CONFIG=$(kubectl -n "$NAMESPACE" get configmap mc-join-config -o json 2>/dev/null || echo '{}')
+  MC_PRIMARY_NAME=$(echo "$MC_JOIN_CONFIG" | jq -r '.data.primaryClusterName // .data.primary // empty' 2>/dev/null)
+  MC_CLUSTER_ID=$(echo "$MC_JOIN_CONFIG" | jq -r '.data.clusterId // .data.clusterID // empty' 2>/dev/null)
+  MC_CLUSTER_COUNT=0
+else
+  MC_ROLE="none"
+  MC_CLUSTER_COUNT=0
+fi
+
+debug "Multi-Cluster: Role=$MC_ROLE, Clusters=$MC_CLUSTER_COUNT"
+
+### -------------------------
 ### Kasten version
 ### -------------------------
 KASTEN_IMAGE=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
@@ -156,6 +196,48 @@ fi
 
 debug "License: $LICENSE_CUSTOMER (Status: $LICENSE_STATUS)"
 debug "License status: $LICENSE_STATUS"
+
+### -------------------------
+### License Consumption (NEW v1.6)
+### -------------------------
+# Get node count - prefer from Report CR if available, fallback to kubectl
+CLUSTER_NODE_COUNT=0
+LICENSE_NODES_FROM_REPORT=""
+
+# Try to get from most recent Report (most accurate)
+REPORT_LICENSE=$(kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null | jq '
+  [.items[] | select(.results.licensing != null)] |
+  sort_by(.metadata.creationTimestamp) |
+  last |
+  .results.licensing // {}
+' 2>/dev/null || echo '{}')
+
+if echo "$REPORT_LICENSE" | jq -e '.nodeCount' >/dev/null 2>&1; then
+  CLUSTER_NODE_COUNT=$(echo "$REPORT_LICENSE" | jq '.nodeCount // 0')
+  LICENSE_NODES_FROM_REPORT=$(echo "$REPORT_LICENSE" | jq -r '.nodeLimit // empty')
+  [ -n "$LICENSE_NODES_FROM_REPORT" ] && [ "$LICENSE_NODES_FROM_REPORT" != "null" ] && LICENSE_NODES="$LICENSE_NODES_FROM_REPORT"
+fi
+
+# Fallback to kubectl if Report didn't have the data
+if [ "$CLUSTER_NODE_COUNT" -eq 0 ] 2>/dev/null; then
+  CLUSTER_NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+fi
+[ -z "$CLUSTER_NODE_COUNT" ] && CLUSTER_NODE_COUNT=0
+
+# Determine if over limit
+if [ "$LICENSE_NODES" = "unlimited" ] || [ "$LICENSE_NODES" = "0" ] || [ "$LICENSE_NODES" = "N/A" ]; then
+  LICENSE_CONSUMPTION_STATUS="OK"
+  LICENSE_NODES_LIMIT="unlimited"
+else
+  LICENSE_NODES_LIMIT="$LICENSE_NODES"
+  if [ "$CLUSTER_NODE_COUNT" -gt "$LICENSE_NODES" ] 2>/dev/null; then
+    LICENSE_CONSUMPTION_STATUS="EXCEEDED"
+  else
+    LICENSE_CONSUMPTION_STATUS="OK"
+  fi
+fi
+
+debug "License consumption: $CLUSTER_NODE_COUNT nodes / $LICENSE_NODES_LIMIT (Status: $LICENSE_CONSUMPTION_STATUS)"
 
 ### -------------------------
 ### Profiles
@@ -660,7 +742,7 @@ debug "K10 deployments: $K10_DEPLOYMENTS_TOTAL (multi-replica: $K10_MULTI_REPLIC
 debug "K10 deployments summary: $K10_DEPLOYMENTS_SUMMARY"
 
 ### -------------------------
-### Catalog Size (NEW v1.5)
+### Catalog Size (NEW v1.5) + Free Space (NEW v1.6)
 ### -------------------------
 # Try multiple methods to find catalog PVC
 CATALOG_PVC=$(kubectl -n "$NAMESPACE" get pvc -l component=catalog -o json 2>/dev/null || echo '{"items":[]}')
@@ -671,7 +753,35 @@ fi
 CATALOG_SIZE=$(echo "$CATALOG_PVC" | jq -r '.items[0].status.capacity.storage // .items[0].spec.resources.requests.storage // "N/A"')
 CATALOG_PVC_NAME=$(echo "$CATALOG_PVC" | jq -r '.items[0].metadata.name // "N/A"')
 
-debug "Catalog PVC: $CATALOG_PVC_NAME, Size: $CATALOG_SIZE"
+# Get catalog free space percentage by exec-ing into catalog pod (NEW v1.6)
+CATALOG_FREE_PERCENT="N/A"
+CATALOG_USED_PERCENT="N/A"
+CATALOG_POD=""
+
+# Find catalog pod (try multiple selectors)
+CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -l component=catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+if [ -z "$CATALOG_POD" ]; then
+  CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null | jq -r '[.items[]? | select(.metadata.name | test("catalog"; "i")) | .metadata.name][0] // empty' 2>/dev/null)
+fi
+
+if [ -n "$CATALOG_POD" ]; then
+  # Exec into catalog pod and get disk usage for /kasten-io (or /mnt/data common mount points)
+  # Try common mount points for catalog data
+  DF_OUTPUT=$(kubectl -n "$NAMESPACE" exec "$CATALOG_POD" -- df -h 2>/dev/null | grep -E '/kasten|/mnt|/data|/var/lib' | head -1)
+  
+  if [ -n "$DF_OUTPUT" ]; then
+    # Parse df output: Filesystem Size Used Avail Use% Mounted
+    CATALOG_USED_PERCENT=$(echo "$DF_OUTPUT" | awk '{gsub(/%/,"",$5); print $5}')
+    if [ -n "$CATALOG_USED_PERCENT" ] && [ "$CATALOG_USED_PERCENT" -eq "$CATALOG_USED_PERCENT" ] 2>/dev/null; then
+      CATALOG_FREE_PERCENT=$((100 - CATALOG_USED_PERCENT))
+    else
+      CATALOG_USED_PERCENT="N/A"
+      CATALOG_FREE_PERCENT="N/A"
+    fi
+  fi
+fi
+
+debug "Catalog PVC: $CATALOG_PVC_NAME, Size: $CATALOG_SIZE, Free: ${CATALOG_FREE_PERCENT}%, Used: ${CATALOG_USED_PERCENT}%"
 
 ### -------------------------
 ### Orphaned RestorePoints (NEW v1.5)
@@ -734,21 +844,44 @@ debug "PolicyPresets: $PRESET_COUNT"
 
 ### -------------------------
 ### Blueprints & Bindings
+### FIX v1.6: Check cluster-wide first, then namespace
 ### -------------------------
-BLUEPRINTS_RAW=$(kubectl -n "$NAMESPACE" get blueprints.cr.kanister.io -o json 2>/dev/null || echo '{"items":[]}')
+# First try cluster-wide (blueprints.cr.kanister.io can be cluster-scoped or namespaced)
+BLUEPRINTS_RAW=$(kubectl get blueprints.cr.kanister.io -A -o json 2>/dev/null || echo '{"items":[]}')
 BLUEPRINTS_JSON=$(echo "$BLUEPRINTS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
 if ! echo "$BLUEPRINTS_JSON" | jq -e '.items' >/dev/null 2>&1; then
   BLUEPRINTS_JSON='{"items":[]}'
 fi
 BLUEPRINT_COUNT=$(echo "$BLUEPRINTS_JSON" | jq '.items | length // 0')
+
+# If cluster-wide returned nothing, try namespace-scoped
+if [ "${BLUEPRINT_COUNT:-0}" -eq 0 ]; then
+  BLUEPRINTS_RAW=$(kubectl -n "$NAMESPACE" get blueprints.cr.kanister.io -o json 2>/dev/null || echo '{"items":[]}')
+  BLUEPRINTS_JSON=$(echo "$BLUEPRINTS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+  if ! echo "$BLUEPRINTS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+    BLUEPRINTS_JSON='{"items":[]}'
+  fi
+  BLUEPRINT_COUNT=$(echo "$BLUEPRINTS_JSON" | jq '.items | length // 0')
+fi
 [ -z "$BLUEPRINT_COUNT" ] && BLUEPRINT_COUNT=0
 
-BINDINGS_RAW=$(kubectl -n "$NAMESPACE" get blueprintbindings.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+# BlueprintBindings - check cluster-wide first
+BINDINGS_RAW=$(kubectl get blueprintbindings.config.kio.kasten.io -A -o json 2>/dev/null || echo '{"items":[]}')
 BINDINGS_JSON=$(echo "$BINDINGS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
 if ! echo "$BINDINGS_JSON" | jq -e '.items' >/dev/null 2>&1; then
   BINDINGS_JSON='{"items":[]}'
 fi
 BINDING_COUNT=$(echo "$BINDINGS_JSON" | jq '.items | length // 0')
+
+# If cluster-wide returned nothing, try namespace-scoped
+if [ "${BINDING_COUNT:-0}" -eq 0 ]; then
+  BINDINGS_RAW=$(kubectl -n "$NAMESPACE" get blueprintbindings.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+  BINDINGS_JSON=$(echo "$BINDINGS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+  if ! echo "$BINDINGS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+    BINDINGS_JSON='{"items":[]}'
+  fi
+  BINDING_COUNT=$(echo "$BINDINGS_JSON" | jq '.items | length // 0')
+fi
 [ -z "$BINDING_COUNT" ] && BINDING_COUNT=0
 
 debug "Blueprints: $BLUEPRINT_COUNT, Bindings: $BINDING_COUNT"
@@ -840,13 +973,16 @@ TOTAL_ACTIONS=$((BACKUP_ACTIONS_TOTAL + EXPORT_ACTIONS_TOTAL))
 COMPLETED_ACTIONS=$((BACKUP_ACTIONS_COMPLETED + EXPORT_ACTIONS_COMPLETED))
 FAILED_ACTIONS=$((BACKUP_ACTIONS_FAILED + EXPORT_ACTIONS_FAILED))
 
-if [ "$TOTAL_ACTIONS" -gt 0 ]; then
-  SUCCESS_RATE=$(awk "BEGIN {printf \"%.1f\", ($COMPLETED_ACTIONS / $TOTAL_ACTIONS) * 100}")
+# FIX v1.6: Calculate success rate based on FINISHED actions only (Complete + Failed)
+# This excludes Running/Pending/Cancelled from the calculation
+FINISHED_ACTIONS=$((COMPLETED_ACTIONS + FAILED_ACTIONS))
+if [ "$FINISHED_ACTIONS" -gt 0 ]; then
+  SUCCESS_RATE=$(awk "BEGIN {printf \"%.1f\", ($COMPLETED_ACTIONS / $FINISHED_ACTIONS) * 100}")
 else
   SUCCESS_RATE="N/A"
 fi
 
-debug "Actions - Total: $TOTAL_ACTIONS, Completed: $COMPLETED_ACTIONS, Failed: $FAILED_ACTIONS, Success: $SUCCESS_RATE%"
+debug "Actions - Total: $TOTAL_ACTIONS, Finished: $FINISHED_ACTIONS, Completed: $COMPLETED_ACTIONS, Failed: $FAILED_ACTIONS, Success: $SUCCESS_RATE%"
 
 ### -------------------------
 ### Data usage
@@ -857,6 +993,81 @@ TOTAL_CAPACITY_GB=$(kubectl get pvc --all-namespaces -o json 2>/dev/null | jq '[
 [ -z "$TOTAL_CAPACITY_GB" ] && TOTAL_CAPACITY_GB=0
 SNAPSHOT_DATA=$(kubectl get volumesnapshots --all-namespaces -o json 2>/dev/null | jq '[.items[]?.status.restoreSize // "0" | gsub("Gi";"") | gsub("G";"") | gsub("Mi";"") | gsub("M";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$SNAPSHOT_DATA" ] && SNAPSHOT_DATA=0
+
+### -------------------------
+### Export Storage & Deduplication (NEW v1.6)
+### -------------------------
+# Get export storage metrics from the most recent Report CR
+# Reports contain storage.objectStorage with physicalBytes and logicalBytes
+# NOTE: Requires k10-system-reports-policy to be enabled
+
+REPORTS_JSON=$(kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
+if ! echo "$REPORTS_JSON" | jq -e '.items' >/dev/null 2>&1; then
+  REPORTS_JSON='{"items":[]}'
+fi
+
+REPORTS_COUNT=$(echo "$REPORTS_JSON" | jq '.items | length')
+
+# Get the most recent report's storage stats
+if [ "$REPORTS_COUNT" -gt 0 ]; then
+  STORAGE_STATS=$(echo "$REPORTS_JSON" | jq '
+    [.items[] | select(.results.storage.objectStorage != null)] |
+    sort_by(.metadata.creationTimestamp) |
+    last |
+    .results.storage.objectStorage // {physicalBytes: 0, logicalBytes: 0, count: 0}
+  ' 2>/dev/null || echo '{"physicalBytes":0,"logicalBytes":0,"count":0}')
+  
+  EXPORT_PHYSICAL_BYTES=$(echo "$STORAGE_STATS" | jq '.physicalBytes // 0')
+  EXPORT_LOGICAL_BYTES=$(echo "$STORAGE_STATS" | jq '.logicalBytes // 0')
+  EXPORT_OBJECT_COUNT=$(echo "$STORAGE_STATS" | jq '.count // 0')
+  EXPORT_DATA_SOURCE="reports"
+else
+  EXPORT_PHYSICAL_BYTES=0
+  EXPORT_LOGICAL_BYTES=0
+  EXPORT_OBJECT_COUNT=0
+  EXPORT_DATA_SOURCE="none"
+fi
+
+# Sanitize values
+[ -z "$EXPORT_PHYSICAL_BYTES" ] || [ "$EXPORT_PHYSICAL_BYTES" = "null" ] && EXPORT_PHYSICAL_BYTES=0
+[ -z "$EXPORT_LOGICAL_BYTES" ] || [ "$EXPORT_LOGICAL_BYTES" = "null" ] && EXPORT_LOGICAL_BYTES=0
+[ -z "$EXPORT_OBJECT_COUNT" ] || [ "$EXPORT_OBJECT_COUNT" = "null" ] && EXPORT_OBJECT_COUNT=0
+
+# Calculate deduplication ratio (logical / physical)
+# < 1.0 means data grew (encryption/compression overhead)
+# > 1.0 means dedup/compression saved space
+if [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null && [ "$EXPORT_LOGICAL_BYTES" -gt 0 ] 2>/dev/null; then
+  DEDUP_RATIO=$(awk "BEGIN {printf \"%.1f\", $EXPORT_LOGICAL_BYTES / $EXPORT_PHYSICAL_BYTES}")
+else
+  DEDUP_RATIO="N/A"
+fi
+
+# Format export storage for display (physical = actual storage used)
+if [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null; then
+  if [ "$EXPORT_PHYSICAL_BYTES" -ge 1073741824 ]; then
+    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f GiB\", $EXPORT_PHYSICAL_BYTES / 1073741824}")
+  elif [ "$EXPORT_PHYSICAL_BYTES" -ge 1048576 ]; then
+    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f MiB\", $EXPORT_PHYSICAL_BYTES / 1048576}")
+  elif [ "$EXPORT_PHYSICAL_BYTES" -ge 1024 ]; then
+    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f KiB\", $EXPORT_PHYSICAL_BYTES / 1024}")
+  else
+    EXPORT_STORAGE_DISPLAY="${EXPORT_PHYSICAL_BYTES} B"
+  fi
+elif [ "$EXPORT_DATA_SOURCE" = "none" ]; then
+  EXPORT_STORAGE_DISPLAY="N/A (enable k10-system-reports-policy)"
+else
+  EXPORT_STORAGE_DISPLAY="0 B"
+fi
+
+# Format dedup ratio for display
+if [ "$DEDUP_RATIO" != "N/A" ]; then
+  DEDUP_DISPLAY="${DEDUP_RATIO}x"
+else
+  DEDUP_DISPLAY="N/A"
+fi
+
+debug "Export Storage: $EXPORT_STORAGE_DISPLAY (Physical: $EXPORT_PHYSICAL_BYTES, Logical: $EXPORT_LOGICAL_BYTES, Objects: $EXPORT_OBJECT_COUNT)"
+debug "Deduplication: $DEDUP_DISPLAY (Source: $EXPORT_DATA_SOURCE)"
 
 debug "PVCs: $TOTAL_PVCS, Capacity: ${TOTAL_CAPACITY_GB}Gi"
 
@@ -928,6 +1139,7 @@ if [ "$MODE" = "json" ]; then
     --argjson totalActions "$TOTAL_ACTIONS" \
     --argjson completedActions "$COMPLETED_ACTIONS" \
     --argjson failedActions "$FAILED_ACTIONS" \
+    --argjson finishedActions "$FINISHED_ACTIONS" \
     --argjson backupActionsTotal "$BACKUP_ACTIONS_TOTAL" \
     --argjson backupActionsCompleted "$BACKUP_ACTIONS_COMPLETED" \
     --argjson backupActionsFailed "$BACKUP_ACTIONS_FAILED" \
@@ -944,12 +1156,21 @@ if [ "$MODE" = "json" ]; then
     --argjson totalPvcs "$TOTAL_PVCS" \
     --arg totalCapacity "$TOTAL_CAPACITY_GB" \
     --argjson snapshotData "$SNAPSHOT_DATA" \
+    --arg exportStorage "$EXPORT_STORAGE_DISPLAY" \
+    --argjson exportStorageBytes "$EXPORT_PHYSICAL_BYTES" \
+    --argjson exportLogicalBytes "$EXPORT_LOGICAL_BYTES" \
+    --arg exportDataSource "$EXPORT_DATA_SOURCE" \
+    --arg dedupRatio "$DEDUP_RATIO" \
+    --arg dedupDisplay "$DEDUP_DISPLAY" \
     --arg licenseCustomer "$LICENSE_CUSTOMER" \
     --arg licenseStart "$LICENSE_START" \
     --arg licenseEnd "$LICENSE_END" \
     --arg licenseNodes "$LICENSE_NODES" \
     --arg licenseId "$LICENSE_ID" \
     --arg licenseStatus "$LICENSE_STATUS" \
+    --argjson clusterNodeCount "$CLUSTER_NODE_COUNT" \
+    --arg licenseNodesLimit "$LICENSE_NODES_LIMIT" \
+    --arg licenseConsumptionStatus "$LICENSE_CONSUMPTION_STATUS" \
     --argjson kdrEnabled "$KDR_ENABLED" \
     --arg kdrMode "$KDR_MODE" \
     --arg kdrFrequency "$KDR_FREQUENCY" \
@@ -959,9 +1180,9 @@ if [ "$MODE" = "json" ]; then
     --argjson presetCount "$PRESET_COUNT" \
     --argjson presets "$(echo "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})')" \
     --argjson blueprintCount "$BLUEPRINT_COUNT" \
-    --argjson blueprints "$(echo "$BLUEPRINTS_JSON" | jq -c '.items | map({name: .metadata.name, actions: (.spec.actions | keys)})')" \
+    --argjson blueprints "$(echo "$BLUEPRINTS_JSON" | jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: (.spec.actions | keys)})')" \
     --argjson bindingCount "$BINDING_COUNT" \
-    --argjson bindings "$(echo "$BINDINGS_JSON" | jq -c '.items | map({name: .metadata.name, blueprint: .spec.blueprintRef.name})')" \
+    --argjson bindings "$(echo "$BINDINGS_JSON" | jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: .spec.blueprintRef.name})')" \
     --argjson transformsetCount "$TRANSFORMSET_COUNT" \
     --argjson transformsets "$(echo "$TRANSFORMSETS_JSON" | jq -c '.items | map({name: .metadata.name, transformCount: (.spec.transforms | length)})')" \
     --arg prometheusEnabled "$PROMETHEUS_ENABLED" \
@@ -986,8 +1207,14 @@ if [ "$MODE" = "json" ]; then
     --argjson k10ContainersWithoutLimits "$K10_CONTAINERS_WITHOUT_LIMITS" \
     --arg catalogSize "$CATALOG_SIZE" \
     --arg catalogPvcName "$CATALOG_PVC_NAME" \
+    --arg catalogFreePercent "$CATALOG_FREE_PERCENT" \
+    --arg catalogUsedPercent "$CATALOG_USED_PERCENT" \
     --argjson orphanedRp "$ORPHANED_RP" \
     --argjson orphanedRpCount "$ORPHANED_RP_COUNT" \
+    --arg mcRole "$MC_ROLE" \
+    --argjson mcClusterCount "${MC_CLUSTER_COUNT:-0}" \
+    --arg mcPrimaryName "${MC_PRIMARY_NAME:-}" \
+    --arg mcClusterId "${MC_CLUSTER_ID:-}" \
     '
     {
       platform: $platform,
@@ -1001,6 +1228,11 @@ if [ "$MODE" = "json" ]; then
         dateEnd: $licenseEnd,
         restrictions: {
           nodes: $licenseNodes
+        },
+        consumption: {
+          currentNodes: $clusterNodeCount,
+          nodeLimit: $licenseNodesLimit,
+          status: $licenseConsumptionStatus
         }
       },
 
@@ -1012,6 +1244,7 @@ if [ "$MODE" = "json" ]; then
         },
         backups: {
           totalActions: $totalActions,
+          finishedActions: $finishedActions,
           completedActions: $completedActions,
           failedActions: $failedActions,
           backupActions: {
@@ -1032,8 +1265,16 @@ if [ "$MODE" = "json" ]; then
             recent: $restoreActionsRecent
           },
           restorePoints: $restorePoints,
-          successRate: $successRate
+          successRate: $successRate,
+          successRateNote: "Calculated from finished actions (Complete + Failed) only"
         }
+      },
+
+      multiCluster: {
+        role: $mcRole,
+        clusterCount: (if $mcRole == "primary" then $mcClusterCount else null end),
+        primaryName: (if $mcRole == "secondary" and $mcPrimaryName != "" then $mcPrimaryName else null end),
+        clusterId: (if $mcRole == "secondary" and $mcClusterId != "" then $mcClusterId else null end)
       },
 
       disasterRecovery: {
@@ -1105,7 +1346,9 @@ if [ "$MODE" = "json" ]; then
 
       catalog: {
         pvcName: $catalogPvcName,
-        size: $catalogSize
+        size: $catalogSize,
+        freeSpacePercent: (if $catalogFreePercent == "N/A" then null else ($catalogFreePercent | tonumber) end),
+        usedPercent: (if $catalogUsedPercent == "N/A" then null else ($catalogUsedPercent | tonumber) end)
       },
 
       orphanedRestorePoints: {
@@ -1116,7 +1359,17 @@ if [ "$MODE" = "json" ]; then
       dataUsage: {
         totalPvcs: $totalPvcs,
         totalCapacityGi: $totalCapacity,
-        snapshotDataBytes: $snapshotData
+        snapshotDataGi: $snapshotData,
+        exportStorage: {
+          display: $exportStorage,
+          physicalBytes: $exportStorageBytes,
+          logicalBytes: $exportLogicalBytes,
+          dataSource: $exportDataSource
+        },
+        deduplication: {
+          ratio: $dedupRatio,
+          display: $dedupDisplay
+        }
       },
 
       bestPractices: {
@@ -1182,7 +1435,7 @@ fi
 # HUMAN OUTPUT
 ##############################################################################
 
-printf "\n${COLOR_BOLD}${COLOR_BLUE}🔍 Kasten Discovery Lite v1.5.1${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}${COLOR_BLUE}🔍 Kasten Discovery Lite v1.6${COLOR_RESET}\n"
 printf "==============================\n"
 printf "Platform: $PLATFORM\n"
 printf "Namespace: $NAMESPACE\n"
@@ -1204,10 +1457,13 @@ else
   fi
   printf "  Valid From:  $LICENSE_START\n"
   printf "  Valid Until: $LICENSE_END\n"
-  if [ "$LICENSE_NODES" = "0" ] || [ "$LICENSE_NODES" = "unlimited" ]; then
-    printf "  Node Limit:  Unlimited\n"
+  # License consumption (NEW v1.6)
+  if [ "$LICENSE_NODES_LIMIT" = "unlimited" ]; then
+    printf "  Node Usage:  ${COLOR_GREEN}$CLUSTER_NODE_COUNT${COLOR_RESET} / unlimited\n"
+  elif [ "$LICENSE_CONSUMPTION_STATUS" = "EXCEEDED" ]; then
+    printf "  Node Usage:  ${COLOR_RED}$CLUSTER_NODE_COUNT / $LICENSE_NODES_LIMIT (EXCEEDED!)${COLOR_RESET}\n"
   else
-    printf "  Node Limit:  $LICENSE_NODES\n"
+    printf "  Node Usage:  ${COLOR_GREEN}$CLUSTER_NODE_COUNT / $LICENSE_NODES_LIMIT${COLOR_RESET}\n"
   fi
 fi
 
@@ -1218,20 +1474,21 @@ printf "    Total:   $PODS\n"
 printf "    Running: $PODS_RUNNING\n"
 printf "    Ready:   $PODS_READY\n"
 printf "\n  Backup Health (Last 14 Days):\n"
-printf "    Total Actions:  $TOTAL_ACTIONS\n"
-printf "    Backup Actions: $BACKUP_ACTIONS_TOTAL (${COLOR_GREEN}$BACKUP_ACTIONS_COMPLETED ok${COLOR_RESET}, ${COLOR_RED}$BACKUP_ACTIONS_FAILED failed${COLOR_RESET})\n"
-printf "    Export Actions: $EXPORT_ACTIONS_TOTAL (${COLOR_GREEN}$EXPORT_ACTIONS_COMPLETED ok${COLOR_RESET}, ${COLOR_RED}$EXPORT_ACTIONS_FAILED failed${COLOR_RESET})\n"
-printf "    Restore Points: $RESTORE_POINTS_COUNT\n"
+printf "    Total Actions:    $TOTAL_ACTIONS\n"
+printf "    Finished Actions: $FINISHED_ACTIONS (Complete + Failed)\n"
+printf "    Backup Actions:   $BACKUP_ACTIONS_TOTAL (${COLOR_GREEN}$BACKUP_ACTIONS_COMPLETED ok${COLOR_RESET}, ${COLOR_RED}$BACKUP_ACTIONS_FAILED failed${COLOR_RESET})\n"
+printf "    Export Actions:   $EXPORT_ACTIONS_TOTAL (${COLOR_GREEN}$EXPORT_ACTIONS_COMPLETED ok${COLOR_RESET}, ${COLOR_RED}$EXPORT_ACTIONS_FAILED failed${COLOR_RESET})\n"
+printf "    Restore Points:   $RESTORE_POINTS_COUNT\n"
 if [ "$SUCCESS_RATE" != "N/A" ]; then
   if [ "$(echo "$SUCCESS_RATE > 95" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
-    printf "    Success Rate:   ${COLOR_GREEN}$SUCCESS_RATE%%${COLOR_RESET}\n"
+    printf "    Success Rate:     ${COLOR_GREEN}$SUCCESS_RATE%%${COLOR_RESET} ${COLOR_CYAN}(of finished actions)${COLOR_RESET}\n"
   elif [ "$(echo "$SUCCESS_RATE > 80" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
-    printf "    Success Rate:   ${COLOR_YELLOW}$SUCCESS_RATE%%${COLOR_RESET}\n"
+    printf "    Success Rate:     ${COLOR_YELLOW}$SUCCESS_RATE%%${COLOR_RESET} ${COLOR_CYAN}(of finished actions)${COLOR_RESET}\n"
   else
-    printf "    Success Rate:   ${COLOR_RED}$SUCCESS_RATE%%${COLOR_RESET}\n"
+    printf "    Success Rate:     ${COLOR_RED}$SUCCESS_RATE%%${COLOR_RESET} ${COLOR_CYAN}(of finished actions)${COLOR_RESET}\n"
   fi
 else
-  printf "    Success Rate:   N/A\n"
+  printf "    Success Rate:     N/A\n"
 fi
 
 ### Restore Actions History (NEW v1.5)
@@ -1243,6 +1500,23 @@ printf "  Running:   $RESTORE_ACTIONS_RUNNING\n"
 if [ "$RESTORE_ACTIONS_TOTAL" -gt 0 ]; then
   printf "  Recent restores:\n"
   echo "$RESTORE_ACTIONS_RECENT" | jq -r '.[] | "    - \(.timestamp | split("T")[0]) | \(.state) | \(.targetNamespace)"' 2>/dev/null | head -5
+fi
+
+### Multi-Cluster (NEW v1.6)
+printf "\n${COLOR_BOLD}🌐 Multi-Cluster${COLOR_RESET}\n"
+if [ "$MC_ROLE" = "primary" ]; then
+  printf "  Role:     ${COLOR_GREEN}PRIMARY${COLOR_RESET}\n"
+  printf "  Clusters: $MC_CLUSTER_COUNT joined\n"
+elif [ "$MC_ROLE" = "secondary" ]; then
+  printf "  Role:     ${COLOR_CYAN}SECONDARY${COLOR_RESET}\n"
+  if [ -n "$MC_PRIMARY_NAME" ]; then
+    printf "  Primary:  $MC_PRIMARY_NAME\n"
+  fi
+  if [ -n "$MC_CLUSTER_ID" ]; then
+    printf "  Cluster ID: $MC_CLUSTER_ID\n"
+  fi
+else
+  printf "  Status:   ${COLOR_YELLOW}Not configured${COLOR_RESET}\n"
 fi
 
 ### Disaster Recovery
@@ -1345,27 +1619,25 @@ else "" end) +
      "matchLabels: " + ([.spec.selector.matchLabels | to_entries[] | "\(.key)=\(.value)"] | join(", "))
    else "all namespaces"
    end) + "\n" +
-"    Retention:\n" +
+"    Retention: " +
 (
   if .spec.retention then
-    (.spec.retention | to_entries[] |
-      "      Policy-level \(.key | ascii_upcase): \(.value)")
-  elif (.spec.actions[]? | has("snapshotRetention") or has("exportParameters"))
+    ([.spec.retention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", "))
+  elif (.spec.actions | any(has("snapshotRetention") or has("exportParameters")))
   then
     (
-      .spec.actions[]? |
-      if .snapshotRetention then
-        (.snapshotRetention | to_entries[] |
-          "      Snapshot \(.key): \(.value)")
-      elif .exportParameters?.retention then
-        (.exportParameters.retention | to_entries[] |
-          "      Export \(.key): \(.value)")
-      else empty end
+      [.spec.actions[] |
+        if .snapshotRetention then
+          "Snapshot(" + ([.snapshotRetention | to_entries[] | "\(.key)=\(.value)"] | join(", ")) + ")"
+        elif .exportParameters?.retention then
+          "Export(" + ([.exportParameters.retention | to_entries[] | "\(.key)=\(.value)"] | join(", ")) + ")"
+        else empty end
+      ] | join("; ")
     )
   else
-    "      not defined"
+    "not defined"
   end
-)
+) + "\n"
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse policy details${COLOR_RESET}\n"
 fi
 
@@ -1486,10 +1758,24 @@ if [ "$K10_PODS_TOTAL" -gt 0 ] 2>/dev/null; then
   fi
 fi
 
-### Catalog Size (NEW v1.5)
-printf "\n${COLOR_BOLD}📁 Catalog${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
-printf "  PVC Name: $CATALOG_PVC_NAME\n"
-printf "  Size:     $CATALOG_SIZE\n"
+### Catalog Size (NEW v1.5) + Free Space (NEW v1.6)
+printf "\n${COLOR_BOLD}📁 Catalog${COLOR_RESET}\n"
+printf "  PVC Name:   $CATALOG_PVC_NAME\n"
+printf "  Size:       $CATALOG_SIZE\n"
+if [ "$CATALOG_FREE_PERCENT" != "N/A" ]; then
+  # Color code based on free space: <10% red, <20% yellow, >=20% green
+  if [ "$CATALOG_FREE_PERCENT" -lt 10 ] 2>/dev/null; then
+    printf "  Free Space: ${COLOR_RED}${CATALOG_FREE_PERCENT}%%${COLOR_RESET} (Used: ${CATALOG_USED_PERCENT}%%)\n"
+    printf "  ${COLOR_RED}⚠️  WARNING: Catalog storage critically low!${COLOR_RESET}\n"
+  elif [ "$CATALOG_FREE_PERCENT" -lt 20 ] 2>/dev/null; then
+    printf "  Free Space: ${COLOR_YELLOW}${CATALOG_FREE_PERCENT}%%${COLOR_RESET} (Used: ${CATALOG_USED_PERCENT}%%)\n"
+    printf "  ${COLOR_YELLOW}⚠️  Consider expanding catalog storage${COLOR_RESET}\n"
+  else
+    printf "  Free Space: ${COLOR_GREEN}${CATALOG_FREE_PERCENT}%%${COLOR_RESET} (Used: ${CATALOG_USED_PERCENT}%%)\n"
+  fi
+else
+  printf "  Free Space: ${COLOR_YELLOW}N/A${COLOR_RESET} (could not determine)\n"
+fi
 
 ### Orphaned RestorePoints (NEW v1.5)
 printf "\n${COLOR_BOLD}🗑️ Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
@@ -1504,7 +1790,7 @@ fi
 printf "\n${COLOR_BOLD}🔧 Kanister Blueprints${COLOR_RESET}\n"
 printf "  Blueprints: $BLUEPRINT_COUNT\n"
 if [ "$BLUEPRINT_COUNT" -gt 0 ]; then
-  echo "$BLUEPRINTS_JSON" | jq -r '.items[] | "  - \(.metadata.name)"'
+  echo "$BLUEPRINTS_JSON" | jq -r '.items[] | "  - \(.metadata.name) (ns: \(.metadata.namespace // "cluster-scoped"))"'
 fi
 printf "  Blueprint Bindings: $BINDING_COUNT\n"
 if [ "$BINDING_COUNT" -gt 0 ]; then
@@ -1539,9 +1825,20 @@ printf "  App policies targeting all namespaces: $ALL_NS_POLICIES\n"
 
 ### Data Usage
 printf "\n${COLOR_BOLD}${COLOR_BLUE}💾 Data Usage${COLOR_RESET}\n"
-printf "  Total PVCs: $TOTAL_PVCS\n"
-printf "  Total Capacity: ${TOTAL_CAPACITY_GB} GiB\n"
-printf "  Snapshot Data: ~${SNAPSHOT_DATA} GiB\n"
+printf "  Total PVCs:      $TOTAL_PVCS\n"
+printf "  Total Capacity:  ${TOTAL_CAPACITY_GB} GiB\n"
+printf "  Snapshot Data:   ~${SNAPSHOT_DATA} GiB\n"
+if [ "$EXPORT_DATA_SOURCE" = "none" ]; then
+  printf "  Export Storage:  ${COLOR_YELLOW}N/A${COLOR_RESET} (enable k10-system-reports-policy)\n"
+elif [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null; then
+  printf "  Export Storage:  $EXPORT_STORAGE_DISPLAY"
+  if [ "$DEDUP_DISPLAY" != "N/A" ]; then
+    printf "  (Dedup: ${COLOR_CYAN}$DEDUP_DISPLAY${COLOR_RESET})"
+  fi
+  printf "\n"
+else
+  printf "  Export Storage:  0 B\n"
+fi
 
 ### Best Practices Compliance
 printf "\n${COLOR_BOLD}📋 Best Practices Compliance${COLOR_RESET}\n"
