@@ -2,14 +2,22 @@
 set -eu
 
 ##############################################################################
-# KDL JSON → HTML Report Generator v1.5
+# KDL JSON → HTML Report Generator v1.6
 #
 # Usage:
-#   ./kdl-json-to-html.sh input.json output.html
+#   ./kdl-json-to-html-v1.6.sh input.json output.html
 #
-# Compatible with Kasten Discovery Lite v1.5 JSON output
+# Compatible with Kasten Discovery Lite v1.6 JSON output
 #
-# New in v1.5:
+# New in v1.6:
+#   - License Consumption (node usage vs limit)
+#   - Multi-Cluster detection (primary/secondary/standalone)
+#   - Export Storage with Deduplication ratio
+#   - Fixed Success Rate display (based on finished actions)
+#   - Blueprint namespace display (cluster-wide detection)
+#   - Policy retention consolidated display
+#
+# Previous features (v1.5):
 #   - Policy Last Run Status with duration
 #   - Unprotected Namespaces section
 #   - Restore Actions History
@@ -35,9 +43,9 @@ command -v jq >/dev/null 2>&1 || {
 
 jq -r '
 def badge(v):
-  if v == true or v == "VALID" or v == "ENABLED" or v == "IN_USE" or v == "COMPLIANT" or v == "CONFIGURED" or v == "COMPLETE" then 
+  if v == true or v == "VALID" or v == "ENABLED" or v == "IN_USE" or v == "COMPLIANT" or v == "CONFIGURED" or v == "COMPLETE" or v == "OK" then 
     "<span class=\"badge ok\">✓ " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" then 
+  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" then 
     "<span class=\"badge error\">✗ " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == "NOT_FOUND" or v == "NOT_CONFIGURED" or v == "NOT_USED" or v == "PARTIAL" then 
     "<span class=\"badge warn\">⚠ " + (v | tostring | gsub("_"; " ")) + "</span>"
@@ -47,6 +55,12 @@ def badge(v):
     "<span class=\"badge ok\">✓ Complete</span>"
   elif v == "Running" then
     "<span class=\"badge info\">⟳ Running</span>"
+  elif v == "primary" or v == "PRIMARY" then
+    "<span class=\"badge ok\">PRIMARY</span>"
+  elif v == "secondary" or v == "SECONDARY" then
+    "<span class=\"badge info\">SECONDARY</span>"
+  elif v == "none" then
+    "<span class=\"badge warn\">Standalone</span>"
   else "<span class=\"badge info\">" + (v | tostring) + "</span>" end;
 
 def statusBadge(v):
@@ -92,15 +106,15 @@ def formatNamespaceSelector:
 
 def formatRetention:
   if type == "array" and length > 0 then
-    (.[0] | 
+    (map(
       if type == "object" then
-        (to_entries | map("<strong>" + .key + ":</strong> " + (.value | tostring)) | join("<br>"))
+        (to_entries | map(.key + "=" + (.value | tostring)) | join(", "))
       else
         tostring
       end
-    )
+    ) | join("; "))
   elif type == "object" then
-    (to_entries | map("<strong>" + .key + ":</strong> " + (.value | tostring)) | join("<br>"))
+    (to_entries | map(.key + "=" + (.value | tostring)) | join(", "))
   else
     "<span class=\"badge warn\">Not defined</span>"
   end;
@@ -110,7 +124,7 @@ def formatRetention:
 <head>
 <meta charset=\"UTF-8\">
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
-<title>Kasten Discovery Lite Report v1.5</title>
+<title>Kasten Discovery Lite Report v1.6</title>
 <style>
 * { box-sizing: border-box; }
 body {
@@ -155,8 +169,21 @@ h2 {
   border-bottom: 2px solid #e1e4e8;
   padding-bottom: 0.5rem;
 }
+h3 {
+  font-size: 1.1rem;
+  margin: 1.5rem 0 0.5rem 0;
+  color: #57606a;
+}
 .new-badge {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  font-size: 0.7rem;
+  padding: 0.2rem 0.5rem;
+  border-radius: 8px;
+  margin-left: 0.5rem;
+}
+.fixed-badge {
+  background: linear-gradient(135deg, #10b981 0%, #059669 100%);
   color: white;
   font-size: 0.7rem;
   padding: 0.2rem 0.5rem;
@@ -181,6 +208,7 @@ h2 {
 .coverage-card { background: linear-gradient(135deg, #d1fae5 0%, #a7f3d0 100%); border-color: #6ee7b7; }
 .dr-card { background: linear-gradient(135deg, #fce7f3 0%, #fbcfe8 100%); border-color: #f9a8d4; }
 .bp-card { background: linear-gradient(135deg, #e0e7ff 0%, #c7d2fe 100%); border-color: #a5b4fc; }
+.mc-card { background: linear-gradient(135deg, #dbeafe 0%, #bfdbfe 100%); border-color: #93c5fd; }
 .warning-card { background: linear-gradient(135deg, #fef3c7 0%, #fde68a 100%); border-color: #fcd34d; }
 .new-feature { background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%); border-color: #38bdf8; }
 table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
@@ -207,6 +235,7 @@ tr:hover { background: #f6f8fa; }
 code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-family: \"SFMono-Regular\", Consolas, monospace; font-size: 0.85rem; }
 .bp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.5rem; }
 .bp-item { display: flex; align-items: center; gap: 0.5rem; padding: 0.5rem; background: #f6f8fa; border-radius: 8px; font-size: 0.9rem; }
+.dedup-highlight { color: #0891b2; font-weight: 600; }
 @media (max-width: 768px) {
   body { padding: 1rem; }
   .container { padding: 1rem; }
@@ -252,6 +281,25 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + "  </div>
 </div>
 
+<!-- Multi-Cluster Section (NEW v1.6) -->
+<h2>🌐 Multi-Cluster Configuration<span class=\"new-badge\">NEW</span></h2>"
++ (if .multiCluster then
+    "<div class=\"card mc-card\">
+      <div class=\"stat-row\"><span class=\"stat-label\">Role</span><span class=\"stat-value\">" + badge(.multiCluster.role) + "</span></div>" +
+    (if .multiCluster.role == "primary" then
+      "<div class=\"stat-row\"><span class=\"stat-label\">Managed Clusters</span><span class=\"stat-value\">" + ((.multiCluster.clusterCount // 0) | tostring) + "</span></div>"
+    elif .multiCluster.role == "secondary" then
+      (if .multiCluster.primaryName then "<div class=\"stat-row\"><span class=\"stat-label\">Primary Cluster</span><span class=\"stat-value\">" + .multiCluster.primaryName + "</span></div>" else "" end) +
+      (if .multiCluster.clusterId then "<div class=\"stat-row\"><span class=\"stat-label\">Cluster ID</span><span class=\"stat-value\"><code>" + .multiCluster.clusterId + "</code></span></div>" else "" end)
+    else
+      "<div class=\"stat-row\"><span class=\"stat-label\">Note</span><span class=\"stat-value\">Not part of a multi-cluster configuration</span></div>"
+    end) +
+    "</div>"
+  else
+    "<div class=\"info-box\">Multi-cluster configuration data not available.</div>"
+  end)
++ "
+
 <!-- Disaster Recovery Section -->
 <h2>🛡️ Disaster Recovery (KDR)</h2>"
 + (if .disasterRecovery then
@@ -271,8 +319,8 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "
 
-<!-- Policy Run Stats (NEW) -->
-<h2>⏱️ Policy Run Statistics<span class=\"new-badge\">NEW</span></h2>"
+<!-- Policy Run Stats -->
+<h2>⏱️ Policy Run Statistics</h2>"
 + (if .policyRunStats then
     "<div class=\"grid-3\">
       <div class=\"card new-feature\">
@@ -305,10 +353,10 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "
 
-<!-- Unprotected Namespaces (NEW) -->
-<h2>🛡️ Namespace Protection<span class=\"new-badge\">NEW</span></h2>"
+<!-- Unprotected Namespaces -->
+<h2>🛡️ Namespace Protection</h2>"
 + (if .coverage then
-    "<p class=\"subtitle\">Based on app policies only (excludes DR/report system policies)</p>" +
+    "<p class=\"section-description\">Based on app policies only (excludes DR/report system policies)</p>" +
     (if .coverage.hasCatchallPolicy then
       "<div class=\"success-box\">✓ <strong>Catch-all policy detected</strong> - All namespaces are protected.</div>"
     elif .coverage.unprotectedNamespaces.count == 0 then
@@ -327,8 +375,8 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "
 
-<!-- Restore Actions History (NEW) -->
-<h2>🔄 Restore Actions History<span class=\"new-badge\">NEW</span></h2>"
+<!-- Restore Actions History -->
+<h2>🔄 Restore Actions History</h2>"
 + (if .health.backups.restoreActions then
     "<div class=\"grid\">
       <div class=\"card new-feature\"><strong>Total</strong><div class=\"card-value\">" + (.health.backups.restoreActions.total | tostring) + "</div></div>
@@ -354,8 +402,8 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "
 
-<!-- K10 Resources (NEW) -->
-<h2>📊 K10 Resource Limits<span class=\"new-badge\">NEW</span></h2>"
+<!-- K10 Resources -->
+<h2>📊 K10 Resource Limits</h2>"
 + (if .k10Resources then
     "<div class=\"grid\">
       <div class=\"card new-feature\"><strong>K10 Pods</strong><div class=\"card-value\">" + (.k10Resources.summary.totalPods // 0 | tostring) + "</div></div>
@@ -386,20 +434,36 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "
 
-<!-- Catalog (NEW) -->
-<h2>📁 Catalog<span class=\"new-badge\">NEW</span></h2>"
+<!-- Catalog -->
+<h2>📁 Catalog</h2>"
 + (if .catalog then
     "<div class=\"card new-feature\">
       <div class=\"stat-row\"><span class=\"stat-label\">PVC Name</span><span class=\"stat-value\">" + .catalog.pvcName + "</span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">Size</span><span class=\"stat-value\">" + .catalog.size + "</span></div>
-    </div>"
+      <div class=\"stat-row\"><span class=\"stat-label\">Size</span><span class=\"stat-value\">" + .catalog.size + "</span></div>" +
+      (if .catalog.freeSpacePercent != null then
+        "<div class=\"stat-row\"><span class=\"stat-label\">Free Space<span class=\"new-badge\">NEW</span></span><span class=\"stat-value\">" +
+        (if .catalog.freeSpacePercent < 10 then
+          "<span class=\"badge error\">" + (.catalog.freeSpacePercent | tostring) + "% ⚠️ Critical</span>"
+        elif .catalog.freeSpacePercent < 20 then
+          "<span class=\"badge warn\">" + (.catalog.freeSpacePercent | tostring) + "% ⚠️ Low</span>"
+        else
+          "<span class=\"badge ok\">" + (.catalog.freeSpacePercent | tostring) + "%</span>"
+        end) +
+        " (Used: " + (.catalog.usedPercent | tostring) + "%)</span></div>" +
+        "<div class=\"progress-bar\"><div class=\"progress-fill\" style=\"width: " + ((.catalog.usedPercent // 0) | tostring) + "%; background: " + 
+          (if .catalog.freeSpacePercent < 10 then "#ef4444" elif .catalog.freeSpacePercent < 20 then "#f59e0b" else "#10b981" end) + 
+        "\"></div></div>"
+      else
+        "<div class=\"stat-row\"><span class=\"stat-label\">Free Space</span><span class=\"stat-value\"><span class=\"badge warn\">N/A</span></span></div>"
+      end) +
+    "</div>"
   else
     "<div class=\"info-box\">Catalog data not available.</div>"
   end)
 + "
 
-<!-- Orphaned RestorePoints (NEW) -->
-<h2>🗑️ Orphaned RestorePoints<span class=\"new-badge\">NEW</span></h2>"
+<!-- Orphaned RestorePoints -->
+<h2>🗑️ Orphaned RestorePoints</h2>"
 + (if .orphanedRestorePoints then
     (if .orphanedRestorePoints.count == 0 then
       "<div class=\"success-box\">✓ <strong>No orphaned RestorePoints detected</strong></div>"
@@ -433,12 +497,17 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       <div class=\"stat-row\"><span class=\"stat-label\">Valid Period</span><span class=\"stat-value\">" + .license.dateStart + " → " + .license.dateEnd + "</span></div>
       <div class=\"stat-row\"><span class=\"stat-label\">Node Limit</span><span class=\"stat-value\">" + 
         (if .license.restrictions.nodes == "unlimited" or .license.restrictions.nodes == "0" then "<span class=\"badge ok\">∞ Unlimited</span>" else .license.restrictions.nodes + " nodes" end) + 
-      "</span></div>
-    </div>"
+      "</span></div>" +
+      (if .license.consumption then
+        "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption<span class=\"new-badge\">NEW</span></span><span class=\"stat-value\">" + 
+          (.license.consumption.currentNodes | tostring) + " / " + .license.consumption.nodeLimit + " " + badge(.license.consumption.status) +
+        "</span></div>"
+      else "" end) +
+    "</div>"
   end)
 + "
 
-<h2>💚 Health Status</h2>"
+<h2>💚 Health Status<span class=\"fixed-badge\">FIXED</span></h2>"
 + (if .health then
     "<div class=\"grid-2\">
       <div class=\"card health-card\">
@@ -449,15 +518,16 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <div class=\"progress-bar\"><div class=\"progress-fill\" style=\"width: " + progressBar(.health.pods.ready; .health.pods.total) + "\"></div></div>
       </div>
       <div class=\"card health-card\">
-        <strong>Backup Health (Last 14 Days)</strong>
+        <strong>Backup Health</strong>
         <div class=\"stat-row\"><span class=\"stat-label\">Total Actions</span><span class=\"stat-value\">" + (.health.backups.totalActions | tostring) + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Finished Actions</span><span class=\"stat-value\">" + ((.health.backups.finishedActions // (.health.backups.completedActions + .health.backups.failedActions)) | tostring) + " <small>(Complete + Failed)</small></span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Backup Actions</span><span class=\"stat-value\">" + 
           (if .health.backups.backupActions then (.health.backups.backupActions.total | tostring) + " (" + (.health.backups.backupActions.completed | tostring) + " ok, " + (.health.backups.backupActions.failed | tostring) + " failed)" else "N/A" end) + 
         "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Export Actions</span><span class=\"stat-value\">" + 
           (if .health.backups.exportActions then (.health.backups.exportActions.total | tostring) + " (" + (.health.backups.exportActions.completed | tostring) + " ok, " + (.health.backups.exportActions.failed | tostring) + " failed)" else "N/A" end) + 
         "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Success Rate</span><span class=\"stat-value\">" + .health.backups.successRate + "%</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Success Rate</span><span class=\"stat-value\">" + .health.backups.successRate + "% <small>(based on finished)</small></span></div>
         <div class=\"progress-bar\"><div class=\"progress-fill\" style=\"width: " + .health.backups.successRate + "%\"></div></div>
       </div>
     </div>"
@@ -470,6 +540,28 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 <div class=\"grid-2\">
   <div class=\"card\"><div class=\"stat-row\"><span class=\"stat-label\">Prometheus</span><span class=\"stat-value\">" + boolBadge(.monitoring.prometheus) + "</span></div></div>
 </div>
+
+<!-- Data Usage with Export Storage (NEW v1.6) -->
+<h2>💾 Data Usage<span class=\"new-badge\">NEW</span></h2>"
++ (if .dataUsage then
+    "<div class=\"grid\">
+      <div class=\"card\"><strong>Total PVCs</strong><div class=\"card-value\">" + (.dataUsage.totalPvcs | tostring) + "</div></div>
+      <div class=\"card\"><strong>Total Capacity</strong><div class=\"card-value\">" + .dataUsage.totalCapacityGi + " GiB</div></div>
+      <div class=\"card\"><strong>Snapshot Data</strong><div class=\"card-value\">~" + (.dataUsage.snapshotDataGi | tostring) + " GiB</div></div>" +
+      (if .dataUsage.exportStorage then
+        "<div class=\"card new-feature\"><strong>Export Storage</strong><div class=\"card-value\">" + .dataUsage.exportStorage.display + "</div></div>
+        <div class=\"card new-feature\"><strong>Deduplication</strong><div class=\"card-value dedup-highlight\">" + .dataUsage.deduplication.display + "</div></div>"
+      else
+        "<div class=\"card\"><strong>Export Storage</strong><div class=\"card-value\">N/A</div></div>"
+      end) +
+    "</div>" +
+    (if .dataUsage.exportStorage.dataSource == "none" then
+      "<div class=\"info-box\">ℹ️ Enable <code>k10-system-reports-policy</code> to collect export storage metrics.</div>"
+    else "" end)
+  else
+    "<div class=\"info-box\">Data usage information not available.</div>"
+  end)
++ "
 
 <h2>📦 Location Profiles</h2>
 <table>
@@ -489,7 +581,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "</tbody></table>
 
-<h2>📜 Backup Policies</h2>
+<h2>📜 Backup Policies<span class=\"fixed-badge\">FIXED</span></h2>
 <table>
 <thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Retention</th></tr></thead>
 <tbody>"
@@ -508,14 +600,22 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "</tbody></table>
 
-<h2>🔧 Kanister Blueprints</h2>"
+<h2>🔧 Kanister Blueprints<span class=\"fixed-badge\">FIXED</span></h2>"
 + (if .kanister then
     "<div class=\"grid-2\">
       <div class=\"card\"><strong>Blueprints</strong><div class=\"card-value\">" + (.kanister.blueprints.count | tostring) + "</div>" +
-      (if (.kanister.blueprints.items | length) > 0 then "<ul style=\"margin-top:0.5rem;padding-left:1.5rem;\">" + ([.kanister.blueprints.items[] | "<li>" + .name + "</li>"] | join("")) + "</ul>" else "" end) +
+      (if (.kanister.blueprints.items | length) > 0 then 
+        "<ul style=\"margin-top:0.5rem;padding-left:1.5rem;\">" + 
+        ([.kanister.blueprints.items[] | "<li>" + .name + (if .namespace then " <small>(ns: " + .namespace + ")</small>" else " <small>(cluster-scoped)</small>" end) + "</li>"] | join("")) + 
+        "</ul>" 
+      else "" end) +
       "</div>
       <div class=\"card\"><strong>Bindings</strong><div class=\"card-value\">" + (.kanister.bindings.count | tostring) + "</div>" +
-      (if (.kanister.bindings.items | length) > 0 then "<ul style=\"margin-top:0.5rem;padding-left:1.5rem;\">" + ([.kanister.bindings.items[] | "<li>" + .name + " → " + .blueprint + "</li>"] | join("")) + "</ul>" else "" end) +
+      (if (.kanister.bindings.items | length) > 0 then 
+        "<ul style=\"margin-top:0.5rem;padding-left:1.5rem;\">" + 
+        ([.kanister.bindings.items[] | "<li>" + .name + " → " + .blueprint + (if .namespace then " <small>(ns: " + .namespace + ")</small>" else "" end) + "</li>"] | join("")) + 
+        "</ul>" 
+      else "" end) +
       "</div>
     </div>"
   else
@@ -534,7 +634,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + "
 
 <div class=\"footer\">
-  <strong>Kasten Discovery Lite v1.5</strong><br>
+  <strong>Kasten Discovery Lite v1.6</strong><br>
   This report provides observational signals only and does not assert compliance.<br>
   Generated from JSON output of Kasten Discovery Lite script.
 </div>
