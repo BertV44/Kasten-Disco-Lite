@@ -2,10 +2,37 @@
 set -eu
 
 ##############################################################################
-# Kasten Discovery Lite v1.6
+# Kasten Discovery Lite v1.8
 # Author: Bertrand CASTAGNET - EMEA TAM
 # 
-# Changes in v1.6:
+# Changes in v1.8:
+# - K10 Helm Configuration extraction (from Helm release secret)
+# - Authentication method detection (OIDC, LDAP, OpenShift, basic, token)
+# - Encryption configuration (AWS KMS, Azure Key Vault, HashiCorp Vault)
+# - FIPS mode detection
+# - Network Policy status
+# - SIEM / Audit Logging configuration
+# - Dashboard access method (Ingress, Route, External Gateway)
+# - Concurrency limiters & executor sizing
+# - Timeout configuration (blueprints, workers, jobs)
+# - Datastore parallelism settings
+# - Excluded applications list
+# - GVB sidecar injection status
+# - Security context configuration
+# - Custom CA certificate detection
+# - 3 new Best Practices: Authentication, KMS Encryption (info), Audit Logging
+#
+# Previous features (v1.7):
+# - KubeVirt / OpenShift Virtualization VM detection (Kasten 8.5+)
+# - VM-based policy detection (virtualMachineRef selector)
+# - Protected vs unprotected VM analysis
+# - VM RestorePoints tracking (appType=virtualMachine)
+# - Guest filesystem freeze configuration detection
+# - VM snapshot concurrency settings
+# - Virtualization platform detection (OpenShift Virt, SUSE/Harvester)
+# - VM protection added to Best Practices compliance
+#
+# Previous features (v1.6):
 # - Fixed Success Rate calculation (based on finished actions only)
 # - Fixed Blueprints detection (cluster-wide check)
 # - Fixed Policy retention display (consolidated on single line)
@@ -79,12 +106,12 @@ fi
 ### -------------------------
 debug() {
   if [ "$DEBUG" = true ]; then
-    echo "${COLOR_YELLOW}🛠 DEBUG: $*${COLOR_RESET}" >&2
+    echo "${COLOR_YELLOW}[DEBUG] DEBUG: $*${COLOR_RESET}" >&2
   fi
 }
 
 error() {
-  echo "${COLOR_RED}❌ ERROR: $*${COLOR_RESET}" >&2
+  echo "${COLOR_RED}[FAIL] ERROR: $*${COLOR_RESET}" >&2
 }
 
 ### -------------------------
@@ -1072,6 +1099,546 @@ debug "Deduplication: $DEDUP_DISPLAY (Source: $EXPORT_DATA_SOURCE)"
 debug "PVCs: $TOTAL_PVCS, Capacity: ${TOTAL_CAPACITY_GB}Gi"
 
 ### -------------------------
+### Virtualization Detection (NEW v1.7)
+### -------------------------
+
+# Check if VirtualMachine CRD exists (KubeVirt / OpenShift Virtualization)
+VM_CRD_EXISTS="false"
+if kubectl get crd virtualmachines.kubevirt.io >/dev/null 2>&1; then
+  VM_CRD_EXISTS="true"
+fi
+
+debug "VirtualMachine CRD exists: $VM_CRD_EXISTS"
+
+if [ "$VM_CRD_EXISTS" = "true" ]; then
+
+  # Detect virtualization platform
+  VIRT_PLATFORM="KubeVirt"
+  VIRT_VERSION="unknown"
+
+  # Check for OpenShift Virtualization (CNV)
+  if [ "$PLATFORM" = "OpenShift" ]; then
+    OCP_VIRT_CSV="$(kubectl get csv -n openshift-cnv -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | test("kubevirt-hyperconverged"))] | sort_by(.metadata.creationTimestamp) | last | .spec.version // empty' 2>/dev/null || echo '')"
+    if [ -n "$OCP_VIRT_CSV" ]; then
+      VIRT_PLATFORM="OpenShift Virtualization"
+      VIRT_VERSION="$OCP_VIRT_CSV"
+    fi
+  fi
+
+  # Check for SUSE Virtualization (Harvester)
+  if kubectl get namespace harvester-system >/dev/null 2>&1; then
+    VIRT_PLATFORM="SUSE Virtualization (Harvester)"
+    HARVESTER_VER="$(kubectl get settings.harvesterhci.io server-version -o jsonpath='{.value}' 2>/dev/null || echo 'unknown')"
+    if [ -n "$HARVESTER_VER" ] && [ "$HARVESTER_VER" != "unknown" ]; then
+      VIRT_VERSION="$HARVESTER_VER"
+    fi
+  fi
+
+  # If still unknown, try KubeVirt operator version
+  if [ "$VIRT_VERSION" = "unknown" ]; then
+    VIRT_VERSION="$(kubectl get kubevirt -A -o jsonpath='{.items[0].status.observedKubeVirtVersion}' 2>/dev/null || echo 'unknown')"
+  fi
+
+  debug "Virtualization platform: $VIRT_PLATFORM $VIRT_VERSION"
+
+  # Get all VMs cluster-wide
+  VMS_JSON="$(kubectl get virtualmachines.kubevirt.io -A -o json 2>/dev/null | jq -c '.' || echo '{"items":[]}')"
+  TOTAL_VMS=$(echo "$VMS_JSON" | jq '.items | length')
+
+  # VM running status
+  VMS_RUNNING=$(echo "$VMS_JSON" | jq '[.items[] | select(.status.printableStatus == "Running" or .status.ready == true)] | length')
+  VMS_STOPPED=$(echo "$VMS_JSON" | jq '[.items[] | select(.status.printableStatus == "Stopped" or (.status.ready == false and (.status.printableStatus == "Stopped" or .status.printableStatus == null)))] | length')
+
+  debug "Total VMs: $TOTAL_VMS (Running: $VMS_RUNNING, Stopped: $VMS_STOPPED)"
+
+  # Detect VM-based policies (using virtualMachineRef selector - Kasten 8.5+)
+  VM_POLICIES_JSON="$(echo "$POLICIES_JSON" | jq -c '[
+    .items[] | select(
+      .spec.selector.matchExpressions[]? |
+      select(.key == "k10.kasten.io/virtualMachineRef")
+    )
+  ]')"
+  VM_POLICY_COUNT=$(echo "$VM_POLICIES_JSON" | jq 'length')
+
+  debug "VM-based policies: $VM_POLICY_COUNT"
+
+  # Extract explicitly protected VM references from VM policies
+  PROTECTED_VM_REFS="$(echo "$VM_POLICIES_JSON" | jq -c '[
+    .[] | .spec.selector.matchExpressions[]? |
+    select(.key == "k10.kasten.io/virtualMachineRef") |
+    .values[]?
+  ] | unique')"
+
+  # Count explicitly protected VMs (via virtualMachineRef)
+  PROTECTED_VM_COUNT_EXPLICIT=$(echo "$PROTECTED_VM_REFS" | jq 'length')
+
+  # Check for wildcard patterns in VM policies
+  VM_HAS_WILDCARDS="false"
+  WILDCARD_COUNT=$(echo "$PROTECTED_VM_REFS" | jq '[.[] | select(test("\\*"))] | length')
+  if [ "$WILDCARD_COUNT" -gt 0 ] 2>/dev/null; then
+    VM_HAS_WILDCARDS="true"
+  fi
+
+  # Check if any namespace-based (catch-all) policies also cover VMs
+  # VMs in namespaces covered by app policies are also protected
+  VM_NAMESPACES="$(echo "$VMS_JSON" | jq -r '[.items[].metadata.namespace] | unique | .[]')"
+  VM_COVERED_BY_NS_POLICY=0
+
+  if [ "$HAS_CATCHALL_POLICY" = "true" ]; then
+    # All VMs are covered by namespace-level catch-all policy
+    VM_COVERED_BY_NS_POLICY=$TOTAL_VMS
+  else
+    # Check which VM namespaces are covered by app policies
+    for vm_ns in $VM_NAMESPACES; do
+      NS_COVERED="false"
+      # Check if this namespace is in the protected list
+      if echo "$APP_POLICIES_JSON" | jq -e --arg ns "$vm_ns" '
+        .items[] | select(
+          .spec.selector == null or
+          (.spec.selector.matchNames // [] | index($ns)) or
+          (.spec.selector.matchExpressions[]? | select(
+            .key == "k10.kasten.io/appNamespace" and .operator == "In" and
+            (.values | index($ns))
+          ))
+        )' >/dev/null 2>&1; then
+        NS_COVERED="true"
+      fi
+      if [ "$NS_COVERED" = "true" ]; then
+        NS_VM_COUNT=$(echo "$VMS_JSON" | jq --arg ns "$vm_ns" '[.items[] | select(.metadata.namespace == $ns)] | length')
+        VM_COVERED_BY_NS_POLICY=$((VM_COVERED_BY_NS_POLICY + NS_VM_COUNT))
+      fi
+    done
+  fi
+
+  # Total protected VMs = unique VMs covered by either VM policies or namespace policies
+  # For simplicity, if wildcards exist, mark as "partial" coverage
+  if [ "$VM_HAS_WILDCARDS" = "true" ]; then
+    PROTECTED_VM_COUNT="$TOTAL_VMS"
+    VM_PROTECTION_NOTE="wildcard patterns detected - verify coverage"
+  elif [ "$VM_COVERED_BY_NS_POLICY" -ge "$TOTAL_VMS" ] 2>/dev/null; then
+    PROTECTED_VM_COUNT="$TOTAL_VMS"
+    VM_PROTECTION_NOTE="covered by namespace-level policies"
+  elif [ "$PROTECTED_VM_COUNT_EXPLICIT" -gt 0 ] || [ "$VM_COVERED_BY_NS_POLICY" -gt 0 ]; then
+    # Combine explicit VM refs and namespace coverage (estimate)
+    PROTECTED_VM_COUNT=$((PROTECTED_VM_COUNT_EXPLICIT + VM_COVERED_BY_NS_POLICY))
+    if [ "$PROTECTED_VM_COUNT" -gt "$TOTAL_VMS" ]; then
+      PROTECTED_VM_COUNT=$TOTAL_VMS
+    fi
+    VM_PROTECTION_NOTE="via VM policies and namespace policies"
+  else
+    PROTECTED_VM_COUNT=0
+    VM_PROTECTION_NOTE="no VM-specific or namespace coverage detected"
+  fi
+
+  UNPROTECTED_VM_COUNT=$((TOTAL_VMS - PROTECTED_VM_COUNT))
+  if [ "$UNPROTECTED_VM_COUNT" -lt 0 ]; then
+    UNPROTECTED_VM_COUNT=0
+  fi
+
+  debug "Protected VMs: $PROTECTED_VM_COUNT / $TOTAL_VMS (unprotected: $UNPROTECTED_VM_COUNT)"
+  debug "VM protection note: $VM_PROTECTION_NOTE"
+
+  # VM-based RestorePoints (appType=virtualMachine label)
+  VM_RESTORE_POINTS=$(kubectl get restorepoints.apps.kio.kasten.io -A -l "k10.kasten.io/appType=virtualMachine" --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+
+  debug "VM RestorePoints: $VM_RESTORE_POINTS"
+
+  # Guest filesystem freeze detection
+  VMS_FREEZE_DISABLED=$(echo "$VMS_JSON" | jq '[.items[] | select(.metadata.annotations["k10.kasten.io/freezeVM"] == "false")] | length')
+  VMS_FREEZE_ENABLED=$((TOTAL_VMS - VMS_FREEZE_DISABLED))
+
+  # Freeze timeout from K10 config
+  FREEZE_TIMEOUT="$(kubectl -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["kubeVirtVMs.snapshot.unfreezeTimeout"] // empty' || echo '')"
+  if [ -z "$FREEZE_TIMEOUT" ]; then
+    FREEZE_TIMEOUT="5m0s"
+  fi
+
+  # VM snapshot concurrency setting
+  VM_SNAPSHOT_CONCURRENCY="$(kubectl -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["limiter.vmSnapshotsPerCluster"] // empty' || echo '')"
+  if [ -z "$VM_SNAPSHOT_CONCURRENCY" ]; then
+    VM_SNAPSHOT_CONCURRENCY="1"
+  fi
+
+  debug "VM Freeze: $VMS_FREEZE_ENABLED enabled, $VMS_FREEZE_DISABLED disabled (timeout: $FREEZE_TIMEOUT)"
+  debug "VM Snapshot Concurrency: $VM_SNAPSHOT_CONCURRENCY"
+
+  # Build VM details JSON for output
+  VM_DETAILS_JSON="$(echo "$VMS_JSON" | jq -c '[.items[] | {
+    name: .metadata.name,
+    namespace: .metadata.namespace,
+    status: (.status.printableStatus // "Unknown"),
+    ready: (.status.ready // false),
+    freezeDisabled: (.metadata.annotations["k10.kasten.io/freezeVM"] == "false")
+  }]')"
+
+  # VM policy details
+  VM_POLICY_DETAILS_JSON="$(echo "$VM_POLICIES_JSON" | jq -c '[.[] | {
+    name: .metadata.name,
+    frequency: (.spec.frequency // "manual"),
+    actions: [.spec.actions[]?.action],
+    vmRefs: [.spec.selector.matchExpressions[]? | select(.key == "k10.kasten.io/virtualMachineRef") | .values[]?]
+  }]')"
+
+else
+  # No VM CRD - virtualization not present
+  VIRT_PLATFORM="None"
+  VIRT_VERSION="N/A"
+  TOTAL_VMS=0
+  VMS_RUNNING=0
+  VMS_STOPPED=0
+  VM_POLICY_COUNT=0
+  PROTECTED_VM_COUNT=0
+  UNPROTECTED_VM_COUNT=0
+  PROTECTED_VM_COUNT_EXPLICIT=0
+  VM_COVERED_BY_NS_POLICY=0
+  VM_HAS_WILDCARDS="false"
+  VM_PROTECTION_NOTE="N/A"
+  VM_RESTORE_POINTS=0
+  VMS_FREEZE_DISABLED=0
+  VMS_FREEZE_ENABLED=0
+  FREEZE_TIMEOUT="N/A"
+  VM_SNAPSHOT_CONCURRENCY="N/A"
+  VM_DETAILS_JSON="[]"
+  VM_POLICY_DETAILS_JSON="[]"
+fi
+
+debug "Virtualization summary: platform=$VIRT_PLATFORM, VMs=$TOTAL_VMS, policies=$VM_POLICY_COUNT"
+
+### -------------------------
+### K10 Configuration & Security (NEW v1.8)
+### -------------------------
+# Primary: Helm release secret (user-supplied values)
+# Fallback: k10-config ConfigMap + resource inspection
+
+debug "Extracting K10 Helm configuration..."
+
+HELM_VALUES='{}'
+HELM_VALUES_SOURCE="none"
+
+# Helm 3 stores release data in secrets labelled owner=helm
+HELM_SECRET_NAME=$(kubectl -n "$NAMESPACE" get secrets -l "name=k10,owner=helm" -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || echo "")
+
+if [ -n "$HELM_SECRET_NAME" ]; then
+  HELM_RELEASE_RAW=$(kubectl -n "$NAMESPACE" get secret "$HELM_SECRET_NAME" -o jsonpath='{.data.release}' 2>/dev/null || echo "")
+  if [ -n "$HELM_RELEASE_RAW" ]; then
+    # Helm release encoding: base64 -> base64 -> gzip -> JSON
+    HELM_VALUES=$(echo "$HELM_RELEASE_RAW" | base64 -d 2>/dev/null | base64 -d 2>/dev/null | gunzip 2>/dev/null | jq -c '.config // {}' 2>/dev/null || echo '{}')
+    if echo "$HELM_VALUES" | jq -e 'keys | length > 0' >/dev/null 2>&1; then
+      HELM_VALUES_SOURCE="helm-secret"
+    else
+      HELM_VALUES='{}'
+    fi
+  fi
+fi
+
+# Fallback: helm CLI
+if [ "$HELM_VALUES_SOURCE" = "none" ] && command -v helm >/dev/null 2>&1; then
+  HELM_VALUES=$(helm get values k10 -n "$NAMESPACE" -o json 2>/dev/null || echo '{}')
+  if echo "$HELM_VALUES" | jq -e 'keys | length > 0' >/dev/null 2>&1; then
+    HELM_VALUES_SOURCE="helm-cli"
+  else
+    HELM_VALUES='{}'
+  fi
+fi
+
+debug "Helm values source: $HELM_VALUES_SOURCE"
+
+# Helpers to read Helm values safely
+helm_val() {
+  _v=$(echo "$HELM_VALUES" | jq -r ".$1 // empty" 2>/dev/null)
+  if [ -n "$_v" ] && [ "$_v" != "null" ]; then echo "$_v"; else echo "${2:-}"; fi
+}
+helm_bool() {
+  _v=$(echo "$HELM_VALUES" | jq -r ".$1 // false" 2>/dev/null)
+  [ "$_v" = "true" ] && echo "true" || echo "false"
+}
+
+# k10-config ConfigMap (shared fallback source)
+K10_CM_JSON=$(kubectl -n "$NAMESPACE" get cm k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
+
+# --- Authentication ---
+AUTH_METHOD="none"
+AUTH_DETAILS=""
+
+AUTH_OIDC=$(helm_bool "auth.oidcAuth.enabled")
+AUTH_LDAP=$(helm_bool "auth.ldap.enabled")
+AUTH_OPENSHIFT=$(helm_bool "auth.openshift.enabled")
+AUTH_BASIC=$(helm_bool "auth.basicAuth.enabled")
+AUTH_TOKEN=$(helm_bool "auth.tokenAuth.enabled")
+
+if [ "$AUTH_OIDC" = "true" ]; then
+  AUTH_METHOD="OIDC"
+  AUTH_DETAILS=$(helm_val "auth.oidcAuth.providerURL" "")
+elif [ "$AUTH_LDAP" = "true" ]; then
+  AUTH_METHOD="LDAP"
+  AUTH_DETAILS=$(helm_val "auth.ldap.host" "")
+elif [ "$AUTH_OPENSHIFT" = "true" ]; then
+  AUTH_METHOD="OpenShift OAuth"
+elif [ "$AUTH_BASIC" = "true" ]; then
+  AUTH_METHOD="Basic Auth"
+elif [ "$AUTH_TOKEN" = "true" ]; then
+  AUTH_METHOD="Token"
+fi
+
+# Fallback detection from secrets/configmap
+if [ "$AUTH_METHOD" = "none" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
+  if kubectl -n "$NAMESPACE" get secret k10-oidc-auth >/dev/null 2>&1; then
+    AUTH_METHOD="OIDC"; AUTH_DETAILS="detected from secret"
+  elif kubectl -n "$NAMESPACE" get secret k10-htpasswd >/dev/null 2>&1; then
+    AUTH_METHOD="Basic Auth"; AUTH_DETAILS="detected from secret"
+  fi
+  if [ "$AUTH_METHOD" = "none" ] && [ "$PLATFORM" = "OpenShift" ]; then
+    _ocp=$(echo "$K10_CM_JSON" | jq -r '.["auth.openshift.enabled"] // empty' 2>/dev/null)
+    [ "$_ocp" = "true" ] && AUTH_METHOD="OpenShift OAuth"
+  fi
+fi
+
+debug "Authentication: $AUTH_METHOD ($AUTH_DETAILS)"
+
+# --- KMS Encryption ---
+ENCRYPTION_PROVIDER="none"
+ENCRYPTION_DETAILS=""
+
+_enc_aws=$(helm_val "encryption.primaryKey.awsCmkKeyId" "")
+_enc_az_url=$(helm_val "encryption.primaryKey.azureKeyVaultURL" "")
+_enc_az_key=$(helm_val "encryption.primaryKey.azureKeyVaultKeyName" "")
+_enc_vault_path=$(helm_val "encryption.primaryKey.vaultTransitPath" "")
+
+if [ -n "$_enc_aws" ]; then
+  ENCRYPTION_PROVIDER="AWS KMS"; ENCRYPTION_DETAILS="CMK configured"
+elif [ -n "$_enc_az_url" ]; then
+  ENCRYPTION_PROVIDER="Azure Key Vault"; ENCRYPTION_DETAILS="${_enc_az_key:-configured}"
+elif [ -n "$_enc_vault_path" ]; then
+  ENCRYPTION_PROVIDER="HashiCorp Vault"; ENCRYPTION_DETAILS="transit: $_enc_vault_path"
+fi
+
+# Fallback: vault address in configmap
+if [ "$ENCRYPTION_PROVIDER" = "none" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
+  _vault=$(echo "$K10_CM_JSON" | jq -r '.["vault.address"] // empty' 2>/dev/null)
+  [ -n "$_vault" ] && ENCRYPTION_PROVIDER="HashiCorp Vault" && ENCRYPTION_DETAILS="detected"
+fi
+
+debug "Encryption: $ENCRYPTION_PROVIDER ($ENCRYPTION_DETAILS)"
+
+# --- FIPS Mode ---
+FIPS_ENABLED=$(helm_bool "fips.enabled")
+if [ "$FIPS_ENABLED" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
+  _fips=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
+    | jq -r '.items[0].spec.template.spec.containers[0].env[]? | select(.name=="K10_FIPS_ENABLED") | .value // empty' 2>/dev/null)
+  [ "$_fips" = "true" ] && FIPS_ENABLED="true"
+fi
+debug "FIPS: $FIPS_ENABLED"
+
+# --- Network Policies ---
+NETPOL_ENABLED="false"
+_np_helm=$(helm_val "networkPolicy.create" "")
+if [ "$_np_helm" = "true" ] || [ "$_np_helm" = "false" ]; then
+  NETPOL_ENABLED="$_np_helm"
+else
+  _np_count=$(kubectl -n "$NAMESPACE" get networkpolicies -l "app.kubernetes.io/name=k10" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  [ -z "$_np_count" ] && _np_count=0
+  [ "$_np_count" -gt 0 ] 2>/dev/null && NETPOL_ENABLED="true"
+fi
+debug "Network Policies: $NETPOL_ENABLED"
+
+# --- SIEM / Audit Logging ---
+SIEM_CLUSTER=$(helm_bool "siem.logging.cluster.enabled")
+SIEM_S3=$(helm_bool "siem.logging.cloud.awsS3.enabled")
+
+AUDIT_ENABLED="false"
+AUDIT_TARGETS=""
+if [ "$SIEM_CLUSTER" = "true" ]; then AUDIT_ENABLED="true"; AUDIT_TARGETS="stdout"; fi
+if [ "$SIEM_S3" = "true" ]; then
+  AUDIT_ENABLED="true"
+  [ -n "$AUDIT_TARGETS" ] && AUDIT_TARGETS="${AUDIT_TARGETS}, S3" || AUDIT_TARGETS="S3"
+fi
+
+# Fallback: check configmap for siem keys
+if [ "$AUDIT_ENABLED" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
+  _siem_check=$(echo "$K10_CM_JSON" | jq -r 'to_entries[] | select(.key | test("siem.*enabled"; "i")) | .value' 2>/dev/null | grep -c "true" || echo "0")
+  [ "$_siem_check" -gt 0 ] 2>/dev/null && AUDIT_ENABLED="true" && AUDIT_TARGETS="detected"
+fi
+debug "Audit Logging: $AUDIT_ENABLED ($AUDIT_TARGETS)"
+
+# --- Custom CA Certificate ---
+CUSTOM_CA=$(helm_val "cacertconfigmap.name" "")
+if [ -z "$CUSTOM_CA" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
+  CUSTOM_CA=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
+    | jq -r '.items[0].spec.template.spec.volumes[]? | select(.configMap.name | test("ca|cert|ssl"; "i")) | .configMap.name // empty' 2>/dev/null | head -1)
+fi
+debug "Custom CA: ${CUSTOM_CA:-none}"
+
+# --- Dashboard Access ---
+DASHBOARD_ACCESS="ClusterIP"
+DASHBOARD_HOST=""
+
+_ing_count=$(kubectl -n "$NAMESPACE" get ingress --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[ -z "$_ing_count" ] && _ing_count=0
+_route_count=0
+[ "$PLATFORM" = "OpenShift" ] && _route_count=$(kubectl -n "$NAMESPACE" get routes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[ -z "$_route_count" ] && _route_count=0
+_extgw=$(kubectl -n "$NAMESPACE" get svc gateway-ext --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[ -z "$_extgw" ] && _extgw=0
+
+if [ "$_ing_count" -gt 0 ] 2>/dev/null; then
+  DASHBOARD_ACCESS="Ingress"
+  DASHBOARD_HOST=$(kubectl -n "$NAMESPACE" get ingress -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || echo "")
+elif [ "$_route_count" -gt 0 ] 2>/dev/null; then
+  DASHBOARD_ACCESS="Route"
+  DASHBOARD_HOST=$(kubectl -n "$NAMESPACE" get routes -o jsonpath='{.items[0].spec.host}' 2>/dev/null || echo "")
+elif [ "$_extgw" -gt 0 ] 2>/dev/null; then
+  DASHBOARD_ACCESS="External Gateway"
+  DASHBOARD_HOST=$(helm_val "externalGateway.fqdn.name" "LoadBalancer")
+fi
+debug "Dashboard: $DASHBOARD_ACCESS ($DASHBOARD_HOST)"
+
+# --- Concurrency Limiters ---
+get_limiter() {
+  _h=$(helm_val "limiter.$1" "")
+  [ -n "$_h" ] && echo "$_h" && return
+  _c=$(echo "$K10_CM_JSON" | jq -r ".\"limiter.$1\" // empty" 2>/dev/null)
+  [ -n "$_c" ] && echo "$_c" && return
+  echo "$2"
+}
+LIM_CSI_SNAP=$(get_limiter "csiSnapshotsPerCluster" "10")
+LIM_EXPORTS=$(get_limiter "snapshotExportsPerCluster" "10")
+LIM_EXPORTS_ACT=$(get_limiter "snapshotExportsPerAction" "3")
+LIM_RESTORES=$(get_limiter "volumeRestoresPerCluster" "10")
+LIM_RESTORES_ACT=$(get_limiter "volumeRestoresPerAction" "3")
+LIM_VM_SNAP=$(get_limiter "vmSnapshotsPerCluster" "1")
+LIM_GVB=$(get_limiter "genericVolumeBackupsPerCluster" "10")
+LIM_EXEC_REPLICAS=$(get_limiter "executorReplicas" "3")
+LIM_EXEC_THREADS=$(get_limiter "executorThreads" "8")
+LIM_WL_SNAP=$(get_limiter "workloadSnapshotsPerAction" "5")
+LIM_WL_RESTORE=$(get_limiter "workloadRestoresPerAction" "3")
+
+debug "Limiters: CSI=$LIM_CSI_SNAP Exports=$LIM_EXPORTS VM=$LIM_VM_SNAP Exec=${LIM_EXEC_REPLICAS}x${LIM_EXEC_THREADS}"
+
+# --- Timeouts ---
+get_timeout() {
+  _h=$(helm_val "timeout.$1" "")
+  [ -n "$_h" ] && echo "$_h" && return
+  _c=$(echo "$K10_CM_JSON" | jq -r ".\"timeout.$1\" // empty" 2>/dev/null)
+  [ -n "$_c" ] && echo "$_c" && return
+  echo "$2"
+}
+TO_BP_BACKUP=$(get_timeout "blueprintBackup" "45")
+TO_BP_RESTORE=$(get_timeout "blueprintRestore" "600")
+TO_BP_HOOKS=$(get_timeout "blueprintHooks" "20")
+TO_BP_DELETE=$(get_timeout "blueprintDelete" "45")
+TO_WORKER=$(get_timeout "workerPodReady" "15")
+TO_JOB=$(get_timeout "jobWait" "600")
+
+debug "Timeouts: BP-backup=${TO_BP_BACKUP}m BP-restore=${TO_BP_RESTORE}m worker=${TO_WORKER}m job=${TO_JOB}m"
+
+# --- Datastore Parallelism ---
+get_ds() {
+  _h=$(helm_val "datastore.$1" "")
+  [ -n "$_h" ] && echo "$_h" && return
+  _c=$(echo "$K10_CM_JSON" | jq -r ".\"datastore.$1\" // empty" 2>/dev/null)
+  [ -n "$_c" ] && echo "$_c" && return
+  echo "$2"
+}
+DS_UPLOADS=$(get_ds "parallelUploads" "8")
+DS_DOWNLOADS=$(get_ds "parallelDownloads" "8")
+DS_BLK_UPLOADS=$(get_ds "parallelBlockUploads" "8")
+DS_BLK_DOWNLOADS=$(get_ds "parallelBlockDownloads" "8")
+
+debug "Datastore: up=$DS_UPLOADS down=$DS_DOWNLOADS blk-up=$DS_BLK_UPLOADS blk-down=$DS_BLK_DOWNLOADS"
+
+# --- Excluded Applications ---
+EXCLUDED_APPS_JSON='[]'
+_ea=$(helm_val "excludedApps" "")
+if [ -z "$_ea" ]; then
+  _ea=$(echo "$K10_CM_JSON" | jq -r '.excludedApps // empty' 2>/dev/null)
+fi
+if [ -n "$_ea" ]; then
+  if echo "$_ea" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    EXCLUDED_APPS_JSON="$_ea"
+  else
+    EXCLUDED_APPS_JSON=$(echo "$_ea" | jq -Rc 'split(",") | map(gsub("^ +| +$";""))' 2>/dev/null || echo '[]')
+  fi
+fi
+EXCLUDED_APPS_COUNT=$(echo "$EXCLUDED_APPS_JSON" | jq 'length' 2>/dev/null || echo "0")
+[ -z "$EXCLUDED_APPS_COUNT" ] || [ "$EXCLUDED_APPS_COUNT" = "null" ] && EXCLUDED_APPS_COUNT=0
+debug "Excluded apps: $EXCLUDED_APPS_COUNT"
+
+# --- GVB Sidecar Injection ---
+GVB_SIDECAR=$(helm_bool "injectGenericVolumeBackupSidecar.enabled")
+if [ "$GVB_SIDECAR" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
+  _gvb_wh=$(kubectl get mutatingwebhookconfigurations -l "app=k10" -o json 2>/dev/null \
+    | jq '[.items[]? | select(.metadata.name | test("generic-volume";"i"))] | length' 2>/dev/null || echo "0")
+  [ "$_gvb_wh" -gt 0 ] 2>/dev/null && GVB_SIDECAR="true"
+fi
+debug "GVB sidecar: $GVB_SIDECAR"
+
+# --- Security Context ---
+SC_RUN_AS_USER=$(helm_val "services.securityContext.runAsUser" "")
+SC_FS_GROUP=$(helm_val "services.securityContext.fsGroup" "")
+if [ -z "$SC_RUN_AS_USER" ]; then
+  _sc=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
+    | jq '.items[0].spec.template.spec.securityContext // {}' 2>/dev/null || echo '{}')
+  SC_RUN_AS_USER=$(echo "$_sc" | jq -r '.runAsUser // "1000"')
+  SC_FS_GROUP=$(echo "$_sc" | jq -r '.fsGroup // "1000"')
+fi
+[ -z "$SC_RUN_AS_USER" ] && SC_RUN_AS_USER="1000"
+[ -z "$SC_FS_GROUP" ] && SC_FS_GROUP="1000"
+debug "Security context: runAsUser=$SC_RUN_AS_USER fsGroup=$SC_FS_GROUP"
+
+# --- Persistence Sizes ---
+PERSIST_SIZE=$(helm_val "global.persistence.size" "20Gi")
+PERSIST_CATALOG=$(helm_val "global.persistence.catalog.size" "$PERSIST_SIZE")
+PERSIST_JOBS=$(helm_val "global.persistence.jobs.size" "$PERSIST_SIZE")
+PERSIST_LOGGING=$(helm_val "global.persistence.logging.size" "$PERSIST_SIZE")
+PERSIST_METERING=$(helm_val "global.persistence.metering.size" "2Gi")
+PERSIST_SC=$(helm_val "global.persistence.storageClass" "")
+debug "Persistence: default=$PERSIST_SIZE catalog=$PERSIST_CATALOG SC=$PERSIST_SC"
+
+# --- Garbage Collector ---
+GC_KEEP_MAX=$(helm_val "garbagecollector.keepMaxActions" "1000")
+GC_PERIOD=$(helm_val "garbagecollector.daemonPeriod" "21600")
+debug "GC: keepMax=$GC_KEEP_MAX period=${GC_PERIOD}s"
+
+# --- Misc Settings ---
+CLUSTER_NAME=$(helm_val "clusterName" "")
+LOG_LEVEL=$(helm_val "logLevel" "info")
+SCC_CREATED="false"
+if [ "$PLATFORM" = "OpenShift" ]; then
+  SCC_CREATED=$(helm_bool "scc.create")
+  if [ "$SCC_CREATED" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
+    _scc=$(kubectl get scc -o json 2>/dev/null | jq '[.items[]? | select(.metadata.name | test("k10|kasten";"i"))] | length' 2>/dev/null || echo "0")
+    [ "$_scc" -gt 0 ] 2>/dev/null && SCC_CREATED="true"
+  fi
+fi
+VAP_ENABLED=$(helm_bool "vap.kastenPolicyPermissions.enabled")
+
+debug "Misc: cluster=$CLUSTER_NAME log=$LOG_LEVEL SCC=$SCC_CREATED VAP=$VAP_ENABLED"
+
+# --- Non-default settings counter ---
+NON_DEFAULT_COUNT=0
+NON_DEFAULT_ITEMS=""
+_nd() {
+  [ "$2" != "$3" ] || return 0
+  NON_DEFAULT_COUNT=$((NON_DEFAULT_COUNT + 1))
+  [ -n "$NON_DEFAULT_ITEMS" ] && NON_DEFAULT_ITEMS="${NON_DEFAULT_ITEMS}, $1" || NON_DEFAULT_ITEMS="$1"
+}
+_nd "csiSnapshots" "$LIM_CSI_SNAP" "10"
+_nd "exports" "$LIM_EXPORTS" "10"
+_nd "restores" "$LIM_RESTORES" "10"
+_nd "vmSnapshots" "$LIM_VM_SNAP" "1"
+_nd "executorReplicas" "$LIM_EXEC_REPLICAS" "3"
+_nd "executorThreads" "$LIM_EXEC_THREADS" "8"
+_nd "bpBackup" "$TO_BP_BACKUP" "45"
+_nd "bpRestore" "$TO_BP_RESTORE" "600"
+_nd "workerPod" "$TO_WORKER" "15"
+_nd "jobWait" "$TO_JOB" "600"
+_nd "uploads" "$DS_UPLOADS" "8"
+_nd "downloads" "$DS_DOWNLOADS" "8"
+_nd "logLevel" "$LOG_LEVEL" "info"
+
+debug "Non-default settings: $NON_DEFAULT_COUNT ($NON_DEFAULT_ITEMS)"
+
+### -------------------------
 ### Best Practices Assessment
 ### -------------------------
 # DR Assessment
@@ -1116,7 +1683,43 @@ else
   BP_COVERAGE_STATUS="GAPS_DETECTED"
 fi
 
-debug "Best Practices - DR: $BP_DR_STATUS, Immutability: $BP_IMMUTABILITY_STATUS, Resources: $BP_RESOURCES_STATUS"
+# VM Protection Assessment (NEW v1.7)
+if [ "$TOTAL_VMS" -gt 0 ]; then
+  if [ "$UNPROTECTED_VM_COUNT" -eq 0 ]; then
+    BP_VM_PROTECTION_STATUS="COMPLETE"
+  elif [ "$VM_POLICY_COUNT" -gt 0 ] || [ "$VM_COVERED_BY_NS_POLICY" -gt 0 ] 2>/dev/null; then
+    BP_VM_PROTECTION_STATUS="PARTIAL"
+  else
+    BP_VM_PROTECTION_STATUS="NOT_CONFIGURED"
+  fi
+else
+  BP_VM_PROTECTION_STATUS="N/A"
+fi
+
+debug "Best Practices - DR: $BP_DR_STATUS, Immutability: $BP_IMMUTABILITY_STATUS, Resources: $BP_RESOURCES_STATUS, VM: $BP_VM_PROTECTION_STATUS"
+
+# Authentication Assessment (NEW v1.8)
+if [ "$AUTH_METHOD" != "none" ]; then
+  BP_AUTH_STATUS="CONFIGURED"
+else
+  BP_AUTH_STATUS="NOT_CONFIGURED"
+fi
+
+# KMS Encryption Assessment (NEW v1.8) - informational/optional
+if [ "$ENCRYPTION_PROVIDER" != "none" ]; then
+  BP_ENCRYPTION_STATUS="CONFIGURED"
+else
+  BP_ENCRYPTION_STATUS="NOT_CONFIGURED"
+fi
+
+# Audit Logging Assessment (NEW v1.8)
+if [ "$AUDIT_ENABLED" = "true" ]; then
+  BP_AUDIT_STATUS="ENABLED"
+else
+  BP_AUDIT_STATUS="NOT_ENABLED"
+fi
+
+debug "Best Practices v1.8 - Auth: $BP_AUTH_STATUS, KMS Encryption: $BP_ENCRYPTION_STATUS, Audit: $BP_AUDIT_STATUS"
 
 ##############################################################################
 # JSON OUTPUT
@@ -1180,11 +1783,11 @@ if [ "$MODE" = "json" ]; then
     --argjson presetCount "$PRESET_COUNT" \
     --argjson presets "$(echo "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})')" \
     --argjson blueprintCount "$BLUEPRINT_COUNT" \
-    --argjson blueprints "$(echo "$BLUEPRINTS_JSON" | jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: (.spec.actions | keys)})')" \
+    --argjson blueprints "$(echo "$BLUEPRINTS_JSON" | jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: ((.spec.actions // {}) | keys)})')" \
     --argjson bindingCount "$BINDING_COUNT" \
-    --argjson bindings "$(echo "$BINDINGS_JSON" | jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: .spec.blueprintRef.name})')" \
+    --argjson bindings "$(echo "$BINDINGS_JSON" | jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: (.spec.blueprintRef.name // "N/A")})')" \
     --argjson transformsetCount "$TRANSFORMSET_COUNT" \
-    --argjson transformsets "$(echo "$TRANSFORMSETS_JSON" | jq -c '.items | map({name: .metadata.name, transformCount: (.spec.transforms | length)})')" \
+    --argjson transformsets "$(echo "$TRANSFORMSETS_JSON" | jq -c '.items | map({name: .metadata.name, transformCount: ((.spec.transforms // []) | length)})')" \
     --arg prometheusEnabled "$PROMETHEUS_ENABLED" \
     --arg bpDr "$BP_DR_STATUS" \
     --arg bpImmutability "$BP_IMMUTABILITY_STATUS" \
@@ -1215,6 +1818,80 @@ if [ "$MODE" = "json" ]; then
     --argjson mcClusterCount "${MC_CLUSTER_COUNT:-0}" \
     --arg mcPrimaryName "${MC_PRIMARY_NAME:-}" \
     --arg mcClusterId "${MC_CLUSTER_ID:-}" \
+    --arg virtPlatform "$VIRT_PLATFORM" \
+    --arg virtVersion "$VIRT_VERSION" \
+    --argjson totalVms "$TOTAL_VMS" \
+    --argjson vmsRunning "$VMS_RUNNING" \
+    --argjson vmsStopped "$VMS_STOPPED" \
+    --argjson vmPolicyCount "$VM_POLICY_COUNT" \
+    --argjson protectedVmCount "$PROTECTED_VM_COUNT" \
+    --argjson unprotectedVmCount "$UNPROTECTED_VM_COUNT" \
+    --argjson protectedVmExplicit "$PROTECTED_VM_COUNT_EXPLICIT" \
+    --argjson vmCoveredByNsPolicy "$VM_COVERED_BY_NS_POLICY" \
+    --arg vmHasWildcards "$VM_HAS_WILDCARDS" \
+    --arg vmProtectionNote "$VM_PROTECTION_NOTE" \
+    --argjson vmRestorePoints "$VM_RESTORE_POINTS" \
+    --argjson vmsFreezeDisabled "$VMS_FREEZE_DISABLED" \
+    --arg freezeTimeout "$FREEZE_TIMEOUT" \
+    --arg vmSnapshotConcurrency "$VM_SNAPSHOT_CONCURRENCY" \
+    --argjson vmDetails "$VM_DETAILS_JSON" \
+    --argjson vmPolicyDetails "$VM_POLICY_DETAILS_JSON" \
+    --arg bpVmProtection "$BP_VM_PROTECTION_STATUS" \
+    --arg helmValuesSource "$HELM_VALUES_SOURCE" \
+    --arg authMethod "$AUTH_METHOD" \
+    --arg authDetails "$AUTH_DETAILS" \
+    --arg encryptionProvider "$ENCRYPTION_PROVIDER" \
+    --arg encryptionDetails "$ENCRYPTION_DETAILS" \
+    --arg fipsEnabled "$FIPS_ENABLED" \
+    --arg netpolEnabled "$NETPOL_ENABLED" \
+    --arg auditEnabled "$AUDIT_ENABLED" \
+    --arg auditTargets "$AUDIT_TARGETS" \
+    --arg customCa "${CUSTOM_CA:-}" \
+    --arg dashboardAccess "$DASHBOARD_ACCESS" \
+    --arg dashboardHost "${DASHBOARD_HOST:-}" \
+    --arg limCsiSnap "$LIM_CSI_SNAP" \
+    --arg limExports "$LIM_EXPORTS" \
+    --arg limExportsAct "$LIM_EXPORTS_ACT" \
+    --arg limRestores "$LIM_RESTORES" \
+    --arg limRestoresAct "$LIM_RESTORES_ACT" \
+    --arg limVmSnap "$LIM_VM_SNAP" \
+    --arg limGvb "$LIM_GVB" \
+    --arg limExecReplicas "$LIM_EXEC_REPLICAS" \
+    --arg limExecThreads "$LIM_EXEC_THREADS" \
+    --arg limWlSnap "$LIM_WL_SNAP" \
+    --arg limWlRestore "$LIM_WL_RESTORE" \
+    --arg toBpBackup "$TO_BP_BACKUP" \
+    --arg toBpRestore "$TO_BP_RESTORE" \
+    --arg toBpHooks "$TO_BP_HOOKS" \
+    --arg toBpDelete "$TO_BP_DELETE" \
+    --arg toWorker "$TO_WORKER" \
+    --arg toJob "$TO_JOB" \
+    --arg dsUploads "$DS_UPLOADS" \
+    --arg dsDownloads "$DS_DOWNLOADS" \
+    --arg dsBlkUploads "$DS_BLK_UPLOADS" \
+    --arg dsBlkDownloads "$DS_BLK_DOWNLOADS" \
+    --argjson excludedApps "$EXCLUDED_APPS_JSON" \
+    --argjson excludedAppsCount "$EXCLUDED_APPS_COUNT" \
+    --arg gvbSidecar "$GVB_SIDECAR" \
+    --arg scRunAsUser "$SC_RUN_AS_USER" \
+    --arg scFsGroup "$SC_FS_GROUP" \
+    --arg persistSize "$PERSIST_SIZE" \
+    --arg persistCatalog "$PERSIST_CATALOG" \
+    --arg persistJobs "$PERSIST_JOBS" \
+    --arg persistLogging "$PERSIST_LOGGING" \
+    --arg persistMetering "$PERSIST_METERING" \
+    --arg persistSc "$PERSIST_SC" \
+    --arg gcKeepMax "$GC_KEEP_MAX" \
+    --arg gcPeriod "$GC_PERIOD" \
+    --arg clusterNameSetting "${CLUSTER_NAME:-}" \
+    --arg logLevelSetting "$LOG_LEVEL" \
+    --arg sccCreated "$SCC_CREATED" \
+    --arg vapEnabled "$VAP_ENABLED" \
+    --argjson nonDefaultCount "$NON_DEFAULT_COUNT" \
+    --arg nonDefaultItems "$NON_DEFAULT_ITEMS" \
+    --arg bpAuth "$BP_AUTH_STATUS" \
+    --arg bpEncryption "$BP_ENCRYPTION_STATUS" \
+    --arg bpAudit "$BP_AUDIT_STATUS" \
     '
     {
       platform: $platform,
@@ -1311,6 +1988,33 @@ if [ "$MODE" = "json" ]; then
         prometheus: ($prometheusEnabled == "true")
       },
 
+      virtualization: {
+        platform: $virtPlatform,
+        version: $virtVersion,
+        totalVMs: $totalVms,
+        vmsRunning: $vmsRunning,
+        vmsStopped: $vmsStopped,
+        vmPolicies: {
+          count: $vmPolicyCount,
+          items: $vmPolicyDetails
+        },
+        protection: {
+          protectedVMs: $protectedVmCount,
+          unprotectedVMs: $unprotectedVmCount,
+          explicitVmRefs: $protectedVmExplicit,
+          coveredByNamespacePolicies: $vmCoveredByNsPolicy,
+          hasWildcardPatterns: ($vmHasWildcards == "true"),
+          note: $vmProtectionNote
+        },
+        vmRestorePoints: $vmRestorePoints,
+        freezeConfiguration: {
+          timeout: $freezeTimeout,
+          vmsWithFreezeDisabled: $vmsFreezeDisabled
+        },
+        snapshotConcurrency: $vmSnapshotConcurrency,
+        vms: $vmDetails
+      },
+
       coverage: {
         policiesTargetingAllNamespaces: $allNs,
         hasCatchallPolicy: ($hasCatchallPolicy == "true"),
@@ -1372,13 +2076,100 @@ if [ "$MODE" = "json" ]; then
         }
       },
 
+      k10Configuration: {
+        source: $helmValuesSource,
+        security: {
+          authentication: {
+            method: $authMethod,
+            details: (if $authDetails != "" then $authDetails else null end)
+          },
+          encryption: {
+            provider: $encryptionProvider,
+            details: (if $encryptionDetails != "" then $encryptionDetails else null end)
+          },
+          fipsMode: ($fipsEnabled == "true"),
+          networkPolicies: ($netpolEnabled == "true"),
+          auditLogging: {
+            enabled: ($auditEnabled == "true"),
+            targets: (if $auditTargets != "" then $auditTargets else null end)
+          },
+          customCaCertificate: (if $customCa != "" then $customCa else null end),
+          securityContext: {
+            runAsUser: $scRunAsUser,
+            fsGroup: $scFsGroup
+          },
+          scc: ($sccCreated == "true"),
+          vap: ($vapEnabled == "true")
+        },
+        dashboardAccess: {
+          method: $dashboardAccess,
+          host: (if $dashboardHost != "" then $dashboardHost else null end)
+        },
+        concurrencyLimiters: {
+          csiSnapshotsPerCluster: $limCsiSnap,
+          snapshotExportsPerCluster: $limExports,
+          snapshotExportsPerAction: $limExportsAct,
+          volumeRestoresPerCluster: $limRestores,
+          volumeRestoresPerAction: $limRestoresAct,
+          vmSnapshotsPerCluster: $limVmSnap,
+          genericVolumeBackupsPerCluster: $limGvb,
+          executorReplicas: $limExecReplicas,
+          executorThreads: $limExecThreads,
+          workloadSnapshotsPerAction: $limWlSnap,
+          workloadRestoresPerAction: $limWlRestore
+        },
+        timeouts: {
+          blueprintBackup: $toBpBackup,
+          blueprintRestore: $toBpRestore,
+          blueprintHooks: $toBpHooks,
+          blueprintDelete: $toBpDelete,
+          workerPodReady: $toWorker,
+          jobWait: $toJob
+        },
+        datastore: {
+          parallelUploads: $dsUploads,
+          parallelDownloads: $dsDownloads,
+          parallelBlockUploads: $dsBlkUploads,
+          parallelBlockDownloads: $dsBlkDownloads
+        },
+        persistence: {
+          defaultSize: $persistSize,
+          catalogSize: $persistCatalog,
+          jobsSize: $persistJobs,
+          loggingSize: $persistLogging,
+          meteringSize: $persistMetering,
+          storageClass: (if $persistSc != "" then $persistSc else null end)
+        },
+        excludedApps: {
+          count: $excludedAppsCount,
+          items: $excludedApps
+        },
+        features: {
+          gvbSidecarInjection: ($gvbSidecar == "true")
+        },
+        garbageCollector: {
+          keepMaxActions: $gcKeepMax,
+          daemonPeriod: $gcPeriod
+        },
+        logLevel: $logLevelSetting,
+        clusterName: (if $clusterNameSetting != "" then $clusterNameSetting else null end),
+        nonDefaultSettings: {
+          count: $nonDefaultCount,
+          items: (if $nonDefaultItems != "" then $nonDefaultItems else null end)
+        }
+      },
+
       bestPractices: {
         disasterRecovery: $bpDr,
         immutability: $bpImmutability,
         policyPresets: $bpPresets,
         monitoring: $bpMonitoring,
         resourceLimits: $bpResources,
-        namespaceProtection: $bpCoverage
+        namespaceProtection: $bpCoverage,
+        vmProtection: $bpVmProtection,
+        authentication: $bpAuth,
+        encryption: $bpEncryption,
+        auditLogging: $bpAudit
       },
 
       immutabilitySignal: ($immutability == "true"),
@@ -1435,25 +2226,25 @@ fi
 # HUMAN OUTPUT
 ##############################################################################
 
-printf "\n${COLOR_BOLD}${COLOR_BLUE}🔍 Kasten Discovery Lite v1.6${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}${COLOR_BLUE}[SEARCH] Kasten Discovery Lite v1.8${COLOR_RESET}\n"
 printf "==============================\n"
 printf "Platform: $PLATFORM\n"
 printf "Namespace: $NAMESPACE\n"
 printf "Kasten Version: $KASTEN_VERSION\n"
 
 ### License
-printf "\n${COLOR_BOLD}📜 License Information${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[LICENSE] License Information${COLOR_RESET}\n"
 if [ "$LICENSE_STATUS" = "NOT_FOUND" ]; then
-  printf "  ${COLOR_YELLOW}⚠️  No license detected${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]  No license detected${COLOR_RESET}\n"
 else
   printf "  Customer:    $LICENSE_CUSTOMER\n"
   printf "  License ID:  $LICENSE_ID\n"
   if [ "$LICENSE_STATUS" = "VALID" ]; then
-    printf "  Status:      ${COLOR_GREEN}✅ VALID${COLOR_RESET}\n"
+    printf "  Status:      ${COLOR_GREEN}[OK] VALID${COLOR_RESET}\n"
   elif [ "$LICENSE_STATUS" = "EXPIRED" ]; then
-    printf "  Status:      ${COLOR_RED}❌ EXPIRED${COLOR_RESET}\n"
+    printf "  Status:      ${COLOR_RED}[FAIL] EXPIRED${COLOR_RESET}\n"
   else
-    printf "  Status:      ${COLOR_YELLOW}⚠️  UNKNOWN${COLOR_RESET}\n"
+    printf "  Status:      ${COLOR_YELLOW}[WARN]  UNKNOWN${COLOR_RESET}\n"
   fi
   printf "  Valid From:  $LICENSE_START\n"
   printf "  Valid Until: $LICENSE_END\n"
@@ -1468,7 +2259,7 @@ else
 fi
 
 ### Health Status
-printf "\n${COLOR_BOLD}💚 Health Status${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[HEALTH] Health Status${COLOR_RESET}\n"
 printf "  Pods:\n"
 printf "    Total:   $PODS\n"
 printf "    Running: $PODS_RUNNING\n"
@@ -1492,7 +2283,7 @@ else
 fi
 
 ### Restore Actions History (NEW v1.5)
-printf "\n${COLOR_BOLD}🔄 Restore Actions History${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[RESTORE] Restore Actions History${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 printf "  Total:     $RESTORE_ACTIONS_TOTAL\n"
 printf "  Completed: ${COLOR_GREEN}$RESTORE_ACTIONS_COMPLETED${COLOR_RESET}\n"
 printf "  Failed:    ${COLOR_RED}$RESTORE_ACTIONS_FAILED${COLOR_RESET}\n"
@@ -1503,7 +2294,7 @@ if [ "$RESTORE_ACTIONS_TOTAL" -gt 0 ]; then
 fi
 
 ### Multi-Cluster (NEW v1.6)
-printf "\n${COLOR_BOLD}🌐 Multi-Cluster${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[GLOBE] Multi-Cluster${COLOR_RESET}\n"
 if [ "$MC_ROLE" = "primary" ]; then
   printf "  Role:     ${COLOR_GREEN}PRIMARY${COLOR_RESET}\n"
   printf "  Clusters: $MC_CLUSTER_COUNT joined\n"
@@ -1520,21 +2311,21 @@ else
 fi
 
 ### Disaster Recovery
-printf "\n${COLOR_BOLD}🛡️ Disaster Recovery (KDR)${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[SHIELD] Disaster Recovery (KDR)${COLOR_RESET}\n"
 if [ "$KDR_ENABLED" = true ]; then
-  printf "  Status:    ${COLOR_GREEN}✅ ENABLED${COLOR_RESET}\n"
+  printf "  Status:    ${COLOR_GREEN}[OK] ENABLED${COLOR_RESET}\n"
   printf "  Mode:      $KDR_MODE\n"
   printf "  Frequency: $KDR_FREQUENCY\n"
   printf "  Profile:   $KDR_PROFILE\n"
 else
-  printf "  ${COLOR_RED}❌ NOT CONFIGURED${COLOR_RESET}\n"
-  printf "  ${COLOR_YELLOW}⚠️  This is critical for Kasten platform resilience${COLOR_RESET}\n"
+  printf "  ${COLOR_RED}[FAIL] NOT CONFIGURED${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]  This is critical for Kasten platform resilience${COLOR_RESET}\n"
 fi
 
 ### Immutability
-printf "\n${COLOR_BOLD}🔒 Immutability Signal${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[LOCK] Immutability Signal${COLOR_RESET}\n"
 if [ "$IMMUTABILITY" = "true" ]; then
-  printf "  Detected:  ${COLOR_GREEN}✅ Yes${COLOR_RESET}\n"
+  printf "  Detected:  ${COLOR_GREEN}[OK] Yes${COLOR_RESET}\n"
   if [ "$IMMUTABILITY_DAYS" -gt 0 ]; then
     printf "  Max Protection Period: ${IMMUTABILITY_DAYS} days\n"
   else
@@ -1542,11 +2333,11 @@ if [ "$IMMUTABILITY" = "true" ]; then
   fi
   printf "  Profiles with immutability: $IMMUTABLE_PROFILES\n"
 else
-  printf "  Detected:  ${COLOR_YELLOW}⚠️  No${COLOR_RESET}\n"
+  printf "  Detected:  ${COLOR_YELLOW}[WARN]  No${COLOR_RESET}\n"
 fi
 
 ### Profiles
-printf "\n${COLOR_BOLD}📦 Location Profiles${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[PACKAGE] Location Profiles${COLOR_RESET}\n"
 printf "  Profiles: $PROFILE_COUNT"
 if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
   printf " (${COLOR_GREEN}$IMMUTABLE_PROFILES with immutability${COLOR_RESET})"
@@ -1565,7 +2356,7 @@ if [ "$PROFILE_COUNT" -gt 0 ]; then
 fi
 
 ### PolicyPresets
-printf "\n${COLOR_BOLD}📋 Policy Presets${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[LIST] Policy Presets${COLOR_RESET}\n"
 if [ "$PRESET_COUNT" -gt 0 ]; then
   printf "  Presets: ${COLOR_GREEN}$PRESET_COUNT${COLOR_RESET}\n"
   echo "$PRESETS_JSON" | jq -r '
@@ -1584,7 +2375,7 @@ else
 fi
 
 ### Policy Last Run Status (NEW v1.5)
-printf "\n${COLOR_BOLD}📜 Kasten Policies${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[LICENSE] Kasten Policies${COLOR_RESET}\n"
 printf "  Total: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)\n"
 printf "  With export: $POLICIES_WITH_EXPORT | Using presets: $POLICIES_WITH_PRESETS\n"
 
@@ -1642,42 +2433,42 @@ else "" end) +
 fi
 
 ### Policy Last Run Summary (NEW v1.5)
-printf "\n${COLOR_BOLD}⏱️ Policy Last Run Status${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[TIME] Policy Last Run Status${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 echo "$POLICY_LAST_RUN" | jq -r '.[]? | 
   "  \(.name): \(if .lastRun then .lastRun.timestamp else "Never" end) | \(if .lastRun then .lastRun.state else "N/A" end)\(if .lastRun.duration then " | \(.lastRun.duration)s" else "" end)"
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}No run data available${COLOR_RESET}\n"
 
 ### Average Policy Run Duration (NEW v1.5)
-printf "\n${COLOR_BOLD}⏱️ Policy Run Duration${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[TIME] Policy Run Duration${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 printf "  Sample size: $DURATION_SAMPLE_COUNT runs (last 14 days)\n"
 if [ "$DURATION_SAMPLE_COUNT" -gt 0 ]; then
   printf "  Average: ${COLOR_GREEN}${AVG_DURATION}s${COLOR_RESET}\n"
   printf "  Min: ${MIN_DURATION}s | Max: ${MAX_DURATION}s\n"
 else
-  printf "  ${COLOR_YELLOW}ℹ️  No completed runs in the last 14 days${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[INFO]  No completed runs in the last 14 days${COLOR_RESET}\n"
 fi
 
 ### Unprotected Namespaces (NEW v1.5)
-printf "\n${COLOR_BOLD}🛡️ Namespace Protection${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[SHIELD] Namespace Protection${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 printf "  ${COLOR_CYAN}(Based on $APP_POLICY_COUNT app policies, excludes DR/report system policies)${COLOR_RESET}\n"
 printf "  Total namespaces in cluster: $(echo "$ALL_NAMESPACES" | jq 'length')\n"
 printf "  Application namespaces (non-system): $APP_NS_COUNT\n"
 printf "  Explicitly targeted by policies: $PROTECTED_NS_COUNT\n"
 
 if [ "$APP_POLICY_COUNT" -eq 0 ]; then
-  printf "  ${COLOR_RED}⚠️  No application backup policies found!${COLOR_RESET}\n"
+  printf "  ${COLOR_RED}[WARN]  No application backup policies found!${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}    Only system policies (DR/report) detected.${COLOR_RESET}\n"
 elif [ "$HAS_CATCHALL_POLICY" = "true" ]; then
-  printf "  ${COLOR_GREEN}✅ Catch-all policy detected${COLOR_RESET} - All namespaces protected\n"
+  printf "  ${COLOR_GREEN}[OK] Catch-all policy detected${COLOR_RESET} - All namespaces protected\n"
   printf "  ${COLOR_CYAN}    Policy: $CATCHALL_POLICIES${COLOR_RESET}\n"
 elif [ "$APP_NS_COUNT" -eq 0 ] 2>/dev/null; then
-  printf "  ${COLOR_YELLOW}ℹ️  No application namespaces found${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[INFO]  No application namespaces found${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}    All namespaces match system patterns (openshift-*, kube-*, etc.)${COLOR_RESET}\n"
   if [ "$PROTECTED_NS_COUNT" -gt 0 ]; then
     printf "  ${COLOR_CYAN}    Policies target system namespaces: $(echo "$PROTECTED_NAMESPACES" | jq -r 'join(", ")')${COLOR_RESET}\n"
   fi
 elif [ "$HAS_COMPLEX_SELECTOR" = "true" ] && [ "$PROTECTED_NS_COUNT" -eq 0 ]; then
-  printf "  ${COLOR_YELLOW}⚠️  Cannot determine coverage${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]  Cannot determine coverage${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}    Policies use label-based selectors: $COMPLEX_SELECTOR_POLICIES${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}    Coverage depends on namespace labels matching policy selectors${COLOR_RESET}\n"
   if [ "$UNPROTECTED_COUNT" -gt 0 ]; then
@@ -1685,12 +2476,12 @@ elif [ "$HAS_COMPLEX_SELECTOR" = "true" ] && [ "$PROTECTED_NS_COUNT" -eq 0 ]; th
     echo "$UNPROTECTED_NS_JSON" | jq -r '.[:10][] | "      - \(.)"' 2>/dev/null
   fi
 elif [ "$UNPROTECTED_COUNT" -eq 0 ]; then
-  printf "  ${COLOR_GREEN}✅ All application namespaces are protected${COLOR_RESET}\n"
+  printf "  ${COLOR_GREEN}[OK] All application namespaces are protected${COLOR_RESET}\n"
   if [ "$PROTECTED_NS_COUNT" -gt 0 ]; then
     printf "  ${COLOR_CYAN}    Targeted: $(echo "$PROTECTED_NAMESPACES" | jq -r 'join(", ")')${COLOR_RESET}\n"
   fi
 else
-  printf "  ${COLOR_RED}⚠️  $UNPROTECTED_COUNT unprotected namespace(s) detected:${COLOR_RESET}\n"
+  printf "  ${COLOR_RED}[WARN]  $UNPROTECTED_COUNT unprotected namespace(s) detected:${COLOR_RESET}\n"
   echo "$UNPROTECTED_NS_JSON" | jq -r '.[:10][] | "    - \(.)"' 2>/dev/null
   if [ "$UNPROTECTED_COUNT" -gt 10 ]; then
     printf "    ... and $((UNPROTECTED_COUNT - 10)) more\n"
@@ -1702,12 +2493,12 @@ fi
 
 # Show complex selector info if applicable
 if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
-  printf "  ${COLOR_YELLOW}ℹ️  Policies with label selectors: $COMPLEX_SELECTOR_POLICIES${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[INFO]  Policies with label selectors: $COMPLEX_SELECTOR_POLICIES${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}    (May protect additional namespaces based on labels)${COLOR_RESET}\n"
 fi
 
 ### K10 Resource Limits (NEW v1.5)
-printf "\n${COLOR_BOLD}📊 K10 Resource Limits${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[STATS] K10 Resource Limits${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 printf "  K10 Pods: $K10_PODS_TOTAL\n"
 printf "  K10 Deployments: $K10_DEPLOYMENTS_TOTAL"
 if [ "${K10_MULTI_REPLICA:-0}" -gt 0 ] 2>/dev/null; then
@@ -1733,7 +2524,7 @@ if [ "${K10_DEPLOYMENTS_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
   printf "\n  Deployment Replicas:\n"
   echo "$K10_DEPLOYMENTS_SUMMARY" | jq -r '
     .deployments[]? | 
-    "  - \(.name): \(.ready)/\(.replicas) ready" + (if .replicas > 1 then " ★" else "" end)
+    "  - \(.name): \(.ready)/\(.replicas) ready" + (if .replicas > 1 then " *" else "" end)
   ' 2>/dev/null | head -30
   DEPLOY_COUNT=$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '.deployments | length' 2>/dev/null || echo "0")
   if [ "${DEPLOY_COUNT:-0}" -gt 30 ] 2>/dev/null; then
@@ -1759,17 +2550,17 @@ if [ "$K10_PODS_TOTAL" -gt 0 ] 2>/dev/null; then
 fi
 
 ### Catalog Size (NEW v1.5) + Free Space (NEW v1.6)
-printf "\n${COLOR_BOLD}📁 Catalog${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[CATALOG] Catalog${COLOR_RESET}\n"
 printf "  PVC Name:   $CATALOG_PVC_NAME\n"
 printf "  Size:       $CATALOG_SIZE\n"
 if [ "$CATALOG_FREE_PERCENT" != "N/A" ]; then
   # Color code based on free space: <10% red, <20% yellow, >=20% green
   if [ "$CATALOG_FREE_PERCENT" -lt 10 ] 2>/dev/null; then
     printf "  Free Space: ${COLOR_RED}${CATALOG_FREE_PERCENT}%%${COLOR_RESET} (Used: ${CATALOG_USED_PERCENT}%%)\n"
-    printf "  ${COLOR_RED}⚠️  WARNING: Catalog storage critically low!${COLOR_RESET}\n"
+    printf "  ${COLOR_RED}[WARN]  WARNING: Catalog storage critically low!${COLOR_RESET}\n"
   elif [ "$CATALOG_FREE_PERCENT" -lt 20 ] 2>/dev/null; then
     printf "  Free Space: ${COLOR_YELLOW}${CATALOG_FREE_PERCENT}%%${COLOR_RESET} (Used: ${CATALOG_USED_PERCENT}%%)\n"
-    printf "  ${COLOR_YELLOW}⚠️  Consider expanding catalog storage${COLOR_RESET}\n"
+    printf "  ${COLOR_YELLOW}[WARN]  Consider expanding catalog storage${COLOR_RESET}\n"
   else
     printf "  Free Space: ${COLOR_GREEN}${CATALOG_FREE_PERCENT}%%${COLOR_RESET} (Used: ${CATALOG_USED_PERCENT}%%)\n"
   fi
@@ -1778,53 +2569,227 @@ else
 fi
 
 ### Orphaned RestorePoints (NEW v1.5)
-printf "\n${COLOR_BOLD}🗑️ Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[TRASH] Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 if [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
-  printf "  ${COLOR_GREEN}✅ No orphaned RestorePoints detected${COLOR_RESET}\n"
+  printf "  ${COLOR_GREEN}[OK] No orphaned RestorePoints detected${COLOR_RESET}\n"
 else
-  printf "  ${COLOR_YELLOW}⚠️  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
   echo "$ORPHANED_RP" | jq -r '.[:5][] | "    - \(.name) [\(.namespace)]"' 2>/dev/null
 fi
 
 ### Blueprints & Bindings
-printf "\n${COLOR_BOLD}🔧 Kanister Blueprints${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[WRENCH] Kanister Blueprints${COLOR_RESET}\n"
 printf "  Blueprints: $BLUEPRINT_COUNT\n"
 if [ "$BLUEPRINT_COUNT" -gt 0 ]; then
   echo "$BLUEPRINTS_JSON" | jq -r '.items[] | "  - \(.metadata.name) (ns: \(.metadata.namespace // "cluster-scoped"))"'
 fi
 printf "  Blueprint Bindings: $BINDING_COUNT\n"
 if [ "$BINDING_COUNT" -gt 0 ]; then
-  echo "$BINDINGS_JSON" | jq -r '.items[] | "  - \(.metadata.name) → \(.spec.blueprintRef.name)"'
+  echo "$BINDINGS_JSON" | jq -r '.items[] | "  - \(.metadata.name) -> \(.spec.blueprintRef.name)"'
 fi
 if [ "$BLUEPRINT_COUNT" -eq 0 ] && [ "$BINDING_COUNT" -eq 0 ]; then
-  printf "  ${COLOR_YELLOW}ℹ️  Consider using Blueprints for database-consistent backups${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[INFO]  Consider using Blueprints for database-consistent backups${COLOR_RESET}\n"
 fi
 
 ### TransformSets
-printf "\n${COLOR_BOLD}🔄 Transform Sets${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[RESTORE] Transform Sets${COLOR_RESET}\n"
 if [ "$TRANSFORMSET_COUNT" -gt 0 ]; then
   printf "  TransformSets: ${COLOR_GREEN}$TRANSFORMSET_COUNT${COLOR_RESET}\n"
   echo "$TRANSFORMSETS_JSON" | jq -r '.items[] | "  - \(.metadata.name) (\(.spec.transforms | length) transforms)"'
 else
   printf "  TransformSets: 0\n"
-  printf "  ${COLOR_YELLOW}ℹ️  TransformSets are useful for DR and cross-cluster migrations${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[INFO]  TransformSets are useful for DR and cross-cluster migrations${COLOR_RESET}\n"
 fi
 
 ### Monitoring
-printf "\n${COLOR_BOLD}📈 Monitoring${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[CHART] Monitoring${COLOR_RESET}\n"
 if [ "$PROMETHEUS_ENABLED" = "true" ]; then
   printf "  Prometheus: ${COLOR_GREEN}ENABLED${COLOR_RESET} ($PROMETHEUS_RUNNING pods running)\n"
 else
   printf "  Prometheus: ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
 fi
 
+### Virtualization (NEW v1.7)
+printf "\n${COLOR_BOLD}[VM]  Virtualization${COLOR_RESET}\n"
+if [ "$VM_CRD_EXISTS" = "true" ]; then
+  printf "  Platform:           ${COLOR_BOLD}$VIRT_PLATFORM${COLOR_RESET}"
+  if [ "$VIRT_VERSION" != "unknown" ] && [ "$VIRT_VERSION" != "N/A" ]; then
+    printf " ($VIRT_VERSION)"
+  fi
+  printf "\n"
+  printf "  Total VMs:          $TOTAL_VMS"
+  if [ "$TOTAL_VMS" -gt 0 ]; then
+    printf " (${COLOR_GREEN}$VMS_RUNNING running${COLOR_RESET}"
+    if [ "$VMS_STOPPED" -gt 0 ]; then
+      printf ", ${COLOR_YELLOW}$VMS_STOPPED stopped${COLOR_RESET}"
+    fi
+    printf ")"
+  fi
+  printf "\n"
+
+  if [ "$TOTAL_VMS" -gt 0 ]; then
+    printf "  VM Policies:        $VM_POLICY_COUNT\n"
+
+    if [ "$VM_POLICY_COUNT" -gt 0 ]; then
+      echo "$VM_POLICY_DETAILS_JSON" | jq -r '.[] | "    - \(.name) [\(.frequency)] -> \(.vmRefs | join(", "))"'
+    fi
+
+    # Protection summary
+    if [ "$UNPROTECTED_VM_COUNT" -eq 0 ]; then
+      printf "  Protected VMs:      ${COLOR_GREEN}$PROTECTED_VM_COUNT / $TOTAL_VMS${COLOR_RESET}\n"
+    elif [ "$PROTECTED_VM_COUNT" -gt 0 ]; then
+      printf "  Protected VMs:      ${COLOR_YELLOW}$PROTECTED_VM_COUNT / $TOTAL_VMS${COLOR_RESET} ($UNPROTECTED_VM_COUNT unprotected)\n"
+    else
+      printf "  Protected VMs:      ${COLOR_RED}0 / $TOTAL_VMS${COLOR_RESET} (no coverage detected)\n"
+    fi
+    if [ "$VM_HAS_WILDCARDS" = "true" ]; then
+      printf "  ${COLOR_CYAN}[INFO]  Wildcard patterns detected - verify actual coverage${COLOR_RESET}\n"
+    fi
+
+    printf "  VM RestorePoints:   $VM_RESTORE_POINTS\n"
+
+    # Freeze configuration
+    printf "  Guest Freeze:       "
+    if [ "$VMS_FREEZE_DISABLED" -eq 0 ]; then
+      printf "${COLOR_GREEN}Enabled${COLOR_RESET} (timeout: $FREEZE_TIMEOUT)\n"
+    else
+      printf "${COLOR_YELLOW}$VMS_FREEZE_DISABLED VM(s) excluded${COLOR_RESET} (timeout: $FREEZE_TIMEOUT)\n"
+    fi
+
+    printf "  Snapshot Concurrency: $VM_SNAPSHOT_CONCURRENCY VM(s) at a time\n"
+  fi
+else
+  printf "  ${COLOR_CYAN}No KubeVirt / OpenShift Virtualization detected${COLOR_RESET}\n"
+fi
+
+
+### K10 Configuration & Security (NEW v1.8)
+printf "\n${COLOR_BOLD}${COLOR_BLUE}K10 Configuration${COLOR_RESET}"
+if [ "$HELM_VALUES_SOURCE" != "none" ]; then
+  printf " ${COLOR_CYAN}(source: $HELM_VALUES_SOURCE)${COLOR_RESET}"
+fi
+printf "\n"
+
+printf "\n  ${COLOR_BOLD}Security:${COLOR_RESET}\n"
+
+# Authentication
+printf "  Authentication:     "
+if [ "$AUTH_METHOD" != "none" ]; then
+  printf "${COLOR_GREEN}$AUTH_METHOD${COLOR_RESET}"
+  [ -n "$AUTH_DETAILS" ] && printf " ($AUTH_DETAILS)"
+  printf "\n"
+else
+  printf "${COLOR_RED}NONE${COLOR_RESET} (dashboard may be unauthenticated)\n"
+fi
+
+# KMS Encryption
+printf "  KMS Encryption:     "
+if [ "$ENCRYPTION_PROVIDER" != "none" ]; then
+  printf "${COLOR_GREEN}$ENCRYPTION_PROVIDER${COLOR_RESET}"
+  [ -n "$ENCRYPTION_DETAILS" ] && printf " ($ENCRYPTION_DETAILS)"
+  printf "\n"
+else
+  printf "${COLOR_CYAN}NOT CONFIGURED${COLOR_RESET} (optional)\n"
+fi
+
+# FIPS
+[ "$FIPS_ENABLED" = "true" ] && printf "  FIPS Mode:          ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+
+# Network Policies
+printf "  Network Policies:   "
+if [ "$NETPOL_ENABLED" = "true" ]; then
+  printf "${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+else
+  printf "${COLOR_YELLOW}DISABLED${COLOR_RESET}\n"
+fi
+
+# Audit Logging
+printf "  Audit Logging:      "
+if [ "$AUDIT_ENABLED" = "true" ]; then
+  printf "${COLOR_GREEN}ENABLED${COLOR_RESET} (targets: $AUDIT_TARGETS)\n"
+else
+  printf "${COLOR_YELLOW}NOT CONFIGURED${COLOR_RESET}\n"
+fi
+
+# Custom CA
+[ -n "$CUSTOM_CA" ] && printf "  Custom CA Cert:     ${COLOR_GREEN}$CUSTOM_CA${COLOR_RESET}\n"
+
+# Security Context
+printf "  Security Context:   runAsUser=$SC_RUN_AS_USER, fsGroup=$SC_FS_GROUP\n"
+
+# Platform-specific
+[ "$PLATFORM" = "OpenShift" ] && [ "$SCC_CREATED" = "true" ] && printf "  SCC:                ${COLOR_GREEN}Created${COLOR_RESET}\n"
+[ "$VAP_ENABLED" = "true" ] && printf "  VAP:                ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+
+# Dashboard Access
+printf "\n  ${COLOR_BOLD}Dashboard Access:${COLOR_RESET}\n"
+printf "  Method:             $DASHBOARD_ACCESS"
+[ -n "$DASHBOARD_HOST" ] && printf " ($DASHBOARD_HOST)"
+printf "\n"
+
+# Concurrency & Performance
+printf "\n  ${COLOR_BOLD}Concurrency Limiters:${COLOR_RESET}\n"
+printf "  Executor:           ${LIM_EXEC_REPLICAS} replicas x ${LIM_EXEC_THREADS} threads\n"
+printf "  CSI Snapshots:      $LIM_CSI_SNAP/cluster"
+[ "$LIM_CSI_SNAP" != "10" ] && printf " ${COLOR_CYAN}(tuned)${COLOR_RESET}"
+printf "\n"
+printf "  Exports:            $LIM_EXPORTS/cluster, $LIM_EXPORTS_ACT/action\n"
+printf "  Restores:           $LIM_RESTORES/cluster, $LIM_RESTORES_ACT/action\n"
+printf "  VM Snapshots:       $LIM_VM_SNAP/cluster"
+[ "$LIM_VM_SNAP" != "1" ] && printf " ${COLOR_CYAN}(tuned)${COLOR_RESET}"
+printf "\n"
+printf "  GVB:                $LIM_GVB/cluster\n"
+
+# Timeouts
+printf "\n  ${COLOR_BOLD}Timeouts (minutes):${COLOR_RESET}\n"
+printf "  Blueprint backup:   $TO_BP_BACKUP"
+[ "$TO_BP_BACKUP" != "45" ] && printf " ${COLOR_CYAN}(tuned)${COLOR_RESET}"
+printf "  | restore: $TO_BP_RESTORE"
+[ "$TO_BP_RESTORE" != "600" ] && printf " ${COLOR_CYAN}(tuned)${COLOR_RESET}"
+printf "\n"
+printf "  Blueprint hooks:    $TO_BP_HOOKS  | delete: $TO_BP_DELETE\n"
+printf "  Worker pod:         $TO_WORKER  | Job wait: $TO_JOB"
+[ "$TO_JOB" != "600" ] && printf " ${COLOR_CYAN}(tuned)${COLOR_RESET}"
+printf "\n"
+
+# Datastore Parallelism
+printf "\n  ${COLOR_BOLD}Datastore Parallelism:${COLOR_RESET}\n"
+printf "  File uploads:       $DS_UPLOADS  | downloads: $DS_DOWNLOADS\n"
+printf "  Block uploads:      $DS_BLK_UPLOADS  | downloads: $DS_BLK_DOWNLOADS\n"
+
+# Persistence
+printf "\n  ${COLOR_BOLD}Persistence:${COLOR_RESET}\n"
+printf "  Default size:       $PERSIST_SIZE\n"
+printf "  Catalog:            $PERSIST_CATALOG | Jobs: $PERSIST_JOBS\n"
+printf "  Logging:            $PERSIST_LOGGING | Metering: $PERSIST_METERING\n"
+[ -n "$PERSIST_SC" ] && printf "  Storage class:      $PERSIST_SC\n"
+
+# Excluded Apps
+printf "\n  ${COLOR_BOLD}Excluded Applications:${COLOR_RESET} $EXCLUDED_APPS_COUNT\n"
+if [ "$EXCLUDED_APPS_COUNT" -gt 0 ] 2>/dev/null; then
+  echo "$EXCLUDED_APPS_JSON" | jq -r '.[:10][] | "    - \(.)"' 2>/dev/null
+  [ "$EXCLUDED_APPS_COUNT" -gt 10 ] 2>/dev/null && printf "    ... and $((EXCLUDED_APPS_COUNT - 10)) more\n"
+fi
+
+# Features
+printf "\n  ${COLOR_BOLD}Features:${COLOR_RESET}\n"
+[ "$GVB_SIDECAR" = "true" ] && printf "  GVB Sidecar:        ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+[ "$LOG_LEVEL" != "info" ] && printf "  Log Level:          ${COLOR_YELLOW}$LOG_LEVEL${COLOR_RESET} (non-default)\n"
+[ -n "$CLUSTER_NAME" ] && printf "  Cluster Name:       $CLUSTER_NAME\n"
+printf "  Garbage Collector:  keepMax=$GC_KEEP_MAX, period=${GC_PERIOD}s\n"
+
+# Non-default summary
+if [ "$NON_DEFAULT_COUNT" -gt 0 ]; then
+  printf "\n  ${COLOR_CYAN}$NON_DEFAULT_COUNT non-default setting(s): $NON_DEFAULT_ITEMS${COLOR_RESET}\n"
+fi
+
 ### Policy Coverage Summary
-printf "\n${COLOR_BOLD}📊 Policy Coverage Summary${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[STATS] Policy Coverage Summary${COLOR_RESET}\n"
 printf "  ${COLOR_CYAN}(Excludes system policies: DR, reporting)${COLOR_RESET}\n"
 printf "  App policies targeting all namespaces: $ALL_NS_POLICIES\n"
 
 ### Data Usage
-printf "\n${COLOR_BOLD}${COLOR_BLUE}💾 Data Usage${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}${COLOR_BLUE}[DISK] Data Usage${COLOR_RESET}\n"
 printf "  Total PVCs:      $TOTAL_PVCS\n"
 printf "  Total Capacity:  ${TOTAL_CAPACITY_GB} GiB\n"
 printf "  Snapshot Data:   ~${SNAPSHOT_DATA} GiB\n"
@@ -1841,55 +2806,85 @@ else
 fi
 
 ### Best Practices Compliance
-printf "\n${COLOR_BOLD}📋 Best Practices Compliance${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}[LIST] Best Practices Compliance${COLOR_RESET}\n"
 
 # Disaster Recovery
 if [ "$BP_DR_STATUS" = "ENABLED" ]; then
-  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($KDR_MODE)\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($KDR_MODE)\n"
 else
-  printf "  ${COLOR_RED}❌${COLOR_RESET} Disaster Recovery:    ${COLOR_RED}NOT ENABLED${COLOR_RESET}\n"
+  printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Disaster Recovery:    ${COLOR_RED}NOT ENABLED${COLOR_RESET}\n"
 fi
 
 # Immutability
 if [ "$BP_IMMUTABILITY_STATUS" = "ENABLED" ]; then
-  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Immutability:         ${COLOR_GREEN}ENABLED${COLOR_RESET} ($IMMUTABLE_PROFILES profiles)\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Immutability:         ${COLOR_GREEN}ENABLED${COLOR_RESET} ($IMMUTABLE_PROFILES profiles)\n"
 else
-  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Immutability:         ${COLOR_YELLOW}NOT CONFIGURED${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Immutability:         ${COLOR_YELLOW}NOT CONFIGURED${COLOR_RESET}\n"
 fi
 
 # PolicyPresets
 if [ "$BP_PRESETS_STATUS" = "IN_USE" ]; then
-  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Policy Presets:       ${COLOR_GREEN}IN USE${COLOR_RESET} ($PRESET_COUNT presets)\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Policy Presets:       ${COLOR_GREEN}IN USE${COLOR_RESET} ($PRESET_COUNT presets)\n"
 else
-  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Policy Presets:       ${COLOR_YELLOW}NOT USED${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Policy Presets:       Not used (optional - standardizes SLAs)\n"
 fi
 
 # Monitoring
 if [ "$BP_MONITORING_STATUS" = "ENABLED" ]; then
-  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
 else
-  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Monitoring:           ${COLOR_YELLOW}NOT ENABLED${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Monitoring:           ${COLOR_YELLOW}NOT ENABLED${COLOR_RESET}\n"
 fi
 
 # Blueprints (informational)
 if [ "$BLUEPRINT_COUNT" -gt 0 ]; then
-  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Kanister Blueprints:  ${COLOR_GREEN}$BLUEPRINT_COUNT configured${COLOR_RESET}\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Kanister Blueprints:  ${COLOR_GREEN}$BLUEPRINT_COUNT configured${COLOR_RESET}\n"
 else
-  printf "  ${COLOR_YELLOW}ℹ️${COLOR_RESET}  Kanister Blueprints:  None (optional for app-consistent backups)\n"
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Kanister Blueprints:  None (optional for app-consistent backups)\n"
 fi
 
 # Resource Limits (NEW v1.5)
 if [ "$BP_RESOURCES_STATUS" = "CONFIGURED" ]; then
-  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Resource Limits:      ${COLOR_GREEN}CONFIGURED${COLOR_RESET}\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Resource Limits:      ${COLOR_GREEN}CONFIGURED${COLOR_RESET}\n"
 else
-  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Resource Limits:      ${COLOR_YELLOW}PARTIAL${COLOR_RESET} ($K10_CONTAINERS_WITHOUT_LIMITS containers without limits)\n"
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Resource Limits:      PARTIAL (optional - $K10_CONTAINERS_WITHOUT_LIMITS containers without limits)\n"
 fi
 
 # Namespace Protection (NEW v1.5)
 if [ "$BP_COVERAGE_STATUS" = "COMPLETE" ]; then
-  printf "  ${COLOR_GREEN}✅${COLOR_RESET} Namespace Protection: ${COLOR_GREEN}COMPLETE${COLOR_RESET}\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Namespace Protection: ${COLOR_GREEN}COMPLETE${COLOR_RESET}\n"
 else
-  printf "  ${COLOR_YELLOW}⚠️${COLOR_RESET}  Namespace Protection: ${COLOR_YELLOW}GAPS DETECTED${COLOR_RESET} ($UNPROTECTED_COUNT unprotected)\n"
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Namespace Protection: GAPS DETECTED (optional - $UNPROTECTED_COUNT unprotected)\n"
 fi
 
-printf "\n${COLOR_GREEN}✅ Discovery completed${COLOR_RESET}\n"
+# VM Protection (NEW v1.7)
+if [ "$BP_VM_PROTECTION_STATUS" = "COMPLETE" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} VM Protection:        ${COLOR_GREEN}COMPLETE${COLOR_RESET} ($TOTAL_VMS VMs)\n"
+elif [ "$BP_VM_PROTECTION_STATUS" = "PARTIAL" ]; then
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  VM Protection:        ${COLOR_YELLOW}PARTIAL${COLOR_RESET} ($PROTECTED_VM_COUNT/$TOTAL_VMS VMs protected)\n"
+elif [ "$BP_VM_PROTECTION_STATUS" = "NOT_CONFIGURED" ]; then
+  printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} VM Protection:        ${COLOR_RED}NOT CONFIGURED${COLOR_RESET} ($TOTAL_VMS VMs unprotected)\n"
+fi
+
+# Authentication (NEW v1.8)
+if [ "$BP_AUTH_STATUS" = "CONFIGURED" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Authentication:       ${COLOR_GREEN}CONFIGURED${COLOR_RESET} ($AUTH_METHOD)\n"
+else
+  printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Authentication:       ${COLOR_RED}NOT CONFIGURED${COLOR_RESET}\n"
+fi
+
+# KMS Encryption (NEW v1.8)
+if [ "$BP_ENCRYPTION_STATUS" = "CONFIGURED" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} KMS Encryption:       ${COLOR_GREEN}CONFIGURED${COLOR_RESET} ($ENCRYPTION_PROVIDER)\n"
+else
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET} KMS Encryption:       ${COLOR_CYAN}NOT CONFIGURED${COLOR_RESET} (optional - for data-at-rest encryption)\n"
+fi
+
+# Audit Logging (NEW v1.8)
+if [ "$BP_AUDIT_STATUS" = "ENABLED" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Audit Logging:        ${COLOR_GREEN}ENABLED${COLOR_RESET} ($AUDIT_TARGETS)\n"
+else
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Audit Logging:        Not enabled (optional - SIEM integration)\n"
+fi
+
+printf "\n${COLOR_GREEN}[OK] Discovery completed${COLOR_RESET}\n"
