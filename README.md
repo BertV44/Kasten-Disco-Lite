@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v1.6
+# Kasten Discovery Lite v1.8
 
 A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
 
@@ -6,161 +6,181 @@ A lightweight, read-only discovery script for Kasten K10 backup infrastructure a
 
 Kasten Discovery Lite provides instant visibility into your Kasten K10 deployment, extracting:
 
-- **License information** (customer, validity, node limits) with **Consumption tracking** ✨ NEW
-- **Health status** (pod health, backup success rates - now based on finished actions)
-- **Multi-Cluster detection** (primary/secondary/standalone) ✨ NEW
+- **K10 Helm Configuration** extraction with 3-tier fallback ✨ NEW
+- **Authentication** method detection (OIDC, LDAP, OpenShift, Basic, Token) ✨ NEW
+- **KMS Encryption** configuration (AWS KMS, Azure Key Vault, HashiCorp Vault) ✨ NEW
+- **FIPS mode**, **Network Policies**, **Audit Logging** detection ✨ NEW
+- **Dashboard access**, **Concurrency limiters**, **Timeouts**, **Datastore parallelism** ✨ NEW
+- **3 new Best Practices checks**: Authentication, KMS Encryption, Audit Logging ✨ NEW
+- **KubeVirt / OpenShift Virtualization** VM detection (Kasten 8.5+)
+- **VM-based policy detection** with protected/unprotected VM analysis
+- **License information** with **Consumption tracking**
+- **Health status** (pod health, backup success rates based on finished actions)
+- **Multi-Cluster detection** (primary/secondary/standalone)
 - **Disaster Recovery (KDR)** status and configuration
-- **Export Storage usage** with **Deduplication ratio** ✨ NEW
+- **Export Storage usage** with **Deduplication ratio**
 - **Policy Last Run Status** with duration
 - **Unprotected Namespaces** detection with label selector support
 - **Restore Actions History**
 - **K10 Resource Limits** (CPU/RAM per container) with **Deployment Replicas**
-- **Catalog Size**
+- **Catalog Size** with **Free Space** alerts
 - **Orphaned RestorePoints** detection
 - **Average Policy Run Duration**
 - **Location Profiles** with immutability detection (supports `Xh` and `Xd` formats)
 - **PolicyPresets** inventory
-- **Kanister Blueprints & BlueprintBindings** (cluster-wide detection) ✨ FIXED
+- **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status
 - **Protection coverage matrix** (excludes system policies: DR, report)
-- **Best Practices compliance** summary
+- **Best Practices compliance** summary (10 checks with severity levels)
 
-The script is designed to be **portable**, **POSIX-compliant**, and **support-grade**.
+The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
 
-## What's New in v1.6
+## What's New in v1.8
 
-### 📁 Catalog Free Space Percentage
+### K10 Helm Configuration Extraction
 
-Monitor catalog storage health with free space alerts:
+Full Kasten configuration discovery using a 3-tier extraction strategy:
 
-```text
-📁 Catalog
-  PVC Name:   catalog-pv-claim
-  Size:       20Gi
-  Free Space: 75% (Used: 25%)
-```
-
-When storage is running low:
+1. **Helm release secret** — Decodes the Helm 3 release secret (base64 → base64 → gzip → JSON) for user-supplied values
+2. **Helm CLI** — Falls back to `helm get values` if secret decoding fails
+3. **Resource inspection** — Inspects ConfigMaps, Secrets, and Deployments directly
 
 ```text
-📁 Catalog
-  PVC Name:   catalog-pv-claim
-  Size:       20Gi
-  Free Space: 8% (Used: 92%)
-  ⚠️  WARNING: Catalog storage critically low!
+K10 Configuration (source: helm-secret)
+
+  Security:
+  Authentication:     Token
+  KMS Encryption:     NOT CONFIGURED (optional)
+  Network Policies:   ENABLED
+  Audit Logging:      NOT CONFIGURED
+  Security Context:   runAsUser=1000, fsGroup=1000
+
+  Dashboard Access:
+  Method:             Route (k10-route.apps.cluster.example.com)
+
+  Concurrency Limiters:
+  Executor:           3 replicas x 8 threads
+  CSI Snapshots:      10/cluster
+  Exports:            10/cluster, 3/action
+  Restores:           10/cluster, 3/action
+  VM Snapshots:       1/cluster
+  GVB:                10/cluster
+
+  Timeouts (minutes):
+  Blueprint backup:   45  | restore: 600
+  Blueprint hooks:    20  | delete: 45
+  Worker pod:         15  | Job wait: 600
+
+  Datastore Parallelism:
+  File uploads:       8  | downloads: 8
+  Block uploads:      8  | downloads: 8
+
+  Persistence:
+  Default size:       20Gi
+  Catalog:            20Gi | Jobs: 20Gi
+  Logging:            20Gi | Metering: 2Gi
+
+  Excluded Applications: 5
+    - kube-system
+    - kube-ingress
+    - kube-node-lease
+    - kube-public
+    - kube-rook-ceph
+
+  Features:
+  Garbage Collector:  keepMax=1000, period=21600s
 ```
 
-### 📊 License Consumption Tracking
+### Security Analysis
 
-Monitor node usage against license limits:
+Authentication method detection with multi-source fallback:
 
 ```text
-📜 License Information
-  Customer:    ACME Corp
-  License ID:  abc123-def456
-  Status:      ✅ VALID
-  Valid from:  2024-01-01
-  Valid until: 2025-12-31
-  Node limit:  10 nodes
-
-  📊 License Consumption (NEW)
-  Cluster nodes: 7 / 10
-  Status:        ✅ OK
+  Authentication:     OIDC (https://idp.example.com)
+  KMS Encryption:     AWS KMS (CMK configured)
+  FIPS Mode:          ENABLED
+  Network Policies:   ENABLED
+  Audit Logging:      ENABLED (targets: stdout, S3)
+  Custom CA Cert:     my-ca-configmap
+  Security Context:   runAsUser=1000, fsGroup=1000
 ```
 
-When exceeding license limits:
+Supported authentication methods: OIDC, LDAP, OpenShift OAuth, Basic Auth, Token.
+Supported KMS encryption providers: AWS KMS, Azure Key Vault, HashiCorp Vault.
+
+### 3 New Best Practices Checks
 
 ```text
-  📊 License Consumption (NEW)
-  Cluster nodes: 12 / 10
-  Status:        ❌ EXCEEDED
+[LIST] Best Practices Compliance
+  [OK] Disaster Recovery:    ENABLED (Quick DR (No Snapshot))
+  [OK] Immutability:         ENABLED (1 profiles)
+  [OK] Authentication:       CONFIGURED (OIDC)             <-- NEW
+  [INFO] KMS Encryption:       NOT CONFIGURED (optional - for data-at-rest encryption)  <-- NEW
+  [INFO]  Audit Logging:     Not enabled (optional)        <-- NEW
 ```
 
-### 🌐 Multi-Cluster Detection
+Best Practices checks now have 3 severity levels:
 
-Automatically detect multi-cluster configurations:
+| Severity | Marker | Checks |
+|----------|--------|--------|
+| **Critical** | `[FAIL]` red | Disaster Recovery, Authentication |
+| **Warning** | `[WARN]` yellow | Immutability, Monitoring, VM Protection |
+| **Info** | `[INFO]` cyan | Policy Presets, KMS Encryption, Audit Logging, Blueprints, Resource Limits, Namespace Protection |
+
+### Performance Tuning Visibility
+
+Non-default values are highlighted with `(tuned)`:
 
 ```text
-🌐 Multi-Cluster Configuration (NEW)
-  Role: PRIMARY
-  Managed Clusters: 5
+  CSI Snapshots:      20/cluster (tuned)
+  Blueprint backup:   60 (tuned)  | restore: 600
 ```
 
-Or for secondary clusters:
+---
+
+## What's New in v1.7
+
+### KubeVirt / OpenShift Virtualization VM Detection
+
+Detect and assess virtual machine protection for Kasten 8.5+:
 
 ```text
-🌐 Multi-Cluster Configuration (NEW)
-  Role: SECONDARY
-  Primary Cluster: production-primary
-  Cluster ID: cluster-abc-123
+[VM]  Virtualization
+  Platform:           OpenShift Virtualization (4.15.2)
+  Total VMs:          12 (10 running, 2 stopped)
+  VM Policies:        2
+    - vm-backup-prod [@daily] -> vm-web-*, vm-db-*
+  Protected VMs:      12 / 12
+  VM RestorePoints:   24
+  Guest Freeze:       Enabled (timeout: 5m0s)
+  Snapshot Concurrency: 3 VM(s) at a time
 ```
 
-### 💾 Export Storage & Deduplication
-
-Track export storage usage with deduplication metrics:
-
-```text
-💾 Data Usage
-  Total PVCs:      45
-  Total Capacity:  500 GiB
-  Snapshot Data:   ~120 GiB
-  Export Storage:  85.3 GiB  (Dedup: 2.1x)    ← NEW
-```
-
-When k10-system-reports-policy is not enabled:
-
-```text
-  Export Storage:  N/A (enable k10-system-reports-policy)
-```
-
-### ✅ Fixed Success Rate Calculation
-
-Success rate now calculated from **finished actions only** (Complete + Failed), excluding Running/Pending/Cancelled for accurate metrics:
-
-```text
-💚 Health Status
-  Actions:
-    - Total:          150
-    - Finished:       145  (Complete + Failed)    ← NEW
-    - Backup Actions: 100 (95 completed, 3 failed)
-    - Export Actions: 50 (47 completed, 2 failed)
-  Success Rate:     97.9%  (based on finished actions)
-```
-
-### 🔧 Fixed Blueprints Detection
-
-Blueprints are now detected cluster-wide first, then namespace-scoped, ensuring all Kanister blueprints are found regardless of where they're installed:
-
-```text
-🔧 Kanister Blueprints
-  Blueprints: 5
-  - mysql-bp (ns: kasten-io)
-  - postgres-bp (ns: kasten-io)
-  - mongodb-bp (ns: cluster-scoped)
-  Blueprint Bindings: 3
-  - mysql-binding → mysql-bp
-  - postgres-binding → postgres-bp
-  - mongodb-binding → mongodb-bp
-```
-
-### 📜 Fixed Policy Retention Display
-
-Policy retention information now displays on a single consolidated line:
-
-```text
-📜 Kasten Policies
-  - daily-backup-all
-    Frequency: @daily
-    Actions: backup, export
-    Retention: hourly=24, daily=7, weekly=4, monthly=12, yearly=1
-```
+Features include:
+- VM-based policy detection (`virtualMachineRef` selector)
+- Protected vs unprotected VM analysis (VM policies + namespace coverage)
+- Virtualization platform detection (OpenShift Virt, SUSE/Harvester, KubeVirt)
+- Guest filesystem freeze configuration and timeout
+- VM snapshot concurrency settings
+- VM RestorePoints tracking (`appType=virtualMachine`)
+- VM Protection added to Best Practices compliance
 
 ---
 
 ## Previous Features
+
+### From v1.6
+
+- **License Consumption** tracking (node usage vs limit)
+- **Multi-Cluster detection** (primary/secondary/none)
+- **Export Storage usage** with **Deduplication ratio**
+- **Catalog Free Space** percentage (via pod exec)
+- **Fixed** Success Rate calculation (based on finished actions only)
+- **Fixed** Blueprints detection (cluster-wide check first)
+- **Fixed** Policy retention display (consolidated on single line)
 
 ### From v1.5
 
@@ -190,6 +210,7 @@ Policy retention information now displays on a single consolidated line:
 - `kubectl` or `oc` configured and authenticated
 - `jq` available in `$PATH`
 - Read permissions to Kasten K10 namespace
+- `base64`, `gunzip` for Helm secret decoding (optional; falls back gracefully)
 
 ---
 
@@ -199,26 +220,26 @@ Policy retention information now displays on a single consolidated line:
 
 ```bash
 # Human-readable output
-./kasten-discovery-lite-v1.6.sh kasten-io
+./KDL-v1.8.sh kasten-io
 
 # JSON output for automation
-./kasten-discovery-lite-v1.6.sh kasten-io --json > discovery.json
+./KDL-v1.8.sh kasten-io --json > discovery.json
 
 # Debug mode (shows detailed processing info)
-./kasten-discovery-lite-v1.6.sh kasten-io --debug
+./KDL-v1.8.sh kasten-io --debug
 
 # Without colors (for logging)
-./kasten-discovery-lite-v1.6.sh kasten-io --no-color
+./KDL-v1.8.sh kasten-io --no-color
 ```
 
 ### Generate HTML Report
 
 ```bash
 # First generate JSON
-./kasten-discovery-lite-v1.6.sh kasten-io --json > discovery.json
+./KDL-v1.8.sh kasten-io --json > discovery.json
 
 # Then convert to HTML
-./kdl-json-to-html-v1.6.sh discovery.json report.html
+./kdl-json-to-html.sh discovery.json report.html
 
 # Open the report
 open report.html   # macOS
@@ -230,21 +251,20 @@ xdg-open report.html   # Linux
 ## Output Sections
 
 ### 1. License Information
-Displays customer name, license ID, validity dates, node restrictions, and **consumption status** (NEW).
+Displays customer name, license ID, validity dates, node restrictions, and consumption status.
 
-### 2. Multi-Cluster Configuration (NEW)
-Shows multi-cluster role (primary/secondary/none) and related cluster details.
-
-### 3. Health Status
+### 2. Health Status
 - Pod counts (total, running, ready)
 - Backup/Export action statistics
-- **Success rate based on finished actions** (FIXED)
+- Success rate based on finished actions (Complete + Failed)
 - Restore points count
 
-### 4. Restore Actions History
-- Total restore actions
-- Completed/Failed/Running counts
+### 3. Restore Actions History
+- Total restore actions with completed/failed/running counts
 - Recent restore operations list
+
+### 4. Multi-Cluster Configuration
+Shows multi-cluster role (primary/secondary/none) and related cluster details.
 
 ### 5. Disaster Recovery (KDR)
 - Enabled/disabled status
@@ -266,7 +286,7 @@ Shows multi-cluster role (primary/secondary/none) and related cluster details.
 ### 9. Policies
 - Policy count breakdown (app vs system)
 - Frequency, actions, selectors
-- **Retention on single line** (FIXED)
+- Retention on single line
 
 ### 10. Policy Last Run Status
 - Last run timestamp and status for each policy
@@ -290,14 +310,14 @@ Shows multi-cluster role (primary/secondary/none) and related cluster details.
 
 ### 14. Catalog
 - PVC name and allocated size
-- **Free space percentage with alerts** (NEW)
+- Free space percentage with alerts
 
 ### 15. Orphaned RestorePoints
 - Count and list of orphaned restore points
 - Namespace association
 
 ### 16. Kanister Blueprints
-- **Cluster-wide detection** (FIXED)
+- Cluster-wide detection
 - Blueprint bindings
 
 ### 17. Transform Sets
@@ -306,101 +326,166 @@ Shows multi-cluster role (primary/secondary/none) and related cluster details.
 ### 18. Monitoring
 - Prometheus status
 
-### 19. Data Usage
+### 19. Virtualization (v1.7)
+- Platform detection (OpenShift Virt, SUSE/Harvester, KubeVirt)
+- VM inventory (running/stopped)
+- VM-based policies and protection coverage
+- Guest freeze configuration and snapshot concurrency
+- VM RestorePoints
+
+### 20. K10 Configuration (v1.8)
+- Helm values source (helm-secret, helm-cli, or resource inspection)
+- Authentication method and provider details
+- KMS Encryption provider and configuration
+- FIPS mode, Network Policies, Audit Logging
+- Dashboard access method (Ingress, Route, External Gateway)
+- Concurrency limiters and executor sizing
+- Timeout configuration (blueprints, workers, jobs)
+- Datastore parallelism settings
+- Persistence sizes and storage class
+- Excluded applications list
+- GVB sidecar injection, Garbage Collector settings
+- Security context, SCC (OpenShift), VAP
+
+### 21. Policy Coverage Summary
+- App policies targeting all namespaces
+
+### 22. Data Usage
 - Total PVCs and capacity
 - Snapshot data size
-- **Export Storage with Deduplication** (NEW)
+- Export Storage with Deduplication ratio
 
-### 20. Best Practices Compliance
-Summary of compliance with Kasten best practices.
+### 23. Best Practices Compliance
+Summary of compliance with Kasten best practices (10 checks).
 
 ---
 
 ## Best Practices Summary
 
-| Check | Status Values |
-|-------|---------------|
-| Disaster Recovery | ✅ ENABLED / ❌ NOT ENABLED |
-| Immutability | ✅ ENABLED / ⚠️ NOT CONFIGURED |
-| Policy Presets | ✅ IN USE / ⚠️ NOT USED |
-| Monitoring | ✅ ENABLED / ⚠️ NOT ENABLED |
-| Kanister Blueprints | ✅ X configured / ℹ️ None |
-| Resource Limits | ✅ CONFIGURED / ⚠️ PARTIAL |
-| Namespace Protection | ✅ COMPLETE / ⚠️ GAPS DETECTED |
+| Check | Severity | Status Values |
+|-------|----------|---------------|
+| **Disaster Recovery** | Critical | `[OK]` ENABLED / `[FAIL]` NOT ENABLED |
+| **Authentication** | Critical | `[OK]` CONFIGURED / `[FAIL]` NOT CONFIGURED |
+| **Immutability** | Warning | `[OK]` ENABLED / `[WARN]` NOT CONFIGURED |
+| **Monitoring** | Warning | `[OK]` ENABLED / `[WARN]` NOT ENABLED |
+| **KMS Encryption** | Info | `[OK]` CONFIGURED / `[INFO]` NOT CONFIGURED |
+| **VM Protection** | Warning | `[OK]` COMPLETE / `[WARN]` PARTIAL / `[FAIL]` NOT CONFIGURED |
+| **Policy Presets** | Optional | `[OK]` IN USE / `[INFO]` Not used |
+| **Kanister Blueprints** | Optional | `[OK]` X configured / `[INFO]` None |
+| **Resource Limits** | Optional | `[OK]` CONFIGURED / `[INFO]` PARTIAL |
+| **Namespace Protection** | Optional | `[OK]` COMPLETE / `[INFO]` GAPS DETECTED |
+| **Audit Logging** | Optional | `[OK]` ENABLED / `[INFO]` Not enabled |
 
 ---
 
 ## JSON Output
 
-`--json` emits a structured JSON document. New/changed fields in v1.6:
+`--json` emits a structured JSON document. New/changed fields in v1.8:
 
 ```json
 {
-  "license": {
-    "customer": "ACME Corp",
-    "id": "abc123",
-    "status": "VALID",
-    "dateStart": "2024-01-01",
-    "dateEnd": "2025-12-31",
-    "restrictions": {
-      "nodes": "10"
+  "k10Configuration": {
+    "source": "helm-secret",
+    "security": {
+      "authentication": {
+        "method": "OIDC",
+        "details": "https://idp.example.com"
+      },
+      "encryption": {
+        "provider": "AWS KMS",
+        "details": "CMK configured"
+      },
+      "fipsMode": true,
+      "networkPolicies": true,
+      "auditLogging": {
+        "enabled": true,
+        "targets": "stdout, S3"
+      },
+      "customCaCertificate": "my-ca-configmap",
+      "securityContext": {
+        "runAsUser": "1000",
+        "fsGroup": "1000"
+      }
     },
-    "consumption": {
-      "currentNodes": 7,
-      "nodeLimit": "10",
-      "status": "OK"
-    }
-  },
-
-  "multiCluster": {
-    "role": "primary",
-    "clusterCount": 5,
-    "primaryName": null,
-    "clusterId": null
-  },
-
-  "health": {
-    "backups": {
-      "totalActions": 150,
-      "finishedActions": 145,
-      "completedActions": 142,
-      "failedActions": 3,
-      "successRate": "97.9",
-      "successRateNote": "Calculated from finished actions (Complete + Failed) only"
-    }
-  },
-
-  "dataUsage": {
-    "totalPvcs": 45,
-    "totalCapacityGi": "500",
-    "snapshotDataGi": 120,
-    "exportStorage": {
-      "display": "85.3 GiB",
-      "physicalBytes": 91590451200,
-      "logicalBytes": 192339947520,
-      "dataSource": "reports"
+    "dashboardAccess": {
+      "method": "Route",
+      "host": "k10-route.apps.cluster.example.com"
     },
-    "deduplication": {
-      "ratio": "2.1",
-      "display": "2.1x"
-    }
-  },
-
-  "kanister": {
-    "blueprints": {
+    "concurrencyLimiters": {
+      "executorReplicas": "3",
+      "executorThreads": "8",
+      "csiSnapshotsPerCluster": "10",
+      "snapshotExportsPerCluster": "10",
+      "vmSnapshotsPerCluster": "1",
+      "genericVolumeBackupsPerCluster": "10"
+    },
+    "timeouts": {
+      "blueprintBackup": "45",
+      "blueprintRestore": "600",
+      "blueprintHooks": "20",
+      "workerPodReady": "15",
+      "jobWait": "600"
+    },
+    "datastore": {
+      "parallelUploads": "8",
+      "parallelDownloads": "8",
+      "parallelBlockUploads": "8",
+      "parallelBlockDownloads": "8"
+    },
+    "persistence": {
+      "defaultSize": "20Gi",
+      "catalogSize": "20Gi",
+      "jobsSize": "20Gi",
+      "loggingSize": "20Gi",
+      "meteringSize": "2Gi"
+    },
+    "excludedApps": {
       "count": 5,
-      "items": [
-        {"name": "mysql-bp", "namespace": "kasten-io", "actions": ["backup", "restore"]},
-        {"name": "mongodb-bp", "namespace": null, "actions": ["backup", "restore"]}
-      ]
+      "items": ["kube-system", "kube-ingress", "kube-node-lease", "kube-public", "kube-rook-ceph"]
+    },
+    "features": {
+      "gvbSidecarInjection": false
+    },
+    "garbageCollector": {
+      "keepMaxActions": "1000",
+      "daemonPeriod": "21600"
     }
   },
 
-  "catalog": {
-    "pvcName": "catalog-pv-claim",
-    "size": "20Gi",
-    "freeSpacePercent": 75,
-    "usedPercent": 25
+  "virtualization": {
+    "platform": "OpenShift Virtualization",
+    "version": "4.15.2",
+    "totalVMs": 12,
+    "vmsRunning": 10,
+    "vmsStopped": 2,
+    "vmPolicies": {
+      "count": 2,
+      "items": [{"name": "vm-backup-prod", "frequency": "@daily", "vmRefs": ["vm-web-*"]}]
+    },
+    "protection": {
+      "protectedVMs": 12,
+      "unprotectedVMs": 0,
+      "note": "covered by namespace-level policies"
+    },
+    "vmRestorePoints": 24,
+    "freezeConfiguration": {
+      "timeout": "5m0s",
+      "vmsWithFreezeDisabled": 0
+    },
+    "snapshotConcurrency": "3"
+  },
+
+  "bestPractices": {
+    "disasterRecovery": "ENABLED",
+    "immutability": "ENABLED",
+    "policyPresets": "IN_USE",
+    "monitoring": "ENABLED",
+    "resourceLimits": "CONFIGURED",
+    "namespaceProtection": "COMPLETE",
+    "vmProtection": "COMPLETE",
+    "authentication": "CONFIGURED",
+    "encryption": "CONFIGURED",
+    "auditLogging": "ENABLED"
   }
 }
 ```
@@ -419,7 +504,7 @@ metadata:
   namespace: kasten-io
 rules:
 - apiGroups: [""]
-  resources: ["pods", "secrets", "configmaps", "persistentvolumeclaims", "nodes"]
+  resources: ["pods", "pods/exec", "secrets", "configmaps", "persistentvolumeclaims", "services"]
   verbs: ["get", "list"]
 - apiGroups: ["apps"]
   resources: ["deployments"]
@@ -442,12 +527,25 @@ rules:
 - apiGroups: ["dist.kio.kasten.io"]
   resources: ["clusters"]
   verbs: ["get", "list"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["networkpolicies", "ingresses"]
+  verbs: ["get", "list"]
+- apiGroups: ["admissionregistration.k8s.io"]
+  resources: ["mutatingwebhookconfigurations"]
+  verbs: ["get", "list"]
 ```
 
-**Cluster-level permissions** (for namespace analysis and multi-cluster):
+**Cluster-level permissions** (for namespace analysis, multi-cluster, and VM detection):
 - `get`, `list` on `namespaces` (cluster-scoped)
 - `get`, `list` on `nodes` (cluster-scoped)
 - `get` on namespace `kasten-io-mc` (for multi-cluster primary detection)
+- `get`, `list` on `virtualmachines.kubevirt.io` (for VM detection)
+- `get`, `list` on `volumesnapshots` (for snapshot data)
+
+**OpenShift-specific**:
+- `get`, `list` on `routes` (for dashboard access detection)
+- `get`, `list` on `clusterserviceversions` in `openshift-cnv` (for CNV version)
+- `get`, `list` on `securitycontextconstraints` (for SCC detection)
 
 ---
 
@@ -458,18 +556,52 @@ Based on the official [Veeam Kasten Best Practices Guide](https://docs.kasten.io
 | Best Practice | What We Check | Why It Matters |
 |---------------|---------------|----------------|
 | **Disaster Recovery** | k10-disaster-recovery-policy exists | Critical for recovering Kasten itself |
+| **Authentication** | Auth method configured (OIDC, LDAP, etc.) | Prevents unauthorized dashboard access |
 | **Immutability** | Profiles with protectionPeriod | Protection against ransomware |
-| **PolicyPresets** | PolicyPresets defined and used | Standardizes SLAs across teams |
 | **Monitoring** | Prometheus pods running | Visibility into backup operations |
+| **KMS Encryption** | KMS encryption provider configured | Data-at-rest protection (optional) |
+| **VM Protection** | VMs covered by policies | Virtual machine backup completeness |
+| **PolicyPresets** | PolicyPresets defined and used | Standardizes SLAs across teams |
 | **Blueprints** | Kanister Blueprints configured | App-consistent backups for databases |
 | **Resource Limits** | K10 containers have limits set | Prevents resource contention |
 | **Namespace Protection** | All app namespaces covered | No gaps in protection |
+| **Audit Logging** | SIEM/audit logging enabled | Compliance and forensics |
 
 ---
 
 ## Version History
 
-- **v1.6** (Current)
+- **v1.8** (Current)
+  - K10 Helm Configuration extraction (3-tier: secret → CLI → resource inspection)
+  - Authentication method detection (OIDC, LDAP, OpenShift, Basic, Token)
+  - KMS Encryption configuration (AWS KMS, Azure Key Vault, HashiCorp Vault)
+  - FIPS mode detection
+  - Network Policy status
+  - SIEM / Audit Logging configuration
+  - Dashboard access method (Ingress, Route, External Gateway)
+  - Concurrency limiters & executor sizing
+  - Timeout configuration (blueprints, workers, jobs)
+  - Datastore parallelism settings
+  - Excluded applications list
+  - GVB sidecar injection status
+  - Security context, Custom CA, SCC, VAP
+  - Persistence sizes and storage class
+  - Garbage Collector configuration
+  - 3 new Best Practices: Authentication (critical), KMS Encryption (info), Audit Logging (optional)
+  - Best Practices severity levels (critical/warning/optional)
+  - Pure ASCII output (no emoji encoding issues)
+
+- **v1.7**
+  - KubeVirt / OpenShift Virtualization VM detection (Kasten 8.5+)
+  - VM-based policy detection (virtualMachineRef selector)
+  - Protected vs unprotected VM analysis
+  - VM RestorePoints tracking (appType=virtualMachine)
+  - Guest filesystem freeze configuration detection
+  - VM snapshot concurrency settings
+  - Virtualization platform detection (OpenShift Virt, SUSE/Harvester)
+  - VM protection added to Best Practices compliance
+
+- **v1.6**
   - Added License Consumption tracking (node usage vs limit)
   - Added Multi-Cluster detection (primary/secondary/none)
   - Added Export Storage usage with Deduplication ratio
@@ -481,7 +613,7 @@ Based on the official [Veeam Kasten Best Practices Guide](https://docs.kasten.io
 
 - **v1.5.1**
   - Added Deployment Replicas display (configured vs ready replicas)
-  - Highlight multi-replica deployments with ★
+  - Highlight multi-replica deployments with star marker
   - Enhanced K10 Resources JSON output with deployments array
 
 - **v1.5**
@@ -528,6 +660,23 @@ Based on the official [Veeam Kasten Best Practices Guide](https://docs.kasten.io
 
 ## Troubleshooting
 
+### Helm configuration shows "source: none"
+
+The script tries 3 methods to extract Helm values:
+1. Decode the Helm release secret (`name=k10,owner=helm`)
+2. Use `helm get values` CLI
+3. Inspect ConfigMaps and resources directly
+
+If all fail, configuration values fall back to defaults. Ensure you have read permissions on secrets in the Kasten namespace.
+
+```bash
+# Check if the Helm secret exists
+kubectl -n kasten-io get secrets -l "name=k10,owner=helm"
+
+# Verify decoding works
+kubectl -n kasten-io get secret sh.helm.release.v1.k10.v1 -o jsonpath='{.data.release}' | base64 -d | base64 -d | gunzip | jq '.config'
+```
+
 ### Catalog free space shows "N/A"
 
 The script exec's into the catalog pod to check disk usage. Ensure:
@@ -555,9 +704,18 @@ Verify the `mc-join-config` ConfigMap exists in the Kasten namespace:
 kubectl -n kasten-io get configmap mc-join-config
 ```
 
+### VM detection shows 0 VMs but VMs exist
+
+Ensure the VirtualMachine CRD exists and you have cluster-wide read access:
+
+```bash
+kubectl get crd virtualmachines.kubevirt.io
+kubectl get virtualmachines -A
+```
+
 ### Blueprints count is 0 but blueprints exist
 
-In v1.6, blueprints are detected cluster-wide first. Verify with:
+Blueprints are detected cluster-wide first, then namespace-scoped. Verify with:
 
 ```bash
 kubectl get blueprints.cr.kanister.io -A
@@ -573,43 +731,48 @@ kubectl -n kasten-io get runactions
 
 ### Success rate seems incorrect
 
-v1.6 calculates success rate from **finished actions only** (Complete + Failed), excluding Running/Pending/Cancelled. This provides more accurate metrics.
+Success rate is calculated from **finished actions only** (Complete + Failed), excluding Running/Pending/Cancelled. This provides more accurate metrics.
 
 ### Debug mode for troubleshooting
 
 Use `--debug` flag to see detailed processing information:
 
 ```bash
-./kasten-discovery-lite-v1.6.sh kasten-io --debug
+./KDL-v1.8.sh kasten-io --debug
 ```
 
 This shows:
-- Namespace validation
-- Platform detection
+- Namespace validation and platform detection
+- Helm values source and extraction status
+- Authentication and KMS encryption detection
 - Multi-cluster detection
 - License consumption calculation
 - Policy counts (app vs system)
-- Export storage metrics
-- Deduplication ratio calculation
+- VM detection and protection analysis
+- Export storage and deduplication metrics
+- All configuration values extracted
 
 ---
 
 ## Use Cases
 
-1. **Pre-migration assessment** - Understand current protection state
-2. **Compliance audits** - Generate snapshot of policies and retention
-3. **Health checks** - Monitor backup success rates and policy execution
-4. **License management** - Track expiration dates and node consumption
-5. **Coverage analysis** - Identify unprotected namespaces
-6. **Support tickets** - Provide detailed environment information
-7. **Automation** - JSON output for CI/CD pipelines
-8. **Documentation** - Generate HTML reports for stakeholders
-9. **Best Practices validation** - Ensure compliance with Kasten recommendations
-10. **Performance monitoring** - Track policy run durations
-11. **Cleanup tasks** - Identify orphaned RestorePoints
-12. **Resource planning** - Review K10 resource allocation
-13. **Multi-cluster management** - Identify cluster roles and relationships
-14. **Storage optimization** - Monitor export storage and deduplication efficiency
+1. **Pre-migration assessment** — Understand current protection state
+2. **Compliance audits** — Generate snapshot of policies and retention
+3. **Health checks** — Monitor backup success rates and policy execution
+4. **License management** — Track expiration dates and node consumption
+5. **Coverage analysis** — Identify unprotected namespaces and VMs
+6. **Support tickets** — Provide detailed environment information
+7. **Automation** — JSON output for CI/CD pipelines
+8. **Documentation** — Generate HTML reports for stakeholders
+9. **Best Practices validation** — Ensure compliance with Kasten recommendations
+10. **Performance monitoring** — Track policy run durations
+11. **Cleanup tasks** — Identify orphaned RestorePoints
+12. **Resource planning** — Review K10 resource allocation
+13. **Multi-cluster management** — Identify cluster roles and relationships
+14. **Storage optimization** — Monitor export storage and deduplication efficiency
+15. **Security assessment** — Validate authentication, KMS encryption, and audit logging
+16. **Configuration review** — Review concurrency, timeouts, and tuning parameters
+17. **VM protection audit** — Ensure virtual machine backup completeness
 
 ---
 
@@ -628,8 +791,8 @@ It does **not**:
 
 | File | Description |
 |------|-------------|
-| `kasten-discovery-lite-v1.6.sh` | Main discovery script |
-| `kdl-json-to-html-v1.6.sh` | HTML report generator |
+| `KDL-v1.8.sh` | Main discovery script |
+| `kdl-json-to-html.sh` | HTML report generator |
 | `README.md` | This documentation |
 
 ---
