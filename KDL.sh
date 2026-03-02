@@ -2194,7 +2194,7 @@ if [ "$MODE" = "json" ]; then
               end
             ),
             retention: (.spec.retention // {}),
-            exportRetention: (.spec.actions[] | select(.action == "export") | .exportParameters.retention // null),
+            exportRetention: (.spec.actions[] | select(.action == "export") | .retention // null),
             presetRef: .spec.presetRef.name
           }
         ]
@@ -2412,22 +2412,27 @@ else "" end) +
    end) + "\n" +
 "    Retention: " +
 (
-  if .spec.retention then
-    ([.spec.retention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", "))
-  elif (.spec.actions | any(has("snapshotRetention") or has("exportParameters")))
-  then
-    (
-      [.spec.actions[] |
-        if .snapshotRetention then
-          "Snapshot(" + ([.snapshotRetention | to_entries[] | "\(.key)=\(.value)"] | join(", ")) + ")"
-        elif .exportParameters?.retention then
-          "Export(" + ([.exportParameters.retention | to_entries[] | "\(.key)=\(.value)"] | join(", ")) + ")"
-        else empty end
-      ] | join("; ")
-    )
-  else
-    "not defined"
-  end
+  # Build snapshot retention string (from top-level .spec.retention or action-level .snapshotRetention)
+  (
+    if .spec.retention and (.spec.retention | length) > 0 then
+      "Snapshot(" + ([.spec.retention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", ")) + ")"
+    elif ([.spec.actions[]? | select(.snapshotRetention and (.snapshotRetention | length) > 0)] | length) > 0 then
+      ([.spec.actions[]? | select(.snapshotRetention and (.snapshotRetention | length) > 0) |
+        "Snapshot(" + ([.snapshotRetention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", ")) + ")"
+      ] | first)
+    else null end
+  ) as $snap |
+  # Build export retention string (from action-level .retention on export actions)
+  (
+    [.spec.actions[]? | select(.action == "export" and .retention != null and (.retention | length) > 0) |
+      "Export(" + ([.retention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", ")) + ")"
+    ] | if length > 0 then first else null end
+  ) as $exp |
+  # Combine
+  if $snap and $exp then $snap + " | " + $exp
+  elif $snap then $snap
+  elif $exp then $exp
+  else "not defined" end
 ) + "\n"
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse policy details${COLOR_RESET}\n"
 fi
