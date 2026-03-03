@@ -2,9 +2,25 @@
 set -eu
 
 ##############################################################################
-# Kasten Discovery Lite v1.8
+# Kasten Discovery Lite v1.8.1
 # Author: Bertrand CASTAGNET - EMEA TAM
 # 
+# Changes in v1.8.1:
+# - Fixed export retention display (was reading wrong JSON path)
+# - Deterministic retention key ordering (daily/weekly/monthly/yearly)
+# - Export frequency and profile displayed per-policy
+# - Added --help, --version, --output FILE flags
+# - Execution timer (completion time display)
+# - Progress indicators during data collection
+# - Parallel kubectl CRD fetches (~13 resources fetched simultaneously)
+# - Shared pod/deployment data (eliminates 4+ redundant kubectl calls)
+# - Replaced bc dependency with awk (works on Alpine/BusyBox)
+# - Portable date fallback (GNU/BSD/awk for 14-day calculation)
+# - Temp file cleanup via trap (EXIT/INT/TERM)
+# - safe_json() / safe_int() helpers replace ~30 duplicate validation blocks
+# - --argjson safety validation before JSON output (prevents silent failures)
+# - KDL version field added to JSON output
+#
 # Changes in v1.8:
 # - K10 Helm Configuration extraction (from Helm release secret)
 # - Authentication method detection (OIDC, LDAP, OpenShift, basic, token)
@@ -64,7 +80,37 @@ set -eu
 ### -------------------------
 ### Args & flags
 ### -------------------------
-NAMESPACE="${1:?Usage: $0 <namespace> [--debug|--json|--no-color]}"
+KDL_VERSION="1.8.1"
+OUTPUT_FILE=""
+
+show_help() {
+  cat <<EOF
+Kasten Discovery Lite v${KDL_VERSION}
+Usage: $0 <namespace> [options]
+
+Options:
+  --json        Output in JSON format
+  --debug       Enable debug messages
+  --no-color    Disable colored output
+  --output FILE Write output to FILE (auto-detects .json)
+  --version     Show version and exit
+  --help        Show this help message
+
+Examples:
+  $0 kasten-io
+  $0 kasten-io --json --output discovery.json
+  $0 kasten-io --debug --no-color
+EOF
+  exit 0
+}
+
+# Handle --help and --version before requiring namespace
+case "${1:-}" in
+  --help|-h) show_help ;;
+  --version|-V) echo "Kasten Discovery Lite v${KDL_VERSION}"; exit 0 ;;
+esac
+
+NAMESPACE="${1:?Usage: $0 <namespace> [--debug|--json|--no-color|--output FILE|--help|--version]}"
 MODE="human"
 DEBUG=false
 USE_COLOR=true
@@ -75,10 +121,26 @@ while [ $# -gt 0 ]; do
     --json) MODE="json" ;;
     --debug) DEBUG=true ;;
     --no-color) USE_COLOR=false ;;
+    --output) OUTPUT_FILE="${2:?--output requires a filename}"; shift ;;
+    --version|-V) echo "Kasten Discovery Lite v${KDL_VERSION}"; exit 0 ;;
+    --help|-h) show_help ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
   esac
   shift
 done
+
+# Auto-detect JSON mode from output file extension
+if [ -n "$OUTPUT_FILE" ] && echo "$OUTPUT_FILE" | grep -q '\.json$'; then
+  MODE="json"
+fi
+
+# Disable colors when writing to file
+if [ -n "$OUTPUT_FILE" ]; then
+  USE_COLOR=false
+fi
+
+# Start execution timer
+START_TIME=$(date +%s)
 
 ### -------------------------
 ### Color support
@@ -106,13 +168,56 @@ fi
 ### -------------------------
 debug() {
   if [ "$DEBUG" = true ]; then
-    echo "${COLOR_YELLOW}[DEBUG] DEBUG: $*${COLOR_RESET}" >&2
+    echo "${COLOR_YELLOW}[DEBUG] $*${COLOR_RESET}" >&2
   fi
 }
 
 error() {
   echo "${COLOR_RED}[FAIL] ERROR: $*${COLOR_RESET}" >&2
 }
+
+progress() {
+  if [ "$MODE" = "human" ] && [ -z "$OUTPUT_FILE" ]; then
+    printf "${COLOR_CYAN}  Collecting %s...${COLOR_RESET}\r" "$1" >&2
+  fi
+}
+
+# Sanitize raw kubectl JSON: strip control chars, validate, fallback
+EMPTY_ITEMS='{"items":[]}'
+safe_json() {
+  _raw="$1"
+  _default="${2:-$EMPTY_ITEMS}"
+  _result=$(echo "$_raw" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null) || _result=""
+  if [ -n "$_result" ] && echo "$_result" | jq -e '.' >/dev/null 2>&1; then
+    echo "$_result"
+  else
+    echo "$_default"
+  fi
+}
+
+# Safe integer extraction: returns 0 on empty/null/non-numeric
+safe_int() {
+  _val="$1"
+  _val=$(echo "$_val" | tr -d '[:space:]')
+  case "$_val" in
+    ''|null|N/A) echo "0" ;;
+    *[!0-9-]*) echo "0" ;;
+    *) echo "$_val" ;;
+  esac
+}
+
+# Compare numbers with awk (replaces bc dependency)
+num_gt() {
+  awk "BEGIN {exit ($1 > $2) ? 0 : 1}" 2>/dev/null
+}
+
+### -------------------------
+### Temp file management
+### -------------------------
+TEMP_DIR=$(mktemp -d /tmp/kdl_XXXXXX 2>/dev/null || echo "/tmp/kdl_$$")
+mkdir -p "$TEMP_DIR" 2>/dev/null
+cleanup() { rm -rf "$TEMP_DIR"; }
+trap cleanup EXIT INT TERM
 
 ### -------------------------
 ### Namespace validation
@@ -179,6 +284,39 @@ else
 fi
 [ -z "$KASTEN_VERSION" ] && KASTEN_VERSION="unknown"
 debug "Kasten version: $KASTEN_VERSION"
+
+### -------------------------
+### Shared data collection (fetch once, reuse everywhere)
+### -------------------------
+progress "pods & deployments"
+kubectl -n "$NAMESPACE" get pods -o json > "$TEMP_DIR/pods.json" 2>/dev/null || echo '{"items":[]}' > "$TEMP_DIR/pods.json"
+kubectl -n "$NAMESPACE" get deployments -o json > "$TEMP_DIR/deploys.json" 2>/dev/null || echo '{"items":[]}' > "$TEMP_DIR/deploys.json"
+
+# Validate shared data
+jq -e '.items' "$TEMP_DIR/pods.json" >/dev/null 2>&1 || echo '{"items":[]}' > "$TEMP_DIR/pods.json"
+jq -e '.items' "$TEMP_DIR/deploys.json" >/dev/null 2>&1 || echo '{"items":[]}' > "$TEMP_DIR/deploys.json"
+
+### -------------------------
+### Parallel CRD resource collection
+### -------------------------
+progress "K10 resources"
+
+kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get policies -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get runactions.actions.kio.kasten.io -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get restoreactions.actions.kio.kasten.io -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get backupactions.actions.kio.kasten.io -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get exportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get restorepoints.apps.kio.kasten.io -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json > "$TEMP_DIR/presets_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json > "$TEMP_DIR/transformsets_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json > "$TEMP_DIR/reports_raw.json" 2>/dev/null &
+kubectl get namespaces -o json > "$TEMP_DIR/namespaces_raw.json" 2>/dev/null &
+kubectl get pvc --all-namespaces -o json > "$TEMP_DIR/pvcs_raw.json" 2>/dev/null &
+kubectl get volumesnapshots --all-namespaces -o json > "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null &
+wait
+
+debug "Parallel fetch complete"
 
 ### -------------------------
 ### License info
@@ -269,14 +407,10 @@ debug "License consumption: $CLUSTER_NODE_COUNT nodes / $LICENSE_NODES_LIMIT (St
 ### -------------------------
 ### Profiles
 ### -------------------------
-PROFILES_JSON=$(kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-# Validate JSON
-if ! echo "$PROFILES_JSON" | jq -e '.' >/dev/null 2>&1; then
-  debug "Invalid profiles JSON, using empty"
-  PROFILES_JSON='{"items":[]}'
-fi
+progress "profiles"
+PROFILES_JSON=$(safe_json "$(cat "$TEMP_DIR/profiles_raw.json" 2>/dev/null)")
 PROFILE_COUNT=$(echo "$PROFILES_JSON" | jq '.items | length // 0')
-[ -z "$PROFILE_COUNT" ] && PROFILE_COUNT=0
+PROFILE_COUNT=$(safe_int "$PROFILE_COUNT")
 
 # Detect immutability - search for protectionPeriod anywhere in spec
 # Use recursive descent to find it regardless of exact path
@@ -312,9 +446,9 @@ debug "Profiles: $PROFILE_COUNT (Immutable: $IMMUTABLE_PROFILES, Days: $IMMUTABI
 ### -------------------------
 ### Policies
 ### -------------------------
-POLICIES_RAW=$(kubectl -n "$NAMESPACE" get policies -o json 2>/dev/null || echo '{"items":[]}')
-# Validate and sanitize JSON - remove control characters that can break parsing
-POLICIES_JSON=$(echo "$POLICIES_RAW" | tr -d '\000-\011\013-\037' | jq -c '
+progress "policies"
+# Sanitize: strip control chars and remove sensitive fields from export params
+POLICIES_JSON=$(cat "$TEMP_DIR/policies_raw.json" 2>/dev/null | tr -d '\000-\011\013-\037' | jq -c '
   .items |= (. // [] | map(
     .spec.actions |= (. // [] | map(
       if .exportParameters then
@@ -324,14 +458,13 @@ POLICIES_JSON=$(echo "$POLICIES_RAW" | tr -d '\000-\011\013-\037' | jq -c '
   ))
 ' 2>/dev/null || echo '{"items":[]}')
 
-# Validate JSON
 if ! echo "$POLICIES_JSON" | jq -e '.' >/dev/null 2>&1; then
   debug "Invalid policies JSON, using empty"
   POLICIES_JSON='{"items":[]}'
 fi
 
 POLICY_COUNT=$(echo "$POLICIES_JSON" | jq '.items | length // 0')
-[ -z "$POLICY_COUNT" ] && POLICY_COUNT=0
+POLICY_COUNT=$(safe_int "$POLICY_COUNT")
 
 # Filter out system policies (DR and reporting) for app coverage analysis
 # Be specific to avoid excluding user policies with "report" in name
@@ -414,15 +547,8 @@ debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE"
 ### -------------------------
 ### Policy Last Run Status (NEW v1.5)
 ### -------------------------
-# Get RunActions to determine last run for each policy
-RUNACTIONS_RAW=$(kubectl -n "$NAMESPACE" get runactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-RUNACTIONS_JSON=$(echo "$RUNACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
-
-# Validate JSON
-if ! echo "$RUNACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  debug "Invalid runactions JSON, using empty"
-  RUNACTIONS_JSON='{"items":[]}'
-fi
+# Use pre-fetched RunActions data
+RUNACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/runactions_raw.json" 2>/dev/null)")
 
 # Build policy last run info
 POLICY_LAST_RUN=$(echo "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON" '
@@ -459,7 +585,7 @@ debug "Policy last run info collected"
 ### Average Policy Run Duration (NEW v1.5)
 ### -------------------------
 # Calculate average duration from completed RunActions (last 14 days)
-FOURTEEN_DAYS_AGO=$(date -d '14 days ago' -Iseconds 2>/dev/null || date -v-14d -Iseconds 2>/dev/null || echo "")
+FOURTEEN_DAYS_AGO=$(date -d '14 days ago' -Iseconds 2>/dev/null || date -v-14d -Iseconds 2>/dev/null || awk 'BEGIN {print strftime("%Y-%m-%dT%H:%M:%S%z", systime() - 14*86400)}' 2>/dev/null || echo "")
 if [ -n "$FOURTEEN_DAYS_AGO" ]; then
   AVG_DURATION_STATS=$(echo "$RUNACTIONS_JSON" | jq --arg cutoff "$FOURTEEN_DAYS_AGO" '
     [(.items // [])[] 
@@ -500,8 +626,8 @@ debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT ru
 ### -------------------------
 ### Unprotected Namespaces (NEW v1.5)
 ### -------------------------
-# Get all namespaces
-ALL_NAMESPACES=$(kubectl get namespaces -o json 2>/dev/null | jq -r '[.items[].metadata.name] // []' 2>/dev/null || echo '[]')
+# Use pre-fetched namespace data
+ALL_NAMESPACES=$(cat "$TEMP_DIR/namespaces_raw.json" 2>/dev/null | jq -r '[.items[].metadata.name] // []' 2>/dev/null || echo '[]')
 
 # Validate JSON
 if ! echo "$ALL_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
@@ -626,22 +752,12 @@ debug "Unprotected list: $UNPROTECTED_NS_JSON"
 ### -------------------------
 ### Restore Actions History (NEW v1.5)
 ### -------------------------
-RESTORE_ACTIONS_RAW=$(kubectl -n "$NAMESPACE" get restoreactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-RESTORE_ACTIONS_JSON=$(echo "$RESTORE_ACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+RESTORE_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null)")
 
-# Validate JSON
-if ! echo "$RESTORE_ACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  RESTORE_ACTIONS_JSON='{"items":[]}'
-fi
-
-RESTORE_ACTIONS_TOTAL=$(echo "$RESTORE_ACTIONS_JSON" | jq '.items | length // 0')
-[ -z "$RESTORE_ACTIONS_TOTAL" ] && RESTORE_ACTIONS_TOTAL=0
-RESTORE_ACTIONS_COMPLETED=$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')
-[ -z "$RESTORE_ACTIONS_COMPLETED" ] && RESTORE_ACTIONS_COMPLETED=0
-RESTORE_ACTIONS_FAILED=$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Failed")] | length // 0')
-[ -z "$RESTORE_ACTIONS_FAILED" ] && RESTORE_ACTIONS_FAILED=0
-RESTORE_ACTIONS_RUNNING=$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Running")] | length // 0')
-[ -z "$RESTORE_ACTIONS_RUNNING" ] && RESTORE_ACTIONS_RUNNING=0
+RESTORE_ACTIONS_TOTAL=$(safe_int "$(echo "$RESTORE_ACTIONS_JSON" | jq '.items | length // 0')")
+RESTORE_ACTIONS_COMPLETED=$(safe_int "$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')")
+RESTORE_ACTIONS_FAILED=$(safe_int "$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Failed")] | length // 0')")
+RESTORE_ACTIONS_RUNNING=$(safe_int "$(echo "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Running")] | length // 0')")
 
 # Get last 5 restore actions summary
 RESTORE_ACTIONS_RECENT=$(echo "$RESTORE_ACTIONS_JSON" | jq -c '
@@ -658,55 +774,28 @@ debug "Restore actions: $RESTORE_ACTIONS_TOTAL (Completed: $RESTORE_ACTIONS_COMP
 ### -------------------------
 ### K10 Resource Limits (NEW v1.5)
 ### -------------------------
-# Get ALL pods in the Kasten namespace using simple approach first
-K10_PODS_TOTAL=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-[ -z "$K10_PODS_TOTAL" ] && K10_PODS_TOTAL=0
+# Reuse shared pod/deploy data (no extra kubectl calls)
+K10_PODS_TOTAL=$(safe_int "$(jq '.items | length' "$TEMP_DIR/pods.json" 2>/dev/null)")
 
-debug "K10 pods count (simple): $K10_PODS_TOTAL"
+debug "K10 pods count: $K10_PODS_TOTAL"
 
-# Get pod details with JSON
-K10_PODS_RAW=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null)
-
-if [ -z "$K10_PODS_RAW" ]; then
-  debug "No pods JSON retrieved"
-  K10_PODS_RAW='{"items":[]}'
-fi
-
-# Write to temp file to avoid shell escaping issues with large JSON
-K10_TEMP_FILE="/tmp/k10_pods_$$.json"
-printf '%s' "$K10_PODS_RAW" > "$K10_TEMP_FILE"
-
-# Validate JSON file
-if ! jq -e '.items' "$K10_TEMP_FILE" >/dev/null 2>&1; then
-  debug "Invalid K10 pods JSON file"
-  echo '{"items":[]}' > "$K10_TEMP_FILE"
-fi
-
-# Count containers - using safe accessor with error handling
-K10_CONTAINERS_TOTAL=$(jq '[.items[]? | .spec.containers[]?] | length // 0' "$K10_TEMP_FILE" 2>/dev/null)
-if [ -z "$K10_CONTAINERS_TOTAL" ] || [ "$K10_CONTAINERS_TOTAL" = "null" ]; then
-  K10_CONTAINERS_TOTAL=0
-fi
+K10_CONTAINERS_TOTAL=$(safe_int "$(jq '[.items[]? | .spec.containers[]?] | length // 0' "$TEMP_DIR/pods.json" 2>/dev/null)")
 
 debug "K10 containers count: $K10_CONTAINERS_TOTAL"
 
-# Count containers with limits (either cpu or memory limit set)
-K10_CONTAINERS_WITH_LIMITS=$(jq '
+K10_CONTAINERS_WITH_LIMITS=$(safe_int "$(jq '
   [.items[]? | .spec.containers[]? | 
     select(.resources.limits != null and .resources.limits != {} and 
            (.resources.limits.cpu != null or .resources.limits.memory != null))
   ] | length // 0
-' "$K10_TEMP_FILE" 2>/dev/null)
-if [ -z "$K10_CONTAINERS_WITH_LIMITS" ] || [ "$K10_CONTAINERS_WITH_LIMITS" = "null" ]; then
-  K10_CONTAINERS_WITH_LIMITS=0
-fi
+' "$TEMP_DIR/pods.json" 2>/dev/null)")
 
 K10_CONTAINERS_WITHOUT_LIMITS=$((K10_CONTAINERS_TOTAL - K10_CONTAINERS_WITH_LIMITS))
 [ "$K10_CONTAINERS_WITHOUT_LIMITS" -lt 0 ] && K10_CONTAINERS_WITHOUT_LIMITS=0
 
 debug "K10 containers with limits: $K10_CONTAINERS_WITH_LIMITS, without: $K10_CONTAINERS_WITHOUT_LIMITS"
 
-# Build detailed summary for display - simplified approach
+# Build detailed summary for display
 K10_RESOURCES_SUMMARY=$(jq -c '
   {
     pods: [.items[]? | {
@@ -722,24 +811,11 @@ K10_RESOURCES_SUMMARY=$(jq -c '
       }]
     }]
   }
-' "$K10_TEMP_FILE" 2>/dev/null)
-
-if [ -z "$K10_RESOURCES_SUMMARY" ] || [ "$K10_RESOURCES_SUMMARY" = "null" ]; then
-  K10_RESOURCES_SUMMARY='{"pods":[]}'
-fi
-
-# Cleanup temp file
-rm -f "$K10_TEMP_FILE"
+' "$TEMP_DIR/pods.json" 2>/dev/null || echo '{"pods":[]}')
 
 debug "K10 summary built successfully"
 
-# Get K10 Deployments with replicas
-K10_DEPLOYMENTS_RAW=$(kubectl -n "$NAMESPACE" get deployments -o json 2>/dev/null || echo '{"items":[]}')
-
-# Write to temp file for safer jq processing
-K10_DEPLOY_TEMP="/tmp/k10_deploy_$$.json"
-printf '%s' "$K10_DEPLOYMENTS_RAW" > "$K10_DEPLOY_TEMP"
-
+# Reuse shared deployment data
 K10_DEPLOYMENTS_SUMMARY=$(jq -c '
   {
     total: (.items | length),
@@ -750,23 +826,12 @@ K10_DEPLOYMENTS_SUMMARY=$(jq -c '
       available: (.status.availableReplicas // 0)
     }] | sort_by(.name)
   }
-' "$K10_DEPLOY_TEMP" 2>/dev/null || echo '{"total":0,"deployments":[]}')
+' "$TEMP_DIR/deploys.json" 2>/dev/null || echo '{"total":0,"deployments":[]}')
 
-rm -f "$K10_DEPLOY_TEMP"
-
-K10_DEPLOYMENTS_TOTAL=$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '.total // 0' 2>/dev/null)
-if [ -z "$K10_DEPLOYMENTS_TOTAL" ] || [ "$K10_DEPLOYMENTS_TOTAL" = "null" ]; then
-  K10_DEPLOYMENTS_TOTAL=0
-fi
-
-# Count deployments with multiple replicas
-K10_MULTI_REPLICA=$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '[.deployments[]? | select(.replicas > 1)] | length // 0' 2>/dev/null)
-if [ -z "$K10_MULTI_REPLICA" ] || [ "$K10_MULTI_REPLICA" = "null" ]; then
-  K10_MULTI_REPLICA=0
-fi
+K10_DEPLOYMENTS_TOTAL=$(safe_int "$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '.total // 0' 2>/dev/null)")
+K10_MULTI_REPLICA=$(safe_int "$(echo "$K10_DEPLOYMENTS_SUMMARY" | jq '[.deployments[]? | select(.replicas > 1)] | length // 0' 2>/dev/null)")
 
 debug "K10 deployments: $K10_DEPLOYMENTS_TOTAL (multi-replica: $K10_MULTI_REPLICA)"
-debug "K10 deployments summary: $K10_DEPLOYMENTS_SUMMARY"
 
 ### -------------------------
 ### Catalog Size (NEW v1.5) + Free Space (NEW v1.6)
@@ -813,16 +878,9 @@ debug "Catalog PVC: $CATALOG_PVC_NAME, Size: $CATALOG_SIZE, Free: ${CATALOG_FREE
 ### -------------------------
 ### Orphaned RestorePoints (NEW v1.5)
 ### -------------------------
-RESTORE_POINTS_RAW=$(kubectl -n "$NAMESPACE" get restorepoints.apps.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-RESTORE_POINTS_JSON=$(echo "$RESTORE_POINTS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
+RESTORE_POINTS_JSON=$(safe_json "$(cat "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null)")
 
-# Validate JSON
-if ! echo "$RESTORE_POINTS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  RESTORE_POINTS_JSON='{"items":[]}'
-fi
-
-RESTORE_POINTS_COUNT=$(echo "$RESTORE_POINTS_JSON" | jq '.items | length // 0')
-[ -z "$RESTORE_POINTS_COUNT" ] && RESTORE_POINTS_COUNT=0
+RESTORE_POINTS_COUNT=$(safe_int "$(echo "$RESTORE_POINTS_JSON" | jq '.items | length // 0')")
 
 # Get policy names for comparison
 POLICY_NAMES=$(echo "$POLICIES_JSON" | jq '[.items[]?.metadata.name] // []' 2>/dev/null || echo '[]')
@@ -859,13 +917,8 @@ debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT"
 ### -------------------------
 ### PolicyPresets
 ### -------------------------
-PRESETS_RAW=$(kubectl -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-PRESETS_JSON=$(echo "$PRESETS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
-if ! echo "$PRESETS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  PRESETS_JSON='{"items":[]}'
-fi
-PRESET_COUNT=$(echo "$PRESETS_JSON" | jq '.items | length // 0')
-[ -z "$PRESET_COUNT" ] && PRESET_COUNT=0
+PRESETS_JSON=$(safe_json "$(cat "$TEMP_DIR/presets_raw.json" 2>/dev/null)")
+PRESET_COUNT=$(safe_int "$(echo "$PRESETS_JSON" | jq '.items | length // 0')")
 
 debug "PolicyPresets: $PRESET_COUNT"
 
@@ -916,13 +969,8 @@ debug "Blueprints: $BLUEPRINT_COUNT, Bindings: $BINDING_COUNT"
 ### -------------------------
 ### TransformSets
 ### -------------------------
-TRANSFORMSETS_RAW=$(kubectl -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-TRANSFORMSETS_JSON=$(echo "$TRANSFORMSETS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
-if ! echo "$TRANSFORMSETS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  TRANSFORMSETS_JSON='{"items":[]}'
-fi
-TRANSFORMSET_COUNT=$(echo "$TRANSFORMSETS_JSON" | jq '.items | length // 0')
-[ -z "$TRANSFORMSET_COUNT" ] && TRANSFORMSET_COUNT=0
+TRANSFORMSETS_JSON=$(safe_json "$(cat "$TEMP_DIR/transformsets_raw.json" 2>/dev/null)")
+TRANSFORMSET_COUNT=$(safe_int "$(echo "$TRANSFORMSETS_JSON" | jq '.items | length // 0')")
 
 debug "TransformSets: $TRANSFORMSET_COUNT"
 
@@ -952,35 +1000,18 @@ debug "Prometheus: $PROMETHEUS_ENABLED ($PROMETHEUS_RUNNING pods)"
 ### -------------------------
 ### Health metrics
 ### -------------------------
-PODS=$(kubectl -n "$NAMESPACE" get pods --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-PODS_RUNNING=$(kubectl -n "$NAMESPACE" get pods --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-K10_PODS_JSON=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null || echo '{"items":[]}')
-PODS_READY=$(echo "$K10_PODS_JSON" | jq '[.items[]? | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length // 0' 2>/dev/null || echo "0")
-
-# Sanitize
-PODS=$(echo "${PODS:-0}" | tr -d '[:space:]')
-PODS_RUNNING=$(echo "${PODS_RUNNING:-0}" | tr -d '[:space:]')
-PODS_READY=$(echo "${PODS_READY:-0}" | tr -d '[:space:]')
-[ -z "$PODS" ] && PODS=0
-[ -z "$PODS_RUNNING" ] && PODS_RUNNING=0
-[ -z "$PODS_READY" ] && PODS_READY=0
+# Reuse shared pod data (no extra kubectl calls)
+PODS=$(safe_int "$(jq '.items | length' "$TEMP_DIR/pods.json" 2>/dev/null)")
+PODS_RUNNING=$(safe_int "$(jq '[.items[]? | select(.status.phase == "Running")] | length' "$TEMP_DIR/pods.json" 2>/dev/null)")
+PODS_READY=$(safe_int "$(jq '[.items[]? | select(.status.conditions[]? | select(.type=="Ready" and .status=="True"))] | length // 0' "$TEMP_DIR/pods.json" 2>/dev/null)")
 
 debug "Pods: $PODS (Running: $PODS_RUNNING, Ready: $PODS_READY)"
 
 ### -------------------------
 ### Backup/Export Actions
 ### -------------------------
-BACKUP_ACTIONS_RAW=$(kubectl -n "$NAMESPACE" get backupactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-BACKUP_ACTIONS_JSON=$(echo "$BACKUP_ACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
-if ! echo "$BACKUP_ACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  BACKUP_ACTIONS_JSON='{"items":[]}'
-fi
-
-EXPORT_ACTIONS_RAW=$(kubectl -n "$NAMESPACE" get exportactions.actions.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-EXPORT_ACTIONS_JSON=$(echo "$EXPORT_ACTIONS_RAW" | tr -d '\000-\011\013-\037' | jq -c '.' 2>/dev/null || echo '{"items":[]}')
-if ! echo "$EXPORT_ACTIONS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  EXPORT_ACTIONS_JSON='{"items":[]}'
-fi
+BACKUP_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/backupactions_raw.json" 2>/dev/null)")
+EXPORT_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/exportactions_raw.json" 2>/dev/null)")
 
 BACKUP_ACTIONS_TOTAL=$(echo "$BACKUP_ACTIONS_JSON" | jq '.items | length // 0')
 [ -z "$BACKUP_ACTIONS_TOTAL" ] && BACKUP_ACTIONS_TOTAL=0
@@ -1014,24 +1045,21 @@ debug "Actions - Total: $TOTAL_ACTIONS, Finished: $FINISHED_ACTIONS, Completed: 
 ### -------------------------
 ### Data usage
 ### -------------------------
-TOTAL_PVCS=$(kubectl get pvc --all-namespaces --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
-[ -z "$TOTAL_PVCS" ] && TOTAL_PVCS=0
-TOTAL_CAPACITY_GB=$(kubectl get pvc --all-namespaces -o json 2>/dev/null | jq '[.items[]?.spec.resources.requests.storage | select(. != null) | gsub("Gi";"") | gsub("G";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+# Reuse pre-fetched PVC and volume snapshot data
+TOTAL_PVCS=$(safe_int "$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq '.items | length // 0' 2>/dev/null)")
+TOTAL_CAPACITY_GB=$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq '[.items[]?.spec.resources.requests.storage | select(. != null) | gsub("Gi";"") | gsub("G";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$TOTAL_CAPACITY_GB" ] && TOTAL_CAPACITY_GB=0
-SNAPSHOT_DATA=$(kubectl get volumesnapshots --all-namespaces -o json 2>/dev/null | jq '[.items[]?.status.restoreSize // "0" | gsub("Gi";"") | gsub("G";"") | gsub("Mi";"") | gsub("M";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+SNAPSHOT_DATA=$(cat "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null | jq '[.items[]?.status.restoreSize // "0" | gsub("Gi";"") | gsub("G";"") | gsub("Mi";"") | gsub("M";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$SNAPSHOT_DATA" ] && SNAPSHOT_DATA=0
 
 ### -------------------------
 ### Export Storage & Deduplication (NEW v1.6)
 ### -------------------------
-# Get export storage metrics from the most recent Report CR
+# Use pre-fetched reports data
 # Reports contain storage.objectStorage with physicalBytes and logicalBytes
 # NOTE: Requires k10-system-reports-policy to be enabled
 
-REPORTS_JSON=$(kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null || echo '{"items":[]}')
-if ! echo "$REPORTS_JSON" | jq -e '.items' >/dev/null 2>&1; then
-  REPORTS_JSON='{"items":[]}'
-fi
+REPORTS_JSON=$(safe_json "$(cat "$TEMP_DIR/reports_raw.json" 2>/dev/null)")
 
 REPORTS_COUNT=$(echo "$REPORTS_JSON" | jq '.items | length')
 
@@ -1722,10 +1750,35 @@ fi
 debug "Best Practices v1.8 - Auth: $BP_AUTH_STATUS, KMS Encryption: $BP_ENCRYPTION_STATUS, Audit: $BP_AUDIT_STATUS"
 
 ##############################################################################
+# OUTPUT REDIRECTION
+##############################################################################
+if [ -n "$OUTPUT_FILE" ]; then
+  exec 3>&1  # save original stdout
+  exec > "$OUTPUT_FILE"
+fi
+
+##############################################################################
+# VALIDATE JSON ARGUMENTS (prevent silent failures in the big jq call)
+##############################################################################
+_safe_arg() { echo "$1" | jq -c '.' 2>/dev/null || echo "$2"; }
+PROFILES_JSON=$(_safe_arg "$PROFILES_JSON" '{"items":[]}')
+POLICIES_JSON=$(_safe_arg "$POLICIES_JSON" '{"items":[]}')
+POLICY_LAST_RUN=$(_safe_arg "$POLICY_LAST_RUN" '[]')
+UNPROTECTED_NS_JSON=$(_safe_arg "$UNPROTECTED_NS_JSON" '[]')
+K10_RESOURCES_SUMMARY=$(_safe_arg "$K10_RESOURCES_SUMMARY" '{"pods":[]}')
+K10_DEPLOYMENTS_SUMMARY=$(_safe_arg "$K10_DEPLOYMENTS_SUMMARY" '{"total":0,"deployments":[]}')
+ORPHANED_RP=$(_safe_arg "$ORPHANED_RP" '[]')
+RESTORE_ACTIONS_RECENT=$(_safe_arg "$RESTORE_ACTIONS_RECENT" '[]')
+VM_DETAILS_JSON=$(_safe_arg "$VM_DETAILS_JSON" '[]')
+VM_POLICY_DETAILS_JSON=$(_safe_arg "$VM_POLICY_DETAILS_JSON" '[]')
+EXCLUDED_APPS_JSON=$(_safe_arg "$EXCLUDED_APPS_JSON" '[]')
+
+##############################################################################
 # JSON OUTPUT
 ##############################################################################
 if [ "$MODE" = "json" ]; then
   jq -n \
+    --arg kdlVersion "$KDL_VERSION" \
     --arg platform "$PLATFORM" \
     --arg version "$KASTEN_VERSION" \
     --argjson profiles "$(echo "$PROFILES_JSON" | jq -c '.')" \
@@ -1894,6 +1947,7 @@ if [ "$MODE" = "json" ]; then
     --arg bpAudit "$BP_AUDIT_STATUS" \
     '
     {
+      kdlVersion: $kdlVersion,
       platform: $platform,
       kastenVersion: $version,
 
@@ -2219,6 +2273,11 @@ if [ "$MODE" = "json" ]; then
         ]
       }
     }'
+  # Finalize output file for JSON mode
+  if [ -n "$OUTPUT_FILE" ]; then
+    exec 1>&3 3>&-
+    echo "Output written to $OUTPUT_FILE" >&2
+  fi
   exit 0
 fi
 
@@ -2226,7 +2285,7 @@ fi
 # HUMAN OUTPUT
 ##############################################################################
 
-printf "\n${COLOR_BOLD}${COLOR_BLUE}[SEARCH] Kasten Discovery Lite v1.8${COLOR_RESET}\n"
+printf "\n${COLOR_BOLD}${COLOR_BLUE}[SEARCH] Kasten Discovery Lite v${KDL_VERSION}${COLOR_RESET}\n"
 printf "==============================\n"
 printf "Platform: $PLATFORM\n"
 printf "Namespace: $NAMESPACE\n"
@@ -2271,9 +2330,9 @@ printf "    Backup Actions:   $BACKUP_ACTIONS_TOTAL (${COLOR_GREEN}$BACKUP_ACTIO
 printf "    Export Actions:   $EXPORT_ACTIONS_TOTAL (${COLOR_GREEN}$EXPORT_ACTIONS_COMPLETED ok${COLOR_RESET}, ${COLOR_RED}$EXPORT_ACTIONS_FAILED failed${COLOR_RESET})\n"
 printf "    Restore Points:   $RESTORE_POINTS_COUNT\n"
 if [ "$SUCCESS_RATE" != "N/A" ]; then
-  if [ "$(echo "$SUCCESS_RATE > 95" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+  if num_gt "$SUCCESS_RATE" 95; then
     printf "    Success Rate:     ${COLOR_GREEN}$SUCCESS_RATE%%${COLOR_RESET} ${COLOR_CYAN}(of finished actions)${COLOR_RESET}\n"
-  elif [ "$(echo "$SUCCESS_RATE > 80" | bc -l 2>/dev/null || echo "0")" = "1" ]; then
+  elif num_gt "$SUCCESS_RATE" 80; then
     printf "    Success Rate:     ${COLOR_YELLOW}$SUCCESS_RATE%%${COLOR_RESET} ${COLOR_CYAN}(of finished actions)${COLOR_RESET}\n"
   else
     printf "    Success Rate:     ${COLOR_RED}$SUCCESS_RATE%%${COLOR_RESET} ${COLOR_CYAN}(of finished actions)${COLOR_RESET}\n"
@@ -2394,6 +2453,14 @@ if [ "$POLICY_COUNT" -gt 0 ]; then
   (if .spec.subFrequency.months and (.spec.subFrequency.months | length) > 0 then "      Months: \(.spec.subFrequency.months | join(", "))\n" else "" end)
 else "" end) +
 "    Actions: \([.spec.actions[]?.action] | join(", "))\n" +
+(
+  [.spec.actions[]? | select(.action == "export" and .exportParameters.frequency != null) | .exportParameters.frequency] |
+  if length > 0 then "    Export Frequency: \(first)\n" else "" end
+) +
+(
+  [.spec.actions[]? | select(.action == "export" and .exportParameters.profile.name != null) | .exportParameters.profile.name] |
+  if length > 0 then "    Export Profile: \(first)\n" else "" end
+) +
 "    Namespace selector: " +
   (if .spec.selector == null then "all namespaces"
    elif .spec.selector.matchNames then 
@@ -2412,20 +2479,26 @@ else "" end) +
    end) + "\n" +
 "    Retention: " +
 (
+  # Helper: extract retention keys in standard order (daily, weekly, monthly, yearly)
+  def ordered_retention:
+    [["daily","weekly","monthly","yearly"][] as $k |
+      if .[$k] then "\($k | ascii_upcase)=\(.[$k])" else empty end
+    ] | join(", ");
+
   # Build snapshot retention string (from top-level .spec.retention or action-level .snapshotRetention)
   (
     if .spec.retention and (.spec.retention | length) > 0 then
-      "Snapshot(" + ([.spec.retention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", ")) + ")"
+      "Snapshot(" + (.spec.retention | ordered_retention) + ")"
     elif ([.spec.actions[]? | select(.snapshotRetention and (.snapshotRetention | length) > 0)] | length) > 0 then
       ([.spec.actions[]? | select(.snapshotRetention and (.snapshotRetention | length) > 0) |
-        "Snapshot(" + ([.snapshotRetention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", ")) + ")"
+        "Snapshot(" + (.snapshotRetention | ordered_retention) + ")"
       ] | first)
     else null end
   ) as $snap |
   # Build export retention string (from action-level .retention on export actions)
   (
     [.spec.actions[]? | select(.action == "export" and .retention != null and (.retention | length) > 0) |
-      "Export(" + ([.retention | to_entries[] | "\(.key | ascii_upcase)=\(.value)"] | join(", ")) + ")"
+      "Export(" + (.retention | ordered_retention) + ")"
     ] | if length > 0 then first else null end
   ) as $exp |
   # Combine
@@ -2892,4 +2965,16 @@ else
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Audit Logging:        Not enabled (optional - SIEM integration)\n"
 fi
 
-printf "\n${COLOR_GREEN}[OK] Discovery completed${COLOR_RESET}\n"
+ELAPSED=$(($(date +%s) - START_TIME))
+if [ "$ELAPSED" -ge 60 ] 2>/dev/null; then
+  ELAPSED_DISPLAY="$((ELAPSED / 60))m $((ELAPSED % 60))s"
+else
+  ELAPSED_DISPLAY="${ELAPSED}s"
+fi
+printf "\n${COLOR_GREEN}[OK] Discovery completed in ${ELAPSED_DISPLAY}${COLOR_RESET}\n"
+
+# Finalize output file
+if [ -n "$OUTPUT_FILE" ]; then
+  exec 1>&3 3>&-  # restore stdout
+  echo "Output written to $OUTPUT_FILE" >&2
+fi
