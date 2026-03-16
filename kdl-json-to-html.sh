@@ -2,12 +2,20 @@
 set -eu
 
 ##############################################################################
-# KDL JSON -> HTML Report Generator v1.8
+# KDL JSON -> HTML Report Generator v1.8.1
 #
 # Usage:
 #   ./kdl-json-to-html.sh input.json output.html
 #
-# Compatible with Kasten Discovery Lite v1.8 JSON output
+# Compatible with Kasten Discovery Lite v1.8.1 JSON output
+#
+# New in v1.8.1:
+#   - Show kdlVersion in subtitle and footer
+#   - Display Blueprint actions (post-export, backup, restore, etc.)
+#   - Display export retention per policy (Snapshot + Export breakdown)
+#   - Fix 7 incorrect tunedBadge defaults (Exports/Cluster, Restores/Cluster,
+#     Executor Replicas, Worker Pod Ready, Job Wait, Block Uploads,
+#     Workload Restores/Action)
 #
 # New in v1.8:
 #   - K10 Configuration section (Helm values, security, performance tuning)
@@ -177,7 +185,7 @@ def tunedBadge(val; dflt):
 <head>
 <meta charset=\"UTF-8\">
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">
-<title>Kasten Discovery Lite Report v1.8</title>
+<title>Kasten Discovery Lite Report</title>
 <style>
 * { box-sizing: border-box; }
 body {
@@ -327,6 +335,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   Generated: " + (now | strftime("%Y-%m-%d %H:%M:%S UTC")) + " | 
   Platform: " + .platform + " | 
   Version: " + .kastenVersion +
+  (if .kdlVersion then " | KDL: v" + .kdlVersion else "" end) +
   (if .k10Configuration.source then " | Config Source: " + .k10Configuration.source else "" end) +
 "
 </div>
@@ -822,7 +831,18 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <td><code>" + .frequency + "</code></td>
         <td>" + (.actions | join(", ")) + "</td>
         <td>" + (.selector | formatNamespaceSelector) + "</td>
-        <td>" + (.retention | formatRetention) + "</td>
+        <td>" + 
+          (if .retention and (.retention | length) > 0 then
+            "Snapshot(" + (.retention | to_entries | map(.key + "=" + (.value | tostring)) | join(", ")) + ")"
+          else "" end) +
+          (if .exportRetention and (.exportRetention | length) > 0 then
+            (if .retention and (.retention | length) > 0 then "<br>" else "" end) +
+            "Export(" + (.exportRetention | to_entries | map(.key + "=" + (.value | tostring)) | join(", ")) + ")"
+          else "" end) +
+          (if ((.retention | length) == 0 or .retention == null) and (.exportRetention == null or (.exportRetention | length) == 0) then
+            "<span class=\"badge warn\">Not defined</span>"
+          else "" end) +
+        "</td>
       </tr>"
     ] | join(""))
   else
@@ -836,7 +856,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       <div class=\"card\"><strong>Blueprints</strong><div class=\"card-value\">" + (.kanister.blueprints.count | tostring) + "</div>" +
       (if (.kanister.blueprints.items | length) > 0 then 
         "<ul style=\"margin-top:0.5rem;padding-left:1.5rem;\">" + 
-        ([.kanister.blueprints.items[]? | "<li>" + .name + (if .namespace then " <small>(ns: " + .namespace + ")</small>" else " <small>(cluster-scoped)</small>" end) + "</li>"] | join("")) + 
+        ([.kanister.blueprints.items[]? | "<li>" + .name + (if .namespace then " <small>(ns: " + .namespace + ")</small>" else " <small>(cluster-scoped)</small>" end) + (if (.actions | length) > 0 then " — <code>" + (.actions | join(", ")) + "</code>" else "" end) + "</li>"] | join("")) + 
         "</ul>" 
       else "" end) +
       "</div>
@@ -916,16 +936,16 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       <div class=\"card\">
         <strong>\u26A1 Concurrency Limiters</strong>
         <div class=\"stat-row\"><span class=\"stat-label\">CSI Snapshots/Cluster</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.csiSnapshotsPerCluster; "10") + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Exports/Cluster</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.snapshotExportsPerCluster; "5") + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Exports/Cluster</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.snapshotExportsPerCluster; "10") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Exports/Action</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.snapshotExportsPerAction; "3") + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Restores/Cluster</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.volumeRestoresPerCluster; "5") + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Restores/Cluster</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.volumeRestoresPerCluster; "10") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Restores/Action</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.volumeRestoresPerAction; "3") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">VM Snapshots/Cluster</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.vmSnapshotsPerCluster; "1") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">GVB/Cluster</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.genericVolumeBackupsPerCluster; "10") + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Executor Replicas</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.executorReplicas; "8") + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Executor Replicas</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.executorReplicas; "3") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Executor Threads</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.executorThreads; "8") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Workload Snapshots/Action</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.workloadSnapshotsPerAction; "5") + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Workload Restores/Action</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.workloadRestoresPerAction; "5") + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Workload Restores/Action</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.concurrencyLimiters.workloadRestoresPerAction; "3") + "</span></div>
       </div>
 
       <div class=\"card\">
@@ -934,8 +954,8 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <div class=\"stat-row\"><span class=\"stat-label\">Blueprint Restore</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.timeouts.blueprintRestore; "600") + " min</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Blueprint Hooks</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.timeouts.blueprintHooks; "20") + " min</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Blueprint Delete</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.timeouts.blueprintDelete; "45") + " min</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Worker Pod Ready</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.timeouts.workerPodReady; "10") + " min</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Job Wait</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.timeouts.jobWait; "0") + " min</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Worker Pod Ready</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.timeouts.workerPodReady; "15") + " min</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Job Wait</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.timeouts.jobWait; "600") + " min</span></div>
       </div>
     </div>
 
@@ -944,7 +964,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <strong>\uD83D\uDCBE Datastore Parallelism</strong>
         <div class=\"stat-row\"><span class=\"stat-label\">File Uploads</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.datastore.parallelUploads; "8") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">File Downloads</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.datastore.parallelDownloads; "8") + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Block Uploads</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.datastore.parallelBlockUploads; "2") + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Block Uploads</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.datastore.parallelBlockUploads; "8") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Block Downloads</span><span class=\"stat-value\">" + tunedBadge(.k10Configuration.datastore.parallelBlockDownloads; "8") + "</span></div>
       </div>
 
@@ -992,7 +1012,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + "
 
 <div class=\"footer\">
-  <strong>Kasten Discovery Lite v1.8</strong><br>
+  <strong>Kasten Discovery Lite" + (if .kdlVersion then " v" + .kdlVersion else "" end) + "</strong><br>
   This report provides observational signals only and does not assert compliance.<br>
   Generated from JSON output of Kasten Discovery Lite script.
 </div>
