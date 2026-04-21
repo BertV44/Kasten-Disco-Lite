@@ -17,9 +17,13 @@ trap '' PIPE 2>/dev/null || true
 #   user with only truncated "Collecting..." progress messages on screen.
 #   Added `|| echo ""` guard so the command substitution always succeeds
 #   and the existing fallback (name-pattern match via jq) can execute.
-#   Confirmed on OpenShift 4.10 / oc 4.10.21 / K10 8.0.15 where the
-#   catalog pod uses `app.kubernetes.io/component=catalog` instead of
-#   the plain `component=catalog` label.
+#   Reported on an OpenShift cluster running K10 8.0.15 with oc client
+#   4.10.21 and /bin/sh symlinked to bash. The customer's catalog pod
+#   did not match the `component=catalog` selector (K10 deployments
+#   may use different label schemes depending on chart version, Helm
+#   overrides, or deployment method). The underlying shell-semantics
+#   bug is independent of the exact label scheme: any environment
+#   where the selector returns zero pods would hit the same failure.
 # - ROBUSTNESS: Temp directory cascade (TMPDIR -> /tmp -> $HOME -> $PWD)
 #   Defensive hardening for hardened hosts where /tmp may be under
 #   quota, noexec, SELinux-restricted, or read-only. The previous
@@ -931,9 +935,9 @@ CATALOG_POD=""
 # cmd exits non-zero. kubectl with `-o jsonpath='{.items[0]...}'` exits
 # non-zero when the selector returns zero items (array index out of
 # range error). Without this guard, the script silently exits whenever
-# the catalog pod isn't labelled `component=catalog` (e.g. K10 8.x
-# deployments use `app.kubernetes.io/component=catalog`), never reaching
-# the fallback or any subsequent section.
+# the `component=catalog` label doesn't match any pod (label scheme
+# varies across K10 chart versions and deployment methods), never
+# reaching the fallback or any subsequent section.
 CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -l component=catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 if [ -z "$CATALOG_POD" ]; then
   CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null | jq -r '[.items[]? | select(.metadata.name | test("catalog"; "i")) | .metadata.name][0] // empty' 2>/dev/null)
