@@ -39,21 +39,24 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 ## What's New in v1.8.3
 
+### Bug Fixes
+
+- **Silent script exit on clusters where the catalog pod is not labelled `component=catalog`** — On bash-as-`/bin/sh` with `set -e`, the pattern `var=$(kubectl ... -o jsonpath='{.items[0]...}' 2>/dev/null)` triggers errexit when the label selector matches zero pods, because kubectl returns non-zero on JSONPath array-out-of-range errors (and `2>/dev/null` suppresses only stderr, not the exit code). The script died silently during the catalog section, never reaching the name-pattern fallback or any subsequent section. Users saw only truncated `Collecting…` progress messages on screen. Confirmed on OpenShift 4.10 / oc 4.10.21 / K10 8.0.15, where the catalog pod uses `app.kubernetes.io/component=catalog` instead of the legacy `component=catalog` label. Added a `|| echo ""` guard so the command substitution always succeeds and the existing fallback can execute.
+
 ### Robustness
 
-- **Temp directory cascade** — v1.8.1 introduced parallel kubectl fetches that write to a temp directory, but the initial implementation wrote to `/tmp` unconditionally. On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the background redirects would fail silently and the script would crash mid-collection, leaving only truncated "`Collecting…`" progress messages visible to the user. v1.8.3 tries candidate locations in order: `$TMPDIR` (POSIX override), then `/tmp`, then `$HOME/.kdl-tmp`, then `$PWD/.kdl-tmp`. The first writable location wins.
-- **Clear error on unrecoverable failure** — if none of the four candidates is writable, the script now exits immediately with an actionable message instructing the user to set `TMPDIR` manually, instead of failing silently further down the execution path.
+- **Temp directory cascade** (`$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`) — Defensive hardening. On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the previous single-path approach could let parallel kubectl redirects fail silently. The cascade picks the first writable location, and exits with a clear, actionable error if none is writable.
 - **New debug line** — `Using temp directory: <path>` is logged in `--debug` mode so the chosen location is always visible when diagnosing issues.
 
-### Workaround for affected users
+### Workaround for affected v1.8.1/v1.8.2 users
 
-Users on hardened hosts where `/tmp` is restricted can now run:
+If upgrading isn't immediately possible, the catalog-pod bug is hit specifically when `kubectl get pods -l component=catalog` returns zero pods. You can pre-check your cluster with:
 
 ```bash
-TMPDIR=$HOME ./KDL-v1.8.3.sh kasten-io
+kubectl -n kasten-io get pods -l component=catalog --no-headers | wc -l
 ```
 
-or set `TMPDIR` in their environment permanently.
+If this returns `0`, your deployment uses a different label scheme and v1.8.1/v1.8.2 will exit silently. Upgrade to v1.8.3.
 
 ---
 
@@ -403,8 +406,8 @@ Key portability measures in v1.8.1:
 ## Version History
 
 - **v1.8.3** (Current)
-  - Temp directory cascade: `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`
-  - Clear error exit when no writable temp location is available (instead of silent mid-run crash)
+  - Fixed silent script exit on clusters where the catalog pod is not labelled `component=catalog` (e.g. K10 8.x with `app.kubernetes.io/component=catalog`). On bash-as-sh with `set -e`, unprotected `var=$(kubectl ... -o jsonpath=...)` assignments trigger errexit when the selector matches zero pods.
+  - Temp directory cascade: `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp` with clear error exit when none is writable (defensive hardening)
   - New debug line showing which temp location was chosen
 
 - **v1.8.2**
@@ -489,19 +492,31 @@ Key portability measures in v1.8.1:
 
 ### Script exits silently after "Collecting..." with no report
 
-In v1.8.1 and v1.8.2, the script wrote temp files to `/tmp` unconditionally. On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the parallel kubectl redirects failed silently and the script crashed mid-collection, leaving only fragments of progress messages on screen. v1.8.3 fixes this by cascading through `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`, and exits with a clear error if none is writable.
+Two root causes, both fixed in v1.8.3:
 
-**Workaround on v1.8.1/v1.8.2**: upgrade to v1.8.3, or explicitly point `TMPDIR` at a writable location:
+**Cause 1 (most common): catalog pod label mismatch.** On bash-as-`/bin/sh` with `set -e`, v1.8.1 and v1.8.2 had an unprotected `var=$(kubectl ... jsonpath=...)` assignment that killed the script whenever `kubectl get pods -l component=catalog` returned zero pods (typical on K10 8.x where the pod uses `app.kubernetes.io/component=catalog` instead).
+
+Pre-check on v1.8.1/v1.8.2:
+
+```bash
+kubectl -n kasten-io get pods -l component=catalog --no-headers | wc -l
+```
+
+If this returns `0`, upgrade to v1.8.3 (no workaround available on older versions short of editing the script).
+
+**Cause 2 (environment-specific): restricted `/tmp`.** On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the parallel kubectl redirects fail silently. v1.8.3 cascades through `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp` and exits with a clear error if none is writable. Workaround on older versions:
 
 ```bash
 TMPDIR=$HOME ./KDL-v1.8.3.sh kasten-io
 ```
 
-**To confirm the cascade is working on v1.8.3**:
+**To verify your install on v1.8.3**:
 
 ```bash
-./KDL-v1.8.3.sh kasten-io --debug 2>&1 | grep "Using temp directory"
+./KDL-v1.8.3.sh kasten-io --debug 2>&1 | tail -30
 ```
+
+You should see `Using temp directory: ...` and progression through all sections (License, Profiles, Policies, KDR, K10 resources, Catalog, etc.) ending with `[OK] Discovery completed in Xs`.
 
 ### Export retention shows "not defined" when it should have values
 
