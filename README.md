@@ -41,7 +41,7 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 ### Bug Fixes
 
-- **Silent script exit on clusters where the catalog pod is not labelled `component=catalog`** — On bash-as-`/bin/sh` with `set -e`, the pattern `var=$(kubectl ... -o jsonpath='{.items[0]...}' 2>/dev/null)` triggers errexit when the label selector matches zero pods, because kubectl returns non-zero on JSONPath array-out-of-range errors (and `2>/dev/null` suppresses only stderr, not the exit code). The script died silently during the catalog section, never reaching the name-pattern fallback or any subsequent section. Users saw only truncated `Collecting…` progress messages on screen. Confirmed on OpenShift 4.10 / oc 4.10.21 / K10 8.0.15, where the catalog pod uses `app.kubernetes.io/component=catalog` instead of the legacy `component=catalog` label. Added a `|| echo ""` guard so the command substitution always succeeds and the existing fallback can execute.
+- **Silent script exit on clusters where the catalog pod is not labelled `component=catalog`** — On bash-as-`/bin/sh` with `set -e`, the pattern `var=$(kubectl ... -o jsonpath='{.items[0]...}' 2>/dev/null)` triggers errexit when the label selector matches zero pods, because kubectl returns non-zero on JSONPath array-out-of-range errors (and `2>/dev/null` suppresses only stderr, not the exit code). The script died silently during the catalog section, never reaching the name-pattern fallback or any subsequent section. Users saw only truncated `Collecting…` progress messages on screen. Reported on an OpenShift cluster (oc client 4.10.21) running K10 8.0.15 where the `component=catalog` selector matched no pods — K10 deployments can use different label schemes depending on chart version, Helm overrides, or deployment method, but the underlying shell bug is independent of the label itself. Added a `|| echo ""` guard so the command substitution always succeeds and the existing fallback can execute.
 
 ### Robustness
 
@@ -406,7 +406,7 @@ Key portability measures in v1.8.1:
 ## Version History
 
 - **v1.8.3** (Current)
-  - Fixed silent script exit on clusters where the catalog pod is not labelled `component=catalog` (e.g. K10 8.x with `app.kubernetes.io/component=catalog`). On bash-as-sh with `set -e`, unprotected `var=$(kubectl ... -o jsonpath=...)` assignments trigger errexit when the selector matches zero pods.
+  - Fixed silent script exit on clusters where the `component=catalog` label selector matches no pods (this can happen with certain K10 deployments depending on chart version, Helm overrides, or deployment method). On bash-as-sh with `set -e`, unprotected `var=$(kubectl ... -o jsonpath=...)` assignments trigger errexit when the selector matches zero pods.
   - Temp directory cascade: `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp` with clear error exit when none is writable (defensive hardening)
   - New debug line showing which temp location was chosen
 
@@ -494,7 +494,7 @@ Key portability measures in v1.8.1:
 
 Two root causes, both fixed in v1.8.3:
 
-**Cause 1 (most common): catalog pod label mismatch.** On bash-as-`/bin/sh` with `set -e`, v1.8.1 and v1.8.2 had an unprotected `var=$(kubectl ... jsonpath=...)` assignment that killed the script whenever `kubectl get pods -l component=catalog` returned zero pods (typical on K10 8.x where the pod uses `app.kubernetes.io/component=catalog` instead).
+**Cause 1 (most common): catalog pod label mismatch.** On bash-as-`/bin/sh` with `set -e`, v1.8.1 and v1.8.2 had an unprotected `var=$(kubectl ... jsonpath=...)` assignment that killed the script whenever `kubectl get pods -l component=catalog` returned zero pods. The exact label scheme on your deployment may differ from the legacy `component=catalog` depending on chart version, Helm overrides, or deployment method.
 
 Pre-check on v1.8.1/v1.8.2:
 
