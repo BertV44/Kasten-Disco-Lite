@@ -3,9 +3,32 @@ set -eu
 trap '' PIPE 2>/dev/null || true
 
 ##############################################################################
-# Kasten Discovery Lite v1.8.1
+# Kasten Discovery Lite v1.8.3
 # Author: Bertrand CASTAGNET - EMEA TAM
-# 
+#
+# Changes in v1.8.3:
+# - ROBUSTNESS: Temp directory cascade (TMPDIR -> /tmp -> $HOME -> $PWD)
+#   Previously the script wrote to /tmp unconditionally and the fallback
+#   path ("/tmp/kdl_$$" via `echo`) silently created a path string without
+#   verifying the directory existed or was writable. On hardened hosts
+#   (/tmp under quota, noexec, SELinux-restricted, or read-only), the
+#   parallel kubectl redirects in v1.8.1+ would fail silently, leaving
+#   empty or missing JSON files that crashed the script mid-collection
+#   with only truncated progress messages visible to the user.
+#   The cascade tries $TMPDIR first (POSIX override), then /tmp, then
+#   $HOME/.kdl-tmp, then $PWD/.kdl-tmp. If none is writable the script
+#   now exits immediately with a clear, actionable error message
+#   instructing the user to set TMPDIR.
+# - Added debug log entry "Using temp directory: ..." (visible with --debug)
+#
+# Changes in v1.8.2:
+# - BUGFIX: "_ep: command not found" on any run with --output
+#   The --output auto-detect block called the _ep() helper before it
+#   was defined later in the script. Replaced the _ep|grep pipeline
+#   with a POSIX `case` statement on the filename extension, which
+#   also removes an unnecessary subprocess. Only triggered when
+#   --output was supplied (empty $OUTPUT_FILE short-circuits via &&).
+#
 # Changes in v1.8.1:
 # - Fixed export retention display (was reading wrong JSON path)
 # - Deterministic retention key ordering (daily/weekly/monthly/yearly)
@@ -81,7 +104,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="1.8.1"
+KDL_VERSION="1.8.3"
 OUTPUT_FILE=""
 
 show_help() {
@@ -131,9 +154,12 @@ while [ $# -gt 0 ]; do
 done
 
 # Auto-detect JSON mode from output file extension
-if [ -n "$OUTPUT_FILE" ] && _ep "$OUTPUT_FILE" | grep -q '\.json$'; then
-  MODE="json"
-fi
+# NOTE: Using `case` instead of `_ep | grep` because helper functions
+# (including _ep) aren't defined until later in the script. A shell glob
+# match also avoids a needless subprocess here.
+case "${OUTPUT_FILE:-}" in
+  *.json) MODE="json" ;;
+esac
 
 # Disable colors when writing to file
 if [ -n "$OUTPUT_FILE" ]; then
@@ -221,8 +247,35 @@ num_gt() {
 ### -------------------------
 ### Temp file management
 ### -------------------------
-TEMP_DIR=$(mktemp -d /tmp/kdl_XXXXXX 2>/dev/null || echo "/tmp/kdl_$$")
-mkdir -p "$TEMP_DIR" 2>/dev/null
+# Cascade of candidate locations for temp files (v1.8.3):
+#   1. $TMPDIR    — POSIX-standard override (user/env preference)
+#   2. /tmp       — traditional default
+#   3. $HOME      — fallback for hardened envs where /tmp is noexec,
+#                   under quota, or restricted by SELinux/AppArmor
+#   4. $PWD       — last resort (useful in containers without $HOME)
+# If all four fail we exit with a clear error rather than crashing
+# silently further down when the background kubectl redirects fail.
+TEMP_DIR=""
+for _candidate in "${TMPDIR:-}" /tmp "${HOME:-}/.kdl-tmp" "$PWD/.kdl-tmp"; do
+  [ -z "$_candidate" ] && continue
+  # Ensure parent exists (for $HOME/.kdl-tmp style paths)
+  mkdir -p "$_candidate" 2>/dev/null || continue
+  if TEMP_DIR=$(mktemp -d "$_candidate/kdl_XXXXXX" 2>/dev/null); then
+    break
+  fi
+  TEMP_DIR=""
+done
+
+if [ -z "$TEMP_DIR" ] || [ ! -d "$TEMP_DIR" ] || [ ! -w "$TEMP_DIR" ]; then
+  error "Cannot create a writable temp directory."
+  error "Tried: \$TMPDIR, /tmp, \$HOME/.kdl-tmp, \$PWD/.kdl-tmp"
+  error "Set TMPDIR to a writable location and retry:"
+  error "  TMPDIR=/some/writable/path $0 $NAMESPACE"
+  exit 1
+fi
+
+debug "Using temp directory: $TEMP_DIR"
+
 cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT INT TERM
 
