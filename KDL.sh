@@ -7,18 +7,28 @@ trap '' PIPE 2>/dev/null || true
 # Author: Bertrand CASTAGNET - EMEA TAM
 #
 # Changes in v1.8.3:
+# - BUGFIX: Silent script exit on clusters where the catalog pod is not
+#   labelled `component=catalog`. On bash-as-/bin/sh with `set -e`, the
+#   pattern `var=$(kubectl ... -o jsonpath='{.items[0]...}' 2>/dev/null)`
+#   triggers errexit when the label selector matches zero pods, because
+#   kubectl returns non-zero on JSONPath array-out-of-range errors even
+#   with stderr suppressed. The script would die silently at line 919
+#   without printing any output past the collection phase, leaving the
+#   user with only truncated "Collecting..." progress messages on screen.
+#   Added `|| echo ""` guard so the command substitution always succeeds
+#   and the existing fallback (name-pattern match via jq) can execute.
+#   Confirmed on OpenShift 4.10 / oc 4.10.21 / K10 8.0.15 where the
+#   catalog pod uses `app.kubernetes.io/component=catalog` instead of
+#   the plain `component=catalog` label.
 # - ROBUSTNESS: Temp directory cascade (TMPDIR -> /tmp -> $HOME -> $PWD)
-#   Previously the script wrote to /tmp unconditionally and the fallback
-#   path ("/tmp/kdl_$$" via `echo`) silently created a path string without
-#   verifying the directory existed or was writable. On hardened hosts
-#   (/tmp under quota, noexec, SELinux-restricted, or read-only), the
-#   parallel kubectl redirects in v1.8.1+ would fail silently, leaving
-#   empty or missing JSON files that crashed the script mid-collection
-#   with only truncated progress messages visible to the user.
-#   The cascade tries $TMPDIR first (POSIX override), then /tmp, then
-#   $HOME/.kdl-tmp, then $PWD/.kdl-tmp. If none is writable the script
-#   now exits immediately with a clear, actionable error message
-#   instructing the user to set TMPDIR.
+#   Defensive hardening for hardened hosts where /tmp may be under
+#   quota, noexec, SELinux-restricted, or read-only. The previous
+#   fallback (`echo "/tmp/kdl_$$"`) created a path string without
+#   verifying writability, letting subsequent parallel kubectl
+#   redirects fail silently. The cascade tries $TMPDIR first (POSIX
+#   override), then /tmp, then $HOME/.kdl-tmp, then $PWD/.kdl-tmp.
+#   If none is writable, the script now exits with a clear, actionable
+#   error instructing the user to set TMPDIR.
 # - Added debug log entry "Using temp directory: ..." (visible with --debug)
 #
 # Changes in v1.8.2:
@@ -916,7 +926,15 @@ CATALOG_USED_PERCENT="N/A"
 CATALOG_POD=""
 
 # Find catalog pod (try multiple selectors)
-CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -l component=catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+# NOTE: The `|| echo ""` is critical — on bash-as-sh with `set -e`,
+# a simple assignment `var=$(cmd 2>/dev/null)` triggers errexit when
+# cmd exits non-zero. kubectl with `-o jsonpath='{.items[0]...}'` exits
+# non-zero when the selector returns zero items (array index out of
+# range error). Without this guard, the script silently exits whenever
+# the catalog pod isn't labelled `component=catalog` (e.g. K10 8.x
+# deployments use `app.kubernetes.io/component=catalog`), never reaching
+# the fallback or any subsequent section.
+CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -l component=catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 if [ -z "$CATALOG_POD" ]; then
   CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null | jq -r '[.items[]? | select(.metadata.name | test("catalog"; "i")) | .metadata.name][0] // empty' 2>/dev/null)
 fi
