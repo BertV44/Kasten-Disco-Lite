@@ -2,12 +2,43 @@
 set -eu
 
 ##############################################################################
-# KDL JSON -> HTML Report Generator v1.8.1
+# KDL JSON -> HTML Report Generator v1.8.3
 #
 # Usage:
 #   ./kdl-json-to-html.sh input.json output.html
 #
-# Compatible with Kasten Discovery Lite v1.8.1 JSON output
+# Compatible with Kasten Discovery Lite v1.8.1 through v1.8.3 JSON output
+# (JSON schema is unchanged across these versions — both v1.8.2 and v1.8.3
+# are bugfix releases that did not alter the output structure).
+#
+# New in v1.8.3 (generator polish):
+#   - Upfront JSON validation: malformed input now gets a clean, actionable
+#     error before the large render block instead of cryptic jq parse
+#     errors pointing at lines deep inside the rendering logic.
+#   - Print stylesheet (@media print): removes the purple gradient
+#     background, ornamental effects, and hover states for print/PDF
+#     output. Controls page breaks (headings stay with content, tables
+#     keep rows together, headers repeat across pages). Makes the HTML
+#     report presentable as a printed or PDF-exported deliverable.
+#   - Generation timestamp also shown in the footer (was already shown
+#     in the header subtitle) — useful on multi-page prints so the last
+#     page still carries the snapshot date.
+#
+# v1.8.3 and v1.8.2 introduced no JSON schema changes in the main script.
+# The generator bump keeps version numbers aligned across deliverables
+# (main script, HTML generator, README, sample outputs) per the project
+# convention of shipping deliverables in sync.
+#
+# Main script changes (for reference — no generator changes were required):
+#   v1.8.3:
+#     - Fixed silent script exit when `component=catalog` label matches
+#       zero pods on bash-as-sh (real customer bug, affects some K10
+#       deployment label schemes)
+#     - Temp directory cascade ($TMPDIR -> /tmp -> $HOME -> $PWD)
+#       for hardened hosts
+#     - New `[DEBUG] Using temp directory: ...` log line
+#   v1.8.2:
+#     - Fixed `_ep: command not found` when --output is supplied
 #
 # New in v1.8.1:
 #   - Show kdlVersion in subtitle and footer
@@ -71,6 +102,18 @@ command -v jq >/dev/null 2>&1 || {
   echo "ERROR: Input JSON not found: $INPUT_JSON" >&2
   exit 1
 }
+
+# Validate input is proper JSON before running the large render block.
+# Without this check, malformed input (truncated file, mixed stdout/stderr,
+# non-KDL JSON) would fail mid-render with cryptic jq errors pointing at
+# lines deep inside the 800-line rendering logic.
+if ! jq -e . "$INPUT_JSON" >/dev/null 2>&1; then
+  echo "ERROR: Input file is not valid JSON: $INPUT_JSON" >&2
+  echo "  The file may be truncated, contain mixed output (e.g. logs + JSON)," >&2
+  echo "  or not be a KDL output file." >&2
+  echo "  To see the parse error, run: jq . \"$INPUT_JSON\"" >&2
+  exit 1
+fi
 
 jq -r '
 def badge(v):
@@ -323,6 +366,61 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   .grid, .grid-2, .grid-3, .config-grid { grid-template-columns: 1fr; }
   table { font-size: 0.85rem; }
   th, td { padding: 0.5rem; }
+}
+@media print {
+  /* Plain white background — no gradient on paper (toner waste, illegible) */
+  body {
+    background: #ffffff !important;
+    color: #000000;
+    padding: 0;
+    min-height: 0;
+  }
+  .container {
+    max-width: none;
+    box-shadow: none !important;
+    padding: 0.5rem;
+    border-radius: 0;
+  }
+  /* Cards: keep their tinted backgrounds (useful color code) but drop
+     the ornamental effects that only make sense on screen */
+  .card {
+    transform: none !important;
+    box-shadow: none !important;
+    transition: none !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .card:hover {
+    transform: none !important;
+    box-shadow: none !important;
+  }
+  /* Section hygiene — never break a heading off from its content */
+  h2 {
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+  h3 {
+    page-break-after: avoid;
+    break-after: avoid;
+  }
+  /* Tables: repeat headers across pages, keep rows intact */
+  table {
+    box-shadow: none !important;
+    border-radius: 0;
+  }
+  thead { display: table-header-group; }
+  tr { page-break-inside: avoid; break-inside: avoid; }
+  /* Badges: ensure borders print clearly even when browser drops backgrounds */
+  .badge {
+    border: 1px solid #888 !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  /* Footer always at the bottom of the last page */
+  .footer {
+    page-break-before: auto;
+    border-top: 1px solid #000;
+  }
 }
 </style>
 </head>
@@ -1014,7 +1112,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 <div class=\"footer\">
   <strong>Kasten Discovery Lite" + (if .kdlVersion then " v" + .kdlVersion else "" end) + "</strong><br>
   This report provides observational signals only and does not assert compliance.<br>
-  Generated from JSON output of Kasten Discovery Lite script.
+  Generated from JSON output of Kasten Discovery Lite script on " + (now | strftime("%Y-%m-%d %H:%M:%S UTC")) + ".
 </div>
 
 </div>
