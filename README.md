@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v1.8.1
+# Kasten Discovery Lite v1.8.3
 
 A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
 
@@ -34,6 +34,34 @@ Kasten Discovery Lite provides instant visibility into your Kasten K10 deploymen
 - **Best Practices compliance** summary (11 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
+
+---
+
+## What's New in v1.8.3
+
+### Robustness
+
+- **Temp directory cascade** — v1.8.1 introduced parallel kubectl fetches that write to a temp directory, but the initial implementation wrote to `/tmp` unconditionally. On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the background redirects would fail silently and the script would crash mid-collection, leaving only truncated "`Collecting…`" progress messages visible to the user. v1.8.3 tries candidate locations in order: `$TMPDIR` (POSIX override), then `/tmp`, then `$HOME/.kdl-tmp`, then `$PWD/.kdl-tmp`. The first writable location wins.
+- **Clear error on unrecoverable failure** — if none of the four candidates is writable, the script now exits immediately with an actionable message instructing the user to set `TMPDIR` manually, instead of failing silently further down the execution path.
+- **New debug line** — `Using temp directory: <path>` is logged in `--debug` mode so the chosen location is always visible when diagnosing issues.
+
+### Workaround for affected users
+
+Users on hardened hosts where `/tmp` is restricted can now run:
+
+```bash
+TMPDIR=$HOME ./KDL-v1.8.3.sh kasten-io
+```
+
+or set `TMPDIR` in their environment permanently.
+
+---
+
+## What's New in v1.8.2
+
+### Bug Fixes
+
+- **Fixed `_ep: command not found` on any run with `--output`** — The `--output` auto-detect block introduced in v1.8.1 called the `_ep()` helper before it was defined later in the script. The `&&` short-circuit masked the issue for runs without `--output`, but any invocation with `--output` (e.g. `./KDL.sh kasten-io --output discovery.json`) emitted `_ep: command not found` and the autodetect silently failed. Replaced the `_ep | grep` pipeline with a POSIX `case` statement on the filename glob, which also drops an unnecessary subprocess. No other changes in v1.8.2.
 
 ---
 
@@ -140,7 +168,7 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 ## Usage
 
 ```bash
-./KDL-v1.8.1.sh <kasten-namespace> [OPTIONS]
+./KDL-v1.8.3.sh <kasten-namespace> [OPTIONS]
 ```
 
 ### Options
@@ -158,28 +186,25 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 
 ```bash
 # Standard human output with colors
-./KDL-v1.8.1.sh kasten-io
+./KDL-v1.8.3.sh kasten-io
 
 # JSON output for automation
-./KDL-v1.8.1.sh kasten-io --json
+./KDL-v1.8.3.sh kasten-io --json
 
 # Save JSON directly to file (auto-detects JSON mode)
-./KDL-v1.8.1.sh kasten-io --output discovery.json
+./KDL-v1.8.3.sh kasten-io --output discovery.json
 
 # Save human output to file
-./KDL-v1.8.1.sh kasten-io --no-color --output report.txt
+./KDL-v1.8.3.sh kasten-io --no-color --output report.txt
 
 # Debug mode for troubleshooting
-./KDL-v1.8.1.sh kasten-io --debug
-
-# Pipe JSON to report generator
-./KDL-v1.8.1.sh kasten-io --json | python3 kasten-report-generator.py -o report.pptx
+./KDL-v1.8.3.sh kasten-io --debug
 
 # Version check
-./KDL-v1.8.1.sh --version
+./KDL-v1.8.3.sh --version
 
 # Help
-./KDL-v1.8.1.sh --help
+./KDL-v1.8.3.sh --help
 ```
 
 ---
@@ -377,7 +402,15 @@ Key portability measures in v1.8.1:
 
 ## Version History
 
-- **v1.8.1** (Current)
+- **v1.8.3** (Current)
+  - Temp directory cascade: `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`
+  - Clear error exit when no writable temp location is available (instead of silent mid-run crash)
+  - New debug line showing which temp location was chosen
+
+- **v1.8.2**
+  - Fixed `_ep: command not found` on any run with `--output` (ordering bug in autodetect block introduced in v1.8.1)
+
+- **v1.8.1**
   - Fixed export retention display (wrong JSON path)
   - Deterministic retention key ordering (daily/weekly/monthly/yearly)
   - Export frequency and profile displayed per-policy
@@ -454,9 +487,25 @@ Key portability measures in v1.8.1:
 
 ## Troubleshooting
 
+### Script exits silently after "Collecting..." with no report
+
+In v1.8.1 and v1.8.2, the script wrote temp files to `/tmp` unconditionally. On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the parallel kubectl redirects failed silently and the script crashed mid-collection, leaving only fragments of progress messages on screen. v1.8.3 fixes this by cascading through `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`, and exits with a clear error if none is writable.
+
+**Workaround on v1.8.1/v1.8.2**: upgrade to v1.8.3, or explicitly point `TMPDIR` at a writable location:
+
+```bash
+TMPDIR=$HOME ./KDL-v1.8.3.sh kasten-io
+```
+
+**To confirm the cascade is working on v1.8.3**:
+
+```bash
+./KDL-v1.8.3.sh kasten-io --debug 2>&1 | grep "Using temp directory"
+```
+
 ### Export retention shows "not defined" when it should have values
 
-In v1.8, export retention was read from the wrong JSON path. Upgrade to v1.8.1 which reads from `.spec.actions[].retention` (the correct location).
+In v1.8, export retention was read from the wrong JSON path. Upgrade to v1.8.1 or later which reads from `.spec.actions[].retention` (the correct location).
 
 ### Helm configuration shows "source: none"
 
@@ -515,7 +564,7 @@ kubectl -n kasten-io get pods -o json | jq '.items[].spec.containers[].resources
 Use `--debug` to see detailed processing information:
 
 ```bash
-./KDL-v1.8.1.sh kasten-io --debug
+./KDL-v1.8.3.sh kasten-io --debug
 ```
 
 This shows namespace validation, platform detection, policy counts, catch-all detection, protected/unprotected lists, K10 pod/container counts, Helm values source, authentication method, encryption provider, limiter values, and non-default settings.
@@ -531,7 +580,7 @@ This shows namespace validation, platform detection, policy counts, catch-all de
 5. **Coverage analysis** — Identify unprotected namespaces and VMs
 6. **Support tickets** — Provide detailed environment information
 7. **Automation** — JSON output for CI/CD pipelines
-8. **Documentation** — Generate HTML/PPTX reports for stakeholders
+8. **Documentation** — Generate HTML reports for stakeholders
 9. **Best Practices validation** — Ensure compliance with Kasten recommendations
 10. **Performance monitoring** — Track policy run durations
 11. **Cleanup tasks** — Identify orphaned RestorePoints
@@ -545,6 +594,8 @@ This shows namespace validation, platform detection, policy counts, catch-all de
 ---
 
 ## Disclaimer
+
+This is an independent **community project** created and maintained by the author on a personal basis. It is **not an official Veeam or Kasten product**, is **not affiliated with or endorsed by Veeam or Kasten**, and is **not covered by Veeam or Kasten support**. The script is provided **"as is"**, without warranty of any kind, express or implied, including but not limited to fitness for a particular purpose. Use at your own discretion and risk.
 
 This script provides **observational signals only**.
 
@@ -560,9 +611,8 @@ It does **not**:
 
 | File | Description |
 |------|-------------|
-| `KDL-v1.8.1.sh` | Main discovery script |
+| `KDL-v1.8.3.sh` | Main discovery script |
 | `kdl-json-to-html.sh` | HTML report generator |
-| `kasten-report-generator.py` | PowerPoint report generator (v1.4) |
 | `README.md` | This documentation |
 
 ---
@@ -573,4 +623,4 @@ Bertrand CASTAGNET - EMEA Technical Account Manager
 
 ## License
 
-Internal use - Veeam/Kasten
+Community project — free to use, modify, and share.
