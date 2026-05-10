@@ -3,8 +3,44 @@ set -eu
 trap '' PIPE 2>/dev/null || true
 
 ##############################################################################
-# Kasten Discovery Lite v1.9
+# Kasten Discovery Lite v1.9.1
 # Author: Bertrand CASTAGNET - EMEA TAM
+#
+# Changes in v1.9.1:
+# - BUGFIX: Locale-sensitive numeric formatting in awk printf calls produced
+#   French-style output (e.g. "73,0%" instead of "73.0") on systems with
+#   LC_NUMERIC set to fr_FR.UTF-8. The decimal comma was being emitted into
+#   the JSON `successRate` and `dedupRatio` string fields and into the
+#   human-readable export storage display, breaking downstream consumers
+#   (HTML/PPTX generators, dashboards) that expect parseable numbers.
+#   Fix: prepend `LC_ALL=C` to all 5 affected awk invocations (2 explicit
+#   ratios + 3 GiB/MiB/KiB sizing branches). LC_ALL=C forces POSIX numeric
+#   format with `.` decimal separator regardless of user locale.
+#   Verified by reproducing the bug on a test system with `locale-gen
+#   fr_FR.UTF-8 && LC_ALL=fr_FR.UTF-8 awk "BEGIN{printf %.1f, 73}"` -> 73,0
+#   and confirming `LC_ALL=C awk ...` -> 73.0.
+# - BUGFIX: Per-Namespace Protection Status (NEW v1.9) excluded namespaces
+#   matching SYSTEM_NS_PATTERNS even when they were the explicit target of a
+#   user policy. On the reporter's cluster, `openshift-etcd` was the
+#   matchNames target of `smoke-test1` policy but did not appear in
+#   namespaceProtectionStatus.items because `openshift-` matches the system
+#   patterns. The Per-NS analysis now unions APP_NAMESPACES (non-system) with
+#   PROTECTED_NAMESPACES (explicitly listed in any user policy), without
+#   modifying APP_NAMESPACES itself (preserves Namespace Protection v1.5
+#   semantics). Result: explicitly-protected system namespaces now show their
+#   true backup/export/restore status instead of being silently dropped.
+# - CALIBRATION: BP-RET-HIGH threshold raised from `> 2` to `> 7`. The
+#   previous threshold flagged any policy with retention > 2 (i.e. nearly
+#   every standard DAILY=7 setup) as WARN. The new threshold targets the
+#   actual concern — excessive simultaneous snapshots impacting source
+#   storage I/O — without false-positive on standard weekly retention.
+#   Note: this is an empirical threshold; consult Kasten K10 documentation
+#   for production sizing guidance specific to your storage backend.
+# - UX: Disaster Recovery section now displays
+#   "N/A (no export in this DR mode)" instead of bare "N/A" when KDR is in
+#   Quick DR (No Snapshot) mode, where there is by design no export profile.
+#   Not a bugfix — just clarification that N/A is expected, not a missing
+#   value.
 #
 # Changes in v1.9:
 # - FEATURES: Failed Actions Top 5 (dedicated section, recursive cause-chain
@@ -150,7 +186,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="1.9"
+KDL_VERSION="1.9.1"
 OUTPUT_FILE=""
 SKIP_HELM=false
 
@@ -810,7 +846,7 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
   KDR_ENABLED=true
   KDR_FREQUENCY=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "N/A"')
   KDR_PROFILE=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.actions[0].exportParameters.profile.name // "N/A"')
-  
+
   # Detect KDR mode from kdrSnapshotConfiguration
   KDR_SNAPSHOT_CONFIG=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration // empty')
   if [ -n "$KDR_SNAPSHOT_CONFIG" ]; then
@@ -827,6 +863,14 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
     KDR_MODE="Legacy DR"
     KDR_LOCAL_SNAPSHOT="false"
     KDR_EXPORT_CATALOG="false"
+  fi
+
+  # v1.9.1: When KDR is in Quick DR (No Snapshot) mode, the policy has no
+  # export action by design — so there's no exportParameters.profile.name
+  # to read. Make the N/A more informative so operators don't think it's
+  # a missing/broken value.
+  if [ "$KDR_PROFILE" = "N/A" ] && [ "$KDR_MODE" = "Quick DR (No Snapshot)" ]; then
+    KDR_PROFILE="N/A (no export in this DR mode)"
   fi
 else
   KDR_ENABLED=false
@@ -1362,7 +1406,7 @@ FAILED_ACTIONS=$((BACKUP_ACTIONS_FAILED + EXPORT_ACTIONS_FAILED))
 # This excludes Running/Pending/Cancelled from the calculation
 FINISHED_ACTIONS=$((COMPLETED_ACTIONS + FAILED_ACTIONS))
 if [ "$FINISHED_ACTIONS" -gt 0 ]; then
-  SUCCESS_RATE=$(awk "BEGIN {printf \"%.1f\", ($COMPLETED_ACTIONS / $FINISHED_ACTIONS) * 100}")
+  SUCCESS_RATE=$(LC_ALL=C awk "BEGIN {printf \"%.1f\", ($COMPLETED_ACTIONS / $FINISHED_ACTIONS) * 100}")
 else
   SUCCESS_RATE="N/A"
 fi
@@ -1507,7 +1551,25 @@ debug "Stuck actions (>${STUCK_HOURS_THRESHOLD}h Running): $STUCK_ACTIONS_COUNT"
 # last successful backup is too old. This is a different failure mode than
 # "unprotected" and warrants its own visibility.
 #
+# v1.9.1 BUGFIX: extend the namespace set with PROTECTED_NAMESPACES so that
+# system-pattern namespaces explicitly listed by a user policy (e.g.
+# openshift-etcd targeted by matchNames) are not silently dropped from the
+# Per-NS analysis. APP_NAMESPACES itself is left untouched to preserve v1.5
+# "Namespace Protection" section semantics. Union + unique gives the right
+# input set for this section's purpose.
+#
 # All inputs already in memory — no kubectl calls.
+
+NS_PROTECTION_INPUT=$(jq -cn '
+  (($app // []) + ($protected // [])) | unique
+' \
+  --argjson app "$APP_NAMESPACES" \
+  --argjson protected "$PROTECTED_NAMESPACES" \
+  2>/dev/null || echo '[]')
+
+if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
+  NS_PROTECTION_INPUT="$APP_NAMESPACES"
+fi
 
 NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
   ($appNamespaces // []) as $ns_list |
@@ -1552,7 +1614,7 @@ NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
       )
     })
 ' \
-  --argjson appNamespaces "$APP_NAMESPACES" \
+  --argjson appNamespaces "$NS_PROTECTION_INPUT" \
   --argjson export "$EXPORT_ACTIONS_JSON" \
   --argjson restore "$RESTORE_ACTIONS_JSON" \
   --argjson runs "$RUNACTIONS_JSON" \
@@ -1698,7 +1760,7 @@ fi
 # < 1.0 means data grew (encryption/compression overhead)
 # > 1.0 means dedup/compression saved space
 if [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null && [ "$EXPORT_LOGICAL_BYTES" -gt 0 ] 2>/dev/null; then
-  DEDUP_RATIO=$(awk "BEGIN {printf \"%.1f\", $EXPORT_LOGICAL_BYTES / $EXPORT_PHYSICAL_BYTES}")
+  DEDUP_RATIO=$(LC_ALL=C awk "BEGIN {printf \"%.1f\", $EXPORT_LOGICAL_BYTES / $EXPORT_PHYSICAL_BYTES}")
 else
   DEDUP_RATIO="N/A"
 fi
@@ -1706,11 +1768,11 @@ fi
 # Format export storage for display (physical = actual storage used)
 if [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null; then
   if [ "$EXPORT_PHYSICAL_BYTES" -ge 1073741824 ]; then
-    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f GiB\", $EXPORT_PHYSICAL_BYTES / 1073741824}")
+    EXPORT_STORAGE_DISPLAY=$(LC_ALL=C awk "BEGIN {printf \"%.1f GiB\", $EXPORT_PHYSICAL_BYTES / 1073741824}")
   elif [ "$EXPORT_PHYSICAL_BYTES" -ge 1048576 ]; then
-    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f MiB\", $EXPORT_PHYSICAL_BYTES / 1048576}")
+    EXPORT_STORAGE_DISPLAY=$(LC_ALL=C awk "BEGIN {printf \"%.1f MiB\", $EXPORT_PHYSICAL_BYTES / 1048576}")
   elif [ "$EXPORT_PHYSICAL_BYTES" -ge 1024 ]; then
-    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f KiB\", $EXPORT_PHYSICAL_BYTES / 1024}")
+    EXPORT_STORAGE_DISPLAY=$(LC_ALL=C awk "BEGIN {printf \"%.1f KiB\", $EXPORT_PHYSICAL_BYTES / 1024}")
   else
     EXPORT_STORAGE_DISPLAY="${EXPORT_PHYSICAL_BYTES} B"
   fi
@@ -2370,13 +2432,18 @@ debug "Best Practices v1.8 - Auth: $BP_AUTH_STATUS, KMS Encryption: $BP_ENCRYPTI
 ### -------------------------
 # Excludes system policies (DR + reports) by reusing APP_POLICIES_JSON.
 
-# BP-RET-HIGH: snapshot retention > 2 (source storage I/O & capacity impact)
+# BP-RET-HIGH: snapshot retention > 7 (excessive simultaneous snapshots
+# impact source storage I/O and capacity)
+# v1.9.1: threshold raised from > 2 (which was too sensitive — flagged
+# every standard DAILY=7 setup) to > 7 (matches the typical maximum
+# weekly retention for legitimate daily-policy use). Empirical threshold;
+# consult Kasten K10 documentation for backend-specific sizing guidance.
 HIGH_SNAP_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
   [.items[]?
     | select(.spec.actions[]?.action == "backup")
     | . as $p
     | (.spec.retention // {} | to_entries | map(.value) | map(select(type == "number")))
-    | select((. | length) > 0 and (max > 2))
+    | select((. | length) > 0 and (max > 7))
     | {name: $p.metadata.name, max: max}
   ]
 ' 2>/dev/null || echo '[]')
@@ -3074,7 +3141,7 @@ if [ "$MODE" = "json" ]; then
         snapshotRetentionHigh: {
           count: $highSnapCount,
           items: $highSnapPolicies,
-          note: "Policies with at least one snapshot retention key > 2 (source storage I/O impact)"
+          note: "Policies with at least one snapshot retention key > 7 (source storage I/O impact at high simultaneous snapshot counts)"
         },
         snapshotRetentionZero: {
           count: $zeroSnapCount,
@@ -4019,9 +4086,9 @@ fi
 
 # Snapshot retention high (NEW v1.9)
 if [ "$BP_SNAP_RETENTION_HIGH_STATUS" = "OK" ]; then
-  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Snapshot retention:   ${COLOR_GREEN}WITHIN LIMITS${COLOR_RESET} (no policy with snapshot retention >2)\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Snapshot retention:   ${COLOR_GREEN}WITHIN LIMITS${COLOR_RESET} (no policy with snapshot retention >7)\n"
 else
-  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Snapshot retention:   ${COLOR_YELLOW}HIGH${COLOR_RESET} ($HIGH_SNAP_COUNT policy/policies with snapshot retention >2 — source SC I/O impact)\n"
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Snapshot retention:   ${COLOR_YELLOW}HIGH${COLOR_RESET} ($HIGH_SNAP_COUNT policy/policies with snapshot retention >7 — source SC I/O impact)\n"
   _ep "$HIGH_SNAP_POLICIES" | jq -r '.[:5][] | "      - " + .name + " (max=" + (.max|tostring) + ")"' 2>/dev/null
 fi
 
