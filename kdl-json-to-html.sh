@@ -2,27 +2,41 @@
 set -eu
 
 ##############################################################################
-# KDL JSON -> HTML Report Generator v1.8.3
+# KDL JSON -> HTML Report Generator v1.9.1
 #
 # Usage:
 #   ./kdl-json-to-html.sh input.json output.html
 #
-# Compatible with Kasten Discovery Lite v1.8.1 through v1.8.3 JSON output
-# (JSON schema is unchanged across these versions — both v1.8.2 and v1.8.3
-# are bugfix releases that did not alter the output structure).
+# Compatible with Kasten Discovery Lite v1.8.1 through v1.9.1 JSON output.
+# Backward compatible: a v1.9.1 generator on v1.8.x JSON simply omits the
+# v1.9 sections (uses `if .field` guards everywhere). A v1.8.3 generator on
+# v1.9.1 JSON ignores the new sections (verified).
 #
-# New in v1.8.3 (generator polish):
-#   - Upfront JSON validation: malformed input now gets a clean, actionable
-#     error before the large render block instead of cryptic jq parse
-#     errors pointing at lines deep inside the rendering logic.
-#   - Print stylesheet (@media print): removes the purple gradient
-#     background, ornamental effects, and hover states for print/PDF
-#     output. Controls page breaks (headings stay with content, tables
-#     keep rows together, headers repeat across pages). Makes the HTML
-#     report presentable as a printed or PDF-exported deliverable.
-#   - Generation timestamp also shown in the footer (was already shown
-#     in the header subtitle) — useful on multi-page prints so the last
-#     page still carries the snapshot date.
+# New in v1.9.1 (generator alignment with KDL v1.9.x schema):
+#   - Header subtitle: K8s server version + distribution from .cluster
+#   - Header subtitle: "(Helm skipped)" notice when .collectionFlags.skipHelm
+#   - Best Practices table: 5 new rows (snapshotRetentionHigh, snapshotRetentionZero,
+#     exportRetentionExplicit, clusterScopedResources, policiesWithoutExport)
+#   - New section: Failed Actions Top 5 with cause-chain error messages
+#   - New section: Stuck Actions (Running > 24h)
+#   - New section: Per-Namespace Protection Status (last backup/export/restore
+#     per ns + stale flag)
+#   - New section: RestorePoints distribution by Namespace (Top 5)
+#   - New section: Profile Validation status (per profile)
+#   - New section: k10-system-reports-policy state (data source for export
+#     storage / dedup metrics)
+#   - New section: StorageClasses + VolumeSnapshotClasses inventory with
+#     CSI driver / VSC cross-check warnings
+#   - New section: Import Policies (multi-cluster context)
+#   - New section: Policies without Export (snapshot-only workloads)
+#   - New section: Retention Analysis (high snapshot, zero snapshot,
+#     implicit export retention)
+#   - Policy Last Run table: error message column when state=Failed
+#   - All new sections use existing helpers (badge, severityBadge, card,
+#     boolBadge, formatDuration) — no new CSS classes required
+#
+# All v1.8.x sections preserved unchanged. v1.8.3 print stylesheet,
+# JSON validation pre-check, and footer timestamp retained.
 #
 # v1.8.3 and v1.8.2 introduced no JSON schema changes in the main script.
 # The generator bump keeps version numbers aligned across deliverables
@@ -121,7 +135,7 @@ def badge(v):
     "<span class=\"badge ok\">\u2713 " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" then 
     "<span class=\"badge error\">\u2717 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" then 
+  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "WARN" then 
     "<span class=\"badge warn\">\u26a0 " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == false then
     "<span class=\"badge warn\">\u2717 false</span>"
@@ -434,7 +448,9 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   Platform: " + .platform + " | 
   Version: " + .kastenVersion +
   (if .kdlVersion then " | KDL: v" + .kdlVersion else "" end) +
+  (if .cluster.kubernetesVersion then " | K8s: " + .cluster.kubernetesVersion + (if .cluster.distribution then " (" + .cluster.distribution + ")" else "" end) else "" end) +
   (if .k10Configuration.source then " | Config Source: " + .k10Configuration.source else "" end) +
+  (if .collectionFlags.skipHelm == true then " | <strong>Helm: skipped</strong>" else "" end) +
 "
 </div>
 
@@ -447,7 +463,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + "</div>
 
 <!-- Best Practices Compliance -->
-<h2>\uD83D\uDCCB Best Practices Compliance<span class=\"new-badge\">v1.8</span></h2>"
+<h2>\uD83D\uDCCB Best Practices Compliance<span class=\"new-badge\">v1.9</span></h2>"
 + (if .bestPractices then
     "<table class=\"bp-table\">
     <thead><tr><th>Check</th><th>Severity</th><th>Status</th><th>Details</th></tr></thead>
@@ -523,7 +539,65 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <td class=\"sev-optional\">Optional</td>
         <td>" + severityBadge("optional"; (.bestPractices.auditLogging // "N/A")) + "</td>
         <td>" + badge(.bestPractices.auditLogging // "N/A") + "</td>
-      </tr>
+      </tr>" +
+      (if .bestPractices.snapshotRetentionHigh then
+      "
+      <tr>
+        <td><strong>Snapshot Retention (high)</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.snapshotRetentionHigh) + "</td>
+        <td>" + badge(.bestPractices.snapshotRetentionHigh) +
+          (if (.retentionAnalysis.snapshotRetentionHigh.count // 0) > 0 then
+            " (" + (.retentionAnalysis.snapshotRetentionHigh.count | tostring) + " policy/policies with snapshot retention >7)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.snapshotRetentionZero then
+      "
+      <tr>
+        <td><strong>Fast Local Recovery</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.snapshotRetentionZero) + "</td>
+        <td>" + badge(.bestPractices.snapshotRetentionZero) +
+          (if (.retentionAnalysis.snapshotRetentionZero.count // 0) > 0 then
+            " (" + (.retentionAnalysis.snapshotRetentionZero.count | tostring) + " policy/policies with zero snapshot retention)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.exportRetentionExplicit then
+      "
+      <tr>
+        <td><strong>Export Retention</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.exportRetentionExplicit) + "</td>
+        <td>" + badge(.bestPractices.exportRetentionExplicit) +
+          (if (.retentionAnalysis.exportWithoutExplicitRetention.count // 0) > 0 then
+            " (" + (.retentionAnalysis.exportWithoutExplicitRetention.count | tostring) + " policy/policies with implicit export retention)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.clusterScopedResources then
+      "
+      <tr>
+        <td><strong>Cluster-scoped Resources</strong></td>
+        <td class=\"sev-optional\">Optional</td>
+        <td>" + severityBadge("optional"; .bestPractices.clusterScopedResources) + "</td>
+        <td>" + badge(.bestPractices.clusterScopedResources) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.policiesWithoutExport then
+      "
+      <tr>
+        <td><strong>Export Coverage</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.policiesWithoutExport) + "</td>
+        <td>" + badge(.bestPractices.policiesWithoutExport) +
+          (if (.policiesWithoutExport.count // 0) > 0 then
+            " (" + (.policiesWithoutExport.count | tostring) + " snapshot-only policy/policies)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      "
     </tbody></table>"
   else
     "<div class=\"info-box\">Best practices data not available.</div>"
@@ -591,7 +665,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       <div class=\"card new-feature\"><strong>Sample Size</strong><div class=\"card-value\">" + (.policyRunStats.averageDuration.sampleCount | tostring) + " runs</div></div>
     </div>
     <table>
-    <thead><tr><th>Policy</th><th>Last Run</th><th>Status</th><th>Duration</th></tr></thead>
+    <thead><tr><th>Policy</th><th>Last Run</th><th>Status</th><th>Duration</th><th>Error (if Failed)</th></tr></thead>
     <tbody>" +
     ([.policyRunStats.lastRuns[]? | 
       "<tr>
@@ -599,6 +673,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <td>" + (if .lastRun then (.lastRun.timestamp | split("T")[0]) else "Never" end) + "</td>
         <td>" + badge(if .lastRun then .lastRun.state else "N/A" end) + "</td>
         <td>" + (if .lastRun.duration then formatDuration(.lastRun.duration) else "N/A" end) + "</td>
+        <td>" + (if .lastRun.error and .lastRun.error != "" then "<small style=\"color:#b91c1c\">" + (.lastRun.error | tostring) + "</small>" else "—" end) + "</td>
       </tr>"
     ] | join("")) +
     "</tbody></table>"
@@ -873,6 +948,161 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   end)
 + "
 
+<!-- Failed Actions Top 5 (NEW v1.9) -->
+<h2>\u274C Failed Actions - Top 5<span class=\"new-badge\">v1.9</span></h2>"
++ (if .failedActionsTop5 and (.failedActionsTop5.count // 0) > 0 then
+    "<p class=\"section-description\">Most recent failures across BackupAction, ExportAction, RestoreAction (sorted desc).</p>
+    <table>
+    <thead><tr><th>Kind</th><th>Date</th><th>Namespace</th><th>Policy</th><th>Error</th></tr></thead>
+    <tbody>" +
+    ([.failedActionsTop5.items[]? | "<tr>
+      <td>" + (.kind // "") + "</td>
+      <td>" + (.timestamp // "" | split("T")[0]) + "</td>
+      <td><code>" + (.namespace // "N/A") + "</code></td>
+      <td>" + (if .policy != "" then "<code>" + .policy + "</code>" else "<em>n/a</em>" end) + "</td>
+      <td>" + (if .message != "" then .message else "<em>(no error message)</em>" end) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .failedActionsTop5 then
+    "<div class=\"success-box\">\u2713 <strong>No failed actions found.</strong></div>"
+  else
+    "<div class=\"info-box\">Failed actions data not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
+<!-- Stuck Actions (NEW v1.9) -->
+<h2>\u23F3 Stuck Actions<span class=\"new-badge\">v1.9</span></h2>"
++ (if .stuckActions and (.stuckActions.count // 0) > 0 then
+    "<p class=\"section-description\">Actions in <code>Running</code> state for more than " + ((.stuckActions.thresholdHours // 24) | tostring) + " hours.</p>
+    <div class=\"warning-box\">\u26a0 <strong>" + (.stuckActions.count | tostring) + " stuck action(s) detected</strong></div>
+    <table>
+    <thead><tr><th>Kind</th><th>Name</th><th>Namespace</th><th>Policy</th><th>Age</th></tr></thead>
+    <tbody>" +
+    ([.stuckActions.items[]? | "<tr>
+      <td>" + (.kind // "") + "</td>
+      <td><code>" + (.name // "") + "</code></td>
+      <td><code>" + (.namespace // "N/A") + "</code></td>
+      <td>" + (if .policy != "" then "<code>" + .policy + "</code>" else "<em>n/a</em>" end) + "</td>
+      <td>" + ((.ageHours // 0) | tostring) + "h</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .stuckActions then
+    "<div class=\"success-box\">\u2713 <strong>No stuck actions detected.</strong></div>"
+  else
+    "<div class=\"info-box\">Stuck actions data not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
+<!-- Per-Namespace Protection Status (NEW v1.9) -->
+<h2>\uD83D\uDCC5 Per-Namespace Protection Status<span class=\"new-badge\">v1.9</span></h2>"
++ (if .namespaceProtectionStatus then
+    "<p class=\"section-description\">Last successful backup / export / restore per application namespace. Stale = backup older than " + ((.namespaceProtectionStatus.thresholdDays // 7) | tostring) + " days.</p>
+    <div class=\"grid\">
+      <div class=\"card\"><strong>Namespaces Analyzed</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.total | tostring) + "</div></div>
+      <div class=\"card\"><strong>Stale</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.stale | tostring) + "</div></div>
+      <div class=\"card\"><strong>Never Backed Up</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.neverBackedUp | tostring) + "</div></div>
+    </div>" +
+    (if (.namespaceProtectionStatus.total // 0) > 0 then
+      "<table>
+      <thead><tr><th>Status</th><th>Namespace</th><th>Last Backup</th><th>Age</th><th>Last Export</th><th>Last Restore</th></tr></thead>
+      <tbody>" +
+      ([.namespaceProtectionStatus.items
+        | sort_by(if .lastBackup == null then "0000" else .lastBackup end)
+        | .[0:20][]? | "<tr>
+        <td>" + (
+          if .lastBackup == null then "<span class=\"badge error\">NEVER</span>"
+          elif .stale then "<span class=\"badge warn\">STALE</span>"
+          else "<span class=\"badge ok\">OK</span>" end
+        ) + "</td>
+        <td><code>" + .namespace + "</code></td>
+        <td>" + (if .lastBackup then (.lastBackup | split("T")[0]) else "<em>never</em>" end) + "</td>
+        <td>" + (if .backupAgeDays != null then (.backupAgeDays | tostring) + "d" else "—" end) + "</td>
+        <td>" + (if .lastExport then (.lastExport | split("T")[0]) else "—" end) + "</td>
+        <td>" + (if .lastRestore then (.lastRestore | split("T")[0]) else "—" end) + "</td>
+      </tr>"] | join("")) +
+      "</tbody></table>" +
+      (if (.namespaceProtectionStatus.total // 0) > 20 then
+        "<p class=\"section-description\"><em>... and " + ((.namespaceProtectionStatus.total - 20) | tostring) + " more (see JSON for full list)</em></p>"
+      else "" end)
+    else
+      "<div class=\"info-box\">No application namespaces to evaluate.</div>"
+    end)
+  else
+    "<div class=\"info-box\">Per-namespace protection status not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
+<!-- RestorePoints by Namespace - Top 5 (NEW v1.9) -->
+<h2>\uD83D\uDCCD RestorePoints by Namespace - Top 5<span class=\"new-badge\">v1.9</span></h2>"
++ (if .restorePointsByNamespace and (.restorePointsByNamespace.top5 // [] | length) > 0 then
+    "<p class=\"section-description\">Namespaces driving the most catalog entries — useful for capacity planning.</p>
+    <table>
+    <thead><tr><th>Namespace</th><th>RestorePoint Count</th></tr></thead>
+    <tbody>" +
+    ([.restorePointsByNamespace.top5[]? | "<tr>
+      <td><code>" + .namespace + "</code></td>
+      <td>" + (.count | tostring) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .restorePointsByNamespace then
+    "<div class=\"info-box\">No RestorePoints found.</div>"
+  else
+    "<div class=\"info-box\">RestorePoint distribution data not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
+<!-- Profile Validation (NEW v1.9) -->
+<h2>\u2705 Profile Validation<span class=\"new-badge\">v1.9</span></h2>"
++ (if .profileValidation and (.profileValidation.items // [] | length) > 0 then
+    (if (.profileValidation.failedCount // 0) > 0 then
+      "<div class=\"warning-box\">\u26a0 <strong>" + (.profileValidation.failedCount | tostring) + " profile(s) in Failed state</strong></div>"
+    else
+      "<div class=\"success-box\">\u2713 <strong>All profiles validated successfully</strong></div>"
+    end) +
+    "<table>
+    <thead><tr><th>Profile</th><th>State</th><th>Error</th></tr></thead>
+    <tbody>" +
+    ([.profileValidation.items[]? | "<tr>
+      <td><code>" + .name + "</code></td>
+      <td>" + (
+        if .state == "Failed" or .state == "Failing" then "<span class=\"badge error\">\u2717 " + .state + "</span>"
+        elif .state == "Success" then "<span class=\"badge ok\">\u2713 Success</span>"
+        else "<span class=\"badge info\">" + (.state // "Unknown") + "</span>" end
+      ) + "</td>
+      <td>" + (if .error then (.error | tostring) else "<em>—</em>" end) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  else
+    "<div class=\"info-box\">Profile validation data not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
+<!-- Reports Policy State (NEW v1.9) -->
+<h2>\uD83D\uDCCA k10-system-reports-policy<span class=\"new-badge\">v1.9</span></h2>"
++ (if .reportsPolicy then
+    (if .reportsPolicy.exists == false then
+      "<div class=\"warning-box\">\u26a0 <strong>Reports policy not found.</strong> Export Storage and Deduplication metrics will be unavailable without it.</div>"
+    else
+      "<p class=\"section-description\">" + (.reportsPolicy.note // "") + "</p>
+      <div class=\"grid\">
+        <div class=\"card\"><strong>Exists</strong><div class=\"card-value\">" + boolBadge(.reportsPolicy.exists) + "</div></div>
+        <div class=\"card\"><strong>Frequency</strong><div class=\"card-value\">" + (.reportsPolicy.frequency // "N/A") + "</div></div>
+        <div class=\"card\"><strong>ReportActions</strong><div class=\"card-value\">" + ((.reportsPolicy.reportActionsCount // 0) | tostring) + "</div></div>
+        <div class=\"card\"><strong>Last State</strong><div class=\"card-value\">" +
+          (if .reportsPolicy.lastRun.state == "Complete" then "<span class=\"badge ok\">\u2713 Complete</span>"
+           elif .reportsPolicy.lastRun.state == "Failed" then "<span class=\"badge error\">\u2717 Failed</span>"
+           else "<span class=\"badge info\">" + (.reportsPolicy.lastRun.state // "N/A") + "</span>" end) +
+          "</div></div>" +
+        (if .reportsPolicy.lastRun.timestamp and .reportsPolicy.lastRun.timestamp != "N/A" then
+          "<div class=\"card\"><strong>Last Run</strong><div class=\"card-value\">" + (.reportsPolicy.lastRun.timestamp | split("T")[0]) + "</div></div>"
+        else "" end) +
+      "</div>"
+    end)
+  else
+    "<div class=\"info-box\">Reports policy data not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
 <h2>\uD83D\uDCC8 Monitoring</h2>
 <div class=\"grid-2\">
   <div class=\"card\"><div class=\"stat-row\"><span class=\"stat-label\">Prometheus</span><span class=\"stat-value\">" + boolBadge(.monitoring.prometheus) + "</span></div></div>
@@ -897,6 +1127,70 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
     else "" end)
   else
     "<div class=\"info-box\">Data usage information not available.</div>"
+  end)
++ "
+
+<!-- StorageClasses + VolumeSnapshotClasses Inventory (NEW v1.9) -->
+<h2>\uD83D\uDDC4\uFE0F StorageClasses &amp; VolumeSnapshotClasses<span class=\"new-badge\">v1.9</span></h2>"
++ (if .storageClasses or .volumeSnapshotClasses then
+    "<p class=\"section-description\">CSI snapshot capability depends on matching StorageClass / VolumeSnapshotClass pairs. Mismatches break Kasten backups via CSI snapshots.</p>" +
+
+    (if .storageClasses then
+      (if .storageClasses.rbacAccessible == false then
+        "<div class=\"warning-box\">\u26a0 <strong>StorageClasses:</strong> RBAC denied or unreachable.</div>"
+      else
+        "<h3>StorageClasses (" + (.storageClasses.count | tostring) +
+          (if (.storageClasses.defaultCount // 0) > 0 then ", " + (.storageClasses.defaultCount | tostring) + " default" else ", no default flagged" end) +
+        ")</h3>" +
+        (if (.storageClasses.count // 0) > 0 then
+          "<table>
+          <thead><tr><th>Name</th><th>Provisioner</th><th>Default</th><th>Expandable</th><th>Reclaim</th><th>Binding</th></tr></thead>
+          <tbody>" +
+          ([.storageClasses.items[]? | "<tr>
+            <td><code>" + .name + "</code></td>
+            <td><code>" + .provisioner + "</code></td>
+            <td>" + (if .isDefault then "<span class=\"badge ok\">DEFAULT</span>" else "—" end) + "</td>
+            <td>" + boolBadge(.expandable) + "</td>
+            <td>" + .reclaimPolicy + "</td>
+            <td>" + .bindingMode + "</td>
+          </tr>"] | join("")) +
+          "</tbody></table>"
+        else
+          "<div class=\"info-box\">No StorageClasses found.</div>"
+        end)
+      end)
+    else "" end) +
+
+    (if .volumeSnapshotClasses then
+      (if .volumeSnapshotClasses.rbacAccessible == false then
+        "<div class=\"warning-box\">\u26a0 <strong>VolumeSnapshotClasses:</strong> RBAC denied or unreachable.</div>"
+      else
+        "<h3>VolumeSnapshotClasses (" + (.volumeSnapshotClasses.count | tostring) +
+          (if (.volumeSnapshotClasses.defaultCount // 0) > 0 then ", " + (.volumeSnapshotClasses.defaultCount | tostring) + " default" else "" end) +
+        ")</h3>" +
+        (if (.volumeSnapshotClasses.count // 0) > 0 then
+          "<table>
+          <thead><tr><th>Name</th><th>Driver</th><th>Default</th><th>Deletion Policy</th></tr></thead>
+          <tbody>" +
+          ([.volumeSnapshotClasses.items[]? | "<tr>
+            <td><code>" + .name + "</code></td>
+            <td><code>" + .driver + "</code></td>
+            <td>" + (if .isDefault then "<span class=\"badge ok\">DEFAULT</span>" else "—" end) + "</td>
+            <td>" + .deletionPolicy + "</td>
+          </tr>"] | join("")) +
+          "</tbody></table>"
+        else
+          "<div class=\"info-box\">No VolumeSnapshotClasses found.</div>"
+        end) +
+        (if (.volumeSnapshotClasses.csiDriversWithoutVsc.count // 0) > 0 then
+          "<div class=\"warning-box\">\u26a0 <strong>" + (.volumeSnapshotClasses.csiDriversWithoutVsc.count | tostring) + " CSI driver(s) used by StorageClasses have NO matching VolumeSnapshotClass:</strong><br>" +
+          ([.volumeSnapshotClasses.csiDriversWithoutVsc.drivers[]? | "<code>" + . + "</code>"] | join(", ")) +
+          "<br><em>These PVCs cannot be CSI-snapshotted by Kasten — Kanister Blueprints or Generic Volume Backup will be required.</em></div>"
+        else "" end)
+      end)
+    else "" end)
+  else
+    "<div class=\"info-box\">StorageClasses / VolumeSnapshotClasses data not available (requires KDL v1.9+).</div>"
   end)
 + "
 
@@ -947,6 +1241,87 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
     "<tr><td colspan=\"5\" style=\"text-align:center;color:#57606a;\">No policies found</td></tr>"
   end)
 + "</tbody></table>
+
+<!-- Import Policies (NEW v1.9) -->
+<h2>\uD83D\uDCE5 Import Policies<span class=\"new-badge\">v1.9</span></h2>"
++ (if .importPolicies and (.importPolicies.count // 0) > 0 then
+    "<p class=\"section-description\">Multi-cluster catalog imports. Most relevant when cluster role is <code>secondary</code>.</p>
+    <table>
+    <thead><tr><th>Policy</th><th>Frequency</th><th>Profile</th></tr></thead>
+    <tbody>" +
+    ([.importPolicies.items[]? | "<tr>
+      <td><code>" + .name + "</code></td>
+      <td>" + (.frequency // "manual") + "</td>
+      <td>" + (if .profile != "" then "<code>" + .profile + "</code>" else "<em>—</em>" end) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .importPolicies and .multiCluster.role == "secondary" then
+    "<div class=\"warning-box\">\u26a0 Secondary cluster but no import policy configured.</div>"
+  elif .importPolicies then
+    "<div class=\"info-box\">No import policies configured (used for multi-cluster catalog imports).</div>"
+  else
+    "<div class=\"info-box\">Import policies data not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
+<!-- Retention Analysis (NEW v1.9) -->
+<h2>\uD83D\uDCD0 Retention Analysis<span class=\"new-badge\">v1.9</span></h2>"
++ (if .retentionAnalysis then
+    "<p class=\"section-description\">Patterns in policy retention configuration that warrant operator review.</p>" +
+
+    (if (.retentionAnalysis.snapshotRetentionHigh.count // 0) > 0 then
+      "<h3>High Snapshot Retention</h3>
+      <p class=\"section-description\">" + (.retentionAnalysis.snapshotRetentionHigh.note // "") + "</p>
+      <table>
+      <thead><tr><th>Policy</th><th>Max Retention</th></tr></thead>
+      <tbody>" +
+      ([.retentionAnalysis.snapshotRetentionHigh.items[]? | "<tr>
+        <td><code>" + .name + "</code></td>
+        <td>" + (.max | tostring) + "</td>
+      </tr>"] | join("")) +
+      "</tbody></table>"
+    else "" end) +
+
+    (if (.retentionAnalysis.snapshotRetentionZero.count // 0) > 0 then
+      "<h3>Zero Snapshot Retention</h3>
+      <p class=\"section-description\">" + (.retentionAnalysis.snapshotRetentionZero.note // "") + "</p>
+      <ul>" +
+      ([.retentionAnalysis.snapshotRetentionZero.items[]? | "<li><code>" + . + "</code></li>"] | join("")) +
+      "</ul>"
+    else "" end) +
+
+    (if (.retentionAnalysis.exportWithoutExplicitRetention.count // 0) > 0 then
+      "<h3>Implicit Export Retention</h3>
+      <p class=\"section-description\">" + (.retentionAnalysis.exportWithoutExplicitRetention.note // "") + "</p>
+      <ul>" +
+      ([.retentionAnalysis.exportWithoutExplicitRetention.items[]? | "<li><code>" + . + "</code></li>"] | join("")) +
+      "</ul>"
+    else "" end) +
+
+    (if ((.retentionAnalysis.snapshotRetentionHigh.count // 0) == 0
+        and (.retentionAnalysis.snapshotRetentionZero.count // 0) == 0
+        and (.retentionAnalysis.exportWithoutExplicitRetention.count // 0) == 0) then
+      "<div class=\"success-box\">\u2713 No retention anomalies detected.</div>"
+    else "" end)
+  else
+    "<div class=\"info-box\">Retention analysis data not available (requires KDL v1.9+).</div>"
+  end)
++ "
+
+<!-- Policies without Export (NEW v1.9) -->
+<h2>\uD83D\uDCE4 Policies without Export<span class=\"new-badge\">v1.9</span></h2>"
++ (if .policiesWithoutExport and (.policiesWithoutExport.count // 0) > 0 then
+    "<p class=\"section-description\">Application policies that snapshot but never export — workloads with no off-site copy.</p>
+    <div class=\"warning-box\">\u26a0 <strong>" + (.policiesWithoutExport.count | tostring) + " snapshot-only policy/policies</strong></div>
+    <ul>" +
+    ([.policiesWithoutExport.items[]? | "<li><code>" + . + "</code></li>"] | join("")) +
+    "</ul>"
+  elif .policiesWithoutExport then
+    "<div class=\"success-box\">\u2713 All application policies have an export action.</div>"
+  else
+    "<div class=\"info-box\">Policy export coverage data not available (requires KDL v1.9+).</div>"
+  end)
++ "
 
 <h2>\uD83D\uDD27 Kanister Blueprints</h2>"
 + (if .kanister then
