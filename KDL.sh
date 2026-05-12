@@ -3,8 +3,153 @@ set -eu
 trap '' PIPE 2>/dev/null || true
 
 ##############################################################################
-# Kasten Discovery Lite v1.8.3
+# Kasten Discovery Lite v2.0
 # Author: Bertrand CASTAGNET - EMEA TAM
+#
+# Changes in v2.0:
+# - INFRASTRUCTURE (patch 1/7): Enriched namespace inventory.
+#   New variable ALL_NAMESPACES_LABELED produces [{name, labels, isSystem}]
+#   from the already-fetched namespaces_raw.json (no new kubectl call, no new
+#   RBAC). Exposed in JSON under coverage.namespacesInventory. Foundation
+#   for upcoming policy-orphan / empty-selector detection (B3, patch 4).
+#   No behaviour change on any existing field; strictly additive.
+# - FEATURE (patch 2/7): K10 RBAC inventory (C2). Collects ClusterRoles,
+#   ClusterRoleBindings, Roles, RoleBindings related to K10 (name prefix
+#   `k10-`/`kasten-` or matching label app.kubernetes.io/name=k10).
+#   Aggregates unique subjects (Users, Groups, ServiceAccounts) across all
+#   bindings. RBAC requirement note: cluster-wide CRB/CR read is NOT in K10
+#   standard ClusterRole — graceful degradation per-resource via
+#   *_RBAC_ACCESSIBLE flags exposed under k10Rbac.accessibility, so consumers
+#   can distinguish "no bindings" from "could not read". 4 new parallel
+#   kubectl fetches; new top-level JSON key `k10Rbac` (does not affect any
+#   existing field). Human output flags wildcard ClusterRoles (informational
+#   — K10's admin role is wildcard by design).
+# - FEATURE (patch 3/7): Effective RPO per policy (A1). For each policy,
+#   measures the MEDIAN interval between consecutive successful (Complete)
+#   RunActions over the same 14-day window already used for average duration.
+#   Failed/Cancelled/Running runs are excluded — RPO measures time between
+#   two SUCCESSFUL backups. Maps K10 frequency aliases (@hourly, @daily,
+#   @weekly, @monthly=30d, @yearly) to theoretical seconds; custom cron
+#   expressions and manual policies are reported without drift judgement.
+#   Drift threshold: median > theoretical × 1.5 (empirical, 50% retard).
+#   Pure derivation from RUNACTIONS_JSON — no new fetch, no new RBAC. New
+#   JSON sub-key `policyRunStats.effectiveRpo` with summary stats + per-
+#   policy items {name, frequencyDeclared, frequencyTheoreticalSeconds,
+#   samples, median, max, drift}. Human output shows drift policies in red
+#   with duration formatted as h/m/s.
+# - FEATURE (patch 4/7): Redundant + empty policies detection (B2, B3).
+#   For each app policy, resolves its selector to the set of EXISTING
+#   namespaces it actually targets by cross-referencing ALL_NAMESPACES_LABELED
+#   (patch 1). Selector kinds handled: catchall, matchNames, matchLabels,
+#   matchExpressions with appNamespace In and label In. Complex operators
+#   (NotIn, Exists, etc.) are flagged as `resolvable=false` and excluded
+#   from the "empty" verdict to avoid false-positives.
+#   B3 (empty): policies whose effective namespace set is 0 — either selector
+#   matches nothing or matchNames lists only non-existing namespaces. Also
+#   reports policies that *partially* reference non-existing namespaces
+#   (matchNames includes some live + some dead refs).
+#   B2 (redundant): all pairs (i,j) with i<j where i and j share >=1
+#   namespace AND >=1 action. Pairs are split into "genuine" (two
+#   non-catchall policies overlap — actionable) and "with catchall"
+#   (by-design redundancy that exists whenever a catch-all policy is used).
+#   System policies (DR/reports) are excluded from the analysis. New JSON
+#   top-level key `policyAnalysis` exposes summary + resolved per-policy
+#   view + empty list + unresolvable list + redundantPairs.
+# - FEATURE (patch 5/7): Ransomware readiness score (F1). Synthesises 8
+#   security pillars into a 0-100 score and a letter grade (A/B/C/D/F):
+#   Immutability(20), Off-cluster export(15), Authentication(15), Disaster
+#   Recovery(15), Audit logging(15), KMS encryption(10), Network policies(10),
+#   TLS verification(5). Grade thresholds: A>=85, B 70-84, C 55-69, D 40-54,
+#   F<40. Identifies the "biggest gap" (largest unscored pillar) as
+#   actionable advice for the operator. Adds a small upstream collection:
+#   profiles with skipTLSVerify=true (PROFILE_TLS_SKIPPED) which deducts the
+#   TLS pillar. No new fetch, no new RBAC — pure synthesis of already-
+#   collected inputs. New JSON top-level key `ransomwareReadiness` with
+#   per-pillar breakdown including the evidence boolean. Human output uses
+#   green/yellow/red grade colouring and per-pillar OK/PARTIAL/FAIL lines
+#   with a short rationale.
+# - NEW DELIVERABLE (patch 6/7): kdl-diff.sh standalone JSON comparator (D1).
+#   Separate POSIX sh script that takes two KDL JSON outputs and reports
+#   changes across 16 sections: metadata, ransomware readiness (delta grade
+#   + per-pillar), licence, backup health, catalog, policies (added/
+#   removed), namespace coverage, policy analysis, effective RPO, K10 RBAC
+#   subjects, profiles, disaster recovery, virtualization, resource limits,
+#   best practices. Classifies each change as improvement/regression/
+#   neutral. Exit code = number of regressions (cap 99), 100 = usage error.
+#   Three output modes: --human (default), --json (structured), --summary
+#   (suppress no-change lines). Backwards-compatible: missing keys in the
+#   baseline are reported as "newly available" rather than crashing — works
+#   even when comparing pre-v2.0 KDL output to v2.0. Designed for TAM
+#   trimestrial reviews and CI gates.
+# - DOCS (patch 7/7): README v2.0 + PPT generator schema upgrade
+#
+# Changes in v1.9.1:
+# - BUGFIX: Locale-sensitive numeric formatting in awk printf calls produced
+#   French-style output (e.g. "73,0%" instead of "73.0") on systems with
+#   LC_NUMERIC set to fr_FR.UTF-8. The decimal comma was being emitted into
+#   the JSON `successRate` and `dedupRatio` string fields and into the
+#   human-readable export storage display, breaking downstream consumers
+#   (HTML/PPTX generators, dashboards) that expect parseable numbers.
+#   Fix: prepend `LC_ALL=C` to all 5 affected awk invocations (2 explicit
+#   ratios + 3 GiB/MiB/KiB sizing branches). LC_ALL=C forces POSIX numeric
+#   format with `.` decimal separator regardless of user locale.
+#   Verified by reproducing the bug on a test system with `locale-gen
+#   fr_FR.UTF-8 && LC_ALL=fr_FR.UTF-8 awk "BEGIN{printf %.1f, 73}"` -> 73,0
+#   and confirming `LC_ALL=C awk ...` -> 73.0.
+# - BUGFIX: Per-Namespace Protection Status (NEW v1.9) excluded namespaces
+#   matching SYSTEM_NS_PATTERNS even when they were the explicit target of a
+#   user policy. On the reporter's cluster, `openshift-etcd` was the
+#   matchNames target of `smoke-test1` policy but did not appear in
+#   namespaceProtectionStatus.items because `openshift-` matches the system
+#   patterns. The Per-NS analysis now unions APP_NAMESPACES (non-system) with
+#   PROTECTED_NAMESPACES (explicitly listed in any user policy), without
+#   modifying APP_NAMESPACES itself (preserves Namespace Protection v1.5
+#   semantics). Result: explicitly-protected system namespaces now show their
+#   true backup/export/restore status instead of being silently dropped.
+# - CALIBRATION: BP-RET-HIGH threshold raised from `> 2` to `> 7`. The
+#   previous threshold flagged any policy with retention > 2 (i.e. nearly
+#   every standard DAILY=7 setup) as WARN. The new threshold targets the
+#   actual concern — excessive simultaneous snapshots impacting source
+#   storage I/O — without false-positive on standard weekly retention.
+#   Note: this is an empirical threshold; consult Kasten K10 documentation
+#   for production sizing guidance specific to your storage backend.
+# - UX: Disaster Recovery section now displays
+#   "N/A (no export in this DR mode)" instead of bare "N/A" when KDR is in
+#   Quick DR (No Snapshot) mode, where there is by design no export profile.
+#   Not a bugfix — just clarification that N/A is expected, not a missing
+#   value.
+#
+# Changes in v1.9:
+# - FEATURES: Failed Actions Top 5 (dedicated section, recursive cause-chain
+#   extraction up to 5 levels via reusable JQ_DEEPEST_MSG helper)
+# - FEATURES: Per-Namespace Protection Status section (last successful
+#   backup/export/restore per app namespace + stale flag, threshold = 7 days)
+# - FEATURES: Stuck Actions detection (state=Running > 24h, top 5)
+# - FEATURES: Profile validation status (.status.validation / .status.error)
+# - FEATURES: k10-system-reports-policy state surfacing + last ReportAction
+#   (KDL silently depends on this policy for Export Storage / Dedup metrics —
+#   now made explicit so users know whether the data source is healthy)
+# - FEATURES: RestorePoints distribution by namespace (top 5) — uses the
+#   k10.kasten.io/appNamespace label (RestorePoint.spec.subject is null in
+#   modern K10 versions, the namespace lives on the metadata.labels)
+# - FEATURES: StorageClasses + VolumeSnapshotClasses inventory with CSI/VSC
+#   cross-check (graceful RBAC degradation if cluster-scoped read denied)
+# - FEATURES: Kubernetes server version + distribution detection
+#   (K3s, RKE/Rancher, AKS, EKS, GKE, Harvester, OpenShift)
+# - FEATURES: Import policies tracking (multi-cluster import workflow
+#   visibility, particularly relevant when MC_ROLE=secondary)
+# - FEATURES: 5 new Best Practices — snapshot retention >2, snapshot
+#   retention =0, export action without explicit .retention,
+#   cluster-scoped resources backup, list of policies without export
+# - FEATURES: POLICY_LAST_RUN enriched with deepest cause-chain error
+#   message (when state=Failed)
+# - CLI: --no-helm flag (skip Helm release secret read for security-
+#   sensitive environments; k10-config ConfigMap fallback still used)
+# - ROBUSTNESS: New collections (ReportActions, StorageClasses,
+#   VolumeSnapshotClasses) added to the parallel CRD fetch block
+# - ROBUSTNESS: All new --argjson values blinded by _safe_arg
+# - CODE QUALITY: Reusable JQ_DEEPEST_MSG helper with bounded recursion
+#   and try/catch on fromjson — defensive against malformed cause strings
 #
 # Changes in v1.8.3:
 # - BUGFIX: Silent script exit on clusters where the catalog pod is not
@@ -118,8 +263,19 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="1.8.3"
+KDL_VERSION="2.0"
 OUTPUT_FILE=""
+SKIP_HELM=false
+
+# Stale threshold for Per-Namespace Protection Status (NEW v1.9): a
+# protected namespace whose last successful backup is older than this many
+# days is flagged as "stale" — distinct from "unprotected" (no policy).
+STALE_DAYS_THRESHOLD=7
+
+# Stuck threshold for Stuck Actions detection (NEW v1.9): an action in
+# state=Running for more than this many hours is reported as stuck (almost
+# always a hung Kanister job or a kubectl exec call that never returned).
+STUCK_HOURS_THRESHOLD=24
 
 show_help() {
   cat <<EOF
@@ -130,6 +286,8 @@ Options:
   --json        Output in JSON format
   --debug       Enable debug messages
   --no-color    Disable colored output
+  --no-helm     Skip Helm release secret read (k10-config ConfigMap fallback
+                still used) — use in security-sensitive environments
   --output FILE Write output to FILE (auto-detects .json)
   --version     Show version and exit
   --help        Show this help message
@@ -138,6 +296,7 @@ Examples:
   $0 kasten-io
   $0 kasten-io --json --output discovery.json
   $0 kasten-io --debug --no-color
+  $0 kasten-io --no-helm --json --output secure-discovery.json
 EOF
   exit 0
 }
@@ -148,7 +307,7 @@ case "${1:-}" in
   --version|-V) echo "Kasten Discovery Lite v${KDL_VERSION}"; exit 0 ;;
 esac
 
-NAMESPACE="${1:?Usage: $0 <namespace> [--debug|--json|--no-color|--output FILE|--help|--version]}"
+NAMESPACE="${1:?Usage: $0 <namespace> [--debug|--json|--no-color|--no-helm|--output FILE|--help|--version]}"
 MODE="human"
 DEBUG=false
 USE_COLOR=true
@@ -159,6 +318,7 @@ while [ $# -gt 0 ]; do
     --json) MODE="json" ;;
     --debug) DEBUG=true ;;
     --no-color) USE_COLOR=false ;;
+    --no-helm) SKIP_HELM=true ;;
     --output) OUTPUT_FILE="${2:?--output requires a filename}"; shift ;;
     --version|-V) echo "Kasten Discovery Lite v${KDL_VERSION}"; exit 0 ;;
     --help|-h) show_help ;;
@@ -258,6 +418,42 @@ num_gt() {
   awk "BEGIN {exit ($1 > $2) ? 0 : 1}" 2>/dev/null
 }
 
+# Reusable jq function: deepest_msg (NEW v1.9)
+# Kasten action errors carry a nested cause chain where each level's `cause`
+# field is itself a JSON-encoded STRING. This recursively unwraps up to 5
+# levels and returns the deepest non-empty message — falling back to the
+# top-level message if unwrapping fails. Designed to be prepended to any
+# jq query via:  jq "$JQ_DEEPEST_MSG"' <your filter>'
+#
+# Defensive design:
+# - Bounded recursion (depth param) — no risk of infinite loops on malformed data
+# - try/catch around fromjson — strings that aren't valid JSON return null cleanly
+# - All accessors null-safe (// "")
+# - Returns "" (never null) so callers can chain string ops safely
+JQ_DEEPEST_MSG='
+def deepest_msg($depth):
+  if $depth <= 0 or (type != "object") then (.message // "")
+  else
+    (.message // "") as $m |
+    (.cause // null) as $c |
+    if ($c == null) or ($c == "") then $m
+    else
+      ( $c
+        | if type == "string" then (try fromjson catch null)
+          elif type == "object" then .
+          else null
+          end
+      ) as $next |
+      if $next == null then $m
+      else
+        ($next | deepest_msg($depth - 1)) as $deeper |
+        if $deeper == "" then $m else $deeper end
+      end
+    end
+  end;
+def deepest_msg: deepest_msg(5);
+'
+
 ### -------------------------
 ### Temp file management
 ### -------------------------
@@ -312,6 +508,51 @@ else
   PLATFORM="Kubernetes"
 fi
 debug "Platform: $PLATFORM"
+
+### -------------------------
+### Kubernetes Server Version + Distribution (NEW v1.9)
+### -------------------------
+# Probe `kubectl version` for the server gitVersion, then refine the
+# distribution by inspecting the first node's providerID and well-known
+# namespaces. Reads only one node's spec — already part of the existing
+# RBAC footprint (KDL already lists nodes for license consumption).
+
+K8S_SERVER_VERSION=$(kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion // "unknown"' 2>/dev/null || echo "unknown")
+[ -z "$K8S_SERVER_VERSION" ] && K8S_SERVER_VERSION="unknown"
+
+# Default distribution from PLATFORM detection above
+if [ "$PLATFORM" = "OpenShift" ]; then
+  K8S_DISTRIBUTION="OpenShift"
+else
+  K8S_DISTRIBUTION="Kubernetes"
+fi
+
+# Refine via providerID on the first node (cloud-managed offerings)
+NODE0_PROVIDER_ID=$(kubectl get nodes -o json 2>/dev/null | jq -r '.items[0].spec.providerID // ""' 2>/dev/null || echo "")
+case "$NODE0_PROVIDER_ID" in
+  azure*|*://azure*) [ "$K8S_DISTRIBUTION" = "Kubernetes" ] && K8S_DISTRIBUTION="AKS" ;;
+  aws*|*://aws*)    [ "$K8S_DISTRIBUTION" = "Kubernetes" ] && K8S_DISTRIBUTION="EKS" ;;
+  gce*|*://gce*)    [ "$K8S_DISTRIBUTION" = "Kubernetes" ] && K8S_DISTRIBUTION="GKE" ;;
+  harvester*)       K8S_DISTRIBUTION="Harvester" ;;
+esac
+
+# Refine via well-known namespaces (vendor-specific signals)
+if [ "$K8S_DISTRIBUTION" = "Kubernetes" ]; then
+  if kubectl get namespace cattle-system >/dev/null 2>&1; then
+    K8S_DISTRIBUTION="Rancher/RKE"
+  elif kubectl get namespace k3s-upgrader >/dev/null 2>&1; then
+    K8S_DISTRIBUTION="K3s"
+  fi
+fi
+
+# Final string-match fallback on the version itself
+case "$K8S_SERVER_VERSION" in
+  *k3s*) K8S_DISTRIBUTION="K3s" ;;
+  *eks*) [ "$K8S_DISTRIBUTION" = "Kubernetes" ] && K8S_DISTRIBUTION="EKS" ;;
+  *gke*) [ "$K8S_DISTRIBUTION" = "Kubernetes" ] && K8S_DISTRIBUTION="GKE" ;;
+esac
+
+debug "K8s: version=$K8S_SERVER_VERSION distribution=$K8S_DISTRIBUTION"
 
 ### -------------------------
 ### Multi-Cluster Detection (NEW v1.6)
@@ -393,6 +634,19 @@ kubectl get blueprints.cr.kanister.io -A -o json > "$TEMP_DIR/blueprints_all_raw
 kubectl -n "$NAMESPACE" get blueprints.cr.kanister.io -o json > "$TEMP_DIR/blueprints_ns_raw.json" 2>/dev/null &
 kubectl get blueprintbindings.config.kio.kasten.io -A -o json > "$TEMP_DIR/bindings_all_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get blueprintbindings.config.kio.kasten.io -o json > "$TEMP_DIR/bindings_ns_raw.json" 2>/dev/null &
+# v1.9 additions: ReportActions (for k10-system-reports-policy state),
+# StorageClasses + VolumeSnapshotClasses (for SC/VSC inventory & cross-check)
+kubectl -n "$NAMESPACE" get reportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/reportactions_raw.json" 2>/dev/null &
+kubectl get storageclass -o json > "$TEMP_DIR/sc_raw.json" 2>/dev/null &
+kubectl get volumesnapshotclass -o json > "$TEMP_DIR/vsc_raw.json" 2>/dev/null &
+# v2.0 additions: RBAC inventory for K10 ClusterRoles + Roles.
+# ClusterRoleBindings/RoleBindings cluster-wide are NOT in the K10 standard
+# ClusterRole — graceful degradation if read denied (handled at extraction).
+# k10-namespaced RoleBindings are usually readable via K10's own ClusterRole.
+kubectl get clusterroles -o json > "$TEMP_DIR/clusterroles_raw.json" 2>/dev/null &
+kubectl get clusterrolebindings -o json > "$TEMP_DIR/clusterrolebindings_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get roles -o json > "$TEMP_DIR/roles_raw.json" 2>/dev/null &
+kubectl -n "$NAMESPACE" get rolebindings -o json > "$TEMP_DIR/rolebindings_raw.json" 2>/dev/null &
 wait
 
 debug "Parallel fetch complete"
@@ -522,6 +776,47 @@ IMMUTABLE_PROFILES=$(_ep "$PROFILES_JSON" | jq '
 
 debug "Profiles: $PROFILE_COUNT (Immutable: $IMMUTABLE_PROFILES, Days: $IMMUTABILITY_DAYS, Raw: $PROTECTION_PERIOD_RAW)"
 
+# Profile validation status (NEW v1.9)
+# Profiles in state Failed/Pending have credential or connectivity issues that
+# silently break exports. We extract per-profile status to surface this early.
+PROFILE_VALIDATION=$(_ep "$PROFILES_JSON" | jq -c '
+  [.items[]? | {
+    name: .metadata.name,
+    state: (.status.validation // .status.state // "Unknown"),
+    error: (.status.error.message // .status.error.cause // null)
+  }]
+' 2>/dev/null || echo '[]')
+
+PROFILE_FAILED_COUNT=$(safe_int "$(_ep "$PROFILE_VALIDATION" | jq '
+  [.[] | select(.state == "Failed" or .state == "Failing")] | length // 0
+')")
+
+debug "Profile validation: $PROFILE_FAILED_COUNT failed/failing"
+
+# v2.0 patch 5: detect profiles with skipTLSVerify=true (used in ransomware
+# readiness scoring). K10 profile schema uses skipSSLVerify (legacy) or
+# skipCertVerification (newer); we check both common paths under locationSpec
+# and infrastoreBlobStore.
+PROFILE_TLS_SKIPPED=$(_ep "$PROFILES_JSON" | jq -c '
+  [.items[]? |
+    . as $p |
+    (
+      ($p.spec.locationSpec.objectStore.skipSSLVerify // false) or
+      ($p.spec.locationSpec.objectStore.skipCertVerification // false) or
+      ($p.spec.infrastoreBlobStore.skipSSLVerify // false) or
+      ($p.spec.infrastoreBlobStore.skipCertVerification // false)
+    ) as $skip |
+    if $skip then {name: $p.metadata.name} else empty end
+  ]
+' 2>/dev/null || echo '[]')
+if ! _ep "$PROFILE_TLS_SKIPPED" | jq -e '.' >/dev/null 2>&1; then
+  PROFILE_TLS_SKIPPED='[]'
+fi
+PROFILE_TLS_SKIPPED_COUNT=$(_ep "$PROFILE_TLS_SKIPPED" | jq 'length // 0')
+[ -z "$PROFILE_TLS_SKIPPED_COUNT" ] && PROFILE_TLS_SKIPPED_COUNT=0
+
+debug "Profiles with TLS verification skipped: $PROFILE_TLS_SKIPPED_COUNT"
+
 ### -------------------------
 ### Policies
 ### -------------------------
@@ -582,9 +877,75 @@ POLICIES_BACKUP_ONLY=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select((.spec.act
 POLICIES_WITH_PRESETS=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select(.spec.presetRef != null)] | length // 0')
 [ -z "$POLICIES_WITH_PRESETS" ] && POLICIES_WITH_PRESETS=0
 
+# Import policies tracking (NEW v1.9)
+# Import policies are used in multi-cluster setups (cluster B imports the
+# catalog of cluster A). Tracking them separately makes multi-cluster
+# import workflows visible — particularly relevant when MC_ROLE=secondary.
+IMPORT_POLICY_COUNT=$(safe_int "$(_ep "$POLICIES_JSON" | jq '
+  [.items[]? | select(.spec.actions[]?.action == "import")] | length // 0
+')")
+
+IMPORT_POLICIES_JSON=$(_ep "$POLICIES_JSON" | jq -c '
+  [.items[]? | select(.spec.actions[]?.action == "import") | {
+    name: .metadata.name,
+    frequency: (.spec.frequency // "manual"),
+    profile: (
+      [.spec.actions[]? | select(.action == "import") | .importParameters.profile.name // empty] | first // ""
+    )
+  }]
+' 2>/dev/null || echo '[]')
+
+# List of app policies WITHOUT an export action (NEW v1.9)
+# Distinct from POLICIES_WITH_EXPORT counter — exposes the names so users
+# can immediately see which workloads are snapshot-only.
+POLICIES_NO_EXPORT_LIST=$(_ep "$APP_POLICIES_JSON" | jq -c '
+  [.items[]? | select((.spec.actions | map(.action) | contains(["export"])) | not) | .metadata.name]
+' 2>/dev/null || echo '[]')
+
+POLICIES_NO_EXPORT_COUNT=$(safe_int "$(_ep "$POLICIES_NO_EXPORT_LIST" | jq 'length // 0')")
+
 debug "App policies targeting all namespaces: $ALL_NS_POLICIES"
-debug "Policies with export: $POLICIES_WITH_EXPORT"
+debug "Policies with export: $POLICIES_WITH_EXPORT (no-export: $POLICIES_NO_EXPORT_COUNT)"
 debug "Policies using presets: $POLICIES_WITH_PRESETS"
+debug "Import policies: $IMPORT_POLICY_COUNT"
+
+### -------------------------
+### k10-system-reports-policy state + ReportActions (NEW v1.9)
+### -------------------------
+# KDL silently depends on this policy for Export Storage / Dedup ratio
+# (computed from Reports CR). We surface its state explicitly here so users
+# know whether the policy exists, is enabled, and has run successfully.
+
+REPORTS_POLICY_EXISTS="false"
+REPORTS_POLICY_FREQUENCY="N/A"
+REPORTS_POLICY_LAST_RUN_STATE="N/A"
+REPORTS_POLICY_LAST_RUN_TS="N/A"
+
+# Look up the policy from the already-loaded POLICIES_JSON (no extra call)
+REPORTS_POLICY=$(_ep "$POLICIES_JSON" | jq -c '
+  [.items[]? | select(.metadata.name == "k10-system-reports-policy")] | first // null
+' 2>/dev/null || echo 'null')
+
+if [ "$REPORTS_POLICY" != "null" ] && [ -n "$REPORTS_POLICY" ]; then
+  REPORTS_POLICY_EXISTS="true"
+  REPORTS_POLICY_FREQUENCY=$(_ep "$REPORTS_POLICY" | jq -r '.spec.frequency // "manual"')
+fi
+
+# Read ReportActions from the parallel-fetched temp file
+REPORT_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/reportactions_raw.json" 2>/dev/null)")
+REPORT_ACTIONS_COUNT=$(safe_int "$(_ep "$REPORT_ACTIONS_JSON" | jq '.items | length // 0')")
+
+if [ "$REPORT_ACTIONS_COUNT" -gt 0 ]; then
+  LAST_REPORT=$(_ep "$REPORT_ACTIONS_JSON" | jq -c '
+    [.items[]?] | sort_by(.metadata.creationTimestamp) | last // null
+  ' 2>/dev/null || echo 'null')
+  if [ "$LAST_REPORT" != "null" ] && [ -n "$LAST_REPORT" ]; then
+    REPORTS_POLICY_LAST_RUN_STATE=$(_ep "$LAST_REPORT" | jq -r '.status.state // "Unknown"')
+    REPORTS_POLICY_LAST_RUN_TS=$(_ep "$LAST_REPORT" | jq -r '.metadata.creationTimestamp // "N/A"')
+  fi
+fi
+
+debug "Reports policy: exists=$REPORTS_POLICY_EXISTS state=$REPORTS_POLICY_LAST_RUN_STATE last=$REPORTS_POLICY_LAST_RUN_TS"
 
 ### -------------------------
 ### Disaster Recovery (KDR)
@@ -594,7 +955,7 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
   KDR_ENABLED=true
   KDR_FREQUENCY=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "N/A"')
   KDR_PROFILE=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.actions[0].exportParameters.profile.name // "N/A"')
-  
+
   # Detect KDR mode from kdrSnapshotConfiguration
   KDR_SNAPSHOT_CONFIG=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration // empty')
   if [ -n "$KDR_SNAPSHOT_CONFIG" ]; then
@@ -611,6 +972,14 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
     KDR_MODE="Legacy DR"
     KDR_LOCAL_SNAPSHOT="false"
     KDR_EXPORT_CATALOG="false"
+  fi
+
+  # v1.9.1: When KDR is in Quick DR (No Snapshot) mode, the policy has no
+  # export action by design — so there's no exportParameters.profile.name
+  # to read. Make the N/A more informative so operators don't think it's
+  # a missing/broken value.
+  if [ "$KDR_PROFILE" = "N/A" ] && [ "$KDR_MODE" = "Quick DR (No Snapshot)" ]; then
+    KDR_PROFILE="N/A (no export in this DR mode)"
   fi
 else
   KDR_ENABLED=false
@@ -630,7 +999,9 @@ debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE"
 RUNACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/runactions_raw.json" 2>/dev/null)")
 
 # Build policy last run info
-POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON" '
+# v1.9: enriched with `error` field (deepest cause-chain message via the
+# JQ_DEEPEST_MSG helper, only populated when state=Failed)
+POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON" "$JQ_DEEPEST_MSG"'
   [.items[]? | . as $policy | {
     name: .metadata.name,
     lastRun: (
@@ -645,6 +1016,11 @@ POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON"
             if .status.endTime and .status.startTime then
               ((.status.endTime | fromdateiso8601) - (.status.startTime | fromdateiso8601))
             else null end
+          ),
+          error: (
+            if (.status.state // "") == "Failed" then
+              ((.status.error // {}) | deepest_msg)
+            else null end
           )
         }
         else null
@@ -658,7 +1034,7 @@ if ! _ep "$POLICY_LAST_RUN" | jq -e '.' >/dev/null 2>&1; then
   POLICY_LAST_RUN='[]'
 fi
 
-debug "Policy last run info collected"
+debug "Policy last run info collected (enriched with error messages)"
 
 ### -------------------------
 ### Average Policy Run Duration (NEW v1.5)
@@ -703,6 +1079,101 @@ DURATION_SAMPLE_COUNT=$(_ep "$AVG_DURATION_STATS" | jq '.count // 0')
 debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT runs)"
 
 ### -------------------------
+### Effective RPO per policy (NEW v2.0 - patch 3/7) - A1
+### -------------------------
+# Computes the effective RPO of each policy by measuring intervals between
+# CONSECUTIVE COMPLETED RunActions on the same 14-day window already used by
+# average duration above. Skipped runs (Failed, Cancelled, Running) are
+# excluded — what matters for RPO is the time between two SUCCESSFUL backups.
+#
+# Median (not mean) is the reported central tendency: it is robust to outlier
+# runs (e.g. a single 12h backup after a maintenance window doesn't blow up
+# the metric). Max is also exposed for SLA worst-case visibility.
+#
+# Drift detection: median > (theoretical frequency × 1.5). Threshold chosen
+# empirically — 50% retard is a clear signal of scheduler/executor pressure
+# without false-positive on natural jitter. Only flagged for policies with a
+# K10 frequency alias (@hourly/@daily/@weekly/@monthly/@yearly); custom cron
+# expressions and manual policies report stats without drift judgement.
+#
+# samples == intervals count == max(0, completedRuns - 1). 0 samples → all
+# numeric fields null and drift null (cannot conclude).
+
+if [ -n "$FOURTEEN_DAYS_AGO" ]; then
+  EFFECTIVE_RPO=$(_ep "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON" --arg cutoff "$FOURTEEN_DAYS_AGO" '
+    # Map K10 frequency alias to theoretical interval in seconds.
+    # 30-day month is the K10 documented convention for @monthly.
+    def freq_secs(f):
+      if f == "@hourly"  then 3600
+      elif f == "@daily"   then 86400
+      elif f == "@weekly"  then 604800
+      elif f == "@monthly" then 2592000
+      elif f == "@yearly"  then 31536000
+      else null end;
+
+    # Median of a number array (returns null on empty)
+    def median:
+      sort as $s | length as $n |
+      if $n == 0 then null
+      elif $n % 2 == 1 then $s[($n - 1) / 2]
+      else (($s[$n/2 - 1] + $s[$n/2]) / 2)
+      end;
+
+    [.items[]? | . as $policy |
+      ($policy.spec.frequency // null) as $freq |
+      freq_secs($freq) as $theoretical |
+      (
+        ($runs.items // [])
+        | map(select(
+            .spec.subject.name == $policy.metadata.name and
+            .status.state == "Complete" and
+            .metadata.creationTimestamp >= $cutoff
+          ))
+        | sort_by(.metadata.creationTimestamp)
+        | [.[] | .metadata.creationTimestamp | fromdateiso8601]
+      ) as $ts |
+      (
+        if ($ts | length) < 2 then []
+        else [range(1; $ts | length) as $i | $ts[$i] - $ts[$i-1]]
+        end
+      ) as $intervals |
+      {
+        name: $policy.metadata.name,
+        frequencyDeclared: $freq,
+        frequencyTheoreticalSeconds: $theoretical,
+        samples: ($intervals | length),
+        median: ($intervals | median),
+        max: (if ($intervals | length) == 0 then null else ($intervals | max) end),
+        drift: (
+          if $theoretical == null or ($intervals | length) < 2 then null
+          else ($intervals | median) > ($theoretical * 1.5)
+          end
+        )
+      }
+    ]
+  ' 2>/dev/null || echo '[]')
+else
+  EFFECTIVE_RPO='[]'
+fi
+
+# Validate
+if ! _ep "$EFFECTIVE_RPO" | jq -e '.' >/dev/null 2>&1; then
+  EFFECTIVE_RPO='[]'
+fi
+
+# Aggregate stats (used in human output + best practices)
+RPO_TOTAL=$(_ep "$EFFECTIVE_RPO" | jq 'length // 0')
+[ -z "$RPO_TOTAL" ] && RPO_TOTAL=0
+RPO_WITH_FREQ=$(_ep "$EFFECTIVE_RPO" | jq '[.[] | select(.frequencyTheoreticalSeconds != null)] | length // 0')
+[ -z "$RPO_WITH_FREQ" ] && RPO_WITH_FREQ=0
+RPO_WITH_SAMPLES=$(_ep "$EFFECTIVE_RPO" | jq '[.[] | select(.samples > 0)] | length // 0')
+[ -z "$RPO_WITH_SAMPLES" ] && RPO_WITH_SAMPLES=0
+RPO_IN_DRIFT=$(_ep "$EFFECTIVE_RPO" | jq '[.[] | select(.drift == true)] | length // 0')
+[ -z "$RPO_IN_DRIFT" ] && RPO_IN_DRIFT=0
+
+debug "Effective RPO: $RPO_TOTAL policies analysed, $RPO_WITH_SAMPLES with samples, $RPO_IN_DRIFT in drift"
+
+### -------------------------
 ### Unprotected Namespaces (NEW v1.5)
 ### -------------------------
 # Use pre-fetched namespace data
@@ -715,6 +1186,28 @@ fi
 
 # System namespaces to exclude from analysis (extended for OpenShift)
 SYSTEM_NS_PATTERNS="kube-system|kube-public|kube-node-lease|openshift-|openshift$|default|kasten-io|calico-|tigera-|cattle-|fleet-|rancher-|ingress-|cert-manager|istio-|linkerd|gatekeeper-|falco|velero|longhorn-|rook-|portworx|metallb|nvidia-|gpu-operator|local-storage|assisted-installer|multicluster-|hive|rhacs-|stackrox|acs-|sso|keycloak|vault|external-secrets|argocd|gitops|tekton-|pipelines|cicd|monitoring|logging|tracing|jaeger|elastic|splunk|datadog|dynatrace|newrelic|prometheus|grafana|alertmanager|thanos"
+
+# v2.0 (patch 1): enriched namespace inventory with labels.
+# Reads the namespaces_raw.json already fetched in the parallel block — no
+# extra kubectl call, no new RBAC. Produces [{name, labels, isSystem}] where
+# isSystem is true when the namespace name matches SYSTEM_NS_PATTERNS.
+# Consumed in JSON output under coverage.namespacesInventory. Foundation
+# for B3 (policy empty-selector detection) and useful in its own right for
+# debugging label-based policy selector mismatches.
+ALL_NAMESPACES_LABELED=$(jq -c --arg patterns "$SYSTEM_NS_PATTERNS" '
+  [(.items // [])[]? | {
+    name: (.metadata.name // ""),
+    labels: (.metadata.labels // {}),
+    isSystem: ((.metadata.name // "") | test($patterns; "i"))
+  }] // []
+' "$TEMP_DIR/namespaces_raw.json" 2>/dev/null || echo '[]')
+
+# Validate
+if ! _ep "$ALL_NAMESPACES_LABELED" | jq -e '.' >/dev/null 2>&1; then
+  ALL_NAMESPACES_LABELED='[]'
+fi
+
+debug "Namespace inventory with labels: $(_ep "$ALL_NAMESPACES_LABELED" | jq 'length') namespaces ($(_ep "$ALL_NAMESPACES_LABELED" | jq '[.[]|select(.isSystem)]|length') system)"
 
 debug "Analyzing namespace protection using APP policies only (excluding DR/report system policies)"
 debug "App policies count for analysis: $APP_POLICY_COUNT"
@@ -827,6 +1320,152 @@ fi
 
 debug "Unprotected namespaces: $UNPROTECTED_COUNT"
 debug "Unprotected list: $UNPROTECTED_NS_JSON"
+
+### -------------------------
+### Policy Analysis: empty + redundant detection (NEW v2.0 - patch 4/7)
+### -------------------------
+# B2: detects pairs of policies that target overlapping namespaces with at
+# least one shared action — flag for the operator to verify intent.
+# B3: detects "empty" policies whose effective namespace set is 0 — either
+# the selector matches nothing or matchNames points to namespaces that do
+# not exist on the cluster.
+#
+# Both rely on resolving each policy's selector to a set of REAL namespace
+# names by cross-referencing ALL_NAMESPACES_LABELED (from patch 1).
+#
+# Selector kinds handled:
+#   - catchall (no selector / empty selector) -> all non-system NS
+#   - matchNames -> direct list
+#   - matchExpressions with appNamespace In -> values
+#   - matchExpressions with label In -> resolved against namespace labels
+#   - matchLabels -> intersection of NS matching ALL label key=value pairs
+#   - matchExpressions with NotIn/Exists/etc -> marked unresolvable
+#     (resolvable=false; isEmpty stays false to avoid false-positive)
+#
+# Scope: APP_POLICIES_JSON only (system DR/reports policies excluded). On
+# clusters without ALL_NAMESPACES_LABELED data, the analysis runs but
+# matchLabels resolution returns []; matchNames still flag empty correctly.
+
+POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAMESPACES_LABELED" '
+  # Resolve targeted namespaces for a single policy.
+  # Returns {namespaces: [...], resolvable: bool, kind: "catchall"|"matchNames"|...}
+  def resolve_ns(policy; allNs):
+    (policy.spec.selector // null) as $sel |
+    if $sel == null or $sel == {} or
+       ($sel.matchNames == null and $sel.matchExpressions == null and $sel.matchLabels == null) then
+      {namespaces: [allNs[]? | select(.isSystem | not) | .name], resolvable: true, kind: "catchall"}
+    elif $sel.matchNames then
+      {namespaces: $sel.matchNames, resolvable: true, kind: "matchNames"}
+    elif $sel.matchExpressions then
+      ([$sel.matchExpressions[]? |
+        if .key == "k10.kasten.io/appNamespace" and .operator == "In" then
+          {ns: .values[]?, unresolvable: false}
+        elif .operator == "In" then
+          . as $expr |
+          (allNs[]? | select(
+            (.labels // {}) as $lbls |
+            ($expr.values | any(. as $v | $lbls[$expr.key] == $v))
+          ) | {ns: .name, unresolvable: false})
+        else
+          {ns: null, unresolvable: true}
+        end
+      ]) as $exprs |
+      if ($exprs | any(.unresolvable)) then
+        {namespaces: [$exprs[]? | select(.ns != null) | .ns] | unique,
+         resolvable: false, kind: "matchExpressions(complex)"}
+      else
+        {namespaces: [$exprs[]?.ns] | unique, resolvable: true, kind: "matchExpressions"}
+      end
+    elif $sel.matchLabels then
+      {
+        namespaces: [allNs[]? | select(
+          (.labels // {}) as $lbls |
+          all($sel.matchLabels | to_entries[]; $lbls[.key] == .value)
+        ) | .name],
+        resolvable: true,
+        kind: "matchLabels"
+      }
+    else
+      {namespaces: [], resolvable: true, kind: "unknown"}
+    end;
+
+  # Build list of existing namespace names for cross-reference
+  ([$nsLabeled[]?.name]) as $existingNs |
+
+  # Per-policy resolved view
+  ([.items[]? | . as $p |
+    resolve_ns($p; $nsLabeled) as $r |
+    ([$r.namespaces[]? | select(. as $n | $existingNs | index($n))] | unique) as $existing |
+    ([$r.namespaces[]? | select(. as $n | $existingNs | index($n) | not)] | unique) as $nonExisting |
+    {
+      name: $p.metadata.name,
+      actions: ([$p.spec.actions[]?.action] | unique),
+      frequency: ($p.spec.frequency // null),
+      selectorKind: $r.kind,
+      resolvable: $r.resolvable,
+      targetedNamespaces: $r.namespaces,
+      existingNamespaces: $existing,
+      nonExistingReferences: $nonExisting,
+      targetedCount: ($r.namespaces | length),
+      effectiveCount: ($existing | length),
+      isEmpty: ($r.resolvable and ($existing | length) == 0)
+    }
+  ]) as $resolved |
+
+  # Generate all pairs (i,j) with i<j, keep those with intersect NS and intersect actions
+  ([range(0; ($resolved | length) - 1) as $i |
+    range($i + 1; $resolved | length) as $j |
+    $resolved[$i] as $p1 |
+    $resolved[$j] as $p2 |
+    ($p1.existingNamespaces | map(. as $n | select($p2.existingNamespaces | index($n)))) as $sharedNs |
+    ($p1.actions | map(. as $a | select($p2.actions | index($a)))) as $sharedActions |
+    if ($sharedNs | length) > 0 and ($sharedActions | length) > 0 then
+      {
+        policies: [$p1.name, $p2.name],
+        sharedNamespaces: $sharedNs,
+        sharedActions: $sharedActions,
+        sameFrequency: ($p1.frequency == $p2.frequency),
+        involvesCatchall: ($p1.selectorKind == "catchall" or $p2.selectorKind == "catchall")
+      }
+    else empty end
+  ]) as $pairs |
+
+  {
+    resolved: $resolved,
+    empty: [$resolved[] | select(.isEmpty)],
+    unresolvable: [$resolved[] | select(.resolvable | not)],
+    withNonExistingNs: [$resolved[] | select(.nonExistingReferences | length > 0)],
+    redundantPairs: $pairs,
+    summary: {
+      totalPolicies: ($resolved | length),
+      emptyCount: ([$resolved[] | select(.isEmpty)] | length),
+      unresolvableCount: ([$resolved[] | select(.resolvable | not)] | length),
+      withNonExistingNsCount: ([$resolved[] | select(.nonExistingReferences | length > 0)] | length),
+      redundantPairCount: ($pairs | length),
+      redundantPairsGenuine: ([$pairs[] | select(.involvesCatchall | not)] | length),
+      redundantPairsWithCatchall: ([$pairs[] | select(.involvesCatchall)] | length)
+    }
+  }
+' 2>/dev/null || echo '{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0}}')
+
+# Validate
+if ! _ep "$POLICY_ANALYSIS" | jq -e '.summary' >/dev/null 2>&1; then
+  POLICY_ANALYSIS='{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0}}'
+fi
+
+# Extract summary stats for human output
+POLICY_EMPTY_COUNT=$(_ep "$POLICY_ANALYSIS" | jq '.summary.emptyCount // 0')
+POLICY_UNRESOLVABLE_COUNT=$(_ep "$POLICY_ANALYSIS" | jq '.summary.unresolvableCount // 0')
+POLICY_NONEXISTING_COUNT=$(_ep "$POLICY_ANALYSIS" | jq '.summary.withNonExistingNsCount // 0')
+POLICY_REDUNDANT_GENUINE=$(_ep "$POLICY_ANALYSIS" | jq '.summary.redundantPairsGenuine // 0')
+POLICY_REDUNDANT_CATCHALL=$(_ep "$POLICY_ANALYSIS" | jq '.summary.redundantPairsWithCatchall // 0')
+[ -z "$POLICY_EMPTY_COUNT" ] && POLICY_EMPTY_COUNT=0
+[ -z "$POLICY_UNRESOLVABLE_COUNT" ] && POLICY_UNRESOLVABLE_COUNT=0
+[ -z "$POLICY_NONEXISTING_COUNT" ] && POLICY_NONEXISTING_COUNT=0
+[ -z "$POLICY_REDUNDANT_GENUINE" ] && POLICY_REDUNDANT_GENUINE=0
+[ -z "$POLICY_REDUNDANT_CATCHALL" ] && POLICY_REDUNDANT_CATCHALL=0
+
+debug "Policy analysis: empty=$POLICY_EMPTY_COUNT unresolvable=$POLICY_UNRESOLVABLE_COUNT nonExistingRef=$POLICY_NONEXISTING_COUNT redundant(genuine)=$POLICY_REDUNDANT_GENUINE redundant(catchall)=$POLICY_REDUNDANT_CATCHALL"
 
 ### -------------------------
 ### Restore Actions History (NEW v1.5)
@@ -1002,6 +1641,35 @@ ORPHANED_RP_COUNT=$(_ep "$ORPHANED_RP" | jq 'length // 0')
 debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT"
 
 ### -------------------------
+### RestorePoints distribution by namespace - Top 5 (NEW v1.9)
+### -------------------------
+# Useful for capacity planning: catalog entries scale with RP count, so this
+# helps identify namespaces driving catalog growth and policies with
+# misconfigured retention.
+#
+# IMPORTANT: In modern K10 versions (verified on 8.5.8), RestorePoint
+# .spec.subject is null — the namespace lives in metadata.labels under
+# k10.kasten.io/appNamespace. Falling back to .spec.subject.namespace
+# preserves compatibility with any older K10 version that still populated it.
+
+RP_BY_NAMESPACE_TOP5=$(_ep "$RESTORE_POINTS_JSON" | jq -c '
+  [(.items // [])[]?
+    | (.metadata.labels["k10.kasten.io/appNamespace"]
+       // .spec.subject.namespace
+       // "unknown")
+  ]
+  | group_by(.)
+  | map({namespace: .[0], count: length})
+  | sort_by(.count) | reverse | .[0:5]
+' 2>/dev/null || echo '[]')
+
+if ! _ep "$RP_BY_NAMESPACE_TOP5" | jq -e '.' >/dev/null 2>&1; then
+  RP_BY_NAMESPACE_TOP5='[]'
+fi
+
+debug "RestorePoints top 5 namespaces collected"
+
+### -------------------------
 ### PolicyPresets
 ### -------------------------
 PRESETS_JSON=$(safe_json "$(cat "$TEMP_DIR/presets_raw.json" 2>/dev/null)")
@@ -1110,12 +1778,233 @@ FAILED_ACTIONS=$((BACKUP_ACTIONS_FAILED + EXPORT_ACTIONS_FAILED))
 # This excludes Running/Pending/Cancelled from the calculation
 FINISHED_ACTIONS=$((COMPLETED_ACTIONS + FAILED_ACTIONS))
 if [ "$FINISHED_ACTIONS" -gt 0 ]; then
-  SUCCESS_RATE=$(awk "BEGIN {printf \"%.1f\", ($COMPLETED_ACTIONS / $FINISHED_ACTIONS) * 100}")
+  SUCCESS_RATE=$(LC_ALL=C awk "BEGIN {printf \"%.1f\", ($COMPLETED_ACTIONS / $FINISHED_ACTIONS) * 100}")
 else
   SUCCESS_RATE="N/A"
 fi
 
 debug "Actions - Total: $TOTAL_ACTIONS, Finished: $FINISHED_ACTIONS, Completed: $COMPLETED_ACTIONS, Failed: $FAILED_ACTIONS, Success: $SUCCESS_RATE%"
+
+### -------------------------
+### Failed Actions Top 5 (NEW v1.9)
+### -------------------------
+# Unified top 5 across BackupActions, ExportActions, RestoreActions where
+# state=Failed, sorted by creationTimestamp desc. Uses the deepest_msg jq
+# helper to recursively unwrap status.error.cause (which is itself a
+# JSON-encoded string) up to 5 levels.
+#
+# All sources already loaded above — no extra kubectl calls.
+
+FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
+  [
+    ($backup.items // []) | .[] | select((.status.state // "") == "Failed") | {
+      kind: "BackupAction",
+      name: (.metadata.name // ""),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "N/A"),
+      policy: (.metadata.labels["k10.kasten.io/policyName"] // ""),
+      timestamp: (.metadata.creationTimestamp // ""),
+      message: ((.status.error // {}) | deepest_msg)
+    }
+  ] +
+  [
+    ($export.items // []) | .[] | select((.status.state // "") == "Failed") | {
+      kind: "ExportAction",
+      name: (.metadata.name // ""),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "N/A"),
+      policy: (.metadata.labels["k10.kasten.io/policyName"] // ""),
+      timestamp: (.metadata.creationTimestamp // ""),
+      message: ((.status.error // {}) | deepest_msg)
+    }
+  ] +
+  [
+    ($restore.items // []) | .[] | select((.status.state // "") == "Failed") | {
+      kind: "RestoreAction",
+      name: (.metadata.name // ""),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .spec.subject.namespace // .metadata.namespace // "N/A"),
+      policy: "",
+      timestamp: (.metadata.creationTimestamp // ""),
+      message: ((.status.error // {}) | deepest_msg)
+    }
+  ]
+  | sort_by(.timestamp) | reverse | .[0:5]
+  | map(.message |= (if length > 180 then .[0:180] + "..." else . end))
+' \
+  --argjson backup "$BACKUP_ACTIONS_JSON" \
+  --argjson export "$EXPORT_ACTIONS_JSON" \
+  --argjson restore "$RESTORE_ACTIONS_JSON" \
+  2>/dev/null || echo '[]')
+
+if ! _ep "$FAILED_ACTIONS_TOP5" | jq -e '.' >/dev/null 2>&1; then
+  FAILED_ACTIONS_TOP5='[]'
+fi
+
+FAILED_ACTIONS_TOP5_COUNT=$(safe_int "$(_ep "$FAILED_ACTIONS_TOP5" | jq 'length // 0')")
+
+debug "Failed actions top 5 collected: $FAILED_ACTIONS_TOP5_COUNT entries"
+
+### -------------------------
+### Stuck Actions (state=Running > threshold) (NEW v1.9)
+### -------------------------
+# An action with state=Running for more than STUCK_HOURS_THRESHOLD hours is
+# almost always a stuck Kanister job or a kubectl-exec call that never returns.
+# Computed cluster-side via jq using `now` (epoch seconds) — portable across
+# GNU/BSD without invoking date(1).
+
+STUCK_ACTIONS=$(jq -cn --argjson threshold "$STUCK_HOURS_THRESHOLD" '
+  [
+    ($backup.items // []) | .[] | select((.status.state // "") == "Running") | {
+      kind: "BackupAction",
+      name: (.metadata.name // ""),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "N/A"),
+      policy: (.metadata.labels["k10.kasten.io/policyName"] // ""),
+      timestamp: (.metadata.creationTimestamp // ""),
+      ageHours: (
+        if .metadata.creationTimestamp then
+          ((now - (.metadata.creationTimestamp | fromdateiso8601)) / 3600 | floor)
+        else 0 end
+      )
+    }
+  ] +
+  [
+    ($export.items // []) | .[] | select((.status.state // "") == "Running") | {
+      kind: "ExportAction",
+      name: (.metadata.name // ""),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "N/A"),
+      policy: (.metadata.labels["k10.kasten.io/policyName"] // ""),
+      timestamp: (.metadata.creationTimestamp // ""),
+      ageHours: (
+        if .metadata.creationTimestamp then
+          ((now - (.metadata.creationTimestamp | fromdateiso8601)) / 3600 | floor)
+        else 0 end
+      )
+    }
+  ] +
+  [
+    ($restore.items // []) | .[] | select((.status.state // "") == "Running") | {
+      kind: "RestoreAction",
+      name: (.metadata.name // ""),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .spec.subject.namespace // .metadata.namespace // "N/A"),
+      policy: "",
+      timestamp: (.metadata.creationTimestamp // ""),
+      ageHours: (
+        if .metadata.creationTimestamp then
+          ((now - (.metadata.creationTimestamp | fromdateiso8601)) / 3600 | floor)
+        else 0 end
+      )
+    }
+  ]
+  | map(select(.ageHours >= $threshold))
+  | sort_by(.ageHours) | reverse | .[0:5]
+' \
+  --argjson backup "$BACKUP_ACTIONS_JSON" \
+  --argjson export "$EXPORT_ACTIONS_JSON" \
+  --argjson restore "$RESTORE_ACTIONS_JSON" \
+  2>/dev/null || echo '[]')
+
+if ! _ep "$STUCK_ACTIONS" | jq -e '.' >/dev/null 2>&1; then
+  STUCK_ACTIONS='[]'
+fi
+
+STUCK_ACTIONS_COUNT=$(safe_int "$(_ep "$STUCK_ACTIONS" | jq 'length // 0')")
+
+debug "Stuck actions (>${STUCK_HOURS_THRESHOLD}h Running): $STUCK_ACTIONS_COUNT"
+
+### -------------------------
+### Per-Namespace Protection Status (NEW v1.9)
+### -------------------------
+# For each application namespace already identified by KDL (APP_NAMESPACES,
+# excluding system patterns), determine:
+#   - Last successful backup timestamp (RunActions covers all policy types)
+#   - Last successful export timestamp (filtered by appNamespace label)
+#   - Last successful restore timestamp (label first, subject.namespace fallback)
+#   - Stale flag (last backup older than STALE_DAYS_THRESHOLD days)
+#
+# A namespace can be "protected" (covered by a policy) but "stale" if its
+# last successful backup is too old. This is a different failure mode than
+# "unprotected" and warrants its own visibility.
+#
+# v1.9.1 BUGFIX: extend the namespace set with PROTECTED_NAMESPACES so that
+# system-pattern namespaces explicitly listed by a user policy (e.g.
+# openshift-etcd targeted by matchNames) are not silently dropped from the
+# Per-NS analysis. APP_NAMESPACES itself is left untouched to preserve v1.5
+# "Namespace Protection" section semantics. Union + unique gives the right
+# input set for this section's purpose.
+#
+# All inputs already in memory — no kubectl calls.
+
+NS_PROTECTION_INPUT=$(jq -cn '
+  (($app // []) + ($protected // [])) | unique
+' \
+  --argjson app "$APP_NAMESPACES" \
+  --argjson protected "$PROTECTED_NAMESPACES" \
+  2>/dev/null || echo '[]')
+
+if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
+  NS_PROTECTION_INPUT="$APP_NAMESPACES"
+fi
+
+NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
+  ($appNamespaces // []) as $ns_list |
+  ($export.items // []) as $export_items |
+  ($restore.items // []) as $restore_items |
+  ($runs.items // []) as $run_items |
+
+  ($run_items | map(select((.status.state // "") == "Complete")) |
+    group_by(.metadata.namespace // "") |
+    map({key: .[0].metadata.namespace, value: (map(.metadata.creationTimestamp) | sort | last)}) |
+    from_entries) as $last_backup |
+
+  ($export_items | map(select((.status.state // "") == "Complete")) |
+    map({ns: (.metadata.labels["k10.kasten.io/appNamespace"] // ""), ts: (.metadata.creationTimestamp // "")}) |
+    map(select(.ns != "")) |
+    group_by(.ns) |
+    map({key: .[0].ns, value: (map(.ts) | sort | last)}) |
+    from_entries) as $last_export |
+
+  ($restore_items | map(select((.status.state // "") == "Complete")) |
+    map({ns: (.metadata.labels["k10.kasten.io/appNamespace"] // .spec.subject.namespace // ""), ts: (.metadata.creationTimestamp // "")}) |
+    map(select(.ns != "")) |
+    group_by(.ns) |
+    map({key: .[0].ns, value: (map(.ts) | sort | last)}) |
+    from_entries) as $last_restore |
+
+  $ns_list
+  | map(. as $ns | {
+      namespace: $ns,
+      lastBackup: ($last_backup[$ns] // null),
+      lastExport: ($last_export[$ns] // null),
+      lastRestore: ($last_restore[$ns] // null),
+      backupAgeDays: (
+        if $last_backup[$ns] then
+          ((now - ($last_backup[$ns] | fromdateiso8601)) / 86400 | floor)
+        else null end
+      ),
+      stale: (
+        if $last_backup[$ns] then
+          (((now - ($last_backup[$ns] | fromdateiso8601)) / 86400 | floor) > $threshold)
+        else true end
+      )
+    })
+' \
+  --argjson appNamespaces "$NS_PROTECTION_INPUT" \
+  --argjson export "$EXPORT_ACTIONS_JSON" \
+  --argjson restore "$RESTORE_ACTIONS_JSON" \
+  --argjson runs "$RUNACTIONS_JSON" \
+  2>/dev/null || echo '[]')
+
+if ! _ep "$NS_PROTECTION_STATUS" | jq -e '.' >/dev/null 2>&1; then
+  NS_PROTECTION_STATUS='[]'
+fi
+
+NS_PROTECTION_TOTAL=$(safe_int "$(_ep "$NS_PROTECTION_STATUS" | jq 'length // 0')")
+NS_STALE_COUNT=$(safe_int "$(_ep "$NS_PROTECTION_STATUS" | jq '
+  [.[] | select(.stale == true and .lastBackup != null)] | length // 0
+')")
+NS_NEVER_BACKED_UP=$(safe_int "$(_ep "$NS_PROTECTION_STATUS" | jq '
+  [.[] | select(.lastBackup == null)] | length // 0
+')")
+
+debug "Per-NS protection: total=$NS_PROTECTION_TOTAL stale=$NS_STALE_COUNT never=$NS_NEVER_BACKED_UP"
 
 ### -------------------------
 ### Data usage
@@ -1126,6 +2015,82 @@ TOTAL_CAPACITY_GB=$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq '[.items[]?.s
 [ -z "$TOTAL_CAPACITY_GB" ] && TOTAL_CAPACITY_GB=0
 SNAPSHOT_DATA=$(cat "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null | jq '[.items[]?.status.restoreSize // "0" | gsub("Gi";"") | gsub("G";"") | gsub("Mi";"") | gsub("M";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$SNAPSHOT_DATA" ] && SNAPSHOT_DATA=0
+
+### -------------------------
+### StorageClasses + VolumeSnapshotClasses Inventory (NEW v1.9)
+### -------------------------
+# Cluster-scoped read; gracefully degrades to empty inventory on RBAC denial
+# (fetched in parallel block, falls back to {"items":[]} if kubectl failed).
+# Strongly relevant to Kasten support: backups depend on CSI snapshot capability,
+# and a missing/misconfigured VolumeSnapshotClass for a given driver is one of
+# the most frequent root causes of backup failures.
+
+if [ -s "$TEMP_DIR/sc_raw.json" ] && jq -e '.items' "$TEMP_DIR/sc_raw.json" >/dev/null 2>&1; then
+  SC_RBAC_OK="true"
+else
+  SC_RBAC_OK="false"
+fi
+SC_JSON=$(safe_json "$(cat "$TEMP_DIR/sc_raw.json" 2>/dev/null)")
+SC_COUNT=$(safe_int "$(_ep "$SC_JSON" | jq '.items | length // 0')")
+
+# Build per-StorageClass summary with default flag, expansion support, and
+# binding/reclaim modes — these are the fields that materially affect Kasten
+# backup/restore behavior.
+SC_SUMMARY=$(_ep "$SC_JSON" | jq -c '
+  [.items[]? | {
+    name: .metadata.name,
+    provisioner: (.provisioner // "unknown"),
+    isDefault: (
+      (.metadata.annotations["storageclass.kubernetes.io/is-default-class"] // "false") == "true"
+    ),
+    expandable: (.allowVolumeExpansion // false),
+    reclaimPolicy: (.reclaimPolicy // "Delete"),
+    bindingMode: (.volumeBindingMode // "Immediate")
+  }] | sort_by(.name)
+' 2>/dev/null || echo '[]')
+
+SC_DEFAULT_COUNT=$(safe_int "$(_ep "$SC_SUMMARY" | jq '[.[] | select(.isDefault)] | length // 0')")
+
+if [ -s "$TEMP_DIR/vsc_raw.json" ] && jq -e '.items' "$TEMP_DIR/vsc_raw.json" >/dev/null 2>&1; then
+  VSC_RBAC_OK="true"
+else
+  VSC_RBAC_OK="false"
+fi
+VSC_JSON=$(safe_json "$(cat "$TEMP_DIR/vsc_raw.json" 2>/dev/null)")
+VSC_COUNT=$(safe_int "$(_ep "$VSC_JSON" | jq '.items | length // 0')")
+
+VSC_SUMMARY=$(_ep "$VSC_JSON" | jq -c '
+  [.items[]? | {
+    name: .metadata.name,
+    driver: (.driver // "unknown"),
+    deletionPolicy: (.deletionPolicy // "Delete"),
+    isDefault: (
+      (.metadata.annotations["snapshot.storage.kubernetes.io/is-default-class"] // "false") == "true"
+    )
+  }] | sort_by(.name)
+' 2>/dev/null || echo '[]')
+
+VSC_DEFAULT_COUNT=$(safe_int "$(_ep "$VSC_SUMMARY" | jq '[.[] | select(.isDefault)] | length // 0')")
+
+# Cross-check: are there CSI provisioners (StorageClasses with CSI provisioner)
+# that have NO matching VolumeSnapshotClass? Such SCs cannot be backed up by
+# Kasten via CSI snapshots — they would need Kanister blueprints or generic
+# volume backup instead.
+SC_CSI_DRIVERS=$(_ep "$SC_JSON" | jq -c '
+  [.items[]? | select(.provisioner | test("\\.csi\\.|csi\\."; "i")) | .provisioner] | unique
+' 2>/dev/null || echo '[]')
+
+VSC_DRIVERS=$(_ep "$VSC_JSON" | jq -c '[.items[]?.driver] | unique' 2>/dev/null || echo '[]')
+
+CSI_DRIVERS_WITHOUT_VSC=$(_ep "$SC_CSI_DRIVERS" | jq -c --argjson vscd "$VSC_DRIVERS" '
+  [.[] | select(. as $d | ($vscd | index($d)) == null)]
+' 2>/dev/null || echo '[]')
+
+CSI_DRIVERS_WITHOUT_VSC_COUNT=$(safe_int "$(_ep "$CSI_DRIVERS_WITHOUT_VSC" | jq 'length // 0')")
+
+debug "StorageClasses: $SC_COUNT (default: $SC_DEFAULT_COUNT, RBAC: $SC_RBAC_OK)"
+debug "VolumeSnapshotClasses: $VSC_COUNT (default: $VSC_DEFAULT_COUNT, RBAC: $VSC_RBAC_OK)"
+debug "CSI drivers without matching VSC: $CSI_DRIVERS_WITHOUT_VSC_COUNT"
 
 ### -------------------------
 ### Export Storage & Deduplication (NEW v1.6)
@@ -1167,7 +2132,7 @@ fi
 # < 1.0 means data grew (encryption/compression overhead)
 # > 1.0 means dedup/compression saved space
 if [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null && [ "$EXPORT_LOGICAL_BYTES" -gt 0 ] 2>/dev/null; then
-  DEDUP_RATIO=$(awk "BEGIN {printf \"%.1f\", $EXPORT_LOGICAL_BYTES / $EXPORT_PHYSICAL_BYTES}")
+  DEDUP_RATIO=$(LC_ALL=C awk "BEGIN {printf \"%.1f\", $EXPORT_LOGICAL_BYTES / $EXPORT_PHYSICAL_BYTES}")
 else
   DEDUP_RATIO="N/A"
 fi
@@ -1175,11 +2140,11 @@ fi
 # Format export storage for display (physical = actual storage used)
 if [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null; then
   if [ "$EXPORT_PHYSICAL_BYTES" -ge 1073741824 ]; then
-    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f GiB\", $EXPORT_PHYSICAL_BYTES / 1073741824}")
+    EXPORT_STORAGE_DISPLAY=$(LC_ALL=C awk "BEGIN {printf \"%.1f GiB\", $EXPORT_PHYSICAL_BYTES / 1073741824}")
   elif [ "$EXPORT_PHYSICAL_BYTES" -ge 1048576 ]; then
-    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f MiB\", $EXPORT_PHYSICAL_BYTES / 1048576}")
+    EXPORT_STORAGE_DISPLAY=$(LC_ALL=C awk "BEGIN {printf \"%.1f MiB\", $EXPORT_PHYSICAL_BYTES / 1048576}")
   elif [ "$EXPORT_PHYSICAL_BYTES" -ge 1024 ]; then
-    EXPORT_STORAGE_DISPLAY=$(awk "BEGIN {printf \"%.1f KiB\", $EXPORT_PHYSICAL_BYTES / 1024}")
+    EXPORT_STORAGE_DISPLAY=$(LC_ALL=C awk "BEGIN {printf \"%.1f KiB\", $EXPORT_PHYSICAL_BYTES / 1024}")
   else
     EXPORT_STORAGE_DISPLAY="${EXPORT_PHYSICAL_BYTES} B"
   fi
@@ -1412,35 +2377,45 @@ debug "Virtualization summary: platform=$VIRT_PLATFORM, VMs=$TOTAL_VMS, policies
 ### -------------------------
 # Primary: Helm release secret (user-supplied values)
 # Fallback: k10-config ConfigMap + resource inspection
+#
+# v1.9: --no-helm flag bypasses the Helm release secret read for security-
+# sensitive environments. The k10-config ConfigMap fallback path is still
+# used downstream, so security/perf settings are still surfaced when the
+# operator uses ConfigMap-based overrides instead of Helm values.
 
 debug "Extracting K10 Helm configuration..."
 
 HELM_VALUES='{}'
 HELM_VALUES_SOURCE="none"
 
-# Helm 3 stores release data in secrets labelled owner=helm
-HELM_SECRET_NAME=$(kubectl -n "$NAMESPACE" get secrets -l "name=k10,owner=helm" -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || echo "")
+if [ "$SKIP_HELM" = true ]; then
+  HELM_VALUES_SOURCE="skipped"
+  debug "Helm values extraction skipped (--no-helm)"
+else
+  # Helm 3 stores release data in secrets labelled owner=helm
+  HELM_SECRET_NAME=$(kubectl -n "$NAMESPACE" get secrets -l "name=k10,owner=helm" -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || echo "")
 
-if [ -n "$HELM_SECRET_NAME" ]; then
-  HELM_RELEASE_RAW=$(kubectl -n "$NAMESPACE" get secret "$HELM_SECRET_NAME" -o jsonpath='{.data.release}' 2>/dev/null || echo "")
-  if [ -n "$HELM_RELEASE_RAW" ]; then
-    # Helm release encoding: base64 -> base64 -> gzip -> JSON
-    HELM_VALUES=$(_ep "$HELM_RELEASE_RAW" | base64 -d 2>/dev/null | base64 -d 2>/dev/null | gunzip 2>/dev/null | jq -c '.config // {}' 2>/dev/null || echo '{}')
+  if [ -n "$HELM_SECRET_NAME" ]; then
+    HELM_RELEASE_RAW=$(kubectl -n "$NAMESPACE" get secret "$HELM_SECRET_NAME" -o jsonpath='{.data.release}' 2>/dev/null || echo "")
+    if [ -n "$HELM_RELEASE_RAW" ]; then
+      # Helm release encoding: base64 -> base64 -> gzip -> JSON
+      HELM_VALUES=$(_ep "$HELM_RELEASE_RAW" | base64 -d 2>/dev/null | base64 -d 2>/dev/null | gunzip 2>/dev/null | jq -c '.config // {}' 2>/dev/null || echo '{}')
+      if _ep "$HELM_VALUES" | jq -e 'keys | length > 0' >/dev/null 2>&1; then
+        HELM_VALUES_SOURCE="helm-secret"
+      else
+        HELM_VALUES='{}'
+      fi
+    fi
+  fi
+
+  # Fallback: helm CLI
+  if [ "$HELM_VALUES_SOURCE" = "none" ] && command -v helm >/dev/null 2>&1; then
+    HELM_VALUES=$(helm get values k10 -n "$NAMESPACE" -o json 2>/dev/null || echo '{}')
     if _ep "$HELM_VALUES" | jq -e 'keys | length > 0' >/dev/null 2>&1; then
-      HELM_VALUES_SOURCE="helm-secret"
+      HELM_VALUES_SOURCE="helm-cli"
     else
       HELM_VALUES='{}'
     fi
-  fi
-fi
-
-# Fallback: helm CLI
-if [ "$HELM_VALUES_SOURCE" = "none" ] && command -v helm >/dev/null 2>&1; then
-  HELM_VALUES=$(helm get values k10 -n "$NAMESPACE" -o json 2>/dev/null || echo '{}')
-  if _ep "$HELM_VALUES" | jq -e 'keys | length > 0' >/dev/null 2>&1; then
-    HELM_VALUES_SOURCE="helm-cli"
-  else
-    HELM_VALUES='{}'
   fi
 fi
 
@@ -1742,6 +2717,216 @@ _nd "logLevel" "$LOG_LEVEL" "info"
 debug "Non-default settings: $NON_DEFAULT_COUNT ($NON_DEFAULT_ITEMS)"
 
 ### -------------------------
+### K10 RBAC Inventory (NEW v2.0 - patch 2/7)
+### -------------------------
+# Inventories ClusterRoles, Roles, ClusterRoleBindings, RoleBindings related
+# to K10. Matching: name starts with "k10-" OR label
+# `app.kubernetes.io/name`/`helm.sh/chart` references k10/kasten. This is
+# what the K10 Helm chart produces.
+#
+# RBAC requirement note: reading ClusterRoleBindings cluster-wide is NOT
+# part of K10's standard ClusterRole. If denied, the corresponding
+# *_RBAC_ACCESSIBLE flag is set to "false" and the section degrades
+# gracefully — the JSON exposes the access status so consumers can
+# distinguish "no bindings" from "could not read bindings".
+
+K10_RBAC_PATTERN="^k10-|^kasten-"
+
+# --- ClusterRoles ---
+CR_RAW_VALID=true
+if ! jq -e '.items' "$TEMP_DIR/clusterroles_raw.json" >/dev/null 2>&1; then
+  CR_RAW_VALID=false
+fi
+if [ "$CR_RAW_VALID" = "true" ]; then
+  K10_CLUSTERROLES_JSON=$(jq -c --arg pat "$K10_RBAC_PATTERN" '
+    [(.items // [])[]? |
+      select(
+        (.metadata.name // "" | test($pat)) or
+        ((.metadata.labels // {})["app.kubernetes.io/name"] // "" | test("k10|kasten"; "i")) or
+        ((.metadata.labels // {})["helm.sh/chart"] // "" | test("k10|kasten"; "i"))
+      ) |
+      {
+        name: .metadata.name,
+        labels: (.metadata.labels // {}),
+        rulesCount: ((.rules // []) | length),
+        verbsAll: ([(.rules // [])[]? | select((.verbs // []) | index("*"))] | length > 0),
+        resourcesAll: ([(.rules // [])[]? | select((.resources // []) | index("*"))] | length > 0)
+      }
+    ] // []
+  ' "$TEMP_DIR/clusterroles_raw.json" 2>/dev/null || echo '[]')
+  CLUSTERROLES_RBAC_ACCESSIBLE="true"
+else
+  K10_CLUSTERROLES_JSON='[]'
+  CLUSTERROLES_RBAC_ACCESSIBLE="false"
+fi
+if ! _ep "$K10_CLUSTERROLES_JSON" | jq -e '.' >/dev/null 2>&1; then
+  K10_CLUSTERROLES_JSON='[]'
+fi
+K10_CLUSTERROLES_COUNT=$(_ep "$K10_CLUSTERROLES_JSON" | jq 'length // 0')
+[ -z "$K10_CLUSTERROLES_COUNT" ] && K10_CLUSTERROLES_COUNT=0
+
+debug "K10 ClusterRoles: $K10_CLUSTERROLES_COUNT (RBAC accessible: $CLUSTERROLES_RBAC_ACCESSIBLE)"
+
+# --- ClusterRoleBindings ---
+# A binding is "K10-related" if EITHER:
+#   (a) its name matches the k10-/kasten- pattern, OR
+#   (b) its roleRef.name matches a K10 ClusterRole we just inventoried
+CRB_RAW_VALID=true
+if ! jq -e '.items' "$TEMP_DIR/clusterrolebindings_raw.json" >/dev/null 2>&1; then
+  CRB_RAW_VALID=false
+fi
+
+# Build the list of K10 ClusterRole names for cross-reference
+K10_CR_NAMES=$(_ep "$K10_CLUSTERROLES_JSON" | jq -c '[.[].name] // []')
+if ! _ep "$K10_CR_NAMES" | jq -e '.' >/dev/null 2>&1; then
+  K10_CR_NAMES='[]'
+fi
+
+if [ "$CRB_RAW_VALID" = "true" ]; then
+  K10_CRB_JSON=$(jq -c --arg pat "$K10_RBAC_PATTERN" --argjson k10cr "$K10_CR_NAMES" '
+    [(.items // [])[]? |
+      . as $item |
+      (($item.metadata.name // "") | test($pat)) as $nameMatch |
+      ($item.roleRef.name // "") as $rn |
+      select($nameMatch or ($k10cr | index($rn))) |
+      {
+        name: $item.metadata.name,
+        roleRef: (($item.roleRef.kind // "") + "/" + (($item.roleRef.name // ""))),
+        subjects: [($item.subjects // [])[]? | {
+          kind: (.kind // ""),
+          name: (.name // ""),
+          namespace: (.namespace // null)
+        }]
+      }
+    ] // []
+  ' "$TEMP_DIR/clusterrolebindings_raw.json" 2>/dev/null || echo '[]')
+  CRB_RBAC_ACCESSIBLE="true"
+else
+  K10_CRB_JSON='[]'
+  CRB_RBAC_ACCESSIBLE="false"
+fi
+if ! _ep "$K10_CRB_JSON" | jq -e '.' >/dev/null 2>&1; then
+  K10_CRB_JSON='[]'
+fi
+K10_CRB_COUNT=$(_ep "$K10_CRB_JSON" | jq 'length // 0')
+[ -z "$K10_CRB_COUNT" ] && K10_CRB_COUNT=0
+
+debug "K10 ClusterRoleBindings: $K10_CRB_COUNT (RBAC accessible: $CRB_RBAC_ACCESSIBLE)"
+
+# --- Roles (namespace-scoped) ---
+ROLES_RAW_VALID=true
+if ! jq -e '.items' "$TEMP_DIR/roles_raw.json" >/dev/null 2>&1; then
+  ROLES_RAW_VALID=false
+fi
+if [ "$ROLES_RAW_VALID" = "true" ]; then
+  K10_ROLES_JSON=$(jq -c --arg pat "$K10_RBAC_PATTERN" '
+    [(.items // [])[]? |
+      select(
+        (.metadata.name // "" | test($pat)) or
+        ((.metadata.labels // {})["app.kubernetes.io/name"] // "" | test("k10|kasten"; "i")) or
+        ((.metadata.labels // {})["helm.sh/chart"] // "" | test("k10|kasten"; "i"))
+      ) |
+      {
+        name: .metadata.name,
+        namespace: .metadata.namespace,
+        rulesCount: ((.rules // []) | length)
+      }
+    ] // []
+  ' "$TEMP_DIR/roles_raw.json" 2>/dev/null || echo '[]')
+  ROLES_RBAC_ACCESSIBLE="true"
+else
+  K10_ROLES_JSON='[]'
+  ROLES_RBAC_ACCESSIBLE="false"
+fi
+if ! _ep "$K10_ROLES_JSON" | jq -e '.' >/dev/null 2>&1; then
+  K10_ROLES_JSON='[]'
+fi
+K10_ROLES_COUNT=$(_ep "$K10_ROLES_JSON" | jq 'length // 0')
+[ -z "$K10_ROLES_COUNT" ] && K10_ROLES_COUNT=0
+
+# --- RoleBindings (namespace-scoped) ---
+RB_RAW_VALID=true
+if ! jq -e '.items' "$TEMP_DIR/rolebindings_raw.json" >/dev/null 2>&1; then
+  RB_RAW_VALID=false
+fi
+
+K10_ROLE_NAMES=$(_ep "$K10_ROLES_JSON" | jq -c '[.[].name] // []')
+if ! _ep "$K10_ROLE_NAMES" | jq -e '.' >/dev/null 2>&1; then
+  K10_ROLE_NAMES='[]'
+fi
+
+if [ "$RB_RAW_VALID" = "true" ]; then
+  K10_RB_JSON=$(jq -c --arg pat "$K10_RBAC_PATTERN" \
+    --argjson k10cr "$K10_CR_NAMES" \
+    --argjson k10r "$K10_ROLE_NAMES" '
+    [(.items // [])[]? |
+      . as $item |
+      (($item.metadata.name // "") | test($pat)) as $nameMatch |
+      ($item.roleRef.name // "") as $rn |
+      select($nameMatch or ($k10cr | index($rn)) or ($k10r | index($rn))) |
+      {
+        name: $item.metadata.name,
+        namespace: $item.metadata.namespace,
+        roleRef: (($item.roleRef.kind // "") + "/" + (($item.roleRef.name // ""))),
+        subjects: [($item.subjects // [])[]? | {
+          kind: (.kind // ""),
+          name: (.name // ""),
+          namespace: (.namespace // null)
+        }]
+      }
+    ] // []
+  ' "$TEMP_DIR/rolebindings_raw.json" 2>/dev/null || echo '[]')
+  RB_RBAC_ACCESSIBLE="true"
+else
+  K10_RB_JSON='[]'
+  RB_RBAC_ACCESSIBLE="false"
+fi
+if ! _ep "$K10_RB_JSON" | jq -e '.' >/dev/null 2>&1; then
+  K10_RB_JSON='[]'
+fi
+K10_RB_COUNT=$(_ep "$K10_RB_JSON" | jq 'length // 0')
+[ -z "$K10_RB_COUNT" ] && K10_RB_COUNT=0
+
+debug "K10 Roles: $K10_ROLES_COUNT | RoleBindings: $K10_RB_COUNT"
+
+# --- Aggregate: unique subjects across CRB + RB ---
+# Deduplicate by kind/name/namespace tuple. Counts by kind for quick reading.
+ALL_RBAC_SUBJECTS=$(jq -c -n \
+  --argjson crb "$K10_CRB_JSON" \
+  --argjson rb "$K10_RB_JSON" '
+  ([($crb // [])[].subjects[]?] + [($rb // [])[].subjects[]?])
+  | unique_by([.kind, .name, (.namespace // "")])
+' 2>/dev/null || echo '[]')
+
+if ! _ep "$ALL_RBAC_SUBJECTS" | jq -e '.' >/dev/null 2>&1; then
+  ALL_RBAC_SUBJECTS='[]'
+fi
+
+RBAC_SUBJECTS_TOTAL=$(_ep "$ALL_RBAC_SUBJECTS" | jq 'length // 0')
+[ -z "$RBAC_SUBJECTS_TOTAL" ] && RBAC_SUBJECTS_TOTAL=0
+RBAC_USERS=$(_ep "$ALL_RBAC_SUBJECTS" | jq '[.[] | select(.kind == "User")] | length // 0')
+[ -z "$RBAC_USERS" ] && RBAC_USERS=0
+RBAC_GROUPS=$(_ep "$ALL_RBAC_SUBJECTS" | jq '[.[] | select(.kind == "Group")] | length // 0')
+[ -z "$RBAC_GROUPS" ] && RBAC_GROUPS=0
+RBAC_SAS=$(_ep "$ALL_RBAC_SUBJECTS" | jq '[.[] | select(.kind == "ServiceAccount")] | length // 0')
+[ -z "$RBAC_SAS" ] && RBAC_SAS=0
+
+debug "K10 RBAC subjects: $RBAC_SUBJECTS_TOTAL total ($RBAC_USERS users, $RBAC_GROUPS groups, $RBAC_SAS SAs)"
+
+# --- Overall RBAC accessibility flag ---
+# Used for human output to tell user what was reachable
+if [ "$CLUSTERROLES_RBAC_ACCESSIBLE" = "true" ] && \
+   [ "$CRB_RBAC_ACCESSIBLE" = "true" ] && \
+   [ "$ROLES_RBAC_ACCESSIBLE" = "true" ] && \
+   [ "$RB_RBAC_ACCESSIBLE" = "true" ]; then
+  RBAC_FULLY_ACCESSIBLE="true"
+else
+  RBAC_FULLY_ACCESSIBLE="false"
+fi
+
+debug "RBAC fully accessible: $RBAC_FULLY_ACCESSIBLE"
+
+### -------------------------
 ### Best Practices Assessment
 ### -------------------------
 # DR Assessment
@@ -1824,6 +3009,213 @@ fi
 
 debug "Best Practices v1.8 - Auth: $BP_AUTH_STATUS, KMS Encryption: $BP_ENCRYPTION_STATUS, Audit: $BP_AUDIT_STATUS"
 
+### -------------------------
+### Additional Best Practices (NEW v1.9)
+### -------------------------
+# Excludes system policies (DR + reports) by reusing APP_POLICIES_JSON.
+
+# BP-RET-HIGH: snapshot retention > 7 (excessive simultaneous snapshots
+# impact source storage I/O and capacity)
+# v1.9.1: threshold raised from > 2 (which was too sensitive — flagged
+# every standard DAILY=7 setup) to > 7 (matches the typical maximum
+# weekly retention for legitimate daily-policy use). Empirical threshold;
+# consult Kasten K10 documentation for backend-specific sizing guidance.
+HIGH_SNAP_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
+  [.items[]?
+    | select(.spec.actions[]?.action == "backup")
+    | . as $p
+    | (.spec.retention // {} | to_entries | map(.value) | map(select(type == "number")))
+    | select((. | length) > 0 and (max > 7))
+    | {name: $p.metadata.name, max: max}
+  ]
+' 2>/dev/null || echo '[]')
+HIGH_SNAP_COUNT=$(safe_int "$(_ep "$HIGH_SNAP_POLICIES" | jq 'length // 0')")
+
+# BP-RET-ZERO: snapshot retention == 0 on all keys (no fast local recovery)
+ZERO_SNAP_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
+  [.items[]?
+    | select(.spec.actions[]?.action == "backup")
+    | . as $p
+    | (.spec.retention // {} | to_entries | map(.value) | map(select(type == "number")))
+    | select((. | length) == 0 or (all(. == 0)))
+    | $p.metadata.name
+  ]
+' 2>/dev/null || echo '[]')
+ZERO_SNAP_COUNT=$(safe_int "$(_ep "$ZERO_SNAP_POLICIES" | jq 'length // 0')")
+
+# BP-EXPORT-NORET: export action without explicit .retention (silently inherits
+# snapshot retention, often involuntary)
+EXPORT_NO_RETENTION_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
+  [.items[]?
+    | select(.spec.actions[]? | (.action == "export"))
+    | . as $p
+    | select(
+        ([.spec.actions[] | select(.action == "export") | .retention // null] | all(. == null))
+      )
+    | $p.metadata.name
+  ]
+' 2>/dev/null || echo '[]')
+EXPORT_NO_RETENTION_COUNT=$(safe_int "$(_ep "$EXPORT_NO_RETENTION_POLICIES" | jq 'length // 0')")
+
+if [ "$HIGH_SNAP_COUNT" -gt 0 ]; then
+  BP_SNAP_RETENTION_HIGH_STATUS="WARN"
+else
+  BP_SNAP_RETENTION_HIGH_STATUS="OK"
+fi
+
+if [ "$ZERO_SNAP_COUNT" -gt 0 ]; then
+  BP_SNAP_RETENTION_ZERO_STATUS="WARN"
+else
+  BP_SNAP_RETENTION_ZERO_STATUS="OK"
+fi
+
+if [ "$EXPORT_NO_RETENTION_COUNT" -gt 0 ]; then
+  BP_EXPORT_RETENTION_STATUS="WARN"
+else
+  BP_EXPORT_RETENTION_STATUS="OK"
+fi
+
+# BP-CLUSTER-SCOPED: at least one policy backing up cluster-scoped resources
+HAS_CLUSTER_SCOPED_POLICY=$(_ep "$APP_POLICIES_JSON" | jq -r '
+  [.items[]?
+    | select(
+        (.spec.selector.matchLabels["k10.kasten.io/appType"] // "") == "cluster"
+        or
+        ([.spec.actions[]? | (.backupParameters.includeClusterResources // false)] | any)
+      )
+    | .metadata.name
+  ] | length > 0
+' 2>/dev/null || echo "false")
+
+if [ "$HAS_CLUSTER_SCOPED_POLICY" = "true" ]; then
+  BP_CLUSTER_SCOPED_STATUS="CONFIGURED"
+else
+  BP_CLUSTER_SCOPED_STATUS="NOT_CONFIGURED"
+fi
+
+# BP-NO-EXPORT-LIST: status reflects presence of policies-without-export
+if [ "$POLICIES_NO_EXPORT_COUNT" -gt 0 ]; then
+  BP_NO_EXPORT_STATUS="WARN"
+else
+  BP_NO_EXPORT_STATUS="OK"
+fi
+
+debug "Best Practices v1.9 - SnapHigh: $BP_SNAP_RETENTION_HIGH_STATUS ($HIGH_SNAP_COUNT), SnapZero: $BP_SNAP_RETENTION_ZERO_STATUS ($ZERO_SNAP_COUNT), ExportNoRet: $BP_EXPORT_RETENTION_STATUS ($EXPORT_NO_RETENTION_COUNT), ClusterScoped: $BP_CLUSTER_SCOPED_STATUS, NoExport: $BP_NO_EXPORT_STATUS ($POLICIES_NO_EXPORT_COUNT)"
+
+### -------------------------
+### Ransomware Readiness Score (NEW v2.0 - patch 5/7) - F1
+### -------------------------
+# Synthesises 8 security pillars into a 0-100 score and a letter grade.
+# Pondération validated with TAM team. All pillars are derived from data
+# already collected upstream (no new fetch, no new RBAC).
+#
+# Pillars (max points):
+#   Immutability       20  — protects against malicious deletion
+#   Off-cluster export 15  — required to survive cluster destruction
+#   Authentication     15  — gate to the dashboard / API
+#   Disaster Recovery  15  — restore the K10 catalog itself
+#   Audit logging      10  — forensic / detect-time visibility
+#   KMS Encryption     10  — data-at-rest protection
+#   Network Policies   10  — east-west isolation
+#   TLS Verification    5  — prevent MITM on profile endpoints (deduct if
+#                            ANY profile has skipTLSVerify=true)
+#   Total              100
+#
+# Letter grade thresholds (empirical, aligned with CISO communication):
+#   A: >= 85     (excellent posture)
+#   B: 70 - 84   (good posture, minor gaps)
+#   C: 55 - 69   (acceptable, several improvements needed)
+#   D: 40 - 54   (significant gaps)
+#   F: <  40     (critical exposure)
+
+# Score each pillar (0 = absent, max = configured)
+RANSOM_IMMUT=0
+RANSOM_IMMUT_MAX=20
+if [ "$IMMUTABILITY" = "true" ] && [ "$IMMUTABLE_PROFILES" -gt 0 ] 2>/dev/null; then
+  RANSOM_IMMUT=$RANSOM_IMMUT_MAX
+fi
+
+RANSOM_EXPORT=0
+RANSOM_EXPORT_MAX=15
+if [ "$POLICIES_WITH_EXPORT" -gt 0 ] 2>/dev/null; then
+  RANSOM_EXPORT=$RANSOM_EXPORT_MAX
+fi
+
+RANSOM_AUTH=0
+RANSOM_AUTH_MAX=15
+if [ "$AUTH_METHOD" != "none" ] && [ -n "$AUTH_METHOD" ]; then
+  RANSOM_AUTH=$RANSOM_AUTH_MAX
+fi
+
+RANSOM_DR=0
+RANSOM_DR_MAX=15
+if [ "$KDR_ENABLED" = "true" ]; then
+  RANSOM_DR=$RANSOM_DR_MAX
+fi
+
+RANSOM_AUDIT=0
+RANSOM_AUDIT_MAX=10
+if [ "$AUDIT_ENABLED" = "true" ]; then
+  RANSOM_AUDIT=$RANSOM_AUDIT_MAX
+fi
+
+RANSOM_KMS=0
+RANSOM_KMS_MAX=10
+if [ "$ENCRYPTION_PROVIDER" != "none" ] && [ -n "$ENCRYPTION_PROVIDER" ]; then
+  RANSOM_KMS=$RANSOM_KMS_MAX
+fi
+
+RANSOM_NETPOL=0
+RANSOM_NETPOL_MAX=10
+if [ "$NETPOL_ENABLED" = "true" ]; then
+  RANSOM_NETPOL=$RANSOM_NETPOL_MAX
+fi
+
+# TLS: deduct if ANY profile skips TLS verification
+RANSOM_TLS_MAX=5
+if [ "$PROFILE_TLS_SKIPPED_COUNT" -gt 0 ] 2>/dev/null; then
+  RANSOM_TLS=0
+else
+  RANSOM_TLS=$RANSOM_TLS_MAX
+fi
+
+RANSOM_TOTAL=$((RANSOM_IMMUT + RANSOM_EXPORT + RANSOM_AUTH + RANSOM_DR + RANSOM_AUDIT + RANSOM_KMS + RANSOM_NETPOL + RANSOM_TLS))
+RANSOM_MAX_TOTAL=$((RANSOM_IMMUT_MAX + RANSOM_EXPORT_MAX + RANSOM_AUTH_MAX + RANSOM_DR_MAX + RANSOM_AUDIT_MAX + RANSOM_KMS_MAX + RANSOM_NETPOL_MAX + RANSOM_TLS_MAX))
+
+# Letter grade
+if [ "$RANSOM_TOTAL" -ge 85 ]; then
+  RANSOM_GRADE="A"
+elif [ "$RANSOM_TOTAL" -ge 70 ]; then
+  RANSOM_GRADE="B"
+elif [ "$RANSOM_TOTAL" -ge 55 ]; then
+  RANSOM_GRADE="C"
+elif [ "$RANSOM_TOTAL" -ge 40 ]; then
+  RANSOM_GRADE="D"
+else
+  RANSOM_GRADE="F"
+fi
+
+# Find the biggest gap (largest unscored pillar) — actionable advice
+RANSOM_BIGGEST_GAP=""
+RANSOM_BIGGEST_GAP_POINTS=0
+_track_gap() {
+  _gap_pts=$(($2 - $1))
+  if [ "$_gap_pts" -gt "$RANSOM_BIGGEST_GAP_POINTS" ]; then
+    RANSOM_BIGGEST_GAP_POINTS=$_gap_pts
+    RANSOM_BIGGEST_GAP="$3"
+  fi
+}
+_track_gap "$RANSOM_IMMUT" "$RANSOM_IMMUT_MAX" "Immutability"
+_track_gap "$RANSOM_EXPORT" "$RANSOM_EXPORT_MAX" "Off-cluster export"
+_track_gap "$RANSOM_AUTH" "$RANSOM_AUTH_MAX" "Authentication"
+_track_gap "$RANSOM_DR" "$RANSOM_DR_MAX" "Disaster Recovery"
+_track_gap "$RANSOM_AUDIT" "$RANSOM_AUDIT_MAX" "Audit logging"
+_track_gap "$RANSOM_KMS" "$RANSOM_KMS_MAX" "KMS encryption"
+_track_gap "$RANSOM_NETPOL" "$RANSOM_NETPOL_MAX" "Network policies"
+_track_gap "$RANSOM_TLS" "$RANSOM_TLS_MAX" "TLS verification"
+
+debug "Ransomware readiness: ${RANSOM_TOTAL}/${RANSOM_MAX_TOTAL} (${RANSOM_GRADE}) | biggest gap: $RANSOM_BIGGEST_GAP (-${RANSOM_BIGGEST_GAP_POINTS} pts)"
+
 ##############################################################################
 # OUTPUT REDIRECTION
 ##############################################################################
@@ -1847,6 +3239,34 @@ RESTORE_ACTIONS_RECENT=$(_safe_arg "$RESTORE_ACTIONS_RECENT" '[]')
 VM_DETAILS_JSON=$(_safe_arg "$VM_DETAILS_JSON" '[]')
 VM_POLICY_DETAILS_JSON=$(_safe_arg "$VM_POLICY_DETAILS_JSON" '[]')
 EXCLUDED_APPS_JSON=$(_safe_arg "$EXCLUDED_APPS_JSON" '[]')
+# v1.9 additions
+FAILED_ACTIONS_TOP5=$(_safe_arg "$FAILED_ACTIONS_TOP5" '[]')
+STUCK_ACTIONS=$(_safe_arg "$STUCK_ACTIONS" '[]')
+NS_PROTECTION_STATUS=$(_safe_arg "$NS_PROTECTION_STATUS" '[]')
+RP_BY_NAMESPACE_TOP5=$(_safe_arg "$RP_BY_NAMESPACE_TOP5" '[]')
+PROFILE_VALIDATION=$(_safe_arg "$PROFILE_VALIDATION" '[]')
+SC_SUMMARY=$(_safe_arg "$SC_SUMMARY" '[]')
+VSC_SUMMARY=$(_safe_arg "$VSC_SUMMARY" '[]')
+CSI_DRIVERS_WITHOUT_VSC=$(_safe_arg "$CSI_DRIVERS_WITHOUT_VSC" '[]')
+IMPORT_POLICIES_JSON=$(_safe_arg "$IMPORT_POLICIES_JSON" '[]')
+POLICIES_NO_EXPORT_LIST=$(_safe_arg "$POLICIES_NO_EXPORT_LIST" '[]')
+HIGH_SNAP_POLICIES=$(_safe_arg "$HIGH_SNAP_POLICIES" '[]')
+ZERO_SNAP_POLICIES=$(_safe_arg "$ZERO_SNAP_POLICIES" '[]')
+EXPORT_NO_RETENTION_POLICIES=$(_safe_arg "$EXPORT_NO_RETENTION_POLICIES" '[]')
+# v2.0 additions
+ALL_NAMESPACES_LABELED=$(_safe_arg "$ALL_NAMESPACES_LABELED" '[]')
+# v2.0 patch 2 - RBAC inventory
+K10_CLUSTERROLES_JSON=$(_safe_arg "$K10_CLUSTERROLES_JSON" '[]')
+K10_CRB_JSON=$(_safe_arg "$K10_CRB_JSON" '[]')
+K10_ROLES_JSON=$(_safe_arg "$K10_ROLES_JSON" '[]')
+K10_RB_JSON=$(_safe_arg "$K10_RB_JSON" '[]')
+ALL_RBAC_SUBJECTS=$(_safe_arg "$ALL_RBAC_SUBJECTS" '[]')
+# v2.0 patch 3 - Effective RPO
+EFFECTIVE_RPO=$(_safe_arg "$EFFECTIVE_RPO" '[]')
+# v2.0 patch 4 - Policy analysis (empty + redundant)
+POLICY_ANALYSIS=$(_safe_arg "$POLICY_ANALYSIS" '{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0}}')
+# v2.0 patch 5 - Ransomware readiness inputs
+PROFILE_TLS_SKIPPED=$(_safe_arg "$PROFILE_TLS_SKIPPED" '[]')
 
 ##############################################################################
 # JSON OUTPUT
@@ -1931,6 +3351,50 @@ if [ "$MODE" = "json" ]; then
     --argjson unprotectedNs "$UNPROTECTED_NS_JSON" \
     --argjson unprotectedCount "$UNPROTECTED_COUNT" \
     --arg hasCatchallPolicy "$HAS_CATCHALL_POLICY" \
+    --argjson nsInventory "$ALL_NAMESPACES_LABELED" \
+    --argjson k10ClusterRoles "$K10_CLUSTERROLES_JSON" \
+    --argjson k10ClusterRoleBindings "$K10_CRB_JSON" \
+    --argjson k10Roles "$K10_ROLES_JSON" \
+    --argjson k10RoleBindings "$K10_RB_JSON" \
+    --argjson k10RbacSubjects "$ALL_RBAC_SUBJECTS" \
+    --argjson rbacSubjectsTotal "$RBAC_SUBJECTS_TOTAL" \
+    --argjson rbacUsers "$RBAC_USERS" \
+    --argjson rbacGroups "$RBAC_GROUPS" \
+    --argjson rbacSAs "$RBAC_SAS" \
+    --arg clusterRolesAccessible "$CLUSTERROLES_RBAC_ACCESSIBLE" \
+    --arg crbAccessible "$CRB_RBAC_ACCESSIBLE" \
+    --arg rolesAccessible "$ROLES_RBAC_ACCESSIBLE" \
+    --arg rbAccessible "$RB_RBAC_ACCESSIBLE" \
+    --arg rbacFullyAccessible "$RBAC_FULLY_ACCESSIBLE" \
+    --argjson effectiveRpo "$EFFECTIVE_RPO" \
+    --argjson rpoTotal "$RPO_TOTAL" \
+    --argjson rpoWithFreq "$RPO_WITH_FREQ" \
+    --argjson rpoWithSamples "$RPO_WITH_SAMPLES" \
+    --argjson rpoInDrift "$RPO_IN_DRIFT" \
+    --argjson policyAnalysis "$POLICY_ANALYSIS" \
+    --argjson ransomImmut "$RANSOM_IMMUT" \
+    --argjson ransomImmutMax "$RANSOM_IMMUT_MAX" \
+    --argjson ransomExport "$RANSOM_EXPORT" \
+    --argjson ransomExportMax "$RANSOM_EXPORT_MAX" \
+    --argjson ransomAuth "$RANSOM_AUTH" \
+    --argjson ransomAuthMax "$RANSOM_AUTH_MAX" \
+    --argjson ransomDr "$RANSOM_DR" \
+    --argjson ransomDrMax "$RANSOM_DR_MAX" \
+    --argjson ransomAudit "$RANSOM_AUDIT" \
+    --argjson ransomAuditMax "$RANSOM_AUDIT_MAX" \
+    --argjson ransomKms "$RANSOM_KMS" \
+    --argjson ransomKmsMax "$RANSOM_KMS_MAX" \
+    --argjson ransomNetpol "$RANSOM_NETPOL" \
+    --argjson ransomNetpolMax "$RANSOM_NETPOL_MAX" \
+    --argjson ransomTls "$RANSOM_TLS" \
+    --argjson ransomTlsMax "$RANSOM_TLS_MAX" \
+    --argjson ransomTotal "$RANSOM_TOTAL" \
+    --argjson ransomMaxTotal "$RANSOM_MAX_TOTAL" \
+    --arg ransomGrade "$RANSOM_GRADE" \
+    --arg ransomBiggestGap "$RANSOM_BIGGEST_GAP" \
+    --argjson ransomBiggestGapPoints "$RANSOM_BIGGEST_GAP_POINTS" \
+    --argjson profileTlsSkipped "$PROFILE_TLS_SKIPPED" \
+    --argjson profileTlsSkippedCount "$PROFILE_TLS_SKIPPED_COUNT" \
     --argjson k10Resources "$K10_RESOURCES_SUMMARY" \
     --argjson k10Deployments "$K10_DEPLOYMENTS_SUMMARY" \
     --argjson k10ContainersTotal "$K10_CONTAINERS_TOTAL" \
@@ -2020,6 +3484,53 @@ if [ "$MODE" = "json" ]; then
     --arg bpAuth "$BP_AUTH_STATUS" \
     --arg bpEncryption "$BP_ENCRYPTION_STATUS" \
     --arg bpAudit "$BP_AUDIT_STATUS" \
+    --arg k8sServerVersion "$K8S_SERVER_VERSION" \
+    --arg k8sDistribution "$K8S_DISTRIBUTION" \
+    --argjson failedActionsTop5 "$FAILED_ACTIONS_TOP5" \
+    --argjson failedActionsTop5Count "$FAILED_ACTIONS_TOP5_COUNT" \
+    --argjson stuckActions "$STUCK_ACTIONS" \
+    --argjson stuckActionsCount "$STUCK_ACTIONS_COUNT" \
+    --argjson stuckHoursThreshold "$STUCK_HOURS_THRESHOLD" \
+    --argjson nsProtectionStatus "$NS_PROTECTION_STATUS" \
+    --argjson nsProtectionTotal "$NS_PROTECTION_TOTAL" \
+    --argjson nsStaleCount "$NS_STALE_COUNT" \
+    --argjson nsNeverBackedUp "$NS_NEVER_BACKED_UP" \
+    --argjson staleDaysThreshold "$STALE_DAYS_THRESHOLD" \
+    --argjson rpByNamespaceTop5 "$RP_BY_NAMESPACE_TOP5" \
+    --argjson profileValidation "$PROFILE_VALIDATION" \
+    --argjson profileFailedCount "$PROFILE_FAILED_COUNT" \
+    --arg reportsPolicyExists "$REPORTS_POLICY_EXISTS" \
+    --arg reportsPolicyFrequency "$REPORTS_POLICY_FREQUENCY" \
+    --arg reportsPolicyLastState "$REPORTS_POLICY_LAST_RUN_STATE" \
+    --arg reportsPolicyLastTs "$REPORTS_POLICY_LAST_RUN_TS" \
+    --argjson reportActionsCount "$REPORT_ACTIONS_COUNT" \
+    --argjson scCount "$SC_COUNT" \
+    --argjson scDefaultCount "$SC_DEFAULT_COUNT" \
+    --arg scRbacOk "$SC_RBAC_OK" \
+    --argjson scSummary "$SC_SUMMARY" \
+    --argjson vscCount "$VSC_COUNT" \
+    --argjson vscDefaultCount "$VSC_DEFAULT_COUNT" \
+    --arg vscRbacOk "$VSC_RBAC_OK" \
+    --argjson vscSummary "$VSC_SUMMARY" \
+    --argjson csiDriversWithoutVsc "$CSI_DRIVERS_WITHOUT_VSC" \
+    --argjson csiDriversWithoutVscCount "$CSI_DRIVERS_WITHOUT_VSC_COUNT" \
+    --argjson importPolicyCount "$IMPORT_POLICY_COUNT" \
+    --argjson importPolicies "$IMPORT_POLICIES_JSON" \
+    --argjson policiesNoExportList "$POLICIES_NO_EXPORT_LIST" \
+    --argjson policiesNoExportCount "$POLICIES_NO_EXPORT_COUNT" \
+    --argjson highSnapPolicies "$HIGH_SNAP_POLICIES" \
+    --argjson highSnapCount "$HIGH_SNAP_COUNT" \
+    --argjson zeroSnapPolicies "$ZERO_SNAP_POLICIES" \
+    --argjson zeroSnapCount "$ZERO_SNAP_COUNT" \
+    --argjson exportNoRetentionPolicies "$EXPORT_NO_RETENTION_POLICIES" \
+    --argjson exportNoRetentionCount "$EXPORT_NO_RETENTION_COUNT" \
+    --arg hasClusterScopedPolicy "$HAS_CLUSTER_SCOPED_POLICY" \
+    --arg skipHelm "$([ "$SKIP_HELM" = true ] && echo true || echo false)" \
+    --arg bpSnapRetentionHigh "$BP_SNAP_RETENTION_HIGH_STATUS" \
+    --arg bpSnapRetentionZero "$BP_SNAP_RETENTION_ZERO_STATUS" \
+    --arg bpExportRetention "$BP_EXPORT_RETENTION_STATUS" \
+    --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
+    --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
     '
     {
       kdlVersion: $kdlVersion,
@@ -2151,7 +3662,23 @@ if [ "$MODE" = "json" ]; then
           count: $unprotectedCount,
           items: $unprotectedNs
         },
+        namespacesInventory: {
+          total: ($nsInventory | length),
+          system: [$nsInventory[] | select(.isSystem)] | length,
+          application: [$nsInventory[] | select(.isSystem | not)] | length,
+          items: $nsInventory
+        },
         note: "Excludes system policies (DR, reporting) and system namespaces"
+      },
+
+      policyAnalysis: {
+        summary: $policyAnalysis.summary,
+        emptyPolicies: $policyAnalysis.empty,
+        unresolvablePolicies: $policyAnalysis.unresolvable,
+        policiesWithNonExistingReferences: $policyAnalysis.withNonExistingNs,
+        redundantPairs: $policyAnalysis.redundantPairs,
+        resolved: $policyAnalysis.resolved,
+        note: "Scope: app policies only (system DR/reports excluded). Empty = selector resolves to 0 existing namespaces. Redundant = pair of policies sharing >=1 namespace AND >=1 action. Pairs flagged involvesCatchall=true are by-design when a catch-all policy exists; genuine pairs are the actionable subset."
       },
 
       policyRunStats: {
@@ -2161,6 +3688,18 @@ if [ "$MODE" = "json" ]; then
           min: $minDuration,
           max: $maxDuration,
           sampleCount: $durationSampleCount
+        },
+        effectiveRpo: {
+          summary: {
+            totalPolicies: $rpoTotal,
+            withKnownFrequency: $rpoWithFreq,
+            withEnoughSamples: $rpoWithSamples,
+            inDrift: $rpoInDrift,
+            driftThreshold: "median > theoretical × 1.5",
+            window: "14 days",
+            note: "Median interval between consecutive successful (Complete) RunActions per policy. Custom cron expressions are reported with stats but no drift judgement."
+          },
+          items: $effectiveRpo
         }
       },
 
@@ -2288,6 +3827,65 @@ if [ "$MODE" = "json" ]; then
         }
       },
 
+      k10Rbac: {
+        accessibility: {
+          fullyAccessible: ($rbacFullyAccessible == "true"),
+          clusterRoles: ($clusterRolesAccessible == "true"),
+          clusterRoleBindings: ($crbAccessible == "true"),
+          roles: ($rolesAccessible == "true"),
+          roleBindings: ($rbAccessible == "true"),
+          note: "ClusterRoleBindings cluster-wide read is not in K10 standard ClusterRole. If false, re-run with a kubeconfig holding cluster-wide RBAC view permissions."
+        },
+        clusterRoles: {
+          count: ($k10ClusterRoles | length),
+          items: $k10ClusterRoles
+        },
+        clusterRoleBindings: {
+          count: ($k10ClusterRoleBindings | length),
+          items: $k10ClusterRoleBindings
+        },
+        roles: {
+          count: ($k10Roles | length),
+          items: $k10Roles
+        },
+        roleBindings: {
+          count: ($k10RoleBindings | length),
+          items: $k10RoleBindings
+        },
+        subjects: {
+          total: $rbacSubjectsTotal,
+          users: $rbacUsers,
+          groups: $rbacGroups,
+          serviceAccounts: $rbacSAs,
+          items: $k10RbacSubjects
+        }
+      },
+
+      ransomwareReadiness: {
+        grade: $ransomGrade,
+        score: $ransomTotal,
+        maxScore: $ransomMaxTotal,
+        biggestGap: (if $ransomBiggestGap != "" then {pillar: $ransomBiggestGap, pointsLost: $ransomBiggestGapPoints} else null end),
+        pillars: {
+          immutability:     {score: $ransomImmut,   max: $ransomImmutMax,   evidence: ($immutability == "true" and $immutableProfiles > 0)},
+          offClusterExport: {score: $ransomExport,  max: $ransomExportMax,  evidence: ($policiesWithExport > 0)},
+          authentication:   {score: $ransomAuth,    max: $ransomAuthMax,    evidence: ($authMethod != "none" and $authMethod != "")},
+          disasterRecovery: {score: $ransomDr,      max: $ransomDrMax,      evidence: $kdrEnabled},
+          auditLogging:     {score: $ransomAudit,   max: $ransomAuditMax,   evidence: ($auditEnabled == "true")},
+          kmsEncryption:    {score: $ransomKms,     max: $ransomKmsMax,     evidence: ($encryptionProvider != "none" and $encryptionProvider != "")},
+          networkPolicies:  {score: $ransomNetpol, max: $ransomNetpolMax, evidence: ($netpolEnabled == "true")},
+          tlsVerification:  {score: $ransomTls,    max: $ransomTlsMax,    evidence: ($profileTlsSkippedCount == 0), profilesSkippingTls: $profileTlsSkipped}
+        },
+        gradeThresholds: {
+          A: ">=85",
+          B: "70-84",
+          C: "55-69",
+          D: "40-54",
+          F: "<40"
+        },
+        note: "Synthesis of 8 security pillars. Score and grade are intended for executive/CISO communication. Pillar weighting validated empirically; review against your org threat model."
+      },
+
       bestPractices: {
         disasterRecovery: $bpDr,
         immutability: $bpImmutability,
@@ -2298,7 +3896,108 @@ if [ "$MODE" = "json" ]; then
         vmProtection: $bpVmProtection,
         authentication: $bpAuth,
         encryption: $bpEncryption,
-        auditLogging: $bpAudit
+        auditLogging: $bpAudit,
+        snapshotRetentionHigh: $bpSnapRetentionHigh,
+        snapshotRetentionZero: $bpSnapRetentionZero,
+        exportRetentionExplicit: $bpExportRetention,
+        clusterScopedResources: $bpClusterScoped,
+        policiesWithoutExport: $bpNoExport,
+        clusterScopedResourcesProtected: ($hasClusterScopedPolicy == "true")
+      },
+
+      cluster: {
+        kubernetesVersion: $k8sServerVersion,
+        distribution: $k8sDistribution
+      },
+
+      failedActionsTop5: {
+        count: $failedActionsTop5Count,
+        items: $failedActionsTop5
+      },
+
+      stuckActions: {
+        thresholdHours: $stuckHoursThreshold,
+        count: $stuckActionsCount,
+        items: $stuckActions
+      },
+
+      namespaceProtectionStatus: {
+        thresholdDays: $staleDaysThreshold,
+        total: $nsProtectionTotal,
+        stale: $nsStaleCount,
+        neverBackedUp: $nsNeverBackedUp,
+        items: $nsProtectionStatus,
+        note: "Stale = last successful backup older than thresholdDays"
+      },
+
+      restorePointsByNamespace: {
+        top5: $rpByNamespaceTop5
+      },
+
+      profileValidation: {
+        failedCount: $profileFailedCount,
+        items: $profileValidation
+      },
+
+      reportsPolicy: {
+        exists: ($reportsPolicyExists == "true"),
+        frequency: $reportsPolicyFrequency,
+        lastRun: {
+          state: $reportsPolicyLastState,
+          timestamp: $reportsPolicyLastTs
+        },
+        reportActionsCount: $reportActionsCount,
+        note: "k10-system-reports-policy is required for Export Storage / Dedup metrics"
+      },
+
+      storageClasses: {
+        rbacAccessible: ($scRbacOk == "true"),
+        count: $scCount,
+        defaultCount: $scDefaultCount,
+        items: $scSummary
+      },
+
+      volumeSnapshotClasses: {
+        rbacAccessible: ($vscRbacOk == "true"),
+        count: $vscCount,
+        defaultCount: $vscDefaultCount,
+        items: $vscSummary,
+        csiDriversWithoutVsc: {
+          count: $csiDriversWithoutVscCount,
+          drivers: $csiDriversWithoutVsc
+        }
+      },
+
+      importPolicies: {
+        count: $importPolicyCount,
+        items: $importPolicies
+      },
+
+      policiesWithoutExport: {
+        count: $policiesNoExportCount,
+        items: $policiesNoExportList
+      },
+
+      retentionAnalysis: {
+        snapshotRetentionHigh: {
+          count: $highSnapCount,
+          items: $highSnapPolicies,
+          note: "Policies with at least one snapshot retention key > 7 (source storage I/O impact at high simultaneous snapshot counts)"
+        },
+        snapshotRetentionZero: {
+          count: $zeroSnapCount,
+          items: $zeroSnapPolicies,
+          note: "Policies with no/zero snapshot retention (no fast local recovery)"
+        },
+        exportWithoutExplicitRetention: {
+          count: $exportNoRetentionCount,
+          items: $exportNoRetentionPolicies,
+          note: "Export action inherits snapshot retention when no .retention is set on the export action"
+        }
+      },
+
+      collectionFlags: {
+        skipHelm: ($skipHelm == "true")
       },
 
       immutabilitySignal: ($immutability == "true"),
@@ -2365,6 +4064,10 @@ printf "==============================\n"
 printf "Platform: $PLATFORM\n"
 printf "Namespace: $NAMESPACE\n"
 printf "Kasten Version: $KASTEN_VERSION\n"
+printf "K8s Version: $K8S_SERVER_VERSION ($K8S_DISTRIBUTION)\n"
+if [ "$SKIP_HELM" = "true" ]; then
+  printf "${COLOR_CYAN}Helm extraction: SKIPPED (--no-helm)${COLOR_RESET}\n"
+fi
 
 ### License
 printf "\n${COLOR_BOLD}[LICENSE] License Information${COLOR_RESET}\n"
@@ -2427,6 +4130,31 @@ if [ "$RESTORE_ACTIONS_TOTAL" -gt 0 ]; then
   _ep "$RESTORE_ACTIONS_RECENT" | jq -r '.[] | "    - \(.timestamp | split("T")[0]) | \(.state) | \(.targetNamespace)"' 2>/dev/null | head -5
 fi
 
+### Failed Actions Top 5 (NEW v1.9)
+printf "\n${COLOR_BOLD}[FAIL] Failed Actions - Top 5${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
+if [ "$FAILED_ACTIONS_TOP5_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_GREEN}[OK] No failed actions found${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_RED}$FAILED_ACTIONS_TOP5_COUNT recent failure(s)${COLOR_RESET} (most recent first):\n"
+  _ep "$FAILED_ACTIONS_TOP5" | jq -r '.[] |
+    "  - [\(.kind)] \(.timestamp | split("T")[0])  ns=\(.namespace)" +
+    (if .policy != "" then "  policy=\(.policy)" else "" end) +
+    "\n      " + (if .message != "" then .message else "(no error message)" end)
+  ' 2>/dev/null
+fi
+
+### Stuck Actions (NEW v1.9)
+printf "\n${COLOR_BOLD}[STUCK] Stuck Actions (Running > ${STUCK_HOURS_THRESHOLD}h)${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
+if [ "$STUCK_ACTIONS_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_GREEN}[OK] No stuck actions detected${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}[WARN] $STUCK_ACTIONS_COUNT action(s) Running for more than ${STUCK_HOURS_THRESHOLD}h${COLOR_RESET}:\n"
+  _ep "$STUCK_ACTIONS" | jq -r '.[] |
+    "  - [\(.kind)] \(.name) ns=\(.namespace) age=\(.ageHours)h" +
+    (if .policy != "" then " policy=\(.policy)" else "" end)
+  ' 2>/dev/null
+fi
+
 ### Multi-Cluster (NEW v1.6)
 printf "\n${COLOR_BOLD}[GLOBE] Multi-Cluster${COLOR_RESET}\n"
 if [ "$MC_ROLE" = "primary" ]; then
@@ -2442,6 +4170,30 @@ elif [ "$MC_ROLE" = "secondary" ]; then
   fi
 else
   printf "  Status:   ${COLOR_YELLOW}Not configured${COLOR_RESET}\n"
+fi
+
+### Reports Policy State (NEW v1.9)
+printf "\n${COLOR_BOLD}[REPORTS] k10-system-reports-policy${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
+if [ "$REPORTS_POLICY_EXISTS" != "true" ]; then
+  printf "  Status:    ${COLOR_YELLOW}NOT FOUND${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN] Without this policy, Export Storage and Dedup Ratio metrics are unavailable${COLOR_RESET}\n"
+else
+  printf "  Exists:    ${COLOR_GREEN}YES${COLOR_RESET}\n"
+  printf "  Frequency: $REPORTS_POLICY_FREQUENCY\n"
+  printf "  ReportActions found: $REPORT_ACTIONS_COUNT\n"
+  if [ "$REPORTS_POLICY_LAST_RUN_TS" = "N/A" ]; then
+    printf "  Last run:  ${COLOR_YELLOW}Never executed${COLOR_RESET}\n"
+  else
+    printf "  Last run:  $REPORTS_POLICY_LAST_RUN_TS\n"
+    case "$REPORTS_POLICY_LAST_RUN_STATE" in
+      Complete|Succeeded|Success)
+        printf "  Last state: ${COLOR_GREEN}$REPORTS_POLICY_LAST_RUN_STATE${COLOR_RESET}\n" ;;
+      Failed)
+        printf "  Last state: ${COLOR_RED}$REPORTS_POLICY_LAST_RUN_STATE${COLOR_RESET}\n" ;;
+      *)
+        printf "  Last state: ${COLOR_YELLOW}$REPORTS_POLICY_LAST_RUN_STATE${COLOR_RESET}\n" ;;
+    esac
+  fi
 fi
 
 ### Disaster Recovery
@@ -2487,6 +4239,22 @@ if [ "$PROFILE_COUNT" -gt 0 ]; then
 "    Endpoint: \(.spec.locationSpec.objectStore.endpoint // .spec.infrastoreBlobStore.endpoint // "default")\n" +
 "    Protection period: \(first(.. | .protectionPeriod? // empty) // "not set")\n"
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse profile details${COLOR_RESET}\n"
+fi
+
+# Profile validation status (NEW v1.9)
+if [ "$PROFILE_COUNT" -gt 0 ]; then
+  printf "\n  ${COLOR_BOLD}Validation status${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}:\n"
+  if [ "$PROFILE_FAILED_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_RED}[WARN] $PROFILE_FAILED_COUNT profile(s) in Failed state${COLOR_RESET}\n"
+  fi
+  _ep "$PROFILE_VALIDATION" | jq -r '.[] |
+    if (.state == "Failed" or .state == "Failing") then
+      "  - " + .name + ": [FAIL] " + (.state // "Failed") +
+        (if .error then " (" + (if (.error|tostring|length) > 120 then (.error|tostring)[0:120]+"..." else .error|tostring end) + ")" else "" end)
+    else
+      "  - " + .name + ": [OK] " + (.state // "Unknown")
+    end
+  ' 2>/dev/null
 fi
 
 ### PolicyPresets
@@ -2585,10 +4353,30 @@ else "" end) +
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse policy details${COLOR_RESET}\n"
 fi
 
-### Policy Last Run Summary (NEW v1.5)
+### Import Policies (NEW v1.9)
+printf "\n${COLOR_BOLD}[IMPORT] Import Policies${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
+if [ "$IMPORT_POLICY_COUNT" -eq 0 ]; then
+  if [ "$MC_ROLE" = "secondary" ]; then
+    printf "  ${COLOR_YELLOW}[WARN] Secondary cluster but no import policy configured${COLOR_RESET}\n"
+  else
+    printf "  ${COLOR_CYAN}[INFO] No import policies (used for multi-cluster catalog imports)${COLOR_RESET}\n"
+  fi
+else
+  printf "  Import policies: ${COLOR_GREEN}$IMPORT_POLICY_COUNT${COLOR_RESET}\n"
+  _ep "$IMPORT_POLICIES_JSON" | jq -r '.[] | "  - \(.name) [\(.frequency)]" + (if .profile != "" then " profile=\(.profile)" else "" end)' 2>/dev/null
+fi
+
+### Policy Last Run Summary (NEW v1.5; v1.9: error message added)
 printf "\n${COLOR_BOLD}[TIME] Policy Last Run Status${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
-_ep "$POLICY_LAST_RUN" | jq -r '.[]? | 
-  "  \(.name): \(if .lastRun then .lastRun.timestamp else "Never" end) | \(if .lastRun then .lastRun.state else "N/A" end)\(if .lastRun.duration then " | \(.lastRun.duration)s" else "" end)"
+_ep "$POLICY_LAST_RUN" | jq -r '.[]? |
+  "  \(.name): " +
+  (if .lastRun then
+    .lastRun.timestamp + " | " + .lastRun.state +
+    (if .lastRun.duration then " | " + (.lastRun.duration | tostring) + "s" else "" end) +
+    (if .lastRun.error and .lastRun.error != "" then
+      "\n      [ERROR] " + (if (.lastRun.error|length) > 180 then .lastRun.error[0:180]+"..." else .lastRun.error end)
+    else "" end)
+  else "Never" end)
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}No run data available${COLOR_RESET}\n"
 
 ### Average Policy Run Duration (NEW v1.5)
@@ -2599,6 +4387,55 @@ if [ "$DURATION_SAMPLE_COUNT" -gt 0 ]; then
   printf "  Min: ${MIN_DURATION}s | Max: ${MAX_DURATION}s\n"
 else
   printf "  ${COLOR_YELLOW}[INFO]  No completed runs in the last 14 days${COLOR_RESET}\n"
+fi
+
+### Effective RPO (NEW v2.0 - patch 3/7)
+printf "\n${COLOR_BOLD}[RPO] Effective RPO per Policy${COLOR_RESET} ${COLOR_CYAN}(NEW v2.0)${COLOR_RESET}\n"
+printf "  ${COLOR_CYAN}Median interval between consecutive successful backups (14d window)${COLOR_RESET}\n"
+printf "  Policies analysed:        $RPO_TOTAL\n"
+printf "  With known frequency:     $RPO_WITH_FREQ (alias-based: @hourly, @daily, etc.)\n"
+printf "  With enough samples (≥2): $RPO_WITH_SAMPLES\n"
+
+if [ "$RPO_IN_DRIFT" -gt 0 ] 2>/dev/null; then
+  printf "  In drift (median > 1.5×): ${COLOR_RED}$RPO_IN_DRIFT${COLOR_RESET}\n"
+else
+  printf "  In drift (median > 1.5×): ${COLOR_GREEN}0${COLOR_RESET}\n"
+fi
+
+# Per-policy details: only show policies with samples (otherwise NA on every column)
+if [ "$RPO_WITH_SAMPLES" -gt 0 ] 2>/dev/null; then
+  printf "\n  Per-policy:\n"
+  # Format duration as human-readable (s -> Hh Mm Ss when >= 60s)
+  _ep "$EFFECTIVE_RPO" | jq -r '
+    def hms($s):
+      if $s == null then "N/A"
+      elif $s < 60 then "\($s|floor)s"
+      elif $s < 3600 then "\(($s/60)|floor)m\(($s%60)|floor)s"
+      elif $s < 86400 then "\(($s/3600)|floor)h\((($s%3600)/60)|floor)m"
+      else "\(($s/86400)|floor)d\((($s%86400)/3600)|floor)h"
+      end;
+    .[] | select(.samples > 0) |
+    "    " +
+    (if .drift == true then "[DRIFT] " elif .drift == false then "[OK]    " else "[INFO]  " end) +
+    .name +
+    " | freq=" + (.frequencyDeclared // "n/a") +
+    " | median=" + hms(.median) +
+    " | max=" + hms(.max) +
+    " | n=\(.samples)"
+  ' 2>/dev/null
+fi
+
+# Tell user which policies could not be analysed (frequency unknown or too few samples)
+RPO_NOT_ANALYSED=$((RPO_TOTAL - RPO_WITH_SAMPLES))
+if [ "$RPO_NOT_ANALYSED" -gt 0 ] 2>/dev/null; then
+  printf "\n  ${COLOR_CYAN}Not analysed (no/insufficient samples in 14d):${COLOR_RESET}\n"
+  _ep "$EFFECTIVE_RPO" | jq -r '
+    .[] | select(.samples == 0) |
+    "    - " + .name + " (freq=" + (.frequencyDeclared // "manual") + ", samples=0)"
+  ' 2>/dev/null | head -10
+  if [ "$RPO_NOT_ANALYSED" -gt 10 ] 2>/dev/null; then
+    printf "    ... and $((RPO_NOT_ANALYSED - 10)) more\n"
+  fi
 fi
 
 ### Unprotected Namespaces (NEW v1.5)
@@ -2648,6 +4485,97 @@ fi
 if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
   printf "  ${COLOR_YELLOW}[INFO]  Policies with label selectors: $COMPLEX_SELECTOR_POLICIES${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}    (May protect additional namespaces based on labels)${COLOR_RESET}\n"
+fi
+
+### Policy Analysis: empty + redundant (NEW v2.0 - patch 4/7)
+printf "\n${COLOR_BOLD}[POLICY-ANALYSIS] Policy Analysis${COLOR_RESET} ${COLOR_CYAN}(NEW v2.0)${COLOR_RESET}\n"
+printf "  ${COLOR_CYAN}Scope: $APP_POLICY_COUNT app policies (system DR/reports excluded)${COLOR_RESET}\n"
+
+# Empty policies (B3)
+if [ "$POLICY_EMPTY_COUNT" -eq 0 ] 2>/dev/null; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Empty policies:        0 (all selectors match at least one existing namespace)\n"
+else
+  printf "  ${COLOR_RED}[WARN]${COLOR_RESET} Empty policies:        $POLICY_EMPTY_COUNT (selector matches no existing namespace)\n"
+  _ep "$POLICY_ANALYSIS" | jq -r '.empty[]? |
+    "    - " + .name +
+    " | selector=" + .selectorKind +
+    (if (.nonExistingReferences | length) > 0 then " | references non-existing: " + (.nonExistingReferences | join(", ")) else "" end)
+  ' 2>/dev/null | head -10
+fi
+
+# Non-existing references (informational, not necessarily empty)
+if [ "$POLICY_NONEXISTING_COUNT" -gt "$POLICY_EMPTY_COUNT" ] 2>/dev/null; then
+  EXTRA_NONEXISTING=$((POLICY_NONEXISTING_COUNT - POLICY_EMPTY_COUNT))
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Policies with dead refs:$EXTRA_NONEXISTING (matchNames includes some non-existing namespaces but still has live ones)\n"
+fi
+
+# Unresolvable policies (informational - operator NotIn etc.)
+if [ "$POLICY_UNRESOLVABLE_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Unresolvable selectors:$POLICY_UNRESOLVABLE_COUNT (complex matchExpressions — NotIn/Exists/etc. — not statically resolved)\n"
+  _ep "$POLICY_ANALYSIS" | jq -r '.unresolvable[]? | "    - " + .name + " (" + .selectorKind + ")"' 2>/dev/null | head -5
+fi
+
+# Redundant pairs (B2)
+TOTAL_REDUNDANT=$((POLICY_REDUNDANT_GENUINE + POLICY_REDUNDANT_CATCHALL))
+if [ "$TOTAL_REDUNDANT" -eq 0 ] 2>/dev/null; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Redundant policy pairs: 0 (no policies share both a namespace and an action)\n"
+else
+  if [ "$POLICY_REDUNDANT_GENUINE" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Redundant policy pairs: $POLICY_REDUNDANT_GENUINE genuine (two non-catchall policies overlap)\n"
+    _ep "$POLICY_ANALYSIS" | jq -r '.redundantPairs[]? | select(.involvesCatchall | not) |
+      "    - [" + (.policies | join(" ↔ ")) + "]" +
+      " | shared NS: " + (.sharedNamespaces | join(", ")) +
+      " | shared actions: " + (.sharedActions | join(", ")) +
+      (if .sameFrequency then " | same frequency" else " | different frequencies" end)
+    ' 2>/dev/null | head -10
+    if [ "$POLICY_REDUNDANT_GENUINE" -gt 10 ] 2>/dev/null; then
+      printf "    ... and $((POLICY_REDUNDANT_GENUINE - 10)) more (see JSON output)\n"
+    fi
+  else
+    printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Redundant policy pairs: 0 genuine\n"
+  fi
+  if [ "$POLICY_REDUNDANT_CATCHALL" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Redundant with catch-all: $POLICY_REDUNDANT_CATCHALL pair(s) (by-design when a catch-all policy exists)\n"
+  fi
+fi
+
+### Per-Namespace Protection Status (NEW v1.9)
+printf "\n${COLOR_BOLD}[NS-STATUS] Per-Namespace Protection Status${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
+printf "  Last successful action per application namespace (stale = > ${STALE_DAYS_THRESHOLD} days)\n"
+printf "  Application namespaces analyzed: $NS_PROTECTION_TOTAL\n"
+
+if [ "$NS_PROTECTION_TOTAL" -eq 0 ]; then
+  printf "  ${COLOR_YELLOW}[INFO]  No application namespaces to evaluate${COLOR_RESET}\n"
+else
+  if [ "$NS_NEVER_BACKED_UP" -gt 0 ]; then
+    printf "  ${COLOR_RED}[WARN] $NS_NEVER_BACKED_UP namespace(s) never successfully backed up${COLOR_RESET}\n"
+  fi
+  if [ "$NS_STALE_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_YELLOW}[WARN] $NS_STALE_COUNT namespace(s) with stale last backup (>${STALE_DAYS_THRESHOLD}d)${COLOR_RESET}\n"
+  fi
+  FRESH=$((NS_PROTECTION_TOTAL - NS_STALE_COUNT - NS_NEVER_BACKED_UP))
+  [ "$FRESH" -lt 0 ] && FRESH=0
+  printf "  ${COLOR_GREEN}[OK]   $FRESH namespace(s) with recent successful backup${COLOR_RESET}\n"
+
+  printf "\n  Detail (showing up to 20):\n"
+  _ep "$NS_PROTECTION_STATUS" | jq -r '
+    sort_by(
+      if .lastBackup == null then "0000" else .lastBackup end
+    )
+    | .[0:20]
+    | .[]
+    | (if .lastBackup == null then "    [NEVER]"
+       elif .stale then "    [STALE]"
+       else "    [OK]   " end)
+      + " " + .namespace
+      + (if .lastBackup then "  last_backup=" + (.lastBackup | split("T")[0]) + " (" + ((.backupAgeDays|tostring)+"d") + ")" else "  last_backup=never" end)
+      + (if .lastExport then "  last_export=" + (.lastExport | split("T")[0]) else "" end)
+      + (if .lastRestore then "  last_restore=" + (.lastRestore | split("T")[0]) else "" end)
+  ' 2>/dev/null
+
+  if [ "$NS_PROTECTION_TOTAL" -gt 20 ]; then
+    printf "    ... and $((NS_PROTECTION_TOTAL - 20)) more (use --json for the full list)\n"
+  fi
 fi
 
 ### K10 Resource Limits (NEW v1.5)
@@ -2728,6 +4656,15 @@ if [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
 else
   printf "  ${COLOR_YELLOW}[WARN]  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
   _ep "$ORPHANED_RP" | jq -r '.[:5][] | "    - \(.name) [\(.namespace)]"' 2>/dev/null
+fi
+
+### RestorePoints by Namespace - Top 5 (NEW v1.9)
+printf "\n${COLOR_BOLD}[RP-DIST] RestorePoints by Namespace - Top 5${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
+RP_TOP_LEN=$(_ep "$RP_BY_NAMESPACE_TOP5" | jq 'length // 0' 2>/dev/null)
+if [ "${RP_TOP_LEN:-0}" -eq 0 ]; then
+  printf "  ${COLOR_YELLOW}[INFO] No RestorePoints found${COLOR_RESET}\n"
+else
+  _ep "$RP_BY_NAMESPACE_TOP5" | jq -r '.[] | "  - \(.namespace): \(.count) RP(s)"' 2>/dev/null
 fi
 
 ### Blueprints & Bindings
@@ -2936,6 +4873,72 @@ if [ "$NON_DEFAULT_COUNT" -gt 0 ]; then
   printf "\n  ${COLOR_CYAN}$NON_DEFAULT_COUNT non-default setting(s): $NON_DEFAULT_ITEMS${COLOR_RESET}\n"
 fi
 
+### K10 RBAC Inventory (NEW v2.0 - patch 2/7)
+printf "\n${COLOR_BOLD}[RBAC] K10 RBAC Inventory${COLOR_RESET} ${COLOR_CYAN}(NEW v2.0)${COLOR_RESET}\n"
+
+# Accessibility status - tell the user what could be read
+if [ "$RBAC_FULLY_ACCESSIBLE" = "true" ]; then
+  printf "  Access:             ${COLOR_GREEN}All RBAC resources accessible${COLOR_RESET}\n"
+else
+  printf "  Access:             ${COLOR_YELLOW}Partial${COLOR_RESET} (some lookups denied — re-run with cluster-wide RBAC view to complete)\n"
+  [ "$CLUSTERROLES_RBAC_ACCESSIBLE" = "false" ] && printf "    ${COLOR_YELLOW}- ClusterRoles read DENIED${COLOR_RESET}\n"
+  [ "$CRB_RBAC_ACCESSIBLE" = "false" ] && printf "    ${COLOR_YELLOW}- ClusterRoleBindings read DENIED${COLOR_RESET}\n"
+  [ "$ROLES_RBAC_ACCESSIBLE" = "false" ] && printf "    ${COLOR_YELLOW}- Roles (in $NAMESPACE) read DENIED${COLOR_RESET}\n"
+  [ "$RB_RBAC_ACCESSIBLE" = "false" ] && printf "    ${COLOR_YELLOW}- RoleBindings (in $NAMESPACE) read DENIED${COLOR_RESET}\n"
+fi
+
+printf "  ClusterRoles:       $K10_CLUSTERROLES_COUNT\n"
+printf "  ClusterRoleBindings:$K10_CRB_COUNT\n"
+printf "  Roles (in $NAMESPACE): $K10_ROLES_COUNT\n"
+printf "  RoleBindings (in $NAMESPACE): $K10_RB_COUNT\n"
+
+# Subjects summary
+printf "\n  ${COLOR_BOLD}Subjects with K10 access:${COLOR_RESET} $RBAC_SUBJECTS_TOTAL"
+if [ "$RBAC_SUBJECTS_TOTAL" -gt 0 ]; then
+  printf " ("
+  _first=true
+  if [ "$RBAC_USERS" -gt 0 ]; then
+    printf "${COLOR_GREEN}$RBAC_USERS user(s)${COLOR_RESET}"
+    _first=false
+  fi
+  if [ "$RBAC_GROUPS" -gt 0 ]; then
+    [ "$_first" = "false" ] && printf ", "
+    printf "${COLOR_GREEN}$RBAC_GROUPS group(s)${COLOR_RESET}"
+    _first=false
+  fi
+  if [ "$RBAC_SAS" -gt 0 ]; then
+    [ "$_first" = "false" ] && printf ", "
+    printf "${COLOR_CYAN}$RBAC_SAS SA(s)${COLOR_RESET}"
+  fi
+  printf ")"
+fi
+printf "\n"
+
+# Show users + groups (audit-relevant; SAs are usually internal)
+RBAC_HUMAN_SUBJECTS=$(_ep "$ALL_RBAC_SUBJECTS" | jq -r '
+  [.[] | select(.kind == "User" or .kind == "Group")]
+  | sort_by(.kind, .name)
+  | .[]
+  | "    - [\(.kind)] \(.name)"
+' 2>/dev/null)
+if [ -n "$RBAC_HUMAN_SUBJECTS" ]; then
+  printf "  Users & Groups:\n"
+  echo "$RBAC_HUMAN_SUBJECTS" | head -20
+  RBAC_HUMAN_COUNT=$(echo "$RBAC_HUMAN_SUBJECTS" | wc -l | tr -d '[:space:]')
+  if [ "${RBAC_HUMAN_COUNT:-0}" -gt 20 ] 2>/dev/null; then
+    printf "    ... and $((RBAC_HUMAN_COUNT - 20)) more (see JSON output for full list)\n"
+  fi
+fi
+
+# Flag any ClusterRole with wildcard verbs/resources (informational, not a hard fail —
+# K10 cluster-admin role is wildcard by design)
+RBAC_WILDCARD_ROLES=$(_ep "$K10_CLUSTERROLES_JSON" | jq -r '
+  [.[] | select(.verbsAll or .resourcesAll) | .name] | join(", ")
+' 2>/dev/null)
+if [ -n "$RBAC_WILDCARD_ROLES" ] && [ "$RBAC_WILDCARD_ROLES" != "null" ]; then
+  printf "  ${COLOR_CYAN}Wildcard ClusterRole(s): $RBAC_WILDCARD_ROLES${COLOR_RESET}\n"
+fi
+
 ### Policy Coverage Summary
 printf "\n${COLOR_BOLD}[STATS] Policy Coverage Summary${COLOR_RESET}\n"
 printf "  ${COLOR_CYAN}(Excludes system policies: DR, reporting)${COLOR_RESET}\n"
@@ -2956,6 +4959,102 @@ elif [ "$EXPORT_PHYSICAL_BYTES" -gt 0 ] 2>/dev/null; then
   printf "\n"
 else
   printf "  Export Storage:  0 B\n"
+fi
+
+### StorageClasses & VolumeSnapshotClasses Inventory (NEW v1.9)
+printf "\n${COLOR_BOLD}[STORAGE] StorageClasses & VolumeSnapshotClasses${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
+
+if [ "$SC_RBAC_OK" != "true" ]; then
+  printf "  ${COLOR_YELLOW}StorageClasses: N/A (RBAC denied or unreachable)${COLOR_RESET}\n"
+else
+  printf "  StorageClasses: $SC_COUNT"
+  if [ "$SC_DEFAULT_COUNT" -gt 0 ]; then
+    printf " (${COLOR_GREEN}$SC_DEFAULT_COUNT default${COLOR_RESET})"
+  else
+    printf " (${COLOR_YELLOW}no default flagged${COLOR_RESET})"
+  fi
+  printf "\n"
+  if [ "$SC_COUNT" -gt 0 ]; then
+    _ep "$SC_SUMMARY" | jq -r '.[] |
+      "  - " + .name +
+      (if .isDefault then " [DEFAULT]" else "" end) +
+      "  provisioner=" + .provisioner +
+      "  expand=" + (.expandable|tostring) +
+      "  reclaim=" + .reclaimPolicy +
+      "  binding=" + .bindingMode
+    ' 2>/dev/null
+  fi
+fi
+
+if [ "$VSC_RBAC_OK" != "true" ]; then
+  printf "\n  ${COLOR_YELLOW}VolumeSnapshotClasses: N/A (RBAC denied or unreachable)${COLOR_RESET}\n"
+else
+  printf "\n  VolumeSnapshotClasses: $VSC_COUNT"
+  if [ "$VSC_DEFAULT_COUNT" -gt 0 ]; then
+    printf " (${COLOR_GREEN}$VSC_DEFAULT_COUNT default${COLOR_RESET})"
+  fi
+  printf "\n"
+  if [ "$VSC_COUNT" -gt 0 ]; then
+    _ep "$VSC_SUMMARY" | jq -r '.[] |
+      "  - " + .name +
+      (if .isDefault then " [DEFAULT]" else "" end) +
+      "  driver=" + .driver +
+      "  deletion=" + .deletionPolicy
+    ' 2>/dev/null
+  fi
+fi
+
+if [ "$CSI_DRIVERS_WITHOUT_VSC_COUNT" -gt 0 ]; then
+  printf "\n  ${COLOR_YELLOW}[WARN] $CSI_DRIVERS_WITHOUT_VSC_COUNT CSI driver(s) used by SC have NO matching VolumeSnapshotClass:${COLOR_RESET}\n"
+  _ep "$CSI_DRIVERS_WITHOUT_VSC" | jq -r '.[] | "    - " + .' 2>/dev/null
+  printf "  ${COLOR_YELLOW}    These PVCs cannot be CSI-snapshotted by Kasten — Kanister/GVB needed${COLOR_RESET}\n"
+fi
+
+### Ransomware Readiness Score (NEW v2.0 - patch 5/7)
+# Color based on grade
+case "$RANSOM_GRADE" in
+  A) _grade_color="$COLOR_GREEN" ;;
+  B) _grade_color="$COLOR_GREEN" ;;
+  C) _grade_color="$COLOR_YELLOW" ;;
+  D) _grade_color="$COLOR_YELLOW" ;;
+  F) _grade_color="$COLOR_RED" ;;
+  *) _grade_color="$COLOR_RESET" ;;
+esac
+
+printf "\n${COLOR_BOLD}[RANSOMWARE-READINESS] Ransomware Readiness Score${COLOR_RESET} ${COLOR_CYAN}(NEW v2.0)${COLOR_RESET}\n"
+printf "  ${COLOR_BOLD}Grade: ${_grade_color}${RANSOM_GRADE}${COLOR_RESET}${COLOR_BOLD} (${RANSOM_TOTAL}/${RANSOM_MAX_TOTAL})${COLOR_RESET}\n"
+printf "\n"
+
+# Show each pillar with check/cross
+_pillar_line() {
+  # $1=label, $2=score, $3=max, $4=evidence-string
+  if [ "$2" -ge "$3" ] 2>/dev/null; then
+    printf "    ${COLOR_GREEN}[OK]${COLOR_RESET}   %-22s %2d/%-2d  %s\n" "$1" "$2" "$3" "$4"
+  elif [ "$2" -gt 0 ] 2>/dev/null; then
+    printf "    ${COLOR_YELLOW}[PARTIAL]${COLOR_RESET} %-22s %2d/%-2d  %s\n" "$1" "$2" "$3" "$4"
+  else
+    printf "    ${COLOR_RED}[FAIL]${COLOR_RESET} %-22s %2d/%-2d  %s\n" "$1" "$2" "$3" "$4"
+  fi
+}
+
+_pillar_line "Immutability"        "$RANSOM_IMMUT"   "$RANSOM_IMMUT_MAX"   "$([ "$IMMUTABILITY" = "true" ] && [ "$IMMUTABLE_PROFILES" -gt 0 ] && echo "$IMMUTABLE_PROFILES profile(s) with retention lock" || echo "no immutable profile configured")"
+_pillar_line "Off-cluster export"  "$RANSOM_EXPORT"  "$RANSOM_EXPORT_MAX"  "$([ "$POLICIES_WITH_EXPORT" -gt 0 ] && echo "$POLICIES_WITH_EXPORT policy/policies export to remote location" || echo "no policy with export action")"
+_pillar_line "Authentication"      "$RANSOM_AUTH"    "$RANSOM_AUTH_MAX"    "$([ "$AUTH_METHOD" != "none" ] && [ -n "$AUTH_METHOD" ] && echo "$AUTH_METHOD" || echo "dashboard may be unauthenticated")"
+_pillar_line "Disaster Recovery"   "$RANSOM_DR"     "$RANSOM_DR_MAX"      "$([ "$KDR_ENABLED" = "true" ] && echo "KDR enabled ($KDR_MODE)" || echo "KDR not configured")"
+_pillar_line "Audit logging"       "$RANSOM_AUDIT"  "$RANSOM_AUDIT_MAX"   "$([ "$AUDIT_ENABLED" = "true" ] && echo "SIEM targets: $AUDIT_TARGETS" || echo "no audit/SIEM configured")"
+_pillar_line "KMS encryption"      "$RANSOM_KMS"    "$RANSOM_KMS_MAX"     "$([ "$ENCRYPTION_PROVIDER" != "none" ] && [ -n "$ENCRYPTION_PROVIDER" ] && echo "$ENCRYPTION_PROVIDER" || echo "no KMS provider configured")"
+_pillar_line "Network policies"    "$RANSOM_NETPOL" "$RANSOM_NETPOL_MAX"  "$([ "$NETPOL_ENABLED" = "true" ] && echo "NetworkPolicies present" || echo "no NetworkPolicies on K10 namespace")"
+_pillar_line "TLS verification"    "$RANSOM_TLS"    "$RANSOM_TLS_MAX"     "$([ "$PROFILE_TLS_SKIPPED_COUNT" -eq 0 ] && echo "all profiles verify TLS" || echo "$PROFILE_TLS_SKIPPED_COUNT profile(s) skip TLS verification")"
+
+# Biggest gap (actionable)
+if [ -n "$RANSOM_BIGGEST_GAP" ] && [ "$RANSOM_BIGGEST_GAP_POINTS" -gt 0 ] 2>/dev/null; then
+  printf "\n  ${COLOR_CYAN}Biggest gap:${COLOR_RESET} ${COLOR_BOLD}$RANSOM_BIGGEST_GAP${COLOR_RESET} (-$RANSOM_BIGGEST_GAP_POINTS points)\n"
+fi
+
+# Show profiles with TLS skipped if any
+if [ "$PROFILE_TLS_SKIPPED_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_RED}Profile(s) skipping TLS verification:${COLOR_RESET}\n"
+  _ep "$PROFILE_TLS_SKIPPED" | jq -r '.[] | "    - " + .name' 2>/dev/null
 fi
 
 ### Best Practices Compliance
@@ -3038,6 +5137,45 @@ if [ "$BP_AUDIT_STATUS" = "ENABLED" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Audit Logging:        ${COLOR_GREEN}ENABLED${COLOR_RESET} ($AUDIT_TARGETS)\n"
 else
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Audit Logging:        Not enabled (optional - SIEM integration)\n"
+fi
+
+# Snapshot retention high (NEW v1.9)
+if [ "$BP_SNAP_RETENTION_HIGH_STATUS" = "OK" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Snapshot retention:   ${COLOR_GREEN}WITHIN LIMITS${COLOR_RESET} (no policy with snapshot retention >7)\n"
+else
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Snapshot retention:   ${COLOR_YELLOW}HIGH${COLOR_RESET} ($HIGH_SNAP_COUNT policy/policies with snapshot retention >7 — source SC I/O impact)\n"
+  _ep "$HIGH_SNAP_POLICIES" | jq -r '.[:5][] | "      - " + .name + " (max=" + (.max|tostring) + ")"' 2>/dev/null
+fi
+
+# Snapshot retention zero (NEW v1.9)
+if [ "$BP_SNAP_RETENTION_ZERO_STATUS" = "OK" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Fast local recovery:  ${COLOR_GREEN}AVAILABLE${COLOR_RESET} (all backup policies retain at least 1 snapshot)\n"
+else
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Fast local recovery:  ${COLOR_YELLOW}LIMITED${COLOR_RESET} ($ZERO_SNAP_COUNT policy/policies with zero snapshot retention)\n"
+  _ep "$ZERO_SNAP_POLICIES" | jq -r '.[:5][] | "      - " + .' 2>/dev/null
+fi
+
+# Export retention explicit (NEW v1.9)
+if [ "$BP_EXPORT_RETENTION_STATUS" = "OK" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Export retention:     ${COLOR_GREEN}EXPLICIT${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Export retention:     ${COLOR_YELLOW}IMPLICIT${COLOR_RESET} ($EXPORT_NO_RETENTION_COUNT policy/policies with export but no explicit .retention)\n"
+  _ep "$EXPORT_NO_RETENTION_POLICIES" | jq -r '.[:5][] | "      - " + .' 2>/dev/null
+fi
+
+# Cluster-scoped resources (NEW v1.9)
+if [ "$BP_CLUSTER_SCOPED_STATUS" = "CONFIGURED" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Cluster-scoped:       ${COLOR_GREEN}CONFIGURED${COLOR_RESET} (CRDs/ClusterRoles backed up)\n"
+else
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Cluster-scoped:       Not configured (no policy with includeClusterResources or appType=cluster)\n"
+fi
+
+# Policies without export (NEW v1.9)
+if [ "$BP_NO_EXPORT_STATUS" = "OK" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Export coverage:      ${COLOR_GREEN}ALL POLICIES EXPORT${COLOR_RESET}\n"
+else
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Export coverage:      ${COLOR_YELLOW}$POLICIES_NO_EXPORT_COUNT policy/policies snapshot-only (no export)${COLOR_RESET}\n"
+  _ep "$POLICIES_NO_EXPORT_LIST" | jq -r '.[:5][] | "      - " + .' 2>/dev/null
 fi
 
 ELAPSED=$(($(date +%s) - START_TIME))

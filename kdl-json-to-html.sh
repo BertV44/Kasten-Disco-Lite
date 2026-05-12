@@ -2,14 +2,25 @@
 set -eu
 
 ##############################################################################
-# KDL JSON -> HTML Report Generator v1.8.3
+# KDL JSON -> HTML Report Generator v2.0
 #
 # Usage:
 #   ./kdl-json-to-html.sh input.json output.html
 #
-# Compatible with Kasten Discovery Lite v1.8.1 through v1.8.3 JSON output
-# (JSON schema is unchanged across these versions — both v1.8.2 and v1.8.3
-# are bugfix releases that did not alter the output structure).
+# Compatible with Kasten Discovery Lite v1.8.1 through v2.0 JSON output.
+# When run against pre-v2.0 JSON, the 5 new sections (ransomwareReadiness,
+# policyAnalysis, k10Rbac, policyRunStats.effectiveRpo, coverage.namespacesInventory)
+# silently degrade with an info-box message; the rest of the report renders
+# unchanged.
+#
+# New in v2.0 (5 new sections, additive only):
+#   - Ransomware Readiness Score (grade A-F, 8 pillars, biggest gap)
+#   - Effective RPO per Policy (median interval, drift vs theoretical)
+#   - Policy Analysis (empty + redundant pairs)
+#   - K10 RBAC Inventory (ClusterRoles, bindings, subjects, wildcard flags,
+#     graceful degradation when cluster-wide RBAC read denied)
+#   - CSS classes added for grade badges (.grade-a through .grade-f)
+#   - No changes to existing v1.x sections.
 #
 # New in v1.8.3 (generator polish):
 #   - Upfront JSON validation: malformed input now gets a clean, actionable
@@ -327,6 +338,47 @@ h3 {
 .vm-card { background: linear-gradient(135deg, #ede9fe 0%, #ddd6fe 100%); border-color: #a78bfa; }
 .config-card { background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%); border-color: #86efac; }
 .security-card { background: linear-gradient(135deg, #fff1f2 0%, #ffe4e6 100%); border-color: #fda4af; }
+.rbac-card { background: linear-gradient(135deg, #fef9c3 0%, #fde68a 100%); border-color: #facc15; }
+.ransomware-card { background: linear-gradient(135deg, #f3e8ff 0%, #e9d5ff 100%); border-color: #c084fc; padding: 1.5rem; }
+.grade-display {
+  display: inline-block;
+  font-size: 4rem;
+  font-weight: 800;
+  padding: 1rem 2rem;
+  border-radius: 16px;
+  margin: 0.5rem 1rem 0.5rem 0;
+  vertical-align: middle;
+  line-height: 1;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+}
+.grade-a { background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; }
+.grade-b { background: linear-gradient(135deg, #34d399 0%, #10b981 100%); color: white; }
+.grade-c { background: linear-gradient(135deg, #fbbf24 0%, #f59e0b 100%); color: white; }
+.grade-d { background: linear-gradient(135deg, #fb923c 0%, #f97316 100%); color: white; }
+.grade-f { background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%); color: white; }
+.pillar-row {
+  display: grid;
+  grid-template-columns: 90px 1fr 90px 1fr;
+  gap: 0.75rem;
+  align-items: center;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #f0f0f0;
+}
+.pillar-row:last-child { border-bottom: none; }
+.pillar-score { font-weight: 700; color: #24292e; font-variant-numeric: tabular-nums; }
+.pillar-evidence { color: #57606a; font-size: 0.9rem; }
+.pillar-ok { color: #059669; font-weight: 700; }
+.pillar-partial { color: #d97706; font-weight: 700; }
+.pillar-fail { color: #dc2626; font-weight: 700; }
+.biggest-gap {
+  margin-top: 1rem;
+  padding: 0.8rem 1rem;
+  background: #fef3c7;
+  border-left: 4px solid #f59e0b;
+  border-radius: 6px;
+  font-size: 0.95rem;
+}
+.success-box { background: #ecfdf5; border-left: 4px solid #10b981; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
 table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; background: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
 th, td { border: 1px solid #e1e4e8; padding: 0.75rem; text-align: left; }
 th { background: linear-gradient(180deg, #f6f8fa 0%, #eaeef2 100%); font-weight: 600; color: #24292e; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.5px; }
@@ -1108,6 +1160,233 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
     "<div class=\"info-box\">K10 configuration data not available. Requires Kasten Discovery Lite v1.8+.</div>"
   end)
 + "
+
+<!-- ============================================ -->
+<!-- v2.0 sections (additive, before footer)      -->
+<!-- ============================================ -->
+
+<!-- Ransomware Readiness Score (NEW v2.0) -->
+<h2>\uD83D\uDEE1\uFE0F Ransomware Readiness Score<span class=\"new-badge\">v2.0</span></h2>"
++ (if .ransomwareReadiness then
+    (.ransomwareReadiness.grade // "?") as $grade |
+    "<div class=\"card ransomware-card\">
+       <div class=\"grade-display grade-" + ($grade | ascii_downcase) + "\">" + $grade + "</div>
+       <div style=\"display:inline-block; vertical-align:middle;\">
+         <strong style=\"font-size: 1.1rem;\">Score: " + (.ransomwareReadiness.score | tostring) + " / " + (.ransomwareReadiness.maxScore | tostring) + "</strong><br>
+         <span style=\"color:#57606a; font-size:0.9rem;\">Synthesis of 8 security pillars. Intended for executive / CISO communication. Pillar weighting is empirical; review against your threat model.</span>
+       </div>
+     </div>
+
+     <h3>Pillar breakdown</h3>
+     <div class=\"card\">" +
+     ([.ransomwareReadiness.pillars | to_entries[] |
+        .key as $k |
+        .value as $v |
+        ($v.score) as $s |
+        ($v.max) as $m |
+        (if $s >= $m then "<span class=\"pillar-ok\">[OK]</span>"
+         elif $s > 0 then "<span class=\"pillar-partial\">[PARTIAL]</span>"
+         else "<span class=\"pillar-fail\">[FAIL]</span>" end) as $status |
+        ({
+          immutability: "Immutability",
+          offClusterExport: "Off-cluster export",
+          authentication: "Authentication",
+          disasterRecovery: "Disaster Recovery",
+          auditLogging: "Audit logging",
+          kmsEncryption: "KMS encryption",
+          networkPolicies: "Network policies",
+          tlsVerification: "TLS verification"
+        }[$k] // $k) as $label |
+        "<div class=\"pillar-row\">
+           " + $status + "
+           <span><strong>" + $label + "</strong></span>
+           <span class=\"pillar-score\">" + ($s | tostring) + "/" + ($m | tostring) + "</span>
+           <span class=\"pillar-evidence\">" + (if $v.evidence then "detected" else "not detected" end) + "</span>
+         </div>"
+     ] | join("")) +
+     "</div>" +
+
+     (if .ransomwareReadiness.biggestGap then
+       "<div class=\"biggest-gap\"><strong>\u26a0 Biggest gap:</strong> " +
+       .ransomwareReadiness.biggestGap.pillar +
+       " (-" + (.ransomwareReadiness.biggestGap.pointsLost | tostring) + " points). Closing this gap is the single highest-impact action available." +
+       "</div>"
+     else "" end) +
+
+     (if ((.ransomwareReadiness.pillars.tlsVerification.profilesSkippingTls // []) | length) > 0 then
+       "<div class=\"warning-box\">\u26a0 <strong>Profile(s) skipping TLS verification</strong>: " +
+       ([.ransomwareReadiness.pillars.tlsVerification.profilesSkippingTls[]? | "<code>" + .name + "</code>"] | join(", ")) +
+       "</div>"
+     else "" end)
+  else
+    "<div class=\"info-box\">Ransomware Readiness Score not available. Requires Kasten Discovery Lite v2.0+.</div>"
+  end)
++ "
+
+<!-- Effective RPO per Policy (NEW v2.0) -->
+<h2>\u23F3 Effective RPO per Policy<span class=\"new-badge\">v2.0</span></h2>"
++ (if (.policyRunStats.effectiveRpo // null) != null then
+    (.policyRunStats.effectiveRpo) as $rpo |
+    "<div class=\"grid\">
+       <div class=\"card new-feature\"><strong>Policies analysed</strong><div class=\"card-value\">" + (($rpo | length) | tostring) + "</div></div>
+       <div class=\"card\"><strong>With theoretical frequency</strong><div class=\"card-value\">" + ([$rpo[] | select(.frequencyTheoreticalSeconds != null)] | length | tostring) + "</div></div>
+       <div class=\"card\"><strong>With samples</strong><div class=\"card-value\">" + ([$rpo[] | select(.samples > 0)] | length | tostring) + "</div></div>
+       <div class=\"card warning-card\"><strong>In drift</strong><div class=\"card-value\">" + ([$rpo[] | select(.drift == true)] | length | tostring) + "</div></div>
+     </div>
+     <p class=\"section-description\">Median interval between consecutive successful (Complete) RunActions over the last 14 days. Drift = median > theoretical \u00d7 1.5.</p>
+     <table>
+       <thead><tr><th>Policy</th><th>Declared</th><th>Theoretical</th><th>Samples</th><th>Median</th><th>Max</th><th>Drift</th></tr></thead>
+       <tbody>" +
+     ([$rpo[] |
+       "<tr>
+          <td><strong>" + .name + "</strong></td>
+          <td>" + (.frequencyDeclared // "<em>manual</em>") + "</td>
+          <td>" + (if .frequencyTheoreticalSeconds then formatDuration(.frequencyTheoreticalSeconds) else "<em>n/a</em>" end) + "</td>
+          <td>" + (.samples | tostring) + "</td>
+          <td>" + (if .median != null then formatDuration(.median | floor) else "<em>n/a</em>" end) + "</td>
+          <td>" + (if .max != null then formatDuration(.max | floor) else "<em>n/a</em>" end) + "</td>
+          <td>" + (if .drift == true then "<span class=\"badge error\">\u2717 drift</span>"
+                   elif .drift == false then "<span class=\"badge ok\">\u2713 on schedule</span>"
+                   else "<span class=\"badge info\">n/a</span>" end) + "</td>
+        </tr>"
+     ] | join("")) +
+     "</tbody></table>"
+  else
+    "<div class=\"info-box\">Effective RPO data not available. Requires Kasten Discovery Lite v2.0+.</div>"
+  end)
++ "
+
+<!-- Policy Analysis: Empty + Redundant (NEW v2.0) -->
+<h2>\uD83D\uDD0D Policy Analysis<span class=\"new-badge\">v2.0</span></h2>"
++ (if (.policyAnalysis.summary // null) != null then
+    (.policyAnalysis.summary) as $s |
+    "<p class=\"section-description\">App policies only (system DR/reports policies excluded). Selectors are resolved against the live namespace inventory to compute the effective coverage.</p>
+     <div class=\"grid\">
+       <div class=\"card\"><strong>Total policies analysed</strong><div class=\"card-value\">" + ($s.totalPolicies | tostring) + "</div></div>
+       <div class=\"card warning-card\"><strong>Empty (coverage = 0)</strong><div class=\"card-value\">" + ($s.emptyCount | tostring) + "</div></div>
+       <div class=\"card\"><strong>Unresolvable</strong><div class=\"card-value\">" + ($s.unresolvableCount | tostring) + "</div></div>
+       <div class=\"card warning-card\"><strong>Refs non-existing NS</strong><div class=\"card-value\">" + ($s.withNonExistingNsCount | tostring) + "</div></div>
+       <div class=\"card warning-card\"><strong>Redundant pairs (genuine)</strong><div class=\"card-value\">" + ($s.redundantPairsGenuine | tostring) + "</div></div>
+       <div class=\"card\"><strong>Redundant pairs (with catch-all)</strong><div class=\"card-value\">" + ($s.redundantPairsWithCatchall | tostring) + "</div></div>
+     </div>" +
+
+     (if ($s.emptyCount // 0) > 0 then
+       "<h3>Empty policies</h3>
+       <div class=\"warning-box\">\u26a0 These policies target 0 effective namespaces. Either the selector matches nothing, or <code>matchNames</code> lists non-existing namespaces.</div>
+       <table>
+         <thead><tr><th>Policy</th><th>Selector kind</th><th>Targeted</th><th>Effective</th></tr></thead>
+         <tbody>" +
+       ([.policyAnalysis.empty[]? |
+         "<tr>
+            <td><strong>" + .name + "</strong></td>
+            <td><code>" + .selectorKind + "</code></td>
+            <td>" + (.targetedCount | tostring) + "</td>
+            <td>" + (.effectiveCount | tostring) + "</td>
+          </tr>"
+       ] | join("")) +
+       "</tbody></table>"
+     else "" end) +
+
+     (if ($s.redundantPairsGenuine // 0) > 0 then
+       "<h3>Redundant pairs (genuine overlap)</h3>
+       <div class=\"warning-box\">\u26a0 These pairs share at least one namespace and at least one action. Two policies running on the same workload waste runtime and may produce conflicting restore points.</div>
+       <table>
+         <thead><tr><th>Policy A</th><th>Policy B</th><th>Shared namespaces</th><th>Shared actions</th><th>Same frequency</th></tr></thead>
+         <tbody>" +
+       ([.policyAnalysis.redundantPairs[]? | select(.involvesCatchall | not) |
+         "<tr>
+            <td><strong>" + .policies[0] + "</strong></td>
+            <td><strong>" + .policies[1] + "</strong></td>
+            <td>" + (.sharedNamespaces | join(", ")) + "</td>
+            <td>" + (.sharedActions | join(", ")) + "</td>
+            <td>" + (if .sameFrequency then "<span class=\"badge warn\">\u26a0 yes</span>" else "<span class=\"badge info\">no</span>" end) + "</td>
+          </tr>"
+       ] | join("")) +
+       "</tbody></table>"
+     else "" end) +
+
+     (if ($s.withNonExistingNsCount // 0) > 0 then
+       "<h3>Policies referencing non-existing namespaces</h3>
+       <table>
+         <thead><tr><th>Policy</th><th>Non-existing references</th></tr></thead>
+         <tbody>" +
+       ([.policyAnalysis.withNonExistingNs[]? |
+         "<tr>
+            <td><strong>" + .name + "</strong></td>
+            <td>" + ([.nonExistingReferences[]? | "<code>" + . + "</code>"] | join(", ")) + "</td>
+          </tr>"
+       ] | join("")) +
+       "</tbody></table>"
+     else "" end) +
+
+     (if ($s.emptyCount // 0) == 0 and ($s.redundantPairsGenuine // 0) == 0 and ($s.withNonExistingNsCount // 0) == 0 then
+       "<div class=\"success-box\">\u2713 <strong>No empty or redundant policies detected.</strong></div>"
+     else "" end)
+  else
+    "<div class=\"info-box\">Policy analysis data not available. Requires Kasten Discovery Lite v2.0+.</div>"
+  end)
++ "
+
+<!-- K10 RBAC Inventory (NEW v2.0) -->
+<h2>\uD83D\uDD11 K10 RBAC Inventory<span class=\"new-badge\">v2.0</span></h2>"
++ (if (.k10Rbac // null) != null then
+    (.k10Rbac.accessibility) as $acc |
+    (.k10Rbac.subjects) as $subj |
+    "<div class=\"card rbac-card\">
+       <strong>Access status</strong><br>" +
+       (if $acc.fullyAccessible then
+         "<span class=\"badge ok\">\u2713 All RBAC resources accessible</span>"
+       else
+         "<span class=\"badge warn\">\u26a0 Partial access</span><br>
+         <span style=\"color:#57606a; font-size:0.9rem;\">" + $acc.note + "</span><br>" +
+         (if ($acc.clusterRoles | not) then "<div style=\"color:#dc2626;\">\u2717 ClusterRoles read DENIED</div>" else "" end) +
+         (if ($acc.clusterRoleBindings | not) then "<div style=\"color:#dc2626;\">\u2717 ClusterRoleBindings read DENIED</div>" else "" end) +
+         (if ($acc.roles | not) then "<div style=\"color:#dc2626;\">\u2717 Roles read DENIED</div>" else "" end) +
+         (if ($acc.roleBindings | not) then "<div style=\"color:#dc2626;\">\u2717 RoleBindings read DENIED</div>" else "" end)
+       end) +
+     "</div>
+
+     <div class=\"grid\">
+       <div class=\"card\"><strong>ClusterRoles</strong><div class=\"card-value\">" + (.k10Rbac.clusterRoles.count | tostring) + "</div></div>
+       <div class=\"card\"><strong>ClusterRoleBindings</strong><div class=\"card-value\">" + (.k10Rbac.clusterRoleBindings.count | tostring) + "</div></div>
+       <div class=\"card\"><strong>Roles</strong><div class=\"card-value\">" + (.k10Rbac.roles.count | tostring) + "</div></div>
+       <div class=\"card\"><strong>RoleBindings</strong><div class=\"card-value\">" + (.k10Rbac.roleBindings.count | tostring) + "</div></div>
+     </div>
+
+     <h3>Subjects with K10 access</h3>
+     <div class=\"grid\">
+       <div class=\"card new-feature\"><strong>Total subjects</strong><div class=\"card-value\">" + ($subj.total | tostring) + "</div></div>
+       <div class=\"card\"><strong>Users</strong><div class=\"card-value\">" + ($subj.users | tostring) + "</div></div>
+       <div class=\"card\"><strong>Groups</strong><div class=\"card-value\">" + ($subj.groups | tostring) + "</div></div>
+       <div class=\"card\"><strong>ServiceAccounts</strong><div class=\"card-value\">" + ($subj.serviceAccounts | tostring) + "</div></div>
+     </div>" +
+
+     (([$subj.items[]? | select(.kind == "User" or .kind == "Group")]) as $humans |
+      if ($humans | length) > 0 then
+       "<h3>Users &amp; Groups (audit-relevant)</h3>
+       <table>
+         <thead><tr><th>Kind</th><th>Name</th><th>Namespace</th></tr></thead>
+         <tbody>" +
+       ([$humans | sort_by(.kind, .name) | .[] |
+         "<tr>
+            <td><span class=\"badge " + (if .kind == "Group" then "info" else "ok" end) + "\">" + .kind + "</span></td>
+            <td><code>" + .name + "</code></td>
+            <td>" + (.namespace // "<em>cluster-wide</em>") + "</td>
+          </tr>"
+       ] | join("")) +
+       "</tbody></table>"
+      else "" end) +
+
+     (([.k10Rbac.clusterRoles.items[]? | select(.verbsAll or .resourcesAll) | .name]) as $wildcards |
+      if ($wildcards | length) > 0 then
+       "<div class=\"info-box\"><strong>Informational:</strong> Wildcard ClusterRole(s) detected (the K10 admin role is wildcard by design): " +
+       ([$wildcards[] | "<code>" + . + "</code>"] | join(", ")) + "</div>"
+      else "" end)
+  else
+    "<div class=\"info-box\">K10 RBAC inventory not available. Requires Kasten Discovery Lite v2.0+.</div>"
+  end)
++ "
+
 
 <div class=\"footer\">
   <strong>Kasten Discovery Lite" + (if .kdlVersion then " v" + .kdlVersion else "" end) + "</strong><br>

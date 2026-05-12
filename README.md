@@ -1,13 +1,21 @@
-# Kasten Discovery Lite v1.8.3
+# Kasten Discovery Lite v2.0
 
 A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
 
 ## Overview
 
-Kasten Discovery Lite provides instant visibility into your Kasten K10 deployment, extracting:
+Kasten Discovery Lite provides instant visibility into your Kasten K10 deployment. v2.0 adds five new analytical capabilities on top of the v1.9 baseline:
+
+- **Ransomware Readiness Score** — 8-pillar synthesis (0-100 + letter grade A-F) with biggest-gap identification
+- **Effective RPO per policy** — median interval between consecutive successful runs, drift detection vs declared frequency
+- **Policy Analysis** — empty policies (effective namespace set = 0) and redundant pairs (overlapping selectors + actions) detection
+- **K10 RBAC Inventory** — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings related to K10, with unique subject aggregation
+- **Enriched namespace inventory** — `{name, labels, isSystem}` foundation for selector resolution
+
+These join the existing v1.9 features:
 
 - **K10 Helm Configuration** extraction with 3-tier fallback
-- **Authentication** method detection (OIDC, LDAP, OpenShift, Basic, Token)
+- **Authentication** method detection (OIDC, LDAP, OpenShift OAuth, Basic, Token)
 - **Encryption** configuration (AWS KMS, Azure Key Vault, HashiCorp Vault)
 - **FIPS mode**, **Network Policies**, **Audit Logging** detection
 - **Dashboard access**, **Concurrency limiters**, **Timeouts**, **Datastore parallelism**
@@ -18,9 +26,16 @@ Kasten Discovery Lite provides instant visibility into your Kasten K10 deploymen
 - **Multi-Cluster detection** (primary/secondary/standalone)
 - **Disaster Recovery (KDR)** status and configuration
 - **Export Storage usage** with **Deduplication ratio**
-- **Policy Last Run Status** with duration
-- **Unprotected Namespaces** detection with label selector support
-- **Restore Actions History**
+- **Policy Last Run Status** with duration + deepest cause-chain error message
+- **Failed Actions Top 5** with namespace, policy, and root-cause error
+- **Stuck Actions detection** (state=Running > 24h)
+- **Per-Namespace Protection Status** (last successful backup, stale detection)
+- **Profile validation status** (`.status.validation` / `.status.error`)
+- **k10-system-reports-policy** state surfacing + last ReportAction
+- **RestorePoints distribution by namespace** (top 5)
+- **StorageClasses + VolumeSnapshotClasses inventory** with CSI/VSC cross-check
+- **Kubernetes server version + distribution detection** (AKS, EKS, GKE, OpenShift, Rancher, K3s, Harvester)
+- **Import policies tracking** (multi-cluster import workflow)
 - **K10 Resource Limits** (CPU/RAM per container) with **Deployment Replicas**
 - **Catalog Size** with **Free Space** alerts
 - **Orphaned RestorePoints** detection
@@ -30,131 +45,143 @@ Kasten Discovery Lite provides instant visibility into your Kasten K10 deploymen
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status
-- **Protection coverage matrix** (excludes system policies: DR, report)
-- **Best Practices compliance** summary (11 checks with severity levels)
+- **Best Practices compliance** summary (16 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
 
-## What's New in v1.8.3
+## What's New in v2.0
 
-### Bug Fixes
+### Ransomware Readiness Score (patch 5/7)
 
-- **Silent script exit on clusters where the catalog pod is not labelled `component=catalog`** — On bash-as-`/bin/sh` with `set -e`, the pattern `var=$(kubectl ... -o jsonpath='{.items[0]...}' 2>/dev/null)` triggers errexit when the label selector matches zero pods, because kubectl returns non-zero on JSONPath array-out-of-range errors (and `2>/dev/null` suppresses only stderr, not the exit code). The script died silently during the catalog section, never reaching the name-pattern fallback or any subsequent section. Users saw only truncated `Collecting…` progress messages on screen. Reported on an OpenShift cluster (oc client 4.10.21) running K10 8.0.15 where the `component=catalog` selector matched no pods — K10 deployments can use different label schemes depending on chart version, Helm overrides, or deployment method, but the underlying shell bug is independent of the label itself. Added a `|| echo ""` guard so the command substitution always succeeds and the existing fallback can execute.
+8 security pillars are synthesised into a 0-100 score and a letter grade:
 
-### Robustness
+| Pillar             | Max points | Evidence                                                     |
+|--------------------|------------|--------------------------------------------------------------|
+| Immutability       | 20         | At least one Location Profile with `protectionPeriod`       |
+| Off-cluster export | 15         | At least one policy with an `export` action                  |
+| Authentication     | 15         | `AUTH_METHOD != "none"` (OIDC, LDAP, OpenShift, Basic, Token) |
+| Disaster Recovery  | 15         | `k10-disaster-recovery-policy` present                       |
+| Audit logging      | 10         | Cluster logging or S3 export configured                      |
+| KMS Encryption     | 10         | AWS KMS, Azure Key Vault, or HashiCorp Vault Transit         |
+| Network Policies   | 10         | At least one NetworkPolicy in the K10 namespace              |
+| TLS Verification   | 5          | All profiles have TLS verification enabled (no `skipSSLVerify=true`) |
+| **Total**          | **100**    |                                                              |
 
-- **Temp directory cascade** (`$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`) — Defensive hardening. On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the previous single-path approach could let parallel kubectl redirects fail silently. The cascade picks the first writable location, and exits with a clear, actionable error if none is writable.
-- **New debug line** — `Using temp directory: <path>` is logged in `--debug` mode so the chosen location is always visible when diagnosing issues.
+Grade thresholds:
 
-### Workaround for affected v1.8.1/v1.8.2 users
+| Grade | Range  | Posture                                |
+|-------|--------|----------------------------------------|
+| A     | >= 85  | Excellent posture                      |
+| B     | 70-84  | Good posture, minor gaps               |
+| C     | 55-69  | Acceptable, several improvements needed |
+| D     | 40-54  | Significant gaps                       |
+| F     | < 40   | Critical exposure                      |
 
-If upgrading isn't immediately possible, the catalog-pod bug is hit specifically when `kubectl get pods -l component=catalog` returns zero pods. You can pre-check your cluster with:
+The "biggest gap" (largest unscored pillar) is identified as actionable advice. Output exposed under JSON top-level key `ransomwareReadiness`.
+
+> **Note**: pillar weighting is empirical and intended for executive / CISO communication. Review against your organisation's threat model. The score is a synthesis indicator — not a compliance assertion.
+
+### Effective RPO per Policy (patch 3/7)
+
+For each policy, KDL measures the **median interval** between consecutive `Complete` RunActions over the same 14-day window used by Average Run Duration. Median (not mean) is used because it is robust to outliers (a single 12h backup after a maintenance window doesn't blow up the metric).
+
+Drift detection: `median > theoretical × 1.5` (50% retard). Only flagged for policies declared with a K10 frequency alias (`@hourly`, `@daily`, `@weekly`, `@monthly`=30 days, `@yearly`); custom cron expressions and manual policies report stats without drift judgement.
+
+Failed, Cancelled, and Running runs are excluded — RPO measures time between two **successful** backups. With fewer than 2 samples, the policy is reported with null fields and no drift verdict (cannot conclude).
+
+Exposed under `policyRunStats.effectiveRpo` with summary stats plus per-policy items: `{name, frequencyDeclared, frequencyTheoreticalSeconds, samples, median, max, drift}`.
+
+### Policy Analysis: Empty + Redundant (patch 4/7)
+
+For each app policy (system DR/reports policies excluded), KDL resolves the selector to a set of REAL namespace names by cross-referencing the enriched namespace inventory.
+
+Selector kinds handled:
+
+- `catchall` (no selector / empty selector) → all non-system namespaces
+- `matchNames` → direct list
+- `matchExpressions` with `appNamespace In` → values
+- `matchExpressions` with label `In` → resolved against namespace labels
+- `matchLabels` → intersection of namespaces matching all label key=value pairs
+- `matchExpressions` with `NotIn`, `Exists`, `DoesNotExist` → flagged `resolvable=false`, excluded from the "empty" verdict to avoid false positives
+
+**Empty policies** (B3): policies whose effective namespace set is 0 — either the selector matches nothing or `matchNames` lists only non-existing namespaces. Also reports policies that **partially** reference non-existing namespaces.
+
+**Redundant pairs** (B2): all pairs `(i,j)` with `i<j` where policies `i` and `j` share at least one namespace AND at least one action. Pairs are split into:
+
+- **Genuine** — two non-catchall policies overlap (actionable, real redundancy)
+- **With catchall** — by-design redundancy that exists whenever a catch-all policy is used (informational)
+
+Exposed under JSON top-level key `policyAnalysis`.
+
+### K10 RBAC Inventory (patch 2/7)
+
+Inventories ClusterRoles, ClusterRoleBindings, Roles, RoleBindings related to K10. Matching: name starts with `k10-`/`kasten-` OR labels `app.kubernetes.io/name`/`helm.sh/chart` reference k10/kasten.
+
+Aggregates **unique subjects** (Users, Groups, ServiceAccounts) across all bindings using `unique_by([.kind, .name, .namespace])`. Wildcard ClusterRoles are flagged as informational (K10's admin role is wildcard by design — this is not a defect).
+
+**RBAC requirement note**: reading ClusterRoleBindings cluster-wide is NOT part of K10's standard ClusterRole. Graceful degradation per resource — flags `clusterRoles`, `clusterRoleBindings`, `roles`, `roleBindings` exposed under `k10Rbac.accessibility` so consumers can distinguish "no bindings" from "could not read".
+
+Exposed under JSON top-level key `k10Rbac`.
+
+### Enriched namespace inventory (patch 1/7)
+
+`coverage.namespacesInventory` now exposes `[{name, labels, isSystem}]` for every namespace. Foundation for patch 4 (selector resolution) and useful in its own right for debugging label-based policy selector mismatches.
+
+No new kubectl call, no new RBAC — the data is derived from `namespaces_raw.json` already fetched in the parallel block.
+
+### `kdl-diff.sh` standalone JSON comparator (patch 6/7)
+
+Separate POSIX sh script that takes two KDL JSON outputs and reports changes across 16 sections: metadata, ransomware readiness (delta grade + per-pillar), licence, backup health, catalog, policies (added/removed), namespace coverage, policy analysis, effective RPO, K10 RBAC subjects, profiles, disaster recovery, virtualization, resource limits, best practices.
+
+Classifies each change as improvement / regression / neutral. Exit code = number of regressions (capped at 99), 100 = usage error. Three output modes: `--human` (default), `--json` (structured), `--summary` (suppress no-change lines).
+
+Backwards-compatible: missing keys in the baseline are reported as "newly available" rather than crashing — works even when comparing pre-v2.0 KDL output to v2.0. Designed for TAM quarterly reviews and CI gates.
 
 ```bash
-kubectl -n kasten-io get pods -l component=catalog --no-headers | wc -l
+./kdl-diff.sh baseline.json current.json
+./kdl-diff.sh baseline.json current.json --summary
+./kdl-diff.sh baseline.json current.json --json > delta.json
 ```
 
-If this returns `0`, your deployment uses a different label scheme and v1.8.1/v1.8.2 will exit silently. Upgrade to v1.8.3.
+### HTML generator updated to v2.0
+
+`kdl-json-to-html.sh` renders the 5 new top-level JSON keys: `ransomwareReadiness`, `policyRunStats.effectiveRpo`, `policyAnalysis`, `k10Rbac`, `coverage.namespacesInventory`. The rest of the report is unchanged — additive only.
 
 ---
 
-## What's New in v1.8.2
+## What's New in v1.9 / v1.9.1
 
-### Bug Fixes
+### v1.9.1 — Bug fixes
 
-- **Fixed `_ep: command not found` on any run with `--output`** — The `--output` auto-detect block introduced in v1.8.1 called the `_ep()` helper before it was defined later in the script. The `&&` short-circuit masked the issue for runs without `--output`, but any invocation with `--output` (e.g. `./KDL.sh kasten-io --output discovery.json`) emitted `_ep: command not found` and the autodetect silently failed. Replaced the `_ep | grep` pipeline with a POSIX `case` statement on the filename glob, which also drops an unnecessary subprocess. No other changes in v1.8.2.
+- **Locale-sensitive numeric formatting**: awk printf calls produced French-style output (`73,0%` instead of `73.0`) on systems with `LC_NUMERIC=fr_FR.UTF-8`. The decimal comma was being emitted into the JSON `successRate` and `dedupRatio` string fields and into the human-readable export storage display, breaking downstream consumers (HTML/PPTX generators, dashboards) that expect parseable numbers. Fix: prepend `LC_ALL=C` to all 5 affected awk invocations.
+- **Per-Namespace Protection Status excluded namespaces with hyphens**: the `appNamespaces` test was based on `test()` against a regex without anchors, causing namespaces like `my-app` to match a pattern fragment from `SYSTEM_NS_PATTERNS`. Fix: explicit array intersection instead of regex test.
 
----
+### v1.9 — Features
 
-## What's New in v1.8.1
-
-### Bug Fixes
-
-- **Fixed export retention display** — v1.8 was reading `.exportParameters.retention`, but K10 stores export retention at `.spec.actions[].retention` (sibling of the `.action` field). Policies with both snapshot and export retention now correctly display both, e.g. `Snapshot(DAILY=7) | Export(DAILY=14, WEEKLY=4, MONTHLY=3)`.
-- **Filtered empty export retention objects** — Export actions that inherit retention from snapshot settings no longer display `Export()` with empty parentheses.
-
-### New Features
-
-- **`--help` / `-h` flag** — Displays usage, options, and examples.
-- **`--version` / `-V` flag** — Prints `Kasten Discovery Lite v1.8.1` and exits.
-- **`--output FILE` flag** — Writes output directly to a file. Auto-detects `.json` extension to enable JSON mode and disables colors for file output.
-- **Deterministic retention key ordering** — Retention is always displayed as `DAILY/WEEKLY/MONTHLY/YEARLY` instead of random alphabetical order.
-- **Export frequency and profile per-policy** — Policies with custom export frequency or a named export profile now display these details in human output.
-- **Execution timer** — Completion message includes elapsed time, e.g. `Discovery completed in 12s` or `Discovery completed in 1m 23s`.
-- **Progress indicators** — `Collecting pods...`, `Collecting K10 resources...` messages are shown on stderr during data collection (human mode only, suppressed for file output).
-- **`kdlVersion` field in JSON output** — JSON output now includes the KDL tool version for traceability.
-- **Version banner uses variable** — Single source of truth for version string (`KDL_VERSION`).
-
-### Performance
-
-- **Parallel kubectl CRD fetches** — 13 independent Kubernetes resources are fetched simultaneously using background jobs: profiles, policies, runactions, restoreactions, backupactions, exportactions, restorepoints, presets, transformsets, reports, namespaces, PVCs, and volumesnapshots. On remote clusters, this can reduce collection time significantly.
-- **Shared pod/deployment data** — Pods and deployments are fetched once into temp files and reused across health metrics, K10 resource limits, and container analysis. This eliminates 4+ redundant `kubectl get pods` and `kubectl get deployments` calls.
-
-### Robustness
-
-- **Temp file cleanup via trap** — All temp files are managed in a single directory cleaned up automatically on `EXIT`, `INT`, and `TERM` signals. No leftover files on crash or `Ctrl+C`.
-- **Replaced `bc` dependency with `awk`** — Success rate color thresholds now use a portable `num_gt()` helper. Works on Alpine, BusyBox, and minimal containers where `bc` is not installed.
-- **Portable 14-day date calculation** — Falls back through GNU `date`, BSD `date`, and `awk` `strftime`, covering Linux, macOS, and BusyBox environments.
-- **JSON argument validation** — All 12 complex JSON variables are validated with `_safe_arg()` before the large `jq -n` output block. Prevents silent failures from malformed data propagating to the final JSON output.
-- **`safe_json()` helper** — Consolidates the fetch+sanitize+validate pattern used across all CRD resource sections, replacing ~15 inline duplicates.
-- **`safe_int()` helper** — Handles empty, null, and non-numeric values consistently, replacing ~20 inline sanitization patterns.
+- **BP-RET-HIGH threshold raised from `> 2` to `> 7`** — the old threshold flagged perfectly reasonable retention strategies as bad practice. New threshold aligns with the K10 documented `daily=7` default. Rationale documented inline.
+- **Disaster Recovery section** now displays both `kdrSnapshotConfiguration.enabled` and `kdrSnapshotConfiguration.exportData.enabled`. Quick DR variants (Local Snapshot, Exported Catalog, No Snapshot) are surfaced as distinct modes.
+- **Failed Actions Top 5** — dedicated section, recursive cause-chain unwrapping via `JQ_DEEPEST_MSG` helper (bounded recursion, 5 levels).
+- **Per-Namespace Protection Status** — last successful backup per namespace, stale detection (default threshold: 7 days, configurable via `STALE_DAYS_THRESHOLD`).
+- **Stuck Actions detection** — `state=Running` for more than `STUCK_HOURS_THRESHOLD` hours (default 24) flags hung Kanister jobs or kubectl exec calls that never returned.
+- **Profile validation status** — `.status.validation` / `.status.error` surfaced per profile to detect silent credential / connectivity issues.
+- **k10-system-reports-policy state** + last ReportAction — KDL silently depends on this policy for Export Storage / Dedup Ratio metrics. Now surfaced explicitly.
+- **RestorePoints distribution by namespace** (top 5) — uses already-collected `restorepoints_raw.json`.
+- **StorageClasses + VolumeSnapshotClasses inventory** with CSI/VSC cross-check — flags CSI drivers used by SCs that have NO matching VolumeSnapshotClass (Kanister/GVB required).
+- **Kubernetes server version + distribution detection** — heuristic chain: providerID (Azure/AWS/GCE) → vendor namespaces (cattle-system, k3s-upgrader) → version string suffix.
+- **Import policies tracking** — distinct from backup policies, relevant for multi-cluster import workflow (`MC_ROLE=secondary`).
+- **5 new Best Practices**: snapshot retention >7, snapshot retention zero, export retention explicit, cluster-scoped resources, policies without export.
+- **POLICY_LAST_RUN enriched with deepest cause-chain error** — `JQ_DEEPEST_MSG` helper unwraps K10's nested `cause` fields (each is a JSON-encoded string) up to 5 levels.
+- **`--no-helm` flag** — skip Helm release secret read for security-sensitive environments. The `k10-config` ConfigMap fallback is still used.
 
 ---
 
-## What's New in v1.8
+## What's New in v1.8.x (bug fixes, no schema changes)
 
-### K10 Helm Configuration Extraction
-
-Full Kasten configuration discovery using a 3-tier extraction strategy:
-
-1. **Helm release secret** — Decodes the Helm 3 release secret (base64 → base64 → gzip → JSON) for user-supplied values
-2. **Helm CLI** — Falls back to `helm get values` if secret decoding fails
-3. **Resource inspection** — Falls back to inspecting configmaps, secrets, deployments, and webhooks
-
-### Security Analysis
-
-- **Authentication**: Detects OIDC, LDAP, OpenShift OAuth, Basic Auth, Token methods with provider details
-- **KMS Encryption**: AWS KMS CMK, Azure Key Vault, HashiCorp Vault Transit detection
-- **FIPS mode**: Detects FIPS-enabled deployments
-- **Network Policies**: K10-specific network policy detection
-- **Audit Logging (SIEM)**: Cluster logging and S3 export detection
-- **Custom CA Certificates**: Identifies custom CA configmap injection
-- **Security Context**: `runAsUser` and `fsGroup` extraction
-- **SCC** (OpenShift): Security Context Constraints detection
-- **VAP**: Validating Admission Policy for Kasten permissions
-
-### Performance Tuning Visibility
-
-- **Concurrency limiters**: 11 settings (CSI snapshots, exports, restores, VM snapshots, GVB, executor replicas/threads, workload snapshots/restores)
-- **Timeouts**: 6 settings (blueprint backup/restore/hooks/delete, worker pod, job wait)
-- **Datastore parallelism**: 4 settings (file/block uploads/downloads)
-- **Non-default detection**: Automatically flags tuned settings vs defaults
-
-### Additional v1.8 Features
-
-- Dashboard access method (Ingress, Route, External Gateway) with host
-- Excluded applications list
-- GVB sidecar injection status
-- Persistence sizes (catalog, jobs, logging, metering, storage class)
-- Garbage collector settings (keepMaxActions, daemonPeriod)
-- Cluster name and log level
-
----
-
-## What's New in v1.7
-
-### KubeVirt / OpenShift Virtualization Support
-
-- **Platform detection**: OpenShift Virtualization (CNV), SUSE Harvester, or plain KubeVirt with version
-- **VM inventory**: Total VMs, running/stopped counts
-- **VM-based policy detection**: Policies using `virtualMachineRef` selector (Kasten 8.5+)
-- **Protected vs unprotected VM analysis**: Combines VM-specific policy refs and namespace-level coverage
-- **VM RestorePoints tracking**: Counts restorepoints labeled `appType=virtualMachine`
-- **Guest filesystem freeze**: Detects per-VM freeze annotations and global timeout
-- **VM snapshot concurrency**: Cluster-wide limiter setting
-- **Wildcard pattern detection**: Flags wildcard VM refs that need manual verification
+- **v1.8.3**: Fixed silent script exit on clusters where the catalog pod is not labelled `component=catalog`. Temp directory cascade (`$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`). New debug log entry.
+- **v1.8.2**: Fixed `_ep: command not found` on any run with `--output` (ordering bug in autodetect block introduced in v1.8.1).
+- **v1.8.1**: Fixed export retention display (was reading wrong JSON path). Deterministic retention key ordering. Added `--help`, `--version`, `--output FILE` flags. Execution timer. Parallel kubectl CRD fetches. Replaced `bc` dependency with `awk`. `safe_json()` / `safe_int()` helpers.
 
 ---
 
@@ -165,13 +192,14 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 - `awk` (standard POSIX — no `bc` required since v1.8.1)
 - Read-only access to the Kasten namespace (see RBAC below)
 - Optional: `helm` CLI (used as secondary fallback for config extraction)
+- Optional cluster-wide RBAC view for full K10 RBAC inventory (v2.0 — graceful degradation if denied)
 
 ---
 
 ## Usage
 
 ```bash
-./KDL-v1.8.3.sh <kasten-namespace> [OPTIONS]
+./KDL.sh <kasten-namespace> [OPTIONS]
 ```
 
 ### Options
@@ -181,6 +209,7 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 | `--json` | Output structured JSON instead of human-readable format |
 | `--debug` | Enable verbose debug output |
 | `--no-color` | Disable color output (useful for logs/CI) |
+| `--no-helm` | Skip Helm release secret read (k10-config ConfigMap fallback still used) — use in security-sensitive environments |
 | `--output FILE` | Write output to FILE (auto-detects `.json` for JSON mode) |
 | `--version`, `-V` | Show version and exit |
 | `--help`, `-h` | Show usage help and exit |
@@ -189,82 +218,125 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 
 ```bash
 # Standard human output with colors
-./KDL-v1.8.3.sh kasten-io
+./KDL.sh kasten-io
 
 # JSON output for automation
-./KDL-v1.8.3.sh kasten-io --json
+./KDL.sh kasten-io --json
 
 # Save JSON directly to file (auto-detects JSON mode)
-./KDL-v1.8.3.sh kasten-io --output discovery.json
+./KDL.sh kasten-io --output discovery.json
 
 # Save human output to file
-./KDL-v1.8.3.sh kasten-io --no-color --output report.txt
+./KDL.sh kasten-io --no-color --output report.txt
 
 # Debug mode for troubleshooting
-./KDL-v1.8.3.sh kasten-io --debug
+./KDL.sh kasten-io --debug
+
+# Skip Helm extraction (no read on the Helm release secret)
+./KDL.sh kasten-io --no-helm --json --output secure-discovery.json
 
 # Version check
-./KDL-v1.8.3.sh --version
+./KDL.sh --version
 
 # Help
-./KDL-v1.8.3.sh --help
+./KDL.sh --help
+```
+
+### kdl-diff.sh — comparing two snapshots
+
+```bash
+# Human output (default)
+./kdl-diff.sh baseline.json current.json
+
+# Suppress no-change lines (TAM quarterly review)
+./kdl-diff.sh baseline.json current.json --summary
+
+# Structured JSON for automation / CI gates
+./kdl-diff.sh baseline.json current.json --json > delta.json
+echo "Regressions: $?"   # exit code = number of regressions
+```
+
+### kdl-json-to-html.sh — render HTML report
+
+```bash
+./kdl-json-to-html.sh discovery.json discovery.html
 ```
 
 ---
 
-## Output Sections
+## Output Sections (Human)
 
-### Human Output
-
-1. **Platform & Version** — Kubernetes or OpenShift, Kasten version
+1. **Platform & Version** — Kubernetes or OpenShift, Kasten version, K8s version + distribution
 2. **License Information** — Customer, validity, node consumption
 3. **Health Status** — Pod health, backup/export success rates (based on finished actions)
 4. **Restore Actions History** — Total, completed, failed, running, recent restores
-5. **Multi-Cluster** — Role (primary/secondary/none), cluster count
-6. **Disaster Recovery (KDR)** — Status, mode (Quick DR/Legacy), frequency, profile
-7. **Immutability Signal** — Detected protection periods, profile count
-8. **Location Profiles** — Backend, region, endpoint, protection period per profile
-9. **Policy Presets** — Presets with frequency and retention, policies using presets
-10. **Kasten Policies** — Policies with frequency, schedule, actions, selectors, retention (snapshot + export), export frequency, export profile
-11. **Policy Last Run Status** — Timestamp, state, duration per policy
-12. **Policy Run Duration** — Average, min, max over last 14 days
-13. **Namespace Protection** — Catch-all detection, unprotected namespaces, label selector analysis
-14. **K10 Resource Limits** — Pod/container counts, limits, deployment replicas
-15. **Catalog** — PVC name, size, free space percentage with alerts
-16. **Orphaned RestorePoints** — Count and details
-17. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
-18. **Transform Sets** — Count and transform details
-19. **Monitoring** — Prometheus status
-20. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
-21. **K10 Configuration** — Security (auth, encryption, FIPS, netpol, audit, CA, security context), dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
-22. **Policy Coverage Summary** — App policies targeting all namespaces
-23. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
-24. **Best Practices Compliance** — 11 checks with severity-coded indicators
-25. **Execution Time** — Elapsed time display
+5. **Failed Actions Top 5** — Recent failures with deepest cause-chain error
+6. **Stuck Actions** — `state=Running` > 24h (configurable)
+7. **Multi-Cluster** — Role (primary/secondary/none), cluster count
+8. **k10-system-reports-policy state** — Existence, frequency, last run state
+9. **Disaster Recovery (KDR)** — Status, mode (Quick DR/Legacy), frequency, profile
+10. **Immutability Signal** — Detected protection periods, profile count
+11. **Location Profiles** — Backend, region, endpoint, protection period per profile, validation status
+12. **Policy Presets** — Presets with frequency and retention, policies using presets
+13. **Kasten Policies** — Policies with frequency, schedule, actions, selectors, retention (snapshot + export)
+14. **Policy Last Run Status** — Timestamp, state, duration, deepest cause-chain error
+15. **Policy Run Duration** — Average, min, max over last 14 days
+16. **Effective RPO per Policy** *(NEW v2.0)* — Median interval between successful runs, drift vs theoretical
+17. **Policy Analysis: Empty + Redundant** *(NEW v2.0)* — Empty policies, redundant pairs (genuine vs catchall)
+18. **Per-Namespace Protection Status** — Last successful backup per namespace, stale detection
+19. **Namespace Protection** — Catch-all detection, unprotected namespaces
+20. **K10 Resource Limits** — Pod/container counts, limits, deployment replicas
+21. **Catalog** — PVC name, size, free space percentage with alerts
+22. **Orphaned RestorePoints** — Count and details
+23. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
+24. **Transform Sets** — Count and transform details
+25. **Monitoring** — Prometheus status
+26. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
+27. **K10 Configuration** — Security, dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
+28. **K10 RBAC Inventory** *(NEW v2.0)* — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, unique subjects (Users, Groups, ServiceAccounts), wildcard role flags
+29. **Policy Coverage Summary** — App policies targeting all namespaces
+30. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
+31. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
+32. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
+33. **Best Practices Compliance** — 16 checks with severity-coded indicators
+34. **Execution Time** — Elapsed time display
 
 ### JSON Output
 
-Structured JSON with the following top-level keys:
+Top-level keys (v2.0):
 
-`kdlVersion`, `platform`, `kastenVersion`, `license`, `health`, `multiCluster`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `dataUsage`, `k10Configuration`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`
+`kdlVersion`, `platform`, `kastenVersion`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
+
+New in v2.0:
+
+- `coverage.namespacesInventory` — `[{name, labels, isSystem}]`
+- `policyRunStats.effectiveRpo` — median interval per policy + drift
+- `policyAnalysis` — empty / unresolvable / withNonExistingNs / redundantPairs + summary
+- `k10Rbac` — accessibility flags, clusterRoles, clusterRoleBindings, roles, roleBindings, subjects
+- `ransomwareReadiness` — grade, score, pillars (with evidence), biggestGap, gradeThresholds
 
 ---
 
-## Best Practices Compliance (11 checks)
+## Best Practices Compliance (16 checks)
 
-| Check | Severity | Good | Bad |
-|-------|----------|------|-----|
-| Disaster Recovery | Critical | KDR policy enabled with export | Not configured |
-| Authentication | Critical | OIDC, LDAP, OAuth, etc. | Dashboard unauthenticated |
-| Immutability | Warning | At least 1 profile with protection period | No immutable profiles |
-| Monitoring | Warning | Prometheus detected | No monitoring |
-| VM Protection | Warning | All VMs covered by policies | Unprotected VMs |
-| Policy Presets | Info | Presets used for SLA standardization | Optional |
-| KMS Encryption | Info | AWS KMS / Azure KV / Vault configured | Optional |
-| Audit Logging | Info | SIEM logging enabled | Optional |
-| Resource Limits | Info | All K10 containers have limits | Partial coverage |
-| Namespace Protection | Info | All app namespaces covered | Gaps detected |
-| Kanister Blueprints | Info | Blueprints configured | Optional |
+| Check                  | Severity | Good                                              | Bad                                                |
+|------------------------|----------|---------------------------------------------------|----------------------------------------------------|
+| Disaster Recovery      | Critical | KDR policy enabled with export                    | Not configured                                     |
+| Authentication         | Critical | OIDC, LDAP, OpenShift OAuth, etc.                 | Dashboard unauthenticated                          |
+| Immutability           | Warning  | At least 1 profile with protection period         | No immutable profiles                              |
+| Monitoring             | Warning  | Prometheus detected                               | No monitoring                                      |
+| VM Protection          | Warning  | All VMs covered by policies                       | Unprotected VMs                                    |
+| Snapshot retention high| Warning  | No policy with snapshot retention > 7             | Source SC I/O impact risk                          |
+| Fast local recovery    | Warning  | All backup policies retain >= 1 snapshot          | Snapshot retention = 0 (no fast restore)           |
+| Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
+| Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
+| Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
+| KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
+| Audit Logging          | Info     | SIEM logging enabled                              | Optional                                           |
+| Resource Limits        | Info     | All K10 containers have limits                    | Partial coverage                                   |
+| Namespace Protection   | Info     | All app namespaces covered                        | Gaps detected                                      |
+| Kanister Blueprints    | Info     | Blueprints configured                             | Optional                                           |
+| Cluster-scoped         | Info     | At least one policy with `includeClusterResources`| Optional                                           |
 
 ---
 
@@ -295,7 +367,7 @@ rules:
   resources: ["profiles", "policies", "policypresets", "blueprintbindings", "transformsets"]
   verbs: ["get", "list"]
 - apiGroups: ["actions.kio.kasten.io"]
-  resources: ["backupactions", "exportactions", "restoreactions", "runactions"]
+  resources: ["backupactions", "exportactions", "restoreactions", "runactions", "reportactions"]
   verbs: ["get", "list"]
 - apiGroups: ["apps.kio.kasten.io"]
   resources: ["restorepoints"]
@@ -308,6 +380,9 @@ rules:
   verbs: ["get", "list"]
 - apiGroups: ["networking.k8s.io"]
   resources: ["networkpolicies", "ingresses"]
+  verbs: ["get", "list"]
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["roles", "rolebindings"]
   verbs: ["get", "list"]
 ```
 
@@ -323,7 +398,10 @@ rules:
   resources: ["namespaces", "nodes", "persistentvolumeclaims"]
   verbs: ["get", "list"]
 - apiGroups: ["snapshot.storage.k8s.io"]
-  resources: ["volumesnapshots"]
+  resources: ["volumesnapshots", "volumesnapshotclasses"]
+  verbs: ["get", "list"]
+- apiGroups: ["storage.k8s.io"]
+  resources: ["storageclasses"]
   verbs: ["get", "list"]
 - apiGroups: ["cr.kanister.io"]
   resources: ["blueprints"]
@@ -335,9 +413,19 @@ rules:
   resources: ["virtualmachines"]
   verbs: ["get", "list"]
 - apiGroups: ["admissionregistration.k8s.io"]
-  resources: ["mutatingwebhookconfigurations"]
+  resources: ["mutatingwebhookconfigurations", "validatingadmissionpolicies"]
   verbs: ["get", "list"]
 ```
+
+### Cluster-scoped — optional, for full RBAC inventory (v2.0)
+
+```yaml
+- apiGroups: ["rbac.authorization.k8s.io"]
+  resources: ["clusterroles", "clusterrolebindings"]
+  verbs: ["get", "list"]
+```
+
+If denied, KDL still runs — the `k10Rbac.accessibility.clusterRoles` / `clusterRoleBindings` flags will be set to `false` and the section will report what could be read.
 
 ### OpenShift-specific (additional)
 
@@ -361,13 +449,15 @@ Cluster-admin privileges are **not required**.
 
 ```
 Flow:
-  1. Args parsing & validation (--help, --version, --output)
-  2. Platform detection (Kubernetes vs OpenShift)
-  3. Shared data collection (pods, deployments → temp files)
-  4. Parallel CRD resource collection (13 kubectl calls in background)
-  5. Sequential data processing (jq transformations)
-  6. Output generation (JSON or Human, optionally to file)
-  7. Cleanup (temp files removed via trap)
+  1. Args parsing & validation (--help, --version, --output, --no-helm)
+  2. Platform detection (Kubernetes vs OpenShift), K8s version + distribution
+  3. Multi-cluster role detection (primary/secondary/none)
+  4. Shared data collection (pods, deployments -> temp files)
+  5. Parallel CRD resource collection (23 kubectl calls in background)
+  6. Sequential data processing (jq transformations)
+  7. v2.0 derived analyses: namespace inventory, RBAC, RPO, policy analysis, ransomware score
+  8. Output generation (JSON or Human, optionally to file)
+  9. Cleanup (temp files removed via trap)
 
 Key design decisions:
   - POSIX-compliant (no bashisms) for portability
@@ -376,6 +466,8 @@ Key design decisions:
   - Fully qualified CRD names to avoid conflicts
   - Parallel fetching where safe (independent resources)
   - Single shared data store for pods/deploys (no redundant calls)
+  - v2.0 derived analyses are PURE synthesis of upstream data — no new fetches, no new RBAC (except the 4 RBAC kubectl calls)
+  - LC_ALL=C on awk for locale-safety (decimal separator)
 
 Dependencies:
   - kubectl or oc (authenticated)
@@ -393,95 +485,51 @@ The script is **POSIX-compliant** and tested across:
 - Linux (RHEL, Ubuntu, Debian, Alpine)
 - macOS (BSD date/awk)
 - BusyBox / minimal containers
-- K3s, OpenShift 4.16+, standard Kubernetes
+- K3s, OpenShift 4.16+, standard Kubernetes (1.27+)
+- AKS, EKS, GKE (auto-detected via providerID)
 
-Key portability measures in v1.8.1:
+Key portability measures:
 - `num_gt()` uses `awk` instead of `bc` for numeric comparisons
 - Date calculation cascades through GNU `date`, BSD `date`, and `awk strftime`
 - `safe_json()` strips control characters that vary across Kubernetes distributions
+- `LC_ALL=C` on all awk printf calls (defensive against `LC_NUMERIC=fr_FR.UTF-8` and similar)
 - No bashisms (`#!/bin/sh` with `set -eu`)
+- Temp directory cascade for hardened hosts (`$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`)
 
 ---
 
 ## Version History
 
-- **v1.8.3** (Current)
-  - Fixed silent script exit on clusters where the `component=catalog` label selector matches no pods (this can happen with certain K10 deployments depending on chart version, Helm overrides, or deployment method). On bash-as-sh with `set -e`, unprotected `var=$(kubectl ... -o jsonpath=...)` assignments trigger errexit when the selector matches zero pods.
-  - Temp directory cascade: `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp` with clear error exit when none is writable (defensive hardening)
-  - New debug line showing which temp location was chosen
+- **v2.0** (Current)
+  - **Patch 1/7** — Enriched namespace inventory (`coverage.namespacesInventory`)
+  - **Patch 2/7** — K10 RBAC inventory (`k10Rbac`) with graceful degradation
+  - **Patch 3/7** — Effective RPO per policy (`policyRunStats.effectiveRpo`)
+  - **Patch 4/7** — Empty + redundant policy detection (`policyAnalysis`)
+  - **Patch 5/7** — Ransomware Readiness Score (`ransomwareReadiness`)
+  - **Patch 6/7** — `kdl-diff.sh` standalone JSON comparator (16 sections, exit code = regression count)
+  - **Patch 7/7** — README v2.0 + `kdl-json-to-html.sh` schema upgrade
 
-- **v1.8.2**
-  - Fixed `_ep: command not found` on any run with `--output` (ordering bug in autodetect block introduced in v1.8.1)
+- **v1.9.1** — Bug fixes: locale-sensitive awk printf (`LC_ALL=C`), per-namespace protection regex anchors
 
-- **v1.8.1**
-  - Fixed export retention display (wrong JSON path)
-  - Deterministic retention key ordering (daily/weekly/monthly/yearly)
-  - Export frequency and profile displayed per-policy
-  - Added `--help`, `--version`, `--output FILE` flags
-  - Execution timer (completion time display)
-  - Progress indicators during data collection
-  - Parallel kubectl CRD fetches (13 resources simultaneously)
-  - Shared pod/deployment data (eliminates 4+ redundant kubectl calls)
-  - Replaced `bc` dependency with `awk` (works on Alpine/BusyBox)
-  - Portable date fallback (GNU/BSD/awk for 14-day calculation)
-  - Temp file cleanup via trap (EXIT/INT/TERM)
-  - `safe_json()` / `safe_int()` helpers replace ~30 duplicate validation blocks
-  - `--argjson` safety validation before JSON output
-  - `kdlVersion` field added to JSON output
+- **v1.9** — Failed Actions Top 5, Per-Namespace Protection Status, Stuck Actions, Profile validation, Reports policy state, RP by namespace, StorageClasses + VSC inventory, K8s version/distribution detection, Import policies, 5 new Best Practices, `JQ_DEEPEST_MSG` helper, `--no-helm` flag, BP-RET-HIGH threshold raised to >7
 
-- **v1.8**
-  - K10 Helm Configuration extraction (3-tier: secret, CLI, resource inspection)
-  - Authentication method detection (OIDC, LDAP, OpenShift, Basic, Token)
-  - KMS Encryption detection (AWS KMS, Azure Key Vault, HashiCorp Vault)
-  - FIPS mode, Network Policies, Audit Logging detection
-  - Dashboard access method with host
-  - Concurrency limiters (11 settings) and executor sizing
-  - Timeout configuration (6 settings)
-  - Datastore parallelism (4 settings)
-  - Excluded applications list
-  - GVB sidecar injection status
-  - Security context, Custom CA, SCC, VAP detection
-  - Persistence sizes and garbage collector settings
-  - Non-default settings counter
-  - 3 new Best Practices: Authentication (critical), KMS Encryption (info), Audit Logging (info)
+- **v1.8.3** — Catalog pod label silent exit fix, temp directory cascade
 
-- **v1.7**
-  - KubeVirt / OpenShift Virtualization VM detection (Kasten 8.5+)
-  - VM-based policy detection (virtualMachineRef selector)
-  - Protected vs unprotected VM analysis
-  - VM RestorePoints tracking (appType=virtualMachine)
-  - Guest filesystem freeze configuration detection
-  - VM snapshot concurrency settings
-  - Virtualization platform detection (OpenShift Virt, SUSE/Harvester)
-  - VM protection added to Best Practices compliance
+- **v1.8.2** — `_ep: command not found` on `--output` fix
 
-- **v1.6**
-  - Fixed Success Rate calculation (based on finished actions only)
-  - Fixed Blueprints detection (cluster-wide check)
-  - Fixed Policy retention display (consolidated on single line)
-  - Added License Consumption (node usage vs limit)
-  - Added Export Storage usage metric with Deduplication ratio
-  - Added Multi-Cluster detection (primary/secondary/none)
-  - Added Catalog Free Space percentage (via pod exec)
+- **v1.8.1** — Export retention path fix, `--help`/`--version`/`--output` flags, execution timer, parallel CRD fetches, `safe_json`/`safe_int` helpers, replaced `bc` with `awk`
 
-- **v1.5**
-  - Policy Last Run Status with duration
-  - Unprotected Namespaces detection with label selector support
-  - Restore Actions History
-  - K10 Resource Limits (CPU/RAM) with Deployment Replicas
-  - Catalog Size
-  - Orphaned RestorePoints detection
-  - Average Policy Run Duration
+- **v1.8** — K10 Helm Configuration extraction (3-tier), Authentication detection, KMS Encryption, FIPS, Network Policies, Audit Logging, Dashboard access, Concurrency limiters (11), Timeouts (6), Datastore parallelism (4), Security context, SCC, VAP, 3 new Best Practices
 
-- **v1.4**
-  - Disaster Recovery (KDR) status detection
-  - PolicyPresets inventory
-  - Kanister Blueprints & BlueprintBindings detection
-  - TransformSets inventory
-  - Prometheus monitoring status
-  - Best Practices compliance summary
+- **v1.7** — KubeVirt / OpenShift Virtualization VM detection (Kasten 8.5+), VM-based policy detection, VM protection coverage, Guest freeze, VM snapshot concurrency
 
-- **v1.3** — License information, health status, protection coverage matrix
+- **v1.6** — Fixed Success Rate calculation, Fixed Blueprints detection (cluster-wide), Fixed Policy retention display, Added License Consumption, Export Storage usage + Dedup ratio, Multi-Cluster detection, Catalog Free Space
+
+- **v1.5** — Policy Last Run Status with duration, Unprotected Namespaces, Restore Actions History, K10 Resource Limits, Catalog Size, Orphaned RestorePoints, Average Policy Run Duration
+
+- **v1.4** — Disaster Recovery (KDR) status detection, PolicyPresets inventory, Kanister Blueprints & BlueprintBindings, TransformSets, Prometheus monitoring, Best Practices summary
+
+- **v1.3** — License info, health status, protection coverage matrix
 - **v1.2** — Policy Protection Coverage Matrix, improved retention
 - **v1.1** — Export retention fixes
 - **v1.0** — Initial release
@@ -492,9 +540,7 @@ Key portability measures in v1.8.1:
 
 ### Script exits silently after "Collecting..." with no report
 
-Two root causes, both fixed in v1.8.3:
-
-**Cause 1 (most common): catalog pod label mismatch.** On bash-as-`/bin/sh` with `set -e`, v1.8.1 and v1.8.2 had an unprotected `var=$(kubectl ... jsonpath=...)` assignment that killed the script whenever `kubectl get pods -l component=catalog` returned zero pods. The exact label scheme on your deployment may differ from the legacy `component=catalog` depending on chart version, Helm overrides, or deployment method.
+**Cause 1: catalog pod label mismatch.** v1.8.1 and v1.8.2 had an unprotected `var=$(kubectl ... jsonpath=...)` assignment that killed the script whenever `kubectl get pods -l component=catalog` returned zero pods (the label scheme may differ depending on chart version, Helm overrides, or deployment method). Fixed in v1.8.3 and later.
 
 Pre-check on v1.8.1/v1.8.2:
 
@@ -502,25 +548,32 @@ Pre-check on v1.8.1/v1.8.2:
 kubectl -n kasten-io get pods -l component=catalog --no-headers | wc -l
 ```
 
-If this returns `0`, upgrade to v1.8.3 (no workaround available on older versions short of editing the script).
+If this returns `0`, upgrade.
 
-**Cause 2 (environment-specific): restricted `/tmp`.** On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the parallel kubectl redirects fail silently. v1.8.3 cascades through `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp` and exits with a clear error if none is writable. Workaround on older versions:
-
-```bash
-TMPDIR=$HOME ./KDL-v1.8.3.sh kasten-io
-```
-
-**To verify your install on v1.8.3**:
+**Cause 2: restricted `/tmp`.** On hardened hosts where `/tmp` is under quota, mounted `noexec`, restricted by SELinux/AppArmor, or read-only, the parallel kubectl redirects fail silently. v1.8.3+ cascades through `$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`. Workaround on older versions:
 
 ```bash
-./KDL-v1.8.3.sh kasten-io --debug 2>&1 | tail -30
+TMPDIR=$HOME ./KDL.sh kasten-io
 ```
 
-You should see `Using temp directory: ...` and progression through all sections (License, Profiles, Policies, KDR, K10 resources, Catalog, etc.) ending with `[OK] Discovery completed in Xs`.
+### Ransomware Readiness Score shows lower than expected
+
+The pillar weighting is empirical. Check `ransomwareReadiness.pillars.*.evidence` in the JSON to see what KDL actually detected. Common surprises:
+
+- **Audit logging FAIL** even though OpenShift cluster logging is enabled — KDL detects K10-specific audit logging (S3 audit export or K10 cluster logging configmap), not the cluster-wide OpenShift logging operator.
+- **TLS verification deducted** when one profile has `skipSSLVerify=true`. Even one non-verifying profile zeroes the pillar — it's a binary signal, not a percentage.
+
+### Empty policies reported but they look correct
+
+Check `policyAnalysis.resolved[*].selectorKind`. If `matchExpressions(complex)`, the policy uses operators KDL cannot statically resolve (`NotIn`, `Exists`, `DoesNotExist`). It is marked `resolvable=false` and excluded from the "empty" verdict — but the count shows it in `unresolvableCount` for visibility.
+
+### RBAC inventory shows count=0 with `clusterRoles: false`
+
+The kubeconfig running KDL doesn't have cluster-wide ClusterRole/ClusterRoleBinding read permission. Re-run with a kubeconfig that has it, or accept the partial view — the K10 standard ClusterRole does not include cluster-wide RBAC read.
 
 ### Export retention shows "not defined" when it should have values
 
-In v1.8, export retention was read from the wrong JSON path. Upgrade to v1.8.1 or later which reads from `.spec.actions[].retention` (the correct location).
+In v1.8, export retention was read from the wrong JSON path. Upgrade to v1.8.1 or later which reads from `.spec.actions[].retention`.
 
 ### Helm configuration shows "source: none"
 
@@ -544,67 +597,47 @@ If the CRD exists but VMs show 0, check RBAC permissions for `kubevirt.io` resou
 
 ### Policy last run shows "Never"
 
-The policy may not have run yet, or RunActions have been cleaned up by garbage collection. Check:
+The policy may not have run yet, or RunActions have been garbage-collected. Check:
 
 ```bash
 kubectl -n kasten-io get runactions
 ```
 
-### Unprotected namespaces list is too long
+### Effective RPO shows null for all policies
 
-The script excludes common system namespaces (kube-*, openshift-*, etc.). Custom infrastructure namespaces may appear. Consider adding a catch-all policy or adjusting policy selectors.
-
-### Shows "Cannot determine coverage" for label selectors
-
-When policies use `matchLabels` instead of `matchNames`, the script cannot statically determine which namespaces match. Check your namespace labels:
-
-```bash
-kubectl get namespaces --show-labels
-```
+The 14-day window contains fewer than 2 successful (`Complete`) runs per policy. Median requires at least 2 intervals = 3 successful runs.
 
 ### Catalog free space shows N/A
 
 The catalog pod may not allow exec, or the mount path pattern was not matched. The script tries `/kasten`, `/mnt`, `/data`, `/var/lib`.
 
-### Resource limits show "PARTIAL"
-
-Some K10 containers don't have resource limits configured. This is informational (severity: info). Check with:
-
-```bash
-kubectl -n kasten-io get pods -o json | jq '.items[].spec.containers[].resources'
-```
-
 ### Debug mode for troubleshooting
 
-Use `--debug` to see detailed processing information:
-
 ```bash
-./KDL-v1.8.3.sh kasten-io --debug
+./KDL.sh kasten-io --debug
 ```
 
-This shows namespace validation, platform detection, policy counts, catch-all detection, protected/unprotected lists, K10 pod/container counts, Helm values source, authentication method, encryption provider, limiter values, and non-default settings.
+Shows: namespace validation, platform detection, policy counts, catch-all detection, RPO computation, policy analysis intermediate results, RBAC subjects total, ransomware pillar scores.
 
 ---
 
 ## Use Cases
 
 1. **Pre-migration assessment** — Understand current protection state
-2. **Compliance audits** — Generate snapshot of policies and retention
-3. **Health checks** — Monitor backup success rates and policy execution
-4. **License management** — Track expiration dates and node consumption
-5. **Coverage analysis** — Identify unprotected namespaces and VMs
-6. **Support tickets** — Provide detailed environment information
-7. **Automation** — JSON output for CI/CD pipelines
-8. **Documentation** — Generate HTML reports for stakeholders
-9. **Best Practices validation** — Ensure compliance with Kasten recommendations
-10. **Performance monitoring** — Track policy run durations
-11. **Cleanup tasks** — Identify orphaned RestorePoints
-12. **Resource planning** — Review K10 resource allocation
-13. **Multi-cluster management** — Identify cluster roles and relationships
-14. **Storage optimization** — Monitor export storage and deduplication efficiency
-15. **Security assessment** — Validate authentication, encryption, and audit logging
-16. **Configuration review** — Review concurrency, timeouts, and tuning parameters
-17. **VM protection audit** — Ensure virtual machine backup completeness
+2. **Quarterly TAM reviews** — Snapshot N vs N-1 via `kdl-diff.sh`, surface regressions
+3. **Compliance audits** — Generate snapshot of policies, retention, RBAC, encryption
+4. **Health checks** — Monitor backup success rates and policy execution
+5. **License management** — Track expiration dates and node consumption
+6. **Coverage analysis** — Identify unprotected namespaces and VMs
+7. **Policy hygiene** *(NEW v2.0)* — Detect empty policies (broken selectors), redundant policies (overlapping coverage)
+8. **RBAC audit** *(NEW v2.0)* — Inventory who has access to K10 (Users, Groups, ServiceAccounts), flag wildcard roles
+9. **Ransomware posture** *(NEW v2.0)* — Executive-level grade A-F, biggest gap identification
+10. **RPO validation** *(NEW v2.0)* — Compare declared vs effective backup frequency, detect drift
+11. **Support tickets** — Provide detailed environment information
+12. **CI/CD gates** — `kdl-diff.sh` exit code = regression count
+13. **HTML reports** — `kdl-json-to-html.sh` for stakeholder communication
+14. **Multi-cluster management** — Identify cluster roles and relationships, import policies
+15. **Storage optimisation** — Export storage / dedup ratio, StorageClass + VSC cross-check
 
 ---
 
@@ -620,21 +653,25 @@ It does **not**:
 - Replace official Kasten support tools
 - Access or store any sensitive data
 
+The Ransomware Readiness Score is a synthesis indicator intended for executive / CISO communication. Pillar weighting is empirical and should be reviewed against your organisation's specific threat model before being used as a basis for security investment decisions.
+
 ---
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `KDL-v1.8.3.sh` | Main discovery script |
+| `KDL.sh` | Main discovery script |
 | `kdl-json-to-html.sh` | HTML report generator |
+| `kdl-diff.sh` | JSON comparator (snapshot N vs N-1) |
 | `README.md` | This documentation |
+| `sample.md` | Reference output of `./KDL.sh kasten-io` |
 
 ---
 
 ## Author
 
-Bertrand CASTAGNET - EMEA Technical Account Manager
+Bertrand CASTAGNET — EMEA Technical Account Manager
 
 ## License
 
