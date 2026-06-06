@@ -618,11 +618,15 @@ progress "K10 resources"
 
 kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get policies -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get runactions.actions.kio.kasten.io -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get restoreactions.actions.kio.kasten.io -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get backupactions.actions.kio.kasten.io -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get exportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get restorepoints.apps.kio.kasten.io -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
+# Action CRs and RestorePoints are cluster-wide (#10/#15): on K10 8.x,
+# policy-driven actions and RP CRs live in the source application namespace,
+# not the K10 namespace. Fetch with -A. Downstream jq resolves the namespace
+# from the k10.kasten.io/appNamespace label // .metadata.namespace.
+kubectl get runactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
+kubectl get restoreactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
+kubectl get backupactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
+kubectl get exportactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
+kubectl get restorepoints.apps.kio.kasten.io -A -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json > "$TEMP_DIR/presets_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json > "$TEMP_DIR/transformsets_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json > "$TEMP_DIR/reports_raw.json" 2>/dev/null &
@@ -1623,7 +1627,7 @@ ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --argjson policies "$POLICY_NAM
     ) |
     {
       name: .metadata.name,
-      namespace: (.spec.subject.namespace // "unknown"),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "unknown"),
       created: .metadata.creationTimestamp,
       actions: [.spec.source.actionName]
     }
@@ -1649,13 +1653,14 @@ debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT"
 #
 # IMPORTANT: In modern K10 versions (verified on 8.5.8), RestorePoint
 # .spec.subject is null — the namespace lives in metadata.labels under
-# k10.kasten.io/appNamespace. Falling back to .spec.subject.namespace
-# preserves compatibility with any older K10 version that still populated it.
+# k10.kasten.io/appNamespace. Now that RestorePoints are fetched cluster-wide
+# (-A, #10), .metadata.namespace is the CR's own namespace (the source app
+# namespace) and is a reliable fallback when the label is absent.
 
 RP_BY_NAMESPACE_TOP5=$(_ep "$RESTORE_POINTS_JSON" | jq -c '
   [(.items // [])[]?
     | (.metadata.labels["k10.kasten.io/appNamespace"]
-       // .spec.subject.namespace
+       // .metadata.namespace
        // "unknown")
   ]
   | group_by(.)
@@ -1720,11 +1725,14 @@ debug "TransformSets: $TRANSFORMSET_COUNT"
 ### -------------------------
 ### Prometheus Monitoring
 ### -------------------------
-# Check for Prometheus in common namespaces/labels
-PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+# Detect the K10-bundled Prometheus ONLY (#16). A cluster-wide search matches
+# any Prometheus (cluster/user-workload monitoring, app instances) — on
+# OpenShift it is true 100% of the time regardless of K10 monitoring state.
+# Scope to the K10 namespace and use the K10 chart pod labels.
+PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 if [ "$PROMETHEUS_RUNNING" -eq 0 ]; then
-  PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app.kubernetes.io/name=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=k10" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 fi
 
