@@ -1042,11 +1042,16 @@ debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE"
 ### -------------------------
 # Use pre-fetched RunActions data
 RUNACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/runactions_raw.json" 2>/dev/null)")
+# Sanitized copy on disk for jq --slurpfile: the action sets are cluster-wide
+# (-A) and can be large; passing them via --argjson on the command line risks
+# E2BIG (Argument list too long). --slurpfile reads from a file, no arg limit.
+printf '%s' "$RUNACTIONS_JSON" > "$TEMP_DIR/runactions_clean.json"
 
 # Build policy last run info
 # v1.9: enriched with `error` field (deepest cause-chain message via the
 # JQ_DEEPEST_MSG helper, only populated when state=Failed)
-POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON" "$JQ_DEEPEST_MSG"'
+POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG"'
+  ($runsArr[0] // {"items":[]}) as $runs |
   [.items[]? | . as $policy | {
     name: .metadata.name,
     lastRun: (
@@ -1362,6 +1367,7 @@ debug "Unprotected list: $UNPROTECTED_NS_JSON"
 ### Restore Actions History (NEW v1.5)
 ### -------------------------
 RESTORE_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null)")
+printf '%s' "$RESTORE_ACTIONS_JSON" > "$TEMP_DIR/restoreactions_clean.json"  # for jq --slurpfile (see runactions note)
 
 RESTORE_ACTIONS_TOTAL=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '.items | length // 0')")
 RESTORE_ACTIONS_COMPLETED=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')")
@@ -1651,6 +1657,8 @@ debug "Pods: $PODS (Running: $PODS_RUNNING, Ready: $PODS_READY)"
 ### -------------------------
 BACKUP_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/backupactions_raw.json" 2>/dev/null)")
 EXPORT_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/exportactions_raw.json" 2>/dev/null)")
+printf '%s' "$BACKUP_ACTIONS_JSON" > "$TEMP_DIR/backupactions_clean.json"  # for jq --slurpfile (see runactions note)
+printf '%s' "$EXPORT_ACTIONS_JSON" > "$TEMP_DIR/exportactions_clean.json"  # for jq --slurpfile (see runactions note)
 
 BACKUP_ACTIONS_TOTAL=$(_ep "$BACKUP_ACTIONS_JSON" | jq '.items | length // 0')
 [ -z "$BACKUP_ACTIONS_TOTAL" ] && BACKUP_ACTIONS_TOTAL=0
@@ -1692,6 +1700,9 @@ debug "Actions - Total: $TOTAL_ACTIONS, Finished: $FINISHED_ACTIONS, Completed: 
 # All sources already loaded above — no extra kubectl calls.
 
 FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
+  ($backupArr[0] // {"items":[]}) as $backup |
+  ($exportArr[0] // {"items":[]}) as $export |
+  ($restoreArr[0] // {"items":[]}) as $restore |
   [
     ($backup.items // []) | .[] | select((.status.state // "") == "Failed") | {
       kind: "BackupAction",
@@ -1725,9 +1736,9 @@ FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
   | sort_by(.timestamp) | reverse | .[0:5]
   | map(.message |= (if length > 180 then .[0:180] + "..." else . end))
 ' \
-  --argjson backup "$BACKUP_ACTIONS_JSON" \
-  --argjson export "$EXPORT_ACTIONS_JSON" \
-  --argjson restore "$RESTORE_ACTIONS_JSON" \
+  --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
+  --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
+  --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$FAILED_ACTIONS_TOP5" | jq -e '.' >/dev/null 2>&1; then
@@ -1747,6 +1758,9 @@ debug "Failed actions top 5 collected: $FAILED_ACTIONS_TOP5_COUNT entries"
 # GNU/BSD without invoking date(1).
 
 STUCK_ACTIONS=$(jq -cn --argjson threshold "$STUCK_HOURS_THRESHOLD" '
+  ($backupArr[0] // {"items":[]}) as $backup |
+  ($exportArr[0] // {"items":[]}) as $export |
+  ($restoreArr[0] // {"items":[]}) as $restore |
   [
     ($backup.items // []) | .[] | select((.status.state // "") == "Running") | {
       kind: "BackupAction",
@@ -1792,9 +1806,9 @@ STUCK_ACTIONS=$(jq -cn --argjson threshold "$STUCK_HOURS_THRESHOLD" '
   | map(select(.ageHours >= $threshold))
   | sort_by(.ageHours) | reverse | .[0:5]
 ' \
-  --argjson backup "$BACKUP_ACTIONS_JSON" \
-  --argjson export "$EXPORT_ACTIONS_JSON" \
-  --argjson restore "$RESTORE_ACTIONS_JSON" \
+  --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
+  --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
+  --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$STUCK_ACTIONS" | jq -e '.' >/dev/null 2>&1; then
@@ -1840,6 +1854,9 @@ if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
+  ($exportArr[0] // {"items":[]}) as $export |
+  ($restoreArr[0] // {"items":[]}) as $restore |
+  ($runsArr[0] // {"items":[]}) as $runs |
   ($appNamespaces // []) as $ns_list |
   ($export.items // []) as $export_items |
   ($restore.items // []) as $restore_items |
@@ -1883,9 +1900,9 @@ NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
     })
 ' \
   --argjson appNamespaces "$NS_PROTECTION_INPUT" \
-  --argjson export "$EXPORT_ACTIONS_JSON" \
-  --argjson restore "$RESTORE_ACTIONS_JSON" \
-  --argjson runs "$RUNACTIONS_JSON" \
+  --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
+  --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
+  --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$NS_PROTECTION_STATUS" | jq -e '.' >/dev/null 2>&1; then
@@ -2615,13 +2632,11 @@ debug "Non-default settings: $NON_DEFAULT_COUNT ($NON_DEFAULT_ITEMS)"
 ### -------------------------
 ### Best Practices Assessment
 ### -------------------------
-# DR Assessment — pass only when KDR is effectively healthy (#13), not merely
-# when the policy CR exists. Broken/incomplete/stale KDR no longer passes.
-if [ "$KDR_STATUS" = "ENABLED" ]; then
-  BP_DR_STATUS="ENABLED"
-else
-  BP_DR_STATUS="NOT_ENABLED"
-fi
+# DR Assessment — carry the effective KDR verdict (#13) so JSON/HTML/text all
+# agree. Only ENABLED passes; CONFIGURED_INCOMPLETE / CONFIGURED_NOT_HEALTHY /
+# NOT_ENABLED each fail the (critical) check with an accurate label instead of a
+# blanket "NOT_ENABLED".
+BP_DR_STATUS="$KDR_STATUS"
 
 # Immutability Assessment
 if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
