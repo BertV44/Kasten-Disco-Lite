@@ -377,6 +377,10 @@ error() {
   echo "${COLOR_RED}[FAIL] ERROR: $*${COLOR_RESET}" >&2
 }
 
+warn() {
+  echo "${COLOR_YELLOW}[WARN] $*${COLOR_RESET}" >&2
+}
+
 progress() {
   if [ "$MODE" = "human" ] && [ -z "$OUTPUT_FILE" ]; then
     printf "${COLOR_CYAN}  Collecting %s...${COLOR_RESET}\r" "$1" >&2
@@ -498,6 +502,30 @@ if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
 fi
 
 debug "Namespace '$NAMESPACE' validated"
+
+### -------------------------
+### RBAC pre-flight check (#17)
+### -------------------------
+# KDL needs a handful of cluster-scoped reads. With a K10-admin-only kubeconfig
+# these silently return empty (namespace inventory, PVCs, nodes, StorageClasses,
+# VolumeSnapshotClasses) and the report looks wrong rather than
+# under-permissioned. Probe up front with `kubectl auth can-i` and emit one
+# actionable warning. Non-fatal: KDL still runs and reports what it can.
+# Warnings go to stderr so JSON output (stdout) stays clean.
+RBAC_MISSING=""
+kubectl auth can-i list namespaces                                   >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list namespaces (cluster-wide)"
+kubectl auth can-i list persistentvolumeclaims --all-namespaces      >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list persistentvolumeclaims --all-namespaces"
+kubectl auth can-i list nodes                                        >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list nodes"
+kubectl auth can-i list storageclasses.storage.k8s.io                >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list storageclasses"
+kubectl auth can-i list volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list volumesnapshotclasses"
+
+if [ -n "$RBAC_MISSING" ]; then
+  warn "Insufficient cluster-scoped RBAC: the following reads are denied, so related sections will be EMPTY (not necessarily zero):"
+  printf '%s' "$RBAC_MISSING" | tr ';' '\n' | while IFS= read -r _rbac_item; do
+    [ -n "$_rbac_item" ] && printf '%s    - %s%s\n' "$COLOR_YELLOW" "$_rbac_item" "$COLOR_RESET" >&2
+  done
+  warn "Fix: apply the bundled least-privilege role -> kubectl apply -f kdl-rbac.yaml (see README, section 'RBAC requirements')."
+fi
 
 ### -------------------------
 ### Platform detection

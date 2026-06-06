@@ -1,0 +1,197 @@
+# kdl-rbac.yaml — least-privilege read-only access for Kasten Discovery Lite (KDL)
+#
+# KDL is a read-only discovery tool. It never creates, updates or deletes
+# anything. This manifest grants exactly the GET/LIST access KDL needs and
+# nothing more, so it can be handed to a restricted (e.g. K10-admin-only)
+# kubeconfig without over-provisioning.
+#
+# It is split intentionally:
+#   - ClusterRole  kasten-discovery-reader        cluster-wide read (no secrets)
+#   - Role         kasten-discovery-reader-ns      namespaced read of the
+#                                                  sensitive bits (Secrets,
+#                                                  ConfigMaps) in the K10
+#                                                  namespace ONLY
+#
+# Usage:
+#   1. Edit the two *Binding* objects at the bottom to point at your principal
+#      (ServiceAccount, User or Group) and the K10 namespace (default kasten-io).
+#   2. kubectl apply -f kdl-rbac.yaml
+#
+# Notes:
+#   - The namespaced Role covers `secrets` (k10-license, Helm release secret).
+#     If you run KDL with `--no-helm` and do not need license details, you may
+#     drop the `secrets` resource from the Role.
+#   - Some resources are optional and only read on the matching platform
+#     (OpenShift routes/scc, KubeVirt/Harvester virtualization, Kanister
+#     blueprints). They are harmless to grant on clusters that lack the CRDs.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kasten-discovery-reader
+  labels:
+    app.kubernetes.io/name: kasten-discovery-lite
+    app.kubernetes.io/component: rbac
+rules:
+  # --- Core cluster-scoped + cross-namespace inventory ---
+  - apiGroups: [""]
+    resources:
+      - namespaces
+      - nodes
+      - pods
+      - services
+      - persistentvolumeclaims
+      - persistentvolumes
+    verbs: ["get", "list"]
+
+  # --- Workloads (K10 deployments, replicas) ---
+  - apiGroups: ["apps"]
+    resources:
+      - deployments
+      - statefulsets
+      - replicasets
+    verbs: ["get", "list"]
+
+  # --- Networking (NetworkPolicies, Ingress) ---
+  - apiGroups: ["networking.k8s.io"]
+    resources:
+      - networkpolicies
+      - ingresses
+    verbs: ["get", "list"]
+
+  # --- Storage (StorageClasses, VolumeSnapshot* ) ---
+  - apiGroups: ["storage.k8s.io"]
+    resources:
+      - storageclasses
+    verbs: ["get", "list"]
+  - apiGroups: ["snapshot.storage.k8s.io"]
+    resources:
+      - volumesnapshotclasses
+      - volumesnapshots
+      - volumesnapshotcontents
+    verbs: ["get", "list"]
+
+  # --- CRD + webhook discovery ---
+  - apiGroups: ["apiextensions.k8s.io"]
+    resources:
+      - customresourcedefinitions
+    verbs: ["get", "list"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources:
+      - mutatingwebhookconfigurations
+    verbs: ["get", "list"]
+
+  # --- Kasten K10 custom resources (read-only) ---
+  - apiGroups: ["config.kio.kasten.io"]
+    resources:
+      - profiles
+      - policies
+      - policypresets
+      - transformsets
+      - blueprintbindings
+    verbs: ["get", "list"]
+  - apiGroups: ["actions.kio.kasten.io"]
+    resources:
+      - backupactions
+      - exportactions
+      - restoreactions
+      - runactions
+      - reportactions
+    verbs: ["get", "list"]
+  - apiGroups: ["apps.kio.kasten.io"]
+    resources:
+      - restorepoints
+    verbs: ["get", "list"]
+  - apiGroups: ["reporting.kio.kasten.io"]
+    resources:
+      - reports
+    verbs: ["get", "list"]
+  - apiGroups: ["dist.kio.kasten.io"]
+    resources:
+      - clusters
+    verbs: ["get", "list"]
+  - apiGroups: ["cr.kanister.io"]
+    resources:
+      - blueprints
+    verbs: ["get", "list"]
+
+  # --- OpenShift (optional; harmless if CRDs absent) ---
+  - apiGroups: ["route.openshift.io"]
+    resources:
+      - routes
+    verbs: ["get", "list"]
+  - apiGroups: ["security.openshift.io"]
+    resources:
+      - securitycontextconstraints
+    verbs: ["get", "list"]
+  - apiGroups: ["operators.coreos.com"]
+    resources:
+      - clusterserviceversions
+    verbs: ["get", "list"]
+
+  # --- Virtualization (optional: KubeVirt / OpenShift Virt / Harvester) ---
+  - apiGroups: ["kubevirt.io"]
+    resources:
+      - virtualmachines
+      - kubevirts
+    verbs: ["get", "list"]
+  - apiGroups: ["harvesterhci.io"]
+    resources:
+      - settings
+    verbs: ["get", "list"]
+---
+# Sensitive reads, scoped to the K10 namespace ONLY (not cluster-wide).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kasten-discovery-reader-ns
+  namespace: kasten-io          # <-- change if your K10 namespace differs
+  labels:
+    app.kubernetes.io/name: kasten-discovery-lite
+    app.kubernetes.io/component: rbac
+rules:
+  - apiGroups: [""]
+    resources:
+      - secrets        # k10-license + Helm release secret; drop if using --no-helm
+      - configmaps     # k10-config fallback
+    verbs: ["get", "list"]
+---
+# ---------------------------------------------------------------------------
+# Bindings — EDIT the subjects to match your principal before applying.
+# Examples below bind a ServiceAccount named "kdl" in namespace "kasten-io".
+# ---------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kasten-discovery-reader
+  labels:
+    app.kubernetes.io/name: kasten-discovery-lite
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kasten-discovery-reader
+subjects:
+  - kind: ServiceAccount
+    name: kdl
+    namespace: kasten-io
+  # - kind: User
+  #   name: alice@example.com
+  #   apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kasten-discovery-reader-ns
+  namespace: kasten-io          # <-- must match the Role namespace above
+  labels:
+    app.kubernetes.io/name: kasten-discovery-lite
+    app.kubernetes.io/component: rbac
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kasten-discovery-reader-ns
+subjects:
+  - kind: ServiceAccount
+    name: kdl
+    namespace: kasten-io
