@@ -149,6 +149,18 @@ Backwards-compatible: missing keys in the baseline are reported as "newly availa
 
 `kdl-json-to-html.sh` renders the 5 new top-level JSON keys: `ransomwareReadiness`, `policyRunStats.effectiveRpo`, `policyAnalysis`, `k10Rbac`, `coverage.namespacesInventory`. The rest of the report is unchanged — additive only.
 
+### Also includes the v1.9.2 remediations
+
+This branch folds in all v1.9.2 fixes:
+
+- **Cluster-wide (`-A`) discovery** of actions and RestorePoints (they live in the source app namespace on K10 8.x), with large sets passed to `jq` via `--slurpfile` to avoid `ARG_MAX` (#10, #15).
+- **Prometheus** detection scoped to the K10 namespace (#16).
+- **`matchLabels`** policy selectors resolved into the protected-namespace set (#11).
+- **KDR effective-health verdict** — `ENABLED` / `CONFIGURED_NOT_HEALTHY` / `CONFIGURED_INCOMPLETE` / `NOT_ENABLED` (#13).
+- **RBAC pre-flight** + bundled [`kdl-rbac.yaml`](kdl-rbac.yaml) (#17).
+- **Resource Limits** best-practice downgraded from Warning to Info (#12).
+- **Multi-secret license** parsing with type, days-remaining and node-limit reconciliation — **breaking change** to the `license` JSON key (now `{status, secretCount, parseableCount, unparseable[], licenses[], nodeLimitAggregate, nodeConsumption, nearestExpiry}`); `kdl-diff.sh` diffs licenses by stable `id` (#14).
+
 ---
 
 ## What's New in v1.9 / v1.9.1
@@ -343,6 +355,22 @@ New in v2.0:
 ## RBAC Requirements
 
 The script is **read-only** and requires the following minimal permissions:
+
+### Quick start: bundled manifest
+
+A ready-to-apply, least-privilege manifest ships with the repo:
+[`kdl-rbac.yaml`](kdl-rbac.yaml). It defines a `kasten-discovery-reader`
+ClusterRole (cluster-wide reads, **no Secrets**) plus a namespaced Role for the
+sensitive reads (Secrets/ConfigMaps in the K10 namespace only), with binding
+templates. Edit the binding subjects, then `kubectl apply -f kdl-rbac.yaml`.
+
+### Pre-flight check
+
+On startup KDL runs `kubectl auth can-i` for its key cluster-scoped reads
+(`namespaces`, `persistentvolumeclaims -A`, `nodes`, `storageclasses`,
+`volumesnapshotclasses`). If any are denied it prints a single actionable
+warning to **stderr** (so `--json` output stays clean) pointing at
+`kdl-rbac.yaml`. KDL still runs and reports what it can.
 
 ### Namespace-scoped (Kasten namespace)
 
