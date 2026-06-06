@@ -545,7 +545,10 @@ kubectl -n "$NAMESPACE" get runactions.actions.kio.kasten.io -o json > "$TEMP_DI
 kubectl -n "$NAMESPACE" get restoreactions.actions.kio.kasten.io -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get backupactions.actions.kio.kasten.io -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get exportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get restorepoints.apps.kio.kasten.io -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
+# RestorePoints are cluster-wide (#10): on K10 8.5.x the RestorePoint CRs live
+# in the source application namespace, not in the K10 namespace. Fetch with -A
+# so the by-namespace Top 5 and the total count match the K10 UI dashboard.
+kubectl get restorepoints.apps.kio.kasten.io -A -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json > "$TEMP_DIR/presets_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json > "$TEMP_DIR/transformsets_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json > "$TEMP_DIR/reports_raw.json" 2>/dev/null &
@@ -1251,7 +1254,7 @@ ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --argjson policies "$POLICY_NAM
     ) |
     {
       name: .metadata.name,
-      namespace: (.spec.subject.namespace // "unknown"),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "unknown"),
       created: .metadata.creationTimestamp,
       actions: [.spec.source.actionName]
     }
@@ -1277,13 +1280,14 @@ debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT"
 #
 # IMPORTANT: In modern K10 versions (verified on 8.5.8), RestorePoint
 # .spec.subject is null — the namespace lives in metadata.labels under
-# k10.kasten.io/appNamespace. Falling back to .spec.subject.namespace
-# preserves compatibility with any older K10 version that still populated it.
+# k10.kasten.io/appNamespace. Now that RestorePoints are fetched cluster-wide
+# (-A, #10), .metadata.namespace is the CR's own namespace (the source app
+# namespace) and is a reliable fallback when the label is absent.
 
 RP_BY_NAMESPACE_TOP5=$(_ep "$RESTORE_POINTS_JSON" | jq -c '
   [(.items // [])[]?
     | (.metadata.labels["k10.kasten.io/appNamespace"]
-       // .spec.subject.namespace
+       // .metadata.namespace
        // "unknown")
   ]
   | group_by(.)
