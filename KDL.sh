@@ -1077,6 +1077,43 @@ if ! _ep "$PROTECTED_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
   PROTECTED_NAMESPACES='[]'
 fi
 
+# Resolve matchLabels selectors to concrete namespaces and merge (#11).
+# PROTECTED_NAMESPACES above only captured matchNames/matchExpressions. K10
+# policies using matchLabels (a common enterprise pattern) select their target
+# namespaces by label; without resolving them those namespaces were reported as
+# unprotected (large false-positive gaps). For each matchLabels policy, build a
+# comma-separated label selector and ask the API server which namespaces carry
+# those labels, then union the result into PROTECTED_NAMESPACES.
+if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
+  MATCHLABELS_SELECTORS=$(_ep "$APP_POLICIES_JSON" | jq -r '
+    .items[]?
+    | (.spec.selector.matchLabels // {})
+    | select(length > 0)
+    | to_entries | map("\(.key)=\(.value)") | join(",")
+  ' 2>/dev/null || echo "")
+
+  if [ -n "$MATCHLABELS_SELECTORS" ]; then
+    LABEL_RESOLVED_NS=$(
+      printf '%s\n' "$MATCHLABELS_SELECTORS" | while IFS= read -r _sel; do
+        [ -z "$_sel" ] && continue
+        kubectl get namespaces -l "$_sel" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+      done
+    )
+
+    if [ -n "$LABEL_RESOLVED_NS" ]; then
+      LABEL_NS_JSON=$(printf '%s' "$LABEL_RESOLVED_NS" | jq -R -s 'split("\n") | map(select(length > 0)) | unique' 2>/dev/null || echo '[]')
+      PROTECTED_NAMESPACES=$(printf '%s\n%s\n' "$PROTECTED_NAMESPACES" "$LABEL_NS_JSON" | jq -c -s 'add | unique' 2>/dev/null || echo "$PROTECTED_NAMESPACES")
+      debug "matchLabels resolved namespaces: $LABEL_NS_JSON"
+    fi
+  fi
+fi
+
+# Re-validate after the merge
+if ! _ep "$PROTECTED_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
+  PROTECTED_NAMESPACES='[]'
+fi
+
 PROTECTED_NS_COUNT=$(_ep "$PROTECTED_NAMESPACES" | jq 'length // 0')
 [ -z "$PROTECTED_NS_COUNT" ] || [ "$PROTECTED_NS_COUNT" = "null" ] && PROTECTED_NS_COUNT=0
 debug "Protected namespaces list ($PROTECTED_NS_COUNT): $PROTECTED_NAMESPACES"
