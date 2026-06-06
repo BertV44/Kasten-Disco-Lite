@@ -3,8 +3,22 @@ set -eu
 trap '' PIPE 2>/dev/null || true
 
 ##############################################################################
-# Kasten Discovery Lite v1.9.1
+# Kasten Discovery Lite v1.9.2
 # Author: Bertrand CASTAGNET - EMEA TAM
+#
+# Changes in v1.9.2:
+# - #10/#15: RestorePoints and BackupAction/ExportAction/RestoreAction/RunAction
+#   fetched cluster-wide (-A) — policy-driven actions and RPs live in the source
+#   application namespace on K10 8.x, not in the K10 namespace.
+# - #15: large -A action/runaction sets passed to jq via --slurpfile (file-based)
+#   instead of --argjson, to avoid ARG_MAX (Argument list too long) on big clusters.
+# - #16: Prometheus detection scoped to the K10 namespace + K10 chart pod labels.
+# - #11: matchLabels policy selectors resolved to namespaces and merged into the
+#   protected set (removes false-positive unprotected gaps).
+# - #13: KDR 4-state effective-health verdict (read from cached policies).
+# - #17: RBAC pre-flight (kubectl auth can-i) + bundled kdl-rbac.yaml.
+# - #14: multi-secret license parsing (type, daysRemaining, node reconciliation);
+#   breaking JSON schema change for the `license` key.
 #
 # Changes in v1.9.1:
 # - BUGFIX: Locale-sensitive numeric formatting in awk printf calls produced
@@ -186,7 +200,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="1.9.1"
+KDL_VERSION="1.9.2"
 OUTPUT_FILE=""
 SKIP_HELM=false
 

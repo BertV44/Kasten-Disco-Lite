@@ -2,15 +2,19 @@
 set -eu
 
 ##############################################################################
-# KDL JSON -> HTML Report Generator v1.9.1
+# KDL JSON -> HTML Report Generator v1.9.2
 #
 # Usage:
 #   ./kdl-json-to-html.sh input.json output.html
 #
-# Compatible with Kasten Discovery Lite v1.8.1 through v1.9.1 JSON output.
-# Backward compatible: a v1.9.1 generator on v1.8.x JSON simply omits the
-# v1.9 sections (uses `if .field` guards everywhere). A v1.8.3 generator on
-# v1.9.1 JSON ignores the new sections (verified).
+# Compatible with Kasten Discovery Lite v1.8.1 through v1.9.2 JSON output.
+# Backward compatible: a v1.9.2 generator on v1.8.x JSON simply omits the
+# newer sections (uses `if .field` guards everywhere).
+#
+# New in v1.9.2:
+#   - KDR card renders the 4-state verdict (badge) + Last Run / Last Successful Run
+#   - License section: multi-license layout (summary + reconciliation, one card
+#     per license, muted list of unparseable secrets) for the reshaped `license` key
 #
 # New in v1.9.1 (generator alignment with KDL v1.9.x schema):
 #   - Header subtitle: K8s server version + distribution from .cluster

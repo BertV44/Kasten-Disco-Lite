@@ -1,6 +1,6 @@
 # CLAUDE.md — Kasten Discovery Lite (KDL)
 
-> Ground truth for this repo. Reflects the **actual code on `main` (v1.9.1)**, not
+> Ground truth for this repo. Reflects the **actual code on `main` (v1.9.2)**, not
 > the aspirational v2.1 narrative found in some loose tracking docs (see
 > "État réel vs. docs de suivi" at the bottom).
 
@@ -14,7 +14,7 @@
 | Auteur | Bertrand Castagnet — EMEA TAM |
 | Dépôt | `BertV44/Kasten-Disco-Lite` (GitHub) |
 | Branche par défaut | `main` |
-| Version courante | **v1.9.1** |
+| Version courante | **v1.9.2** |
 | Langage | **POSIX `sh` strict** (`#!/bin/sh`, pas de bashisms) |
 
 ## Fichiers
@@ -83,24 +83,26 @@ Color support → Helpers → Temp files → Namespace validation → Platform d
 K8s version/distribution → Multi-cluster → Kasten version → Shared data collection →
 Parallel CRD collection → License / consumption → … → émission texte ou JSON.
 
-## Travail en cours — jalon **V1.9.2** (8 issues ouvertes)
+## Jalon **V1.9.2** — état
 
-| # | Type | Prio | Titre |
-|---|---|---|---|
-| 17 | enhancement | P1 | RBAC pre-flight check + discovery-reader ClusterRole |
-| 15 | bug | P1 | Failed Actions not detected: scope limited to K10 namespace |
-| 10 | bug | P1 | RestorePoints scope limited to single namespace |
-| 13 | enhancement | P2 | KDR detection: extend beyond policy presence |
-| 11 | bug | P2 | Namespace Protection: matchLabels selectors not resolved |
-| 16 | bug | P3 | Prometheus detection: restrict to K10 namespace |
-| 14 | enhancement | P3 | License: extract product type and compute duration |
-| 12 | enhancement | P3 | Resource Limits BP: switch from Warning to Info |
+Délivré via **PR #18** (`dev-1.9.2` → `main`) : #10, #11, #13, #14, #15, #16, #17.
+
+| # | Type | Prio | Titre | Statut |
+|---|---|---|---|---|
+| 17 | enhancement | P1 | RBAC pre-flight check + discovery-reader ClusterRole | ✅ |
+| 15 | bug | P1 | Failed Actions not detected: scope limited to K10 namespace | ✅ |
+| 10 | bug | P1 | RestorePoints scope limited to single namespace | ✅ |
+| 13 | enhancement | P2 | KDR detection: extend beyond policy presence | ✅ |
+| 11 | bug | P2 | Namespace Protection: matchLabels selectors not resolved | ✅ |
+| 16 | bug | P3 | Prometheus detection: restrict to K10 namespace | ✅ |
+| 14 | enhancement | P3 | License: extract product type and compute duration | ✅ |
+| 12 | enhancement | P3 | Resource Limits BP: switch from Warning to Info | ⏳ **non traité** (hors PR #18) |
 
 Consulter une issue : `gh issue view <n>`. Lister : `gh issue list --state open`.
 
 ## Branches
 
-- `main` — v1.9.1 (stable, courante).
+- `main` — **v1.9.2** (après merge de la PR #18).
 - `dev-1.9` — base des correctifs v1.9.x (mergée via PR #9).
 - `dev-2.0` — piste **v2.x** (env vars overridables, détection throttling
   `collectionHealth`, tag `RANSOMWARE`, `kdl-diff.sh`). **Non mergée.** Rattrapage +
