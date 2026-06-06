@@ -294,7 +294,7 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 ### Human Output
 
 1. **Platform & Version** — Kubernetes or OpenShift, Kasten version, **K8s server version & distribution** *(v1.9)*
-2. **License Information** — Customer, validity, node consumption
+2. **License Information** — **Multi-secret aware** *(v1.9.2)*: enumerates every `k10-license*` secret, parses each defensively (unparseable ones are listed, never fatal), and reports per license: customer, **type** (STARTER confirmed; TRIAL/ENTERPRISE are `[unverified]` prefix guesses), product, validity with **days-remaining**, node limit, features. Adds a **node-limit reconciliation** block (sum across secrets vs the Report CR `nodeLimit`, with a mismatch warning) and a node-consumption verdict (current vs effective limit). See "License details" below.
 3. **Health Status** — Pod health, backup/export success rates (based on finished actions)
 4. **Restore Actions History** — Total, completed, failed, running, recent restores
 5. **Failed Actions — Top 5** — Most recent failures with cause-chain error messages *(v1.9)*
@@ -341,6 +341,26 @@ Structured JSON with the following top-level keys:
 
 **v1.9 enrichment in `policyRunStats.lastRuns[]`**:
 new optional `error` field (deepest cause-chain message when `state=Failed`)
+
+**v1.9.2 — `license` key reshaped (breaking change)**:
+The flat license fields (`customer`, `id`, `status`, `dateStart`, `dateEnd`,
+`restrictions`, `consumption`) are **replaced** by a multi-secret structure:
+`license.{status, secretCount, parseableCount, unparseable[], licenses[], nodeLimitAggregate, nodeConsumption, nearestExpiry}`.
+Each entry in `licenses[]` carries `{secret, customer, id, type, product, dateStart, dateEnd, daysRemaining, status, nodes, features}`.
+
+#### License details (v1.9.2)
+
+- **Multi-secret enumeration** — every secret whose name starts with
+  `k10-license` is read. Secrets missing `customerName`/`id` (or with no
+  decodable payload) are reported under `unparseable[]` and never abort the run.
+- **Type derivation** — `STARTER` is confirmed (literal `customerName: starter-license`
+  or an `id` starting `starter-`). `TRIAL`/`ENTERPRISE` are `[unverified]`
+  prefix guesses; anything else is `UNKNOWN`. Field names are matched
+  case-insensitively (payloads vary between `dateStart`/`datestart`).
+- **Node-limit reconciliation** — `nodeLimitAggregate` exposes the sum across
+  secrets (`fromSecrets`) and the Report CR value (`fromReportCR`) and flags a
+  `mismatch` when they disagree (K10 may apply internal caps not visible in the
+  secret payload). The license node limit applies to **total** cluster nodes.
 
 ---
 

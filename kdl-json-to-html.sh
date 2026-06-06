@@ -901,23 +901,42 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + "
 
 <h2>\uD83D\uDCDC License Information</h2>"
-+ (if .license.status == "NOT_FOUND" then
-    "<div class=\"warning-box\">\u26a0 <strong>License not found</strong></div>"
++ (if (.license == null) then
+    "<div class=\"info-box\">License data not available.</div>"
+  elif .license.status == "NOT_FOUND" then
+    "<div class=\"warning-box\">\u26a0 <strong>No license secret detected</strong></div>"
   else
+    # Summary card: secret counts + node-limit reconciliation + consumption
     "<div class=\"card license-card\">
-      <div class=\"stat-row\"><span class=\"stat-label\">Customer</span><span class=\"stat-value\">" + .license.customer + "</span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">License ID</span><span class=\"stat-value\"><code>" + .license.id + "</code></span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\">" + statusBadge(.license.status) + "</span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">Valid Period</span><span class=\"stat-value\">" + .license.dateStart + " \u2192 " + .license.dateEnd + "</span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">Node Limit</span><span class=\"stat-value\">" + 
-        (if .license.restrictions.nodes == "unlimited" or .license.restrictions.nodes == "0" then "<span class=\"badge ok\">\u221E Unlimited</span>" else .license.restrictions.nodes + " nodes" end) + 
-      "</span></div>" +
-      (if .license.consumption then
-        "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + 
-          (.license.consumption.currentNodes | tostring) + " / " + .license.consumption.nodeLimit + " " + badge(.license.consumption.status) +
-        "</span></div>"
-      else "" end) +
-    "</div>"
+      <div class=\"stat-row\"><span class=\"stat-label\">Secrets found</span><span class=\"stat-value\">" + (.license.secretCount | tostring) + " (" + (.license.parseableCount | tostring) + " parseable, " + ((.license.unparseable | length) | tostring) + " unparseable)</span></div>"
+    + (if .license.nodeLimitAggregate then
+        "<div class=\"stat-row\"><span class=\"stat-label\">Node Limit (secrets sum)</span><span class=\"stat-value\">" + (.license.nodeLimitAggregate.fromSecrets | tostring) + (if .license.nodeLimitAggregate.hasUnlimited then " <span class=\"badge ok\">\u221E includes unlimited</span>" else "" end) + "</span></div>"
+        + "<div class=\"stat-row\"><span class=\"stat-label\">Node Limit (Report CR)</span><span class=\"stat-value\">" + ((.license.nodeLimitAggregate.fromReportCR // "n/a") | tostring) + (if .license.nodeLimitAggregate.mismatch then " <span class=\"badge warn\">\u26a0 mismatch</span>" else "" end) + "</span></div>"
+      else "" end)
+    + (if .license.nodeConsumption then
+        "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.limit | tostring) + " " + badge(.license.nodeConsumption.status) + "</span></div>"
+      else "" end)
+    + "</div>"
+    # One card per parseable license
+    + ((.license.licenses // []) | to_entries | map(
+        "<div class=\"card license-card\">
+          <div class=\"stat-row\"><span class=\"stat-label\">License #" + ((.key + 1) | tostring) + "</span><span class=\"stat-value\"><code>" + .value.secret + "</code></span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Customer</span><span class=\"stat-value\">" + .value.customer + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">License ID</span><span class=\"stat-value\"><code>" + .value.id + "</code></span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Type</span><span class=\"stat-value\">" + badge(.value.type) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Product</span><span class=\"stat-value\">" + .value.product + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\">" + badge(.value.status) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Valid Period</span><span class=\"stat-value\">" + (.value.dateStart | sub("T.*"; "")) + " \u2192 " + (.value.dateEnd | sub("T.*"; "")) + (if .value.daysRemaining == null then "" else " (" + (.value.daysRemaining | tostring) + " days remaining)" end) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Node Limit</span><span class=\"stat-value\">" + (if .value.nodes == "unlimited" then "<span class=\"badge ok\">\u221E Unlimited</span>" else (.value.nodes + " nodes") end) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Features</span><span class=\"stat-value\">" + .value.features + "</span></div>
+        </div>"
+      ) | join(""))
+    # Muted list of unparseable secrets
+    + (if ((.license.unparseable // []) | length) > 0 then
+        "<div class=\"card\" style=\"opacity:0.75\"><div class=\"stat-row\"><span class=\"stat-label\">Unparseable secrets</span><span class=\"stat-value\"></span></div>"
+        + (.license.unparseable | map("<div class=\"stat-row\"><span class=\"stat-label\"><code>" + .secret + "</code></span><span class=\"stat-value\">" + .reason + "</span></div>") | join(""))
+        + "</div>"
+      else "" end)
   end)
 + "
 

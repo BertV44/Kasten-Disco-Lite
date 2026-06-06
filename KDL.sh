@@ -607,90 +607,200 @@ wait
 debug "Parallel fetch complete"
 
 ### -------------------------
-### License info
+### License info — multi-secret, type, duration, node reconciliation (#14)
 ### -------------------------
-LICENSE_RAW=$(kubectl -n "$NAMESPACE" get secret k10-license -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null || echo '')
+# Real clusters can carry several k10-license* secrets (renewals, additive
+# licenses, vendor upgrades). Enumerate them all by name prefix (no consistent
+# labeling exists), parse each defensively, and tolerate unparseable ones rather
+# than aborting. Field names are matched case-insensitively: observed payloads
+# vary between camelCase (dateStart/dateEnd/customerName) and lowercase
+# (datestart/dateend) depending on the issuing tooling.
+progress "license"
 
-if [ -n "$LICENSE_RAW" ]; then
-  # License is YAML format, use awk to extract values
-  LICENSE_CUSTOMER=$(_ep "$LICENSE_RAW" | awk -F': ' '/^customerName:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_START=$(_ep "$LICENSE_RAW" | awk -F': ' '/^dateStart:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_END=$(_ep "$LICENSE_RAW" | awk -F': ' '/^dateEnd:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_NODES=$(_ep "$LICENSE_RAW" | awk -F': ' '/^[[:space:]]*nodes:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_ID=$(_ep "$LICENSE_RAW" | awk -F': ' '/^id:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  
-  # Set defaults if empty
-  [ -z "$LICENSE_CUSTOMER" ] && LICENSE_CUSTOMER="N/A"
-  [ -z "$LICENSE_START" ] && LICENSE_START="N/A"
-  [ -z "$LICENSE_END" ] && LICENSE_END="N/A"
-  [ -z "$LICENSE_NODES" ] && LICENSE_NODES="unlimited"
-  [ -z "$LICENSE_ID" ] && LICENSE_ID="N/A"
-  
-  # Check if license is valid
-  if [ "$LICENSE_END" != "N/A" ] && [ "$LICENSE_END" != "null" ]; then
-    LICENSE_END_DATE=$(_ep "$LICENSE_END" | cut -d'T' -f1)
-    CURRENT_DATE=$(date +%Y-%m-%d)
-    if [ "$LICENSE_END_DATE" \< "$CURRENT_DATE" ]; then
-      LICENSE_STATUS="EXPIRED"
-    else
-      LICENSE_STATUS="VALID"
-    fi
-  else
-    LICENSE_STATUS="UNKNOWN"
+# Extract a top-level scalar field, case-insensitive on the key, quotes stripped.
+_lic_field() { # $1 = raw payload, $2 = lowercased field name
+  printf '%s' "$1" | awk -F': ' -v f="$2" '
+    tolower($1) == f { v = $2; gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/["'\'']/, "", v); print v; exit }'
+}
+
+LICENSE_SECRET_NAMES=$(kubectl -n "$NAMESPACE" get secrets -o json 2>/dev/null \
+  | jq -r '[.items[]? | select(.metadata.name | startswith("k10-license")) | .metadata.name] | .[]' 2>/dev/null || echo "")
+LICENSE_SECRET_COUNT=$(printf '%s\n' "$LICENSE_SECRET_NAMES" | awk 'NF{c++} END{print c+0}')
+
+LICENSES_PARSED='[]'
+LICENSES_UNPARSEABLE='[]'
+
+for _lic_name in $LICENSE_SECRET_NAMES; do
+  RAW=$(kubectl -n "$NAMESPACE" get secret "$_lic_name" -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null)
+
+  if [ -z "$RAW" ]; then
+    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "no .data.license field" '. + [{secret: $s, reason: $r}]')
+    continue
   fi
-else
-  LICENSE_CUSTOMER="N/A"
-  LICENSE_START="N/A"
-  LICENSE_END="N/A"
-  LICENSE_NODES="N/A"
-  LICENSE_ID="N/A"
-  LICENSE_STATUS="NOT_FOUND"
-fi
 
-debug "License: $LICENSE_CUSTOMER (Status: $LICENSE_STATUS)"
-debug "License status: $LICENSE_STATUS"
+  CUSTOMER=$(_lic_field "$RAW" "customername")
+  ID=$(_lic_field "$RAW" "id")
+
+  # Minimum viable license signature; otherwise record and move on.
+  if [ -z "$CUSTOMER" ] || [ -z "$ID" ]; then
+    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "missing customerName or id" '. + [{secret: $s, reason: $r}]')
+    continue
+  fi
+
+  PRODUCT=$(_lic_field "$RAW" "product")
+  START_DATE=$(_lic_field "$RAW" "datestart")
+  END_DATE=$(_lic_field "$RAW" "dateend")
+  # restrictions.nodes is nested (indented); match the indented key only.
+  NODES=$(printf '%s' "$RAW" | awk -F': ' '/^[[:space:]]+nodes:/ {v=$2; gsub(/^[ \t]+|[ \t]+$/,"",v); gsub(/["'\'']/,"",v); print v; exit}')
+  FEATURES_RAW=$(printf '%s' "$RAW" | awk -F': ' 'tolower($1)=="features" {print $2; exit}')
+
+  [ -z "$PRODUCT" ] && PRODUCT="N/A"
+  [ -z "$START_DATE" ] && START_DATE="N/A"
+  [ -z "$END_DATE" ] && END_DATE="N/A"
+  [ -z "$NODES" ] && NODES="unlimited"
+
+  # Type derivation. Only "starter" is confirmed against a real payload; other
+  # prefixes are [unverified] and default to UNKNOWN rather than guessing.
+  if [ "$CUSTOMER" = "starter-license" ] || printf '%s' "$ID" | grep -q '^starter-'; then
+    TYPE="STARTER"
+  elif printf '%s' "$ID" | grep -q '^trial-'; then
+    TYPE="TRIAL"        # [unverified] prefix — confirm against a real trial dump
+  elif printf '%s' "$ID" | grep -q '^enterprise-'; then
+    TYPE="ENTERPRISE"   # [unverified] prefix — confirm against a real commercial dump
+  else
+    TYPE="UNKNOWN"
+  fi
+
+  # Features: null -> "-"; otherwise pass through trimmed (further parsing TBD
+  # once a non-null sample exists).
+  if [ -z "$FEATURES_RAW" ] || [ "$(printf '%s' "$FEATURES_RAW" | tr -d '[:space:]')" = "null" ]; then
+    FEATURES="-"
+  else
+    FEATURES=$(printf '%s' "$FEATURES_RAW" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  fi
+
+  LICENSES_PARSED=$(_ep "$LICENSES_PARSED" | jq -c \
+    --arg s "$_lic_name" --arg c "$CUSTOMER" --arg i "$ID" --arg p "$PRODUCT" \
+    --arg sd "$START_DATE" --arg ed "$END_DATE" --arg n "$NODES" \
+    --arg f "$FEATURES" --arg t "$TYPE" \
+    '. + [{secret: $s, customer: $c, id: $i, type: $t, product: $p,
+           dateStart: $sd, dateEnd: $ed, nodes: $n, features: $f}]')
+done
+
+# Enrich each license with daysRemaining + per-license status, computed
+# cluster-side via jq now/fromdateiso8601 (portable; tolerates the ".000Z"
+# fractional-seconds suffix that fromdateiso8601 cannot parse directly).
+LICENSES_PARSED=$(_ep "$LICENSES_PARSED" | jq -c '
+  [ .[] | . + (
+      (.dateEnd // "N/A") as $ed
+      | if ($ed == "N/A" or $ed == "null" or $ed == "") then {daysRemaining: null, status: "UNKNOWN"}
+        else
+          (((($ed | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) - now) / 86400) | floor) as $d
+          | {daysRemaining: $d, status: (if $d < 0 then "EXPIRED" else "VALID" end)}
+        end
+    ) ]
+' 2>/dev/null || echo "$LICENSES_PARSED")
+
+LICENSES_COUNT=$(_ep "$LICENSES_PARSED" | jq 'length // 0')
+
+# Nearest upcoming expiry across all parseable licenses (quick-read top level).
+NEAREST_EXPIRY=$(_ep "$LICENSES_PARSED" | jq -c '
+  [ .[] | select(.daysRemaining != null) ] | sort_by(.daysRemaining) | first
+  | if . == null then null else {secret: .secret, dateEnd: .dateEnd, daysRemaining: .daysRemaining} end
+' 2>/dev/null || echo 'null')
 
 ### -------------------------
-### License Consumption (NEW v1.6)
+### License node reconciliation + consumption (#14)
 ### -------------------------
-# Get node count - prefer from Report CR if available, fallback to kubectl
-CLUSTER_NODE_COUNT=0
-LICENSE_NODES_FROM_REPORT=""
+# Sum of node limits across all parseable licenses (treat "unlimited" as 0 here;
+# the hasUnlimited flag carries the real meaning).
+SECRETS_NODE_TOTAL=$(_ep "$LICENSES_PARSED" | jq '[.[] | (.nodes | if . == "unlimited" then 0 else (tonumber? // 0) end)] | add // 0')
+HAS_UNLIMITED=$(_ep "$LICENSES_PARSED" | jq 'any(.nodes == "unlimited") // false')
 
-# Try to get from most recent Report (most accurate)
+# Authoritative node count + limit from the most recent Report CR (if present).
 REPORT_LICENSE=$(kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null | jq '
-  [.items[] | select(.results.licensing != null)] |
-  sort_by(.metadata.creationTimestamp) |
-  last |
-  .results.licensing // {}
+  [.items[] | select(.results.licensing != null)] | sort_by(.metadata.creationTimestamp) | last | .results.licensing // {}
 ' 2>/dev/null || echo '{}')
+REPORT_NODE_LIMIT=$(_ep "$REPORT_LICENSE" | jq -r '.nodeLimit // empty')
+REPORT_NODE_COUNT=$(_ep "$REPORT_LICENSE" | jq '.nodeCount // 0')
 
-if _ep "$REPORT_LICENSE" | jq -e '.nodeCount' >/dev/null 2>&1; then
-  CLUSTER_NODE_COUNT=$(_ep "$REPORT_LICENSE" | jq '.nodeCount // 0')
-  LICENSE_NODES_FROM_REPORT=$(_ep "$REPORT_LICENSE" | jq -r '.nodeLimit // empty')
-  [ -n "$LICENSE_NODES_FROM_REPORT" ] && [ "$LICENSE_NODES_FROM_REPORT" != "null" ] && LICENSE_NODES="$LICENSE_NODES_FROM_REPORT"
-fi
-
-# Fallback to kubectl if Report didn't have the data
-if [ "$CLUSTER_NODE_COUNT" -eq 0 ] 2>/dev/null; then
+# Current cluster node count: Report CR value, else live kubectl count.
+if [ "${REPORT_NODE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  CLUSTER_NODE_COUNT="$REPORT_NODE_COUNT"
+else
   CLUSTER_NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 fi
 [ -z "$CLUSTER_NODE_COUNT" ] && CLUSTER_NODE_COUNT=0
 
-# Determine if over limit
-if [ "$LICENSE_NODES" = "unlimited" ] || [ "$LICENSE_NODES" = "0" ] || [ "$LICENSE_NODES" = "N/A" ]; then
-  LICENSE_CONSUMPTION_STATUS="OK"
-  LICENSE_NODES_LIMIT="unlimited"
-else
-  LICENSE_NODES_LIMIT="$LICENSE_NODES"
-  if [ "$CLUSTER_NODE_COUNT" -gt "$LICENSE_NODES" ] 2>/dev/null; then
-    LICENSE_CONSUMPTION_STATUS="EXCEEDED"
-  else
-    LICENSE_CONSUMPTION_STATUS="OK"
-  fi
+# Reconciliation: do the secret sum and the Report CR limit agree?
+NODE_LIMIT_MISMATCH="false"
+if [ -n "$REPORT_NODE_LIMIT" ] && [ "$REPORT_NODE_LIMIT" != "null" ] && [ "$HAS_UNLIMITED" = "false" ]; then
+  [ "$REPORT_NODE_LIMIT" != "$SECRETS_NODE_TOTAL" ] && NODE_LIMIT_MISMATCH="true"
 fi
 
-debug "License consumption: $CLUSTER_NODE_COUNT nodes / $LICENSE_NODES_LIMIT (Status: $LICENSE_CONSUMPTION_STATUS)"
+# Effective limit for the consumption check: Report CR if present, else the
+# secret sum. K10 applies the limit to TOTAL nodes (taints/schedulability do not
+# reduce the count).
+if [ "$HAS_UNLIMITED" = "true" ]; then
+  EFFECTIVE_LIMIT="unlimited"
+elif [ -n "$REPORT_NODE_LIMIT" ] && [ "$REPORT_NODE_LIMIT" != "null" ]; then
+  EFFECTIVE_LIMIT="$REPORT_NODE_LIMIT"
+elif [ "${LICENSES_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  EFFECTIVE_LIMIT="$SECRETS_NODE_TOTAL"
+else
+  EFFECTIVE_LIMIT="unlimited"
+fi
+
+CONSUMPTION_STATUS="OK"
+if [ "$EFFECTIVE_LIMIT" != "unlimited" ] && [ "$EFFECTIVE_LIMIT" != "0" ]; then
+  [ "$CLUSTER_NODE_COUNT" -gt "$EFFECTIVE_LIMIT" ] 2>/dev/null && CONSUMPTION_STATUS="EXCEEDED"
+fi
+
+# Overall license status (drives the text section + best-practices).
+if [ "${LICENSE_SECRET_COUNT:-0}" -eq 0 ] && [ "${LICENSES_COUNT:-0}" -eq 0 ]; then
+  LICENSE_STATUS="NOT_FOUND"
+elif [ "${LICENSES_COUNT:-0}" -eq 0 ]; then
+  LICENSE_STATUS="UNPARSEABLE"
+else
+  LICENSE_STATUS="PRESENT"
+fi
+
+# Single structured object — the source of truth for JSON + text + HTML.
+LICENSE_JSON=$(jq -cn \
+  --arg overall "$LICENSE_STATUS" \
+  --argjson secretCount "${LICENSE_SECRET_COUNT:-0}" \
+  --argjson parseableCount "${LICENSES_COUNT:-0}" \
+  --argjson unparseable "$LICENSES_UNPARSEABLE" \
+  --argjson licenses "$LICENSES_PARSED" \
+  --argjson fromSecrets "${SECRETS_NODE_TOTAL:-0}" \
+  --arg fromReportCR "${REPORT_NODE_LIMIT:-}" \
+  --argjson mismatch "${NODE_LIMIT_MISMATCH:-false}" \
+  --argjson hasUnlimited "${HAS_UNLIMITED:-false}" \
+  --argjson current "${CLUSTER_NODE_COUNT:-0}" \
+  --arg limit "$EFFECTIVE_LIMIT" \
+  --arg consStatus "$CONSUMPTION_STATUS" \
+  --argjson nearestExpiry "$NEAREST_EXPIRY" \
+  '{
+    status: $overall,
+    secretCount: $secretCount,
+    parseableCount: $parseableCount,
+    unparseable: $unparseable,
+    licenses: $licenses,
+    nodeLimitAggregate: {
+      fromSecrets: $fromSecrets,
+      fromReportCR: (if $fromReportCR == "" then null else ($fromReportCR | tonumber? // $fromReportCR) end),
+      mismatch: $mismatch,
+      hasUnlimited: $hasUnlimited
+    },
+    nodeConsumption: {
+      current: $current,
+      limit: ($limit | tonumber? // $limit),
+      status: $consStatus
+    },
+    nearestExpiry: $nearestExpiry
+  }' 2>/dev/null || echo '{"status":"ERROR","secretCount":0,"parseableCount":0,"unparseable":[],"licenses":[]}')
+
+debug "License: secrets=$LICENSE_SECRET_COUNT parseable=$LICENSES_COUNT status=$LICENSE_STATUS consumption=$CLUSTER_NODE_COUNT/$EFFECTIVE_LIMIT ($CONSUMPTION_STATUS) mismatch=$NODE_LIMIT_MISMATCH"
 
 ### -------------------------
 ### Profiles
@@ -2762,15 +2872,7 @@ if [ "$MODE" = "json" ]; then
     --arg exportDataSource "$EXPORT_DATA_SOURCE" \
     --arg dedupRatio "$DEDUP_RATIO" \
     --arg dedupDisplay "$DEDUP_DISPLAY" \
-    --arg licenseCustomer "$LICENSE_CUSTOMER" \
-    --arg licenseStart "$LICENSE_START" \
-    --arg licenseEnd "$LICENSE_END" \
-    --arg licenseNodes "$LICENSE_NODES" \
-    --arg licenseId "$LICENSE_ID" \
-    --arg licenseStatus "$LICENSE_STATUS" \
-    --argjson clusterNodeCount "$CLUSTER_NODE_COUNT" \
-    --arg licenseNodesLimit "$LICENSE_NODES_LIMIT" \
-    --arg licenseConsumptionStatus "$LICENSE_CONSUMPTION_STATUS" \
+    --argjson licenseBlock "$LICENSE_JSON" \
     --argjson kdrEnabled "$KDR_ENABLED" \
     --arg kdrStatus "$KDR_STATUS" \
     --arg kdrMode "$KDR_MODE" \
@@ -2945,21 +3047,7 @@ if [ "$MODE" = "json" ]; then
       platform: $platform,
       kastenVersion: $version,
 
-      license: {
-        customer: $licenseCustomer,
-        id: $licenseId,
-        status: $licenseStatus,
-        dateStart: $licenseStart,
-        dateEnd: $licenseEnd,
-        restrictions: {
-          nodes: $licenseNodes
-        },
-        consumption: {
-          currentNodes: $clusterNodeCount,
-          nodeLimit: $licenseNodesLimit,
-          status: $licenseConsumptionStatus
-        }
-      },
+      license: $licenseBlock,
 
       health: {
         pods: {
@@ -3396,26 +3484,47 @@ fi
 ### License
 printf "\n${COLOR_BOLD}[LICENSE] License Information${COLOR_RESET}\n"
 if [ "$LICENSE_STATUS" = "NOT_FOUND" ]; then
-  printf "  ${COLOR_YELLOW}[WARN]  No license detected${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]  No license secret detected${COLOR_RESET}\n"
 else
-  printf "  Customer:    $LICENSE_CUSTOMER\n"
-  printf "  License ID:  $LICENSE_ID\n"
-  if [ "$LICENSE_STATUS" = "VALID" ]; then
-    printf "  Status:      ${COLOR_GREEN}[OK] VALID${COLOR_RESET}\n"
-  elif [ "$LICENSE_STATUS" = "EXPIRED" ]; then
-    printf "  Status:      ${COLOR_RED}[FAIL] EXPIRED${COLOR_RESET}\n"
-  else
-    printf "  Status:      ${COLOR_YELLOW}[WARN]  UNKNOWN${COLOR_RESET}\n"
+  _lic_parseable=$(_ep "$LICENSE_JSON" | jq -r '.parseableCount // 0')
+  _lic_unparseable=$(_ep "$LICENSE_JSON" | jq -r '(.unparseable | length) // 0')
+  printf "  Secrets found:    %s (%s parseable, %s unparseable)\n" \
+    "$(_ep "$LICENSE_JSON" | jq -r '.secretCount // 0')" "$_lic_parseable" "$_lic_unparseable"
+  if [ "${_lic_unparseable:-0}" -gt 0 ] 2>/dev/null; then
+    _ep "$LICENSE_JSON" | jq -r '.unparseable[]? | "  Unparseable:      \(.secret) (\(.reason))"'
   fi
-  printf "  Valid From:  $LICENSE_START\n"
-  printf "  Valid Until: $LICENSE_END\n"
-  # License consumption (NEW v1.6)
-  if [ "$LICENSE_NODES_LIMIT" = "unlimited" ]; then
-    printf "  Node Usage:  ${COLOR_GREEN}$CLUSTER_NODE_COUNT${COLOR_RESET} / unlimited\n"
-  elif [ "$LICENSE_CONSUMPTION_STATUS" = "EXCEEDED" ]; then
-    printf "  Node Usage:  ${COLOR_RED}$CLUSTER_NODE_COUNT / $LICENSE_NODES_LIMIT (EXCEEDED!)${COLOR_RESET}\n"
+
+  # Per-license detail
+  _ep "$LICENSE_JSON" | jq -r '
+    .licenses | to_entries[] | .key as $i | .value as $l |
+    "\n  License #\($i + 1): \($l.secret)"
+    + "\n    Customer:       \($l.customer)"
+    + "\n    License ID:     \($l.id)"
+    + "\n    Type:           \($l.type)"
+    + "\n    Product:        \($l.product)"
+    + "\n    Valid:          \($l.dateStart | sub("T.*"; "")) -> \($l.dateEnd | sub("T.*"; ""))"
+      + (if $l.daysRemaining == null then "" else " (\($l.daysRemaining) days remaining)" end)
+    + "\n    Status:         \($l.status)"
+    + "\n    Node Limit:     \($l.nodes)"
+    + "\n    Features:       \($l.features)"
+  '
+
+  # Node limit reconciliation
+  printf "\n  Node Limit Reconciliation:\n"
+  printf "    From secrets:   %s (sum across %s license(s))\n" \
+    "$(_ep "$LICENSE_JSON" | jq -r '.nodeLimitAggregate.fromSecrets')" "$_lic_parseable"
+  printf "    From Report CR: %s\n" "$(_ep "$LICENSE_JSON" | jq -r '.nodeLimitAggregate.fromReportCR // "n/a"')"
+  if [ "$(_ep "$LICENSE_JSON" | jq -r '.nodeLimitAggregate.mismatch')" = "true" ]; then
+    printf "    ${COLOR_YELLOW}[WARN]          Mismatch detected — K10 may apply internal caps or license\n                    logic not visible from the secret payload${COLOR_RESET}\n"
+  fi
+
+  # Node consumption
+  _cons_cur=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.current')
+  _cons_lim=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.limit')
+  if [ "$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.status')" = "EXCEEDED" ]; then
+    printf "\n  Node Consumption: ${COLOR_RED}[FAIL] %s / %s (EXCEEDED)${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
   else
-    printf "  Node Usage:  ${COLOR_GREEN}$CLUSTER_NODE_COUNT / $LICENSE_NODES_LIMIT${COLOR_RESET}\n"
+    printf "\n  Node Consumption: ${COLOR_GREEN}[OK] %s / %s${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
   fi
 fi
 
