@@ -371,6 +371,28 @@ new optional `error` field (deepest cause-chain message when `state=Failed`)
 
 The script is **read-only** and requires the following minimal permissions:
 
+### Quick start: bundled manifest
+
+A ready-to-apply, least-privilege manifest ships with the repo:
+[`kdl-rbac.yaml`](kdl-rbac.yaml). It defines a `kasten-discovery-reader`
+ClusterRole (cluster-wide reads, **no Secrets**) plus a namespaced Role for the
+sensitive reads (Secrets/ConfigMaps in the K10 namespace only), with binding
+templates. Edit the binding subjects to point at your principal, then:
+
+```sh
+kubectl apply -f kdl-rbac.yaml
+```
+
+### Pre-flight check
+
+On startup KDL runs `kubectl auth can-i` for its key cluster-scoped reads
+(`namespaces`, `persistentvolumeclaims -A`, `nodes`, `storageclasses`,
+`volumesnapshotclasses`). If any are denied it prints a single actionable
+warning to **stderr** (so `--json` output on stdout stays clean) listing exactly
+what is missing and pointing at `kdl-rbac.yaml`. KDL still runs and reports what
+it can — denied reads surface as empty/degraded sections rather than silent
+failures.
+
 ### Namespace-scoped (Kasten namespace)
 
 ```yaml
