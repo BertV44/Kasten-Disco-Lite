@@ -853,7 +853,11 @@ debug "Reports policy: exists=$REPORTS_POLICY_EXISTS state=$REPORTS_POLICY_LAST_
 ### -------------------------
 ### Disaster Recovery (KDR)
 ### -------------------------
-KDR_POLICY_JSON=$(kubectl -n "$NAMESPACE" get policy k10-disaster-recovery-policy -o json 2>/dev/null || echo '{}')
+# Read the KDR policy from the already-fetched POLICIES_JSON instead of an extra
+# `kubectl get policy` call (#13). The shortname k10-disaster-recovery-policy is
+# the canonical KDR policy name.
+KDR_POLICY_JSON=$(_ep "$POLICIES_JSON" | jq -c 'first(.items[]? | select(.metadata.name == "k10-disaster-recovery-policy")) // {}' 2>/dev/null || echo '{}')
+[ -z "$KDR_POLICY_JSON" ] && KDR_POLICY_JSON='{}'
 if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
   KDR_ENABLED=true
   KDR_FREQUENCY=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "N/A"')
@@ -938,6 +942,78 @@ if ! _ep "$POLICY_LAST_RUN" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 debug "Policy last run info collected (enriched with error messages)"
+
+### -------------------------
+### KDR effective-health verdict (#13)
+### -------------------------
+# Policy presence alone does not mean DR actually protects anything. Derive a
+# 4-state verdict from config completeness + the last KDR RunAction, instead of
+# the bare KDR_ENABLED boolean (kept above for backward compat).
+#   ENABLED                 configured, last run Complete, success not stale
+#   CONFIGURED_NOT_HEALTHY  configured but last run Failed / never succeeded / stale
+#   CONFIGURED_INCOMPLETE   policy present but config cannot protect data
+#   NOT_ENABLED             no KDR policy
+if [ "$KDR_ENABLED" = true ]; then
+  # Config completeness: a mode that exports data needs an export profile; a
+  # "No Snapshot" mode protects nothing.
+  KDR_CONFIG_COMPLETE=true
+  case "$KDR_MODE" in
+    "Quick DR (Exported Catalog)"|"Legacy DR")
+      case "$KDR_PROFILE" in ""|"N/A"|"N/A "*) KDR_CONFIG_COMPLETE=false ;; esac
+      ;;
+    "Quick DR (No Snapshot)")
+      KDR_CONFIG_COMPLETE=false
+      ;;
+  esac
+
+  # Last KDR RunAction (RunAction.spec.subject.name == policy name), and last
+  # successful run; staleness measured cluster-side via jq `now` (portable).
+  KDR_RUN_FACTS=$(_ep "$RUNACTIONS_JSON" | jq -c \
+    --arg pol "k10-disaster-recovery-policy" \
+    --argjson thr "$STALE_DAYS_THRESHOLD" '
+    ([.items[]? | select(.spec.subject.name == $pol)]) as $r |
+    ($r | sort_by(.metadata.creationTimestamp) | last) as $last |
+    ($r | map(select((.status.state // "") == "Complete"))
+       | sort_by(.metadata.creationTimestamp) | last) as $ok |
+    {
+      lastState: (if $last then ($last.status.state // "Unknown") else "None" end),
+      hasSuccess: ($ok != null),
+      lastSuccessTs: (if $ok then ($ok.metadata.creationTimestamp // "") else "" end),
+      successStale: (
+        if ($ok != null) and ($ok.metadata.creationTimestamp != null)
+        then ((now - ($ok.metadata.creationTimestamp | fromdateiso8601)) > ($thr * 86400))
+        else true end
+      )
+    }
+  ' 2>/dev/null || echo '{}')
+  [ -z "$KDR_RUN_FACTS" ] && KDR_RUN_FACTS='{}'
+
+  KDR_LAST_RUN_STATE=$(_ep "$KDR_RUN_FACTS" | jq -r '.lastState // "None"')
+  KDR_HAS_SUCCESS=$(_ep "$KDR_RUN_FACTS" | jq -r '.hasSuccess // false')
+  KDR_SUCCESS_STALE=$(_ep "$KDR_RUN_FACTS" | jq -r '.successStale // true')
+  KDR_LAST_SUCCESS_TS=$(_ep "$KDR_RUN_FACTS" | jq -r '.lastSuccessTs // ""')
+
+  if [ "$KDR_CONFIG_COMPLETE" != true ]; then
+    KDR_STATUS="CONFIGURED_INCOMPLETE"
+  elif [ "$KDR_LAST_RUN_STATE" = "Failed" ]; then
+    KDR_STATUS="CONFIGURED_NOT_HEALTHY"
+  elif [ "$KDR_HAS_SUCCESS" != "true" ]; then
+    KDR_STATUS="CONFIGURED_NOT_HEALTHY"
+  elif [ "$KDR_SUCCESS_STALE" = "true" ]; then
+    KDR_STATUS="CONFIGURED_NOT_HEALTHY"
+  else
+    KDR_STATUS="ENABLED"
+  fi
+else
+  KDR_STATUS="NOT_ENABLED"
+  KDR_CONFIG_COMPLETE="false"
+  KDR_LAST_RUN_STATE="None"
+  KDR_HAS_SUCCESS="false"
+  KDR_SUCCESS_STALE="true"
+  KDR_LAST_SUCCESS_TS=""
+fi
+
+debug "KDR status: $KDR_STATUS (config_complete=$KDR_CONFIG_COMPLETE lastRun=$KDR_LAST_RUN_STATE hasSuccess=$KDR_HAS_SUCCESS successStale=$KDR_SUCCESS_STALE)"
 
 ### -------------------------
 ### Average Policy Run Duration (NEW v1.5)
@@ -2401,8 +2477,9 @@ debug "Non-default settings: $NON_DEFAULT_COUNT ($NON_DEFAULT_ITEMS)"
 ### -------------------------
 ### Best Practices Assessment
 ### -------------------------
-# DR Assessment
-if [ "$KDR_ENABLED" = true ]; then
+# DR Assessment — pass only when KDR is effectively healthy (#13), not merely
+# when the policy CR exists. Broken/incomplete/stale KDR no longer passes.
+if [ "$KDR_STATUS" = "ENABLED" ]; then
   BP_DR_STATUS="ENABLED"
 else
   BP_DR_STATUS="NOT_ENABLED"
@@ -2667,11 +2744,14 @@ if [ "$MODE" = "json" ]; then
     --arg licenseNodesLimit "$LICENSE_NODES_LIMIT" \
     --arg licenseConsumptionStatus "$LICENSE_CONSUMPTION_STATUS" \
     --argjson kdrEnabled "$KDR_ENABLED" \
+    --arg kdrStatus "$KDR_STATUS" \
     --arg kdrMode "$KDR_MODE" \
     --arg kdrFrequency "$KDR_FREQUENCY" \
     --arg kdrProfile "$KDR_PROFILE" \
     --arg kdrLocalSnapshot "$KDR_LOCAL_SNAPSHOT" \
     --arg kdrExportCatalog "$KDR_EXPORT_CATALOG" \
+    --arg kdrLastRunState "$KDR_LAST_RUN_STATE" \
+    --arg kdrLastSuccessfulRun "$KDR_LAST_SUCCESS_TS" \
     --argjson presetCount "$PRESET_COUNT" \
     --argjson presets "$(_ep "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})')" \
     --argjson blueprintCount "$BLUEPRINT_COUNT" \
@@ -2896,11 +2976,14 @@ if [ "$MODE" = "json" ]; then
 
       disasterRecovery: {
         enabled: $kdrEnabled,
+        status: $kdrStatus,
         mode: $kdrMode,
         frequency: $kdrFrequency,
         profile: $kdrProfile,
         localCatalogSnapshot: ($kdrLocalSnapshot == "true"),
-        exportCatalogSnapshot: ($kdrExportCatalog == "true")
+        exportCatalogSnapshot: ($kdrExportCatalog == "true"),
+        lastRunState: $kdrLastRunState,
+        lastSuccessfulRun: (if $kdrLastSuccessfulRun == "" then null else $kdrLastSuccessfulRun end)
       },
 
       policyPresets: {
@@ -3412,10 +3495,24 @@ fi
 ### Disaster Recovery
 printf "\n${COLOR_BOLD}[SHIELD] Disaster Recovery (KDR)${COLOR_RESET}\n"
 if [ "$KDR_ENABLED" = true ]; then
-  printf "  Status:    ${COLOR_GREEN}[OK] ENABLED${COLOR_RESET}\n"
+  case "$KDR_STATUS" in
+    ENABLED)
+      printf "  Status:    ${COLOR_GREEN}[OK] ENABLED${COLOR_RESET}\n" ;;
+    CONFIGURED_NOT_HEALTHY)
+      printf "  Status:    ${COLOR_RED}[WARN] CONFIGURED_NOT_HEALTHY${COLOR_RESET} ${COLOR_CYAN}(last run: %s)${COLOR_RESET}\n" "$KDR_LAST_RUN_STATE" ;;
+    CONFIGURED_INCOMPLETE)
+      printf "  Status:    ${COLOR_YELLOW}[WARN] CONFIGURED_INCOMPLETE${COLOR_RESET} ${COLOR_CYAN}(config cannot protect data)${COLOR_RESET}\n" ;;
+    *)
+      printf "  Status:    ${COLOR_YELLOW}[WARN] %s${COLOR_RESET}\n" "$KDR_STATUS" ;;
+  esac
   printf "  Mode:      $KDR_MODE\n"
   printf "  Frequency: $KDR_FREQUENCY\n"
   printf "  Profile:   $KDR_PROFILE\n"
+  if [ -n "$KDR_LAST_SUCCESS_TS" ]; then
+    printf "  Last OK:   $KDR_LAST_SUCCESS_TS\n"
+  else
+    printf "  Last OK:   ${COLOR_YELLOW}none${COLOR_RESET}\n"
+  fi
 else
   printf "  ${COLOR_RED}[FAIL] NOT CONFIGURED${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}[WARN]  This is critical for Kasten platform resilience${COLOR_RESET}\n"
@@ -4062,6 +4159,8 @@ printf "\n${COLOR_BOLD}[LIST] Best Practices Compliance${COLOR_RESET}\n"
 # Disaster Recovery
 if [ "$BP_DR_STATUS" = "ENABLED" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($KDR_MODE)\n"
+elif [ "$KDR_ENABLED" = true ]; then
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Disaster Recovery:    ${COLOR_YELLOW}%s${COLOR_RESET} ($KDR_MODE)\n" "$KDR_STATUS"
 else
   printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Disaster Recovery:    ${COLOR_RED}NOT ENABLED${COLOR_RESET}\n"
 fi
