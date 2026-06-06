@@ -293,28 +293,52 @@ add_section_json "ransomwareReadiness" "$RANSOM_JSON"
 ### Licence
 ### -------------------------
 print_section "Licence"
+# v1.9.2 license schema: multi-secret. Diff per-license by stable id rather
+# than by array index, plus the overall presence + node-consumption verdicts.
 B_LIC_STATUS=$(get_baseline '.license.status')
 C_LIC_STATUS=$(get_current '.license.status')
-B_LIC_END=$(get_baseline '.license.dateEnd')
-C_LIC_END=$(get_current '.license.dateEnd')
-B_LIC_NODES_CUR=$(get_baseline '.license.consumption.currentNodes')
-C_LIC_NODES_CUR=$(get_current '.license.consumption.currentNodes')
-B_LIC_CONS=$(get_baseline '.license.consumption.status')
-C_LIC_CONS=$(get_current '.license.consumption.status')
+B_LIC_CONS=$(get_baseline '.license.nodeConsumption.status')
+C_LIC_CONS=$(get_current '.license.nodeConsumption.status')
+C_LIC_NODES_CUR=$(get_current '.license.nodeConsumption.current')
+C_LIC_END=$(get_current '.license.nearestExpiry.dateEnd')
+
+B_LIC_IDS=$(get_baseline_json '[.license.licenses[]?.id]')
+C_LIC_IDS=$(get_current_json '[.license.licenses[]?.id]')
+ADDED_LICS=$(set_diff "$C_LIC_IDS" "$B_LIC_IDS")
+REMOVED_LICS=$(set_diff "$B_LIC_IDS" "$C_LIC_IDS")
+
+# Per-license status transitions for ids present in both snapshots.
+LIC_TRANSITIONS=$(jq -c -n \
+  --argjson b "$(get_baseline_json '.license.licenses')" \
+  --argjson c "$(get_current_json '.license.licenses')" '
+  ($b // []) as $bl | ($c // []) as $cl |
+  [ $cl[]? | . as $ci | ($bl[]? | select(.id == $ci.id)) as $bi
+    | select($bi != null and $bi.status != $ci.status)
+    | {id: $ci.id, from: $bi.status, to: $ci.status} ]
+' 2>/dev/null || echo '[]')
 
 LIC_CHANGED=false
 if [ "$B_LIC_STATUS" != "$C_LIC_STATUS" ]; then
-  if [ "$C_LIC_STATUS" = "EXPIRED" ]; then
-    print_change "[REGRESSION]" "$COLOR_RED" "License status: ${B_LIC_STATUS} → ${C_LIC_STATUS}"
-    mark_regression
-  elif [ "$B_LIC_STATUS" = "EXPIRED" ] && [ "$C_LIC_STATUS" = "VALID" ]; then
-    print_change "[IMPROVED]" "$COLOR_GREEN" "License renewed: ${B_LIC_STATUS} → ${C_LIC_STATUS}"
-    mark_improvement
-  else
-    print_change "[CHANGE]" "$COLOR_YELLOW" "License status: ${B_LIC_STATUS} → ${C_LIC_STATUS}"
-    mark_neutral
-  fi
-  LIC_CHANGED=true
+  print_change "[CHANGE]" "$COLOR_YELLOW" "License presence: ${B_LIC_STATUS} → ${C_LIC_STATUS}"
+  mark_neutral; LIC_CHANGED=true
+fi
+if [ "$ADDED_LICS" != "[]" ]; then
+  print_change "[CHANGE]" "$COLOR_YELLOW" "License(s) added: $(printf '%s' "$ADDED_LICS" | jq -r 'join(", ")')"
+  mark_neutral; LIC_CHANGED=true
+fi
+if [ "$REMOVED_LICS" != "[]" ]; then
+  print_change "[REGRESSION]" "$COLOR_RED" "License(s) removed: $(printf '%s' "$REMOVED_LICS" | jq -r 'join(", ")')"
+  mark_regression; LIC_CHANGED=true
+fi
+LIC_EXPIRED=$(printf '%s' "$LIC_TRANSITIONS" | jq -r '[.[] | select(.to == "EXPIRED")] | length' 2>/dev/null || echo 0)
+LIC_RENEWED=$(printf '%s' "$LIC_TRANSITIONS" | jq -r '[.[] | select(.from == "EXPIRED" and .to == "VALID")] | length' 2>/dev/null || echo 0)
+if [ "${LIC_EXPIRED:-0}" -gt 0 ] 2>/dev/null; then
+  print_change "[REGRESSION]" "$COLOR_RED" "License expired: $(printf '%s' "$LIC_TRANSITIONS" | jq -r '[.[]|select(.to=="EXPIRED")|.id]|join(", ")')"
+  mark_regression; LIC_CHANGED=true
+fi
+if [ "${LIC_RENEWED:-0}" -gt 0 ] 2>/dev/null; then
+  print_change "[IMPROVED]" "$COLOR_GREEN" "License renewed: $(printf '%s' "$LIC_TRANSITIONS" | jq -r '[.[]|select(.from=="EXPIRED" and .to=="VALID")|.id]|join(", ")')"
+  mark_improvement; LIC_CHANGED=true
 fi
 if [ "$B_LIC_CONS" != "$C_LIC_CONS" ]; then
   if [ "$C_LIC_CONS" = "EXCEEDED" ]; then
@@ -327,15 +351,18 @@ if [ "$B_LIC_CONS" != "$C_LIC_CONS" ]; then
   LIC_CHANGED=true
 fi
 if [ "$LIC_CHANGED" = false ] && [ "$SUMMARY_ONLY" = false ] && [ "$MODE" = "human" ]; then
-  print_change "[OK]" "$COLOR_GREEN" "No change (status: ${C_LIC_STATUS}, ends: ${C_LIC_END})"
+  print_change "[OK]" "$COLOR_GREEN" "No change (status: ${C_LIC_STATUS}, nearest expiry: ${C_LIC_END})"
 fi
 
 LIC_JSON=$(jq -c -n \
   --arg bs "$B_LIC_STATUS" --arg cs "$C_LIC_STATUS" \
-  --arg bend "$B_LIC_END" --arg cend "$C_LIC_END" \
-  --arg bcons "$B_LIC_CONS" --arg ccons "$C_LIC_CONS" '
-  {baselineStatus: $bs, currentStatus: $cs, baselineDateEnd: $bend, currentDateEnd: $cend,
+  --arg cend "$C_LIC_END" \
+  --arg bcons "$B_LIC_CONS" --arg ccons "$C_LIC_CONS" \
+  --argjson added "$ADDED_LICS" --argjson removed "$REMOVED_LICS" \
+  --argjson transitions "$LIC_TRANSITIONS" '
+  {baselineStatus: $bs, currentStatus: $cs, currentNearestExpiry: $cend,
    baselineConsumption: $bcons, currentConsumption: $ccons,
+   licensesAdded: $added, licensesRemoved: $removed, statusTransitions: $transitions,
    statusChanged: ($bs != $cs), consumptionChanged: ($bcons != $ccons)}
 ')
 add_section_json "license" "$LIC_JSON"
