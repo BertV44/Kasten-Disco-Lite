@@ -130,9 +130,9 @@ jq -r '
 def badge(v):
   if v == true or v == "VALID" or v == "ENABLED" or v == "IN_USE" or v == "COMPLIANT" or v == "CONFIGURED" or v == "COMPLETE" or v == "OK" then 
     "<span class=\"badge ok\">\u2713 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" then 
+  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" or v == "CONFIGURED_NOT_HEALTHY" then
     "<span class=\"badge error\">\u2717 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" then 
+  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "CONFIGURED_INCOMPLETE" then
     "<span class=\"badge warn\">\u26a0 " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == false then
     "<span class=\"badge warn\">\u2717 false</span>"
@@ -554,9 +554,9 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       "
       <tr>
         <td><strong>Resource Limits</strong></td>
-        <td class=\"sev-warning\">Warning</td>
-        <td>" + severityBadge("warning"; (.bestPractices.resourceLimits // "N/A")) + "</td>
-        <td>" + badge(.bestPractices.resourceLimits // "N/A") + "</td>
+        <td class=\"sev-optional\">Info</td>
+        <td>" + severityBadge("optional"; (.bestPractices.resourceLimits // "N/A")) + "</td>
+        <td>" + (if (.bestPractices.resourceLimits // "N/A") == "CONFIGURED" then badge("CONFIGURED") else "<span class=\"badge info\">ℹ " + (.bestPractices.resourceLimits // "N/A") + "</span>" end) + "</td>
       </tr>
       <tr>
         <td><strong>Policy Presets</strong></td>
@@ -606,12 +606,14 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + (if .disasterRecovery then
     (if .disasterRecovery.enabled then
       "<div class=\"card dr-card\">
-        <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\"><span class=\"badge ok\">\u2713 ENABLED</span></span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\">" + badge(.disasterRecovery.status // "ENABLED") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Mode</span><span class=\"stat-value\">" + .disasterRecovery.mode + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Frequency</span><span class=\"stat-value\"><code>" + .disasterRecovery.frequency + "</code></span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Profile</span><span class=\"stat-value\">" + .disasterRecovery.profile + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Local Catalog Snapshot</span><span class=\"stat-value\">" + boolBadge(.disasterRecovery.localCatalogSnapshot) + "</span></div>
-      </div>"
+        <div class=\"stat-row\"><span class=\"stat-label\">Local Catalog Snapshot</span><span class=\"stat-value\">" + boolBadge(.disasterRecovery.localCatalogSnapshot) + "</span></div>"
+        + (if .disasterRecovery.lastRunState then "<div class=\"stat-row\"><span class=\"stat-label\">Last Run</span><span class=\"stat-value\">" + badge(.disasterRecovery.lastRunState) + "</span></div>" else "" end)
+        + (if .disasterRecovery.lastSuccessfulRun then "<div class=\"stat-row\"><span class=\"stat-label\">Last Successful Run</span><span class=\"stat-value\"><code>" + .disasterRecovery.lastSuccessfulRun + "</code></span></div>" else "" end)
+      + "</div>"
     else
       "<div class=\"error-box\">\u274C <strong>Disaster Recovery is NOT CONFIGURED</strong><br>This is critical for Kasten platform resilience.</div>"
     end)
