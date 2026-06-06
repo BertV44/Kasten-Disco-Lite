@@ -522,9 +522,9 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       "
       <tr>
         <td><strong>Resource Limits</strong></td>
-        <td class=\"sev-warning\">Warning</td>
-        <td>" + severityBadge("warning"; (.bestPractices.resourceLimits // "N/A")) + "</td>
-        <td>" + badge(.bestPractices.resourceLimits // "N/A") + "</td>
+        <td class=\"sev-optional\">Info</td>
+        <td>" + severityBadge("optional"; (.bestPractices.resourceLimits // "N/A")) + "</td>
+        <td>" + (if (.bestPractices.resourceLimits // "N/A") == "CONFIGURED" then badge("CONFIGURED") else "<span class=\"badge info\">ℹ " + (.bestPractices.resourceLimits // "N/A") + "</span>" end) + "</td>
       </tr>
       <tr>
         <td><strong>Policy Presets</strong></td>

@@ -4363,7 +4363,7 @@ fi
 if [ "$BP_RESOURCES_STATUS" = "CONFIGURED" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Resource Limits:      ${COLOR_GREEN}CONFIGURED${COLOR_RESET}\n"
 else
-  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Resource Limits:      PARTIAL (optional - $K10_CONTAINERS_WITHOUT_LIMITS containers without limits)\n"
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Resource Limits:      ${COLOR_CYAN}PARTIAL${COLOR_RESET} (informational, not a warning - $K10_CONTAINERS_WITHOUT_LIMITS container(s) without limits; service-mesh/monitoring sidecars routinely lack them)\n"
 fi
 
 # Namespace Protection (NEW v1.5)

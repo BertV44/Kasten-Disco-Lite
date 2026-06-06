@@ -399,7 +399,7 @@ Each entry in `licenses[]` carries `{secret, customer, id, type, product, dateSt
 | Policy Presets | Info | Presets used for SLA standardization | Optional |
 | KMS Encryption | Info | AWS KMS / Azure KV / Vault configured | Optional |
 | Audit Logging | Info | SIEM logging enabled | Optional |
-| Resource Limits | Info | All K10 containers have limits | Partial coverage |
+| Resource Limits | Info | All K10 containers have limits | Partial coverage — informational only, not a warning (service-mesh/monitoring sidecars routinely lack limits) |
 | Namespace Protection | Info | All app namespaces covered | Gaps detected |
 | Kanister Blueprints | Info | Blueprints configured | Optional |
 | Cluster-scoped Resources *(v1.9)* | Info | At least one policy backs up cluster-scoped resources | Optional |
