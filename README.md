@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v1.9.1
+# Kasten Discovery Lite v1.9.2
 
 A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
 
@@ -44,6 +44,25 @@ Kasten Discovery Lite provides instant visibility into your Kasten K10 deploymen
 - **Best Practices compliance** summary (16 checks with severity levels) *(11 v1.8 + 5 new in v1.9)*
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
+
+---
+
+## What's New in v1.9.2
+
+Milestone fixes across discovery scope, KDR health, RBAC and licensing.
+
+### Bug Fixes
+
+- **Cluster-wide action & RestorePoint discovery (#10, #15)** — On K10 8.x, policy-driven `BackupAction`/`ExportAction`/`RestoreAction`/`RunAction` CRs and `RestorePoint` CRs live in the **source application namespace**, not in the K10 namespace. Fetching with `-n <k10-ns>` made "Failed Actions Top 5" report zero on clusters with real failures, under-counted action totals / success rate, and limited the RestorePoints-by-namespace view to `kasten-io`. These are now fetched cluster-wide (`-A`); the by-namespace fallback chain resolves the `k10.kasten.io/appNamespace` label, then `.metadata.namespace`.
+- **jq `--slurpfile` for large `-A` sets (#15)** — Passing the now cluster-wide action/runaction JSON to jq via `--argjson` could exceed `ARG_MAX` ("Argument list too long") on large clusters, silently emptying Failed-Actions-Top5, Policy-Last-Run, Stuck-Actions and Per-Namespace status. Those blocks now read the sanitized JSON from a temp file via `--slurpfile` (no argument-size limit).
+- **Prometheus detection scoped to the K10 namespace (#16)** — A cluster-wide `-l app=prometheus` matched any Prometheus (cluster/user-workload monitoring, app instances) and on OpenShift returned ENABLED 100% of the time. Detection is now scoped to the K10 namespace, with the K10 Helm chart pod labels (`app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=k10`) as fallback.
+- **`matchLabels` selectors resolved in Namespace Protection (#11)** — Policies selecting namespaces by `matchLabels` were flagged as "complex selector" and their targets never resolved, inflating the unprotected-gap count. KDL now resolves them via `kubectl get namespaces -l <key>=<value>` and merges the result into the protected set.
+
+### Enhancements
+
+- **KDR effective-health verdict (#13)** — KDR is read from the cached policies (no extra `kubectl` call) and reported as a 4-state verdict — `ENABLED`, `CONFIGURED_NOT_HEALTHY`, `CONFIGURED_INCOMPLETE`, `NOT_ENABLED` — derived from config completeness, the last KDR `RunAction` state, and a staleness check (`STALE_DAYS_THRESHOLD`, 7 days). A present-but-broken or incomplete KDR no longer shows a false `ENABLED`, and Best Practices reflects the same verdict.
+- **RBAC pre-flight + bundled role (#17)** — On startup KDL probes its key cluster-scoped reads with `kubectl auth can-i` (namespaces, PVCs `-A`, nodes, storageclasses, volumesnapshotclasses) and prints one actionable warning to **stderr** when any are denied — no more silent empty sections. A least-privilege [`kdl-rbac.yaml`](kdl-rbac.yaml) ships a `kasten-discovery-reader` ClusterRole (no Secrets) plus a namespaced Role for the sensitive reads. See [RBAC Requirements](#rbac-requirements).
+- **License: multi-secret, type, duration, node reconciliation (#14)** — KDL now enumerates **every** `k10-license*` secret, derives a license **type** (STARTER confirmed; TRIAL/ENTERPRISE `[unverified]`), computes **days remaining**, and reconciles the node limit from the secrets against the Report CR (with a mismatch warning). **Breaking JSON change**: the flat `license` fields are replaced by a structured object (`status`, `secretCount`, `parseableCount`, `unparseable[]`, `licenses[]`, `nodeLimitAggregate`, `nodeConsumption`, `nearestExpiry`). See [License details](#license-details-v192).
 
 ---
 
@@ -244,7 +263,7 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 ## Usage
 
 ```bash
-./KDL-v1.9.1.sh <kasten-namespace> [OPTIONS]
+./KDL.sh <kasten-namespace> [OPTIONS]
 ```
 
 ### Options
@@ -263,28 +282,28 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 
 ```bash
 # Standard human output with colors
-./KDL-v1.9.1.sh kasten-io
+./KDL.sh kasten-io
 
 # JSON output for automation
-./KDL-v1.9.1.sh kasten-io --json
+./KDL.sh kasten-io --json
 
 # Save JSON directly to file (auto-detects JSON mode)
-./KDL-v1.9.1.sh kasten-io --output discovery.json
+./KDL.sh kasten-io --output discovery.json
 
 # Save human output to file
-./KDL-v1.9.1.sh kasten-io --no-color --output report.txt
+./KDL.sh kasten-io --no-color --output report.txt
 
 # Skip Helm release secret read (security-sensitive environments)
-./KDL-v1.9.1.sh kasten-io --no-helm --json --output secure-discovery.json
+./KDL.sh kasten-io --no-helm --json --output secure-discovery.json
 
 # Debug mode for troubleshooting
-./KDL-v1.9.1.sh kasten-io --debug
+./KDL.sh kasten-io --debug
 
 # Version check
-./KDL-v1.9.1.sh --version
+./KDL.sh --version
 
 # Help
-./KDL-v1.9.1.sh --help
+./KDL.sh --help
 ```
 
 ---
@@ -294,7 +313,7 @@ Full Kasten configuration discovery using a 3-tier extraction strategy:
 ### Human Output
 
 1. **Platform & Version** — Kubernetes or OpenShift, Kasten version, **K8s server version & distribution** *(v1.9)*
-2. **License Information** — Customer, validity, node consumption
+2. **License Information** — **Multi-secret aware** *(v1.9.2)*: enumerates every `k10-license*` secret, parses each defensively (unparseable ones are listed, never fatal), and reports per license: customer, **type** (STARTER confirmed; TRIAL/ENTERPRISE are `[unverified]` prefix guesses), product, validity with **days-remaining**, node limit, features. Adds a **node-limit reconciliation** block (sum across secrets vs the Report CR `nodeLimit`, with a mismatch warning) and a node-consumption verdict (current vs effective limit). See "License details" below.
 3. **Health Status** — Pod health, backup/export success rates (based on finished actions)
 4. **Restore Actions History** — Total, completed, failed, running, recent restores
 5. **Failed Actions — Top 5** — Most recent failures with cause-chain error messages *(v1.9)*
@@ -342,6 +361,26 @@ Structured JSON with the following top-level keys:
 **v1.9 enrichment in `policyRunStats.lastRuns[]`**:
 new optional `error` field (deepest cause-chain message when `state=Failed`)
 
+**v1.9.2 — `license` key reshaped (breaking change)**:
+The flat license fields (`customer`, `id`, `status`, `dateStart`, `dateEnd`,
+`restrictions`, `consumption`) are **replaced** by a multi-secret structure:
+`license.{status, secretCount, parseableCount, unparseable[], licenses[], nodeLimitAggregate, nodeConsumption, nearestExpiry}`.
+Each entry in `licenses[]` carries `{secret, customer, id, type, product, dateStart, dateEnd, daysRemaining, status, nodes, features}`.
+
+#### License details (v1.9.2)
+
+- **Multi-secret enumeration** — every secret whose name starts with
+  `k10-license` is read. Secrets missing `customerName`/`id` (or with no
+  decodable payload) are reported under `unparseable[]` and never abort the run.
+- **Type derivation** — `STARTER` is confirmed (literal `customerName: starter-license`
+  or an `id` starting `starter-`). `TRIAL`/`ENTERPRISE` are `[unverified]`
+  prefix guesses; anything else is `UNKNOWN`. Field names are matched
+  case-insensitively (payloads vary between `dateStart`/`datestart`).
+- **Node-limit reconciliation** — `nodeLimitAggregate` exposes the sum across
+  secrets (`fromSecrets`) and the Report CR value (`fromReportCR`) and flags a
+  `mismatch` when they disagree (K10 may apply internal caps not visible in the
+  secret payload). The license node limit applies to **total** cluster nodes.
+
 ---
 
 ## Best Practices Compliance (16 checks)
@@ -370,6 +409,28 @@ new optional `error` field (deepest cause-chain message when `state=Failed`)
 ## RBAC Requirements
 
 The script is **read-only** and requires the following minimal permissions:
+
+### Quick start: bundled manifest
+
+A ready-to-apply, least-privilege manifest ships with the repo:
+[`kdl-rbac.yaml`](kdl-rbac.yaml). It defines a `kasten-discovery-reader`
+ClusterRole (cluster-wide reads, **no Secrets**) plus a namespaced Role for the
+sensitive reads (Secrets/ConfigMaps in the K10 namespace only), with binding
+templates. Edit the binding subjects to point at your principal, then:
+
+```sh
+kubectl apply -f kdl-rbac.yaml
+```
+
+### Pre-flight check
+
+On startup KDL runs `kubectl auth can-i` for its key cluster-scoped reads
+(`namespaces`, `persistentvolumeclaims -A`, `nodes`, `storageclasses`,
+`volumesnapshotclasses`). If any are denied it prints a single actionable
+warning to **stderr** (so `--json` output on stdout stays clean) listing exactly
+what is missing and pointing at `kdl-rbac.yaml`. KDL still runs and reports what
+it can — denied reads surface as empty/degraded sections rather than silent
+failures.
 
 ### Namespace-scoped (Kasten namespace)
 
@@ -708,7 +769,7 @@ kubectl -n kasten-io get pods -o json | jq '.items[].spec.containers[].resources
 Use `--debug` to see detailed processing information:
 
 ```bash
-./KDL-v1.9.1.sh kasten-io --debug
+./KDL.sh kasten-io --debug
 ```
 
 This shows namespace validation, platform detection, K8s version & distribution, policy counts, catch-all detection, protected/unprotected lists, K10 pod/container counts, Helm values source, authentication method, encryption provider, limiter values, profile validation results, reports policy state, SC/VSC RBAC accessibility, and non-default settings.
@@ -763,8 +824,9 @@ It does **not**:
 
 | File | Description |
 |------|-------------|
-| `KDL-v1.9.1.sh` | Main discovery script |
-| `kdl-json-to-html.sh` | HTML report generator (v1.9.1, compatible with v1.8.1+ JSON) |
+| `KDL.sh` | Main discovery script |
+| `kdl-json-to-html.sh` | HTML report generator (v1.9.2, compatible with v1.8.1+ JSON) |
+| `kdl-rbac.yaml` | Least-privilege RBAC manifest (`kasten-discovery-reader`) *(v1.9.2)* |
 | `kasten-report-generator.py` | PowerPoint report generator (Python) |
 | `README.md` | This documentation |
 

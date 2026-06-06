@@ -3,8 +3,22 @@ set -eu
 trap '' PIPE 2>/dev/null || true
 
 ##############################################################################
-# Kasten Discovery Lite v1.9.1
+# Kasten Discovery Lite v1.9.2
 # Author: Bertrand CASTAGNET - EMEA TAM
+#
+# Changes in v1.9.2:
+# - #10/#15: RestorePoints and BackupAction/ExportAction/RestoreAction/RunAction
+#   fetched cluster-wide (-A) — policy-driven actions and RPs live in the source
+#   application namespace on K10 8.x, not in the K10 namespace.
+# - #15: large -A action/runaction sets passed to jq via --slurpfile (file-based)
+#   instead of --argjson, to avoid ARG_MAX (Argument list too long) on big clusters.
+# - #16: Prometheus detection scoped to the K10 namespace + K10 chart pod labels.
+# - #11: matchLabels policy selectors resolved to namespaces and merged into the
+#   protected set (removes false-positive unprotected gaps).
+# - #13: KDR 4-state effective-health verdict (read from cached policies).
+# - #17: RBAC pre-flight (kubectl auth can-i) + bundled kdl-rbac.yaml.
+# - #14: multi-secret license parsing (type, daysRemaining, node reconciliation);
+#   breaking JSON schema change for the `license` key.
 #
 # Changes in v1.9.1:
 # - BUGFIX: Locale-sensitive numeric formatting in awk printf calls produced
@@ -186,7 +200,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="1.9.1"
+KDL_VERSION="1.9.2"
 OUTPUT_FILE=""
 SKIP_HELM=false
 
@@ -298,6 +312,10 @@ debug() {
 
 error() {
   echo "${COLOR_RED}[FAIL] ERROR: $*${COLOR_RESET}" >&2
+}
+
+warn() {
+  echo "${COLOR_YELLOW}[WARN] $*${COLOR_RESET}" >&2
 }
 
 progress() {
@@ -423,6 +441,30 @@ fi
 debug "Namespace '$NAMESPACE' validated"
 
 ### -------------------------
+### RBAC pre-flight check (#17)
+### -------------------------
+# KDL needs a handful of cluster-scoped reads. With a K10-admin-only kubeconfig
+# these silently return empty (namespace inventory, PVCs, nodes, StorageClasses,
+# VolumeSnapshotClasses) and the report looks wrong rather than
+# under-permissioned. Probe up front with `kubectl auth can-i` and emit one
+# actionable warning. Non-fatal: KDL still runs and reports what it can.
+# Warnings go to stderr so JSON output (stdout) stays clean.
+RBAC_MISSING=""
+kubectl auth can-i list namespaces                                   >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list namespaces (cluster-wide)"
+kubectl auth can-i list persistentvolumeclaims --all-namespaces      >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list persistentvolumeclaims --all-namespaces"
+kubectl auth can-i list nodes                                        >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list nodes"
+kubectl auth can-i list storageclasses.storage.k8s.io                >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list storageclasses"
+kubectl auth can-i list volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list volumesnapshotclasses"
+
+if [ -n "$RBAC_MISSING" ]; then
+  warn "Insufficient cluster-scoped RBAC: the following reads are denied, so related sections will be EMPTY (not necessarily zero):"
+  printf '%s' "$RBAC_MISSING" | tr ';' '\n' | while IFS= read -r _rbac_item; do
+    [ -n "$_rbac_item" ] && printf '%s    - %s%s\n' "$COLOR_YELLOW" "$_rbac_item" "$COLOR_RESET" >&2
+  done
+  warn "Fix: apply the bundled least-privilege role -> kubectl apply -f kdl-rbac.yaml (see README, section 'RBAC requirements')."
+fi
+
+### -------------------------
 ### Platform detection
 ### -------------------------
 if kubectl api-resources 2>/dev/null | grep -q "route.*openshift"; then
@@ -541,11 +583,23 @@ progress "K10 resources"
 
 kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get policies -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get runactions.actions.kio.kasten.io -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get restoreactions.actions.kio.kasten.io -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get backupactions.actions.kio.kasten.io -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get exportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get restorepoints.apps.kio.kasten.io -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
+# Action CRs are cluster-wide (#15): on K10 8.x, policy-driven actions are
+# created in the source application namespace, not in the K10 namespace.
+# Fetching with `-n $NAMESPACE` reported zero Failed Actions and under-counted
+# the action totals / success rate on clusters with real failures. The
+# downstream jq already resolves the namespace from
+# .metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace, so -A
+# is a drop-in. NOTE (#15): for very large clusters (>~1k actions) a future
+# optimization is a 2-step fetch (custom-columns for counters, full JSON only
+# for namespaces with Failed/Running actions) — deferred, needs live benchmark.
+kubectl get runactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
+kubectl get restoreactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
+kubectl get backupactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
+kubectl get exportactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
+# RestorePoints are cluster-wide (#10): on K10 8.5.x the RestorePoint CRs live
+# in the source application namespace, not in the K10 namespace. Fetch with -A
+# so the by-namespace Top 5 and the total count match the K10 UI dashboard.
+kubectl get restorepoints.apps.kio.kasten.io -A -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json > "$TEMP_DIR/presets_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json > "$TEMP_DIR/transformsets_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json > "$TEMP_DIR/reports_raw.json" 2>/dev/null &
@@ -567,90 +621,200 @@ wait
 debug "Parallel fetch complete"
 
 ### -------------------------
-### License info
+### License info — multi-secret, type, duration, node reconciliation (#14)
 ### -------------------------
-LICENSE_RAW=$(kubectl -n "$NAMESPACE" get secret k10-license -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null || echo '')
+# Real clusters can carry several k10-license* secrets (renewals, additive
+# licenses, vendor upgrades). Enumerate them all by name prefix (no consistent
+# labeling exists), parse each defensively, and tolerate unparseable ones rather
+# than aborting. Field names are matched case-insensitively: observed payloads
+# vary between camelCase (dateStart/dateEnd/customerName) and lowercase
+# (datestart/dateend) depending on the issuing tooling.
+progress "license"
 
-if [ -n "$LICENSE_RAW" ]; then
-  # License is YAML format, use awk to extract values
-  LICENSE_CUSTOMER=$(_ep "$LICENSE_RAW" | awk -F': ' '/^customerName:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_START=$(_ep "$LICENSE_RAW" | awk -F': ' '/^dateStart:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_END=$(_ep "$LICENSE_RAW" | awk -F': ' '/^dateEnd:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_NODES=$(_ep "$LICENSE_RAW" | awk -F': ' '/^[[:space:]]*nodes:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  LICENSE_ID=$(_ep "$LICENSE_RAW" | awk -F': ' '/^id:/ {gsub(/["'\'']/, "", $2); print $2}' | head -n1)
-  
-  # Set defaults if empty
-  [ -z "$LICENSE_CUSTOMER" ] && LICENSE_CUSTOMER="N/A"
-  [ -z "$LICENSE_START" ] && LICENSE_START="N/A"
-  [ -z "$LICENSE_END" ] && LICENSE_END="N/A"
-  [ -z "$LICENSE_NODES" ] && LICENSE_NODES="unlimited"
-  [ -z "$LICENSE_ID" ] && LICENSE_ID="N/A"
-  
-  # Check if license is valid
-  if [ "$LICENSE_END" != "N/A" ] && [ "$LICENSE_END" != "null" ]; then
-    LICENSE_END_DATE=$(_ep "$LICENSE_END" | cut -d'T' -f1)
-    CURRENT_DATE=$(date +%Y-%m-%d)
-    if [ "$LICENSE_END_DATE" \< "$CURRENT_DATE" ]; then
-      LICENSE_STATUS="EXPIRED"
-    else
-      LICENSE_STATUS="VALID"
-    fi
-  else
-    LICENSE_STATUS="UNKNOWN"
+# Extract a top-level scalar field, case-insensitive on the key, quotes stripped.
+_lic_field() { # $1 = raw payload, $2 = lowercased field name
+  printf '%s' "$1" | awk -F': ' -v f="$2" '
+    tolower($1) == f { v = $2; gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/["'\'']/, "", v); print v; exit }'
+}
+
+LICENSE_SECRET_NAMES=$(kubectl -n "$NAMESPACE" get secrets -o json 2>/dev/null \
+  | jq -r '[.items[]? | select(.metadata.name | startswith("k10-license")) | .metadata.name] | .[]' 2>/dev/null || echo "")
+LICENSE_SECRET_COUNT=$(printf '%s\n' "$LICENSE_SECRET_NAMES" | awk 'NF{c++} END{print c+0}')
+
+LICENSES_PARSED='[]'
+LICENSES_UNPARSEABLE='[]'
+
+for _lic_name in $LICENSE_SECRET_NAMES; do
+  RAW=$(kubectl -n "$NAMESPACE" get secret "$_lic_name" -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null)
+
+  if [ -z "$RAW" ]; then
+    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "no .data.license field" '. + [{secret: $s, reason: $r}]')
+    continue
   fi
-else
-  LICENSE_CUSTOMER="N/A"
-  LICENSE_START="N/A"
-  LICENSE_END="N/A"
-  LICENSE_NODES="N/A"
-  LICENSE_ID="N/A"
-  LICENSE_STATUS="NOT_FOUND"
-fi
 
-debug "License: $LICENSE_CUSTOMER (Status: $LICENSE_STATUS)"
-debug "License status: $LICENSE_STATUS"
+  CUSTOMER=$(_lic_field "$RAW" "customername")
+  ID=$(_lic_field "$RAW" "id")
+
+  # Minimum viable license signature; otherwise record and move on.
+  if [ -z "$CUSTOMER" ] || [ -z "$ID" ]; then
+    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "missing customerName or id" '. + [{secret: $s, reason: $r}]')
+    continue
+  fi
+
+  PRODUCT=$(_lic_field "$RAW" "product")
+  START_DATE=$(_lic_field "$RAW" "datestart")
+  END_DATE=$(_lic_field "$RAW" "dateend")
+  # restrictions.nodes is nested (indented); match the indented key only.
+  NODES=$(printf '%s' "$RAW" | awk -F': ' '/^[[:space:]]+nodes:/ {v=$2; gsub(/^[ \t]+|[ \t]+$/,"",v); gsub(/["'\'']/,"",v); print v; exit}')
+  FEATURES_RAW=$(printf '%s' "$RAW" | awk -F': ' 'tolower($1)=="features" {print $2; exit}')
+
+  [ -z "$PRODUCT" ] && PRODUCT="N/A"
+  [ -z "$START_DATE" ] && START_DATE="N/A"
+  [ -z "$END_DATE" ] && END_DATE="N/A"
+  [ -z "$NODES" ] && NODES="unlimited"
+
+  # Type derivation. Only "starter" is confirmed against a real payload; other
+  # prefixes are [unverified] and default to UNKNOWN rather than guessing.
+  if [ "$CUSTOMER" = "starter-license" ] || printf '%s' "$ID" | grep -q '^starter-'; then
+    TYPE="STARTER"
+  elif printf '%s' "$ID" | grep -q '^trial-'; then
+    TYPE="TRIAL"        # [unverified] prefix — confirm against a real trial dump
+  elif printf '%s' "$ID" | grep -q '^enterprise-'; then
+    TYPE="ENTERPRISE"   # [unverified] prefix — confirm against a real commercial dump
+  else
+    TYPE="UNKNOWN"
+  fi
+
+  # Features: null -> "-"; otherwise pass through trimmed (further parsing TBD
+  # once a non-null sample exists).
+  if [ -z "$FEATURES_RAW" ] || [ "$(printf '%s' "$FEATURES_RAW" | tr -d '[:space:]')" = "null" ]; then
+    FEATURES="-"
+  else
+    FEATURES=$(printf '%s' "$FEATURES_RAW" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  fi
+
+  LICENSES_PARSED=$(_ep "$LICENSES_PARSED" | jq -c \
+    --arg s "$_lic_name" --arg c "$CUSTOMER" --arg i "$ID" --arg p "$PRODUCT" \
+    --arg sd "$START_DATE" --arg ed "$END_DATE" --arg n "$NODES" \
+    --arg f "$FEATURES" --arg t "$TYPE" \
+    '. + [{secret: $s, customer: $c, id: $i, type: $t, product: $p,
+           dateStart: $sd, dateEnd: $ed, nodes: $n, features: $f}]')
+done
+
+# Enrich each license with daysRemaining + per-license status, computed
+# cluster-side via jq now/fromdateiso8601 (portable; tolerates the ".000Z"
+# fractional-seconds suffix that fromdateiso8601 cannot parse directly).
+LICENSES_PARSED=$(_ep "$LICENSES_PARSED" | jq -c '
+  [ .[] | . + (
+      (.dateEnd // "N/A") as $ed
+      | if ($ed == "N/A" or $ed == "null" or $ed == "") then {daysRemaining: null, status: "UNKNOWN"}
+        else
+          (((($ed | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) - now) / 86400) | floor) as $d
+          | {daysRemaining: $d, status: (if $d < 0 then "EXPIRED" else "VALID" end)}
+        end
+    ) ]
+' 2>/dev/null || echo "$LICENSES_PARSED")
+
+LICENSES_COUNT=$(_ep "$LICENSES_PARSED" | jq 'length // 0')
+
+# Nearest upcoming expiry across all parseable licenses (quick-read top level).
+NEAREST_EXPIRY=$(_ep "$LICENSES_PARSED" | jq -c '
+  [ .[] | select(.daysRemaining != null) ] | sort_by(.daysRemaining) | first
+  | if . == null then null else {secret: .secret, dateEnd: .dateEnd, daysRemaining: .daysRemaining} end
+' 2>/dev/null || echo 'null')
 
 ### -------------------------
-### License Consumption (NEW v1.6)
+### License node reconciliation + consumption (#14)
 ### -------------------------
-# Get node count - prefer from Report CR if available, fallback to kubectl
-CLUSTER_NODE_COUNT=0
-LICENSE_NODES_FROM_REPORT=""
+# Sum of node limits across all parseable licenses (treat "unlimited" as 0 here;
+# the hasUnlimited flag carries the real meaning).
+SECRETS_NODE_TOTAL=$(_ep "$LICENSES_PARSED" | jq '[.[] | (.nodes | if . == "unlimited" then 0 else (tonumber? // 0) end)] | add // 0')
+HAS_UNLIMITED=$(_ep "$LICENSES_PARSED" | jq 'any(.nodes == "unlimited") // false')
 
-# Try to get from most recent Report (most accurate)
+# Authoritative node count + limit from the most recent Report CR (if present).
 REPORT_LICENSE=$(kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null | jq '
-  [.items[] | select(.results.licensing != null)] |
-  sort_by(.metadata.creationTimestamp) |
-  last |
-  .results.licensing // {}
+  [.items[] | select(.results.licensing != null)] | sort_by(.metadata.creationTimestamp) | last | .results.licensing // {}
 ' 2>/dev/null || echo '{}')
+REPORT_NODE_LIMIT=$(_ep "$REPORT_LICENSE" | jq -r '.nodeLimit // empty')
+REPORT_NODE_COUNT=$(_ep "$REPORT_LICENSE" | jq '.nodeCount // 0')
 
-if _ep "$REPORT_LICENSE" | jq -e '.nodeCount' >/dev/null 2>&1; then
-  CLUSTER_NODE_COUNT=$(_ep "$REPORT_LICENSE" | jq '.nodeCount // 0')
-  LICENSE_NODES_FROM_REPORT=$(_ep "$REPORT_LICENSE" | jq -r '.nodeLimit // empty')
-  [ -n "$LICENSE_NODES_FROM_REPORT" ] && [ "$LICENSE_NODES_FROM_REPORT" != "null" ] && LICENSE_NODES="$LICENSE_NODES_FROM_REPORT"
-fi
-
-# Fallback to kubectl if Report didn't have the data
-if [ "$CLUSTER_NODE_COUNT" -eq 0 ] 2>/dev/null; then
+# Current cluster node count: Report CR value, else live kubectl count.
+if [ "${REPORT_NODE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  CLUSTER_NODE_COUNT="$REPORT_NODE_COUNT"
+else
   CLUSTER_NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 fi
 [ -z "$CLUSTER_NODE_COUNT" ] && CLUSTER_NODE_COUNT=0
 
-# Determine if over limit
-if [ "$LICENSE_NODES" = "unlimited" ] || [ "$LICENSE_NODES" = "0" ] || [ "$LICENSE_NODES" = "N/A" ]; then
-  LICENSE_CONSUMPTION_STATUS="OK"
-  LICENSE_NODES_LIMIT="unlimited"
-else
-  LICENSE_NODES_LIMIT="$LICENSE_NODES"
-  if [ "$CLUSTER_NODE_COUNT" -gt "$LICENSE_NODES" ] 2>/dev/null; then
-    LICENSE_CONSUMPTION_STATUS="EXCEEDED"
-  else
-    LICENSE_CONSUMPTION_STATUS="OK"
-  fi
+# Reconciliation: do the secret sum and the Report CR limit agree?
+NODE_LIMIT_MISMATCH="false"
+if [ -n "$REPORT_NODE_LIMIT" ] && [ "$REPORT_NODE_LIMIT" != "null" ] && [ "$HAS_UNLIMITED" = "false" ]; then
+  [ "$REPORT_NODE_LIMIT" != "$SECRETS_NODE_TOTAL" ] && NODE_LIMIT_MISMATCH="true"
 fi
 
-debug "License consumption: $CLUSTER_NODE_COUNT nodes / $LICENSE_NODES_LIMIT (Status: $LICENSE_CONSUMPTION_STATUS)"
+# Effective limit for the consumption check: Report CR if present, else the
+# secret sum. K10 applies the limit to TOTAL nodes (taints/schedulability do not
+# reduce the count).
+if [ "$HAS_UNLIMITED" = "true" ]; then
+  EFFECTIVE_LIMIT="unlimited"
+elif [ -n "$REPORT_NODE_LIMIT" ] && [ "$REPORT_NODE_LIMIT" != "null" ]; then
+  EFFECTIVE_LIMIT="$REPORT_NODE_LIMIT"
+elif [ "${LICENSES_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  EFFECTIVE_LIMIT="$SECRETS_NODE_TOTAL"
+else
+  EFFECTIVE_LIMIT="unlimited"
+fi
+
+CONSUMPTION_STATUS="OK"
+if [ "$EFFECTIVE_LIMIT" != "unlimited" ] && [ "$EFFECTIVE_LIMIT" != "0" ]; then
+  [ "$CLUSTER_NODE_COUNT" -gt "$EFFECTIVE_LIMIT" ] 2>/dev/null && CONSUMPTION_STATUS="EXCEEDED"
+fi
+
+# Overall license status (drives the text section + best-practices).
+if [ "${LICENSE_SECRET_COUNT:-0}" -eq 0 ] && [ "${LICENSES_COUNT:-0}" -eq 0 ]; then
+  LICENSE_STATUS="NOT_FOUND"
+elif [ "${LICENSES_COUNT:-0}" -eq 0 ]; then
+  LICENSE_STATUS="UNPARSEABLE"
+else
+  LICENSE_STATUS="PRESENT"
+fi
+
+# Single structured object — the source of truth for JSON + text + HTML.
+LICENSE_JSON=$(jq -cn \
+  --arg overall "$LICENSE_STATUS" \
+  --argjson secretCount "${LICENSE_SECRET_COUNT:-0}" \
+  --argjson parseableCount "${LICENSES_COUNT:-0}" \
+  --argjson unparseable "$LICENSES_UNPARSEABLE" \
+  --argjson licenses "$LICENSES_PARSED" \
+  --argjson fromSecrets "${SECRETS_NODE_TOTAL:-0}" \
+  --arg fromReportCR "${REPORT_NODE_LIMIT:-}" \
+  --argjson mismatch "${NODE_LIMIT_MISMATCH:-false}" \
+  --argjson hasUnlimited "${HAS_UNLIMITED:-false}" \
+  --argjson current "${CLUSTER_NODE_COUNT:-0}" \
+  --arg limit "$EFFECTIVE_LIMIT" \
+  --arg consStatus "$CONSUMPTION_STATUS" \
+  --argjson nearestExpiry "$NEAREST_EXPIRY" \
+  '{
+    status: $overall,
+    secretCount: $secretCount,
+    parseableCount: $parseableCount,
+    unparseable: $unparseable,
+    licenses: $licenses,
+    nodeLimitAggregate: {
+      fromSecrets: $fromSecrets,
+      fromReportCR: (if $fromReportCR == "" then null else ($fromReportCR | tonumber? // $fromReportCR) end),
+      mismatch: $mismatch,
+      hasUnlimited: $hasUnlimited
+    },
+    nodeConsumption: {
+      current: $current,
+      limit: ($limit | tonumber? // $limit),
+      status: $consStatus
+    },
+    nearestExpiry: $nearestExpiry
+  }' 2>/dev/null || echo '{"status":"ERROR","secretCount":0,"parseableCount":0,"unparseable":[],"licenses":[]}')
+
+debug "License: secrets=$LICENSE_SECRET_COUNT parseable=$LICENSES_COUNT status=$LICENSE_STATUS consumption=$CLUSTER_NODE_COUNT/$EFFECTIVE_LIMIT ($CONSUMPTION_STATUS) mismatch=$NODE_LIMIT_MISMATCH"
 
 ### -------------------------
 ### Profiles
@@ -841,7 +1005,11 @@ debug "Reports policy: exists=$REPORTS_POLICY_EXISTS state=$REPORTS_POLICY_LAST_
 ### -------------------------
 ### Disaster Recovery (KDR)
 ### -------------------------
-KDR_POLICY_JSON=$(kubectl -n "$NAMESPACE" get policy k10-disaster-recovery-policy -o json 2>/dev/null || echo '{}')
+# Read the KDR policy from the already-fetched POLICIES_JSON instead of an extra
+# `kubectl get policy` call (#13). The shortname k10-disaster-recovery-policy is
+# the canonical KDR policy name.
+KDR_POLICY_JSON=$(_ep "$POLICIES_JSON" | jq -c 'first(.items[]? | select(.metadata.name == "k10-disaster-recovery-policy")) // {}' 2>/dev/null || echo '{}')
+[ -z "$KDR_POLICY_JSON" ] && KDR_POLICY_JSON='{}'
 if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
   KDR_ENABLED=true
   KDR_FREQUENCY=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "N/A"')
@@ -888,11 +1056,16 @@ debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE"
 ### -------------------------
 # Use pre-fetched RunActions data
 RUNACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/runactions_raw.json" 2>/dev/null)")
+# Sanitized copy on disk for jq --slurpfile: the action sets are cluster-wide
+# (-A) and can be large; passing them via --argjson on the command line risks
+# E2BIG (Argument list too long). --slurpfile reads from a file, no arg limit.
+printf '%s' "$RUNACTIONS_JSON" > "$TEMP_DIR/runactions_clean.json"
 
 # Build policy last run info
 # v1.9: enriched with `error` field (deepest cause-chain message via the
 # JQ_DEEPEST_MSG helper, only populated when state=Failed)
-POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --argjson runs "$RUNACTIONS_JSON" "$JQ_DEEPEST_MSG"'
+POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG"'
+  ($runsArr[0] // {"items":[]}) as $runs |
   [.items[]? | . as $policy | {
     name: .metadata.name,
     lastRun: (
@@ -926,6 +1099,78 @@ if ! _ep "$POLICY_LAST_RUN" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 debug "Policy last run info collected (enriched with error messages)"
+
+### -------------------------
+### KDR effective-health verdict (#13)
+### -------------------------
+# Policy presence alone does not mean DR actually protects anything. Derive a
+# 4-state verdict from config completeness + the last KDR RunAction, instead of
+# the bare KDR_ENABLED boolean (kept above for backward compat).
+#   ENABLED                 configured, last run Complete, success not stale
+#   CONFIGURED_NOT_HEALTHY  configured but last run Failed / never succeeded / stale
+#   CONFIGURED_INCOMPLETE   policy present but config cannot protect data
+#   NOT_ENABLED             no KDR policy
+if [ "$KDR_ENABLED" = true ]; then
+  # Config completeness: a mode that exports data needs an export profile; a
+  # "No Snapshot" mode protects nothing.
+  KDR_CONFIG_COMPLETE=true
+  case "$KDR_MODE" in
+    "Quick DR (Exported Catalog)"|"Legacy DR")
+      case "$KDR_PROFILE" in ""|"N/A"|"N/A "*) KDR_CONFIG_COMPLETE=false ;; esac
+      ;;
+    "Quick DR (No Snapshot)")
+      KDR_CONFIG_COMPLETE=false
+      ;;
+  esac
+
+  # Last KDR RunAction (RunAction.spec.subject.name == policy name), and last
+  # successful run; staleness measured cluster-side via jq `now` (portable).
+  KDR_RUN_FACTS=$(_ep "$RUNACTIONS_JSON" | jq -c \
+    --arg pol "k10-disaster-recovery-policy" \
+    --argjson thr "$STALE_DAYS_THRESHOLD" '
+    ([.items[]? | select(.spec.subject.name == $pol)]) as $r |
+    ($r | sort_by(.metadata.creationTimestamp) | last) as $last |
+    ($r | map(select((.status.state // "") == "Complete"))
+       | sort_by(.metadata.creationTimestamp) | last) as $ok |
+    {
+      lastState: (if $last then ($last.status.state // "Unknown") else "None" end),
+      hasSuccess: ($ok != null),
+      lastSuccessTs: (if $ok then ($ok.metadata.creationTimestamp // "") else "" end),
+      successStale: (
+        if ($ok != null) and ($ok.metadata.creationTimestamp != null)
+        then ((now - ($ok.metadata.creationTimestamp | fromdateiso8601)) > ($thr * 86400))
+        else true end
+      )
+    }
+  ' 2>/dev/null || echo '{}')
+  [ -z "$KDR_RUN_FACTS" ] && KDR_RUN_FACTS='{}'
+
+  KDR_LAST_RUN_STATE=$(_ep "$KDR_RUN_FACTS" | jq -r '.lastState // "None"')
+  KDR_HAS_SUCCESS=$(_ep "$KDR_RUN_FACTS" | jq -r '.hasSuccess // false')
+  KDR_SUCCESS_STALE=$(_ep "$KDR_RUN_FACTS" | jq -r '.successStale // true')
+  KDR_LAST_SUCCESS_TS=$(_ep "$KDR_RUN_FACTS" | jq -r '.lastSuccessTs // ""')
+
+  if [ "$KDR_CONFIG_COMPLETE" != true ]; then
+    KDR_STATUS="CONFIGURED_INCOMPLETE"
+  elif [ "$KDR_LAST_RUN_STATE" = "Failed" ]; then
+    KDR_STATUS="CONFIGURED_NOT_HEALTHY"
+  elif [ "$KDR_HAS_SUCCESS" != "true" ]; then
+    KDR_STATUS="CONFIGURED_NOT_HEALTHY"
+  elif [ "$KDR_SUCCESS_STALE" = "true" ]; then
+    KDR_STATUS="CONFIGURED_NOT_HEALTHY"
+  else
+    KDR_STATUS="ENABLED"
+  fi
+else
+  KDR_STATUS="NOT_ENABLED"
+  KDR_CONFIG_COMPLETE="false"
+  KDR_LAST_RUN_STATE="None"
+  KDR_HAS_SUCCESS="false"
+  KDR_SUCCESS_STALE="true"
+  KDR_LAST_SUCCESS_TS=""
+fi
+
+debug "KDR status: $KDR_STATUS (config_complete=$KDR_CONFIG_COMPLETE lastRun=$KDR_LAST_RUN_STATE hasSuccess=$KDR_HAS_SUCCESS successStale=$KDR_SUCCESS_STALE)"
 
 ### -------------------------
 ### Average Policy Run Duration (NEW v1.5)
@@ -1065,6 +1310,43 @@ if ! _ep "$PROTECTED_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
   PROTECTED_NAMESPACES='[]'
 fi
 
+# Resolve matchLabels selectors to concrete namespaces and merge (#11).
+# PROTECTED_NAMESPACES above only captured matchNames/matchExpressions. K10
+# policies using matchLabels (a common enterprise pattern) select their target
+# namespaces by label; without resolving them those namespaces were reported as
+# unprotected (large false-positive gaps). For each matchLabels policy, build a
+# comma-separated label selector and ask the API server which namespaces carry
+# those labels, then union the result into PROTECTED_NAMESPACES.
+if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
+  MATCHLABELS_SELECTORS=$(_ep "$APP_POLICIES_JSON" | jq -r '
+    .items[]?
+    | (.spec.selector.matchLabels // {})
+    | select(length > 0)
+    | to_entries | map("\(.key)=\(.value)") | join(",")
+  ' 2>/dev/null || echo "")
+
+  if [ -n "$MATCHLABELS_SELECTORS" ]; then
+    LABEL_RESOLVED_NS=$(
+      printf '%s\n' "$MATCHLABELS_SELECTORS" | while IFS= read -r _sel; do
+        [ -z "$_sel" ] && continue
+        kubectl get namespaces -l "$_sel" \
+          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
+      done
+    )
+
+    if [ -n "$LABEL_RESOLVED_NS" ]; then
+      LABEL_NS_JSON=$(printf '%s' "$LABEL_RESOLVED_NS" | jq -R -s 'split("\n") | map(select(length > 0)) | unique' 2>/dev/null || echo '[]')
+      PROTECTED_NAMESPACES=$(printf '%s\n%s\n' "$PROTECTED_NAMESPACES" "$LABEL_NS_JSON" | jq -c -s 'add | unique' 2>/dev/null || echo "$PROTECTED_NAMESPACES")
+      debug "matchLabels resolved namespaces: $LABEL_NS_JSON"
+    fi
+  fi
+fi
+
+# Re-validate after the merge
+if ! _ep "$PROTECTED_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
+  PROTECTED_NAMESPACES='[]'
+fi
+
 PROTECTED_NS_COUNT=$(_ep "$PROTECTED_NAMESPACES" | jq 'length // 0')
 [ -z "$PROTECTED_NS_COUNT" ] || [ "$PROTECTED_NS_COUNT" = "null" ] && PROTECTED_NS_COUNT=0
 debug "Protected namespaces list ($PROTECTED_NS_COUNT): $PROTECTED_NAMESPACES"
@@ -1099,6 +1381,7 @@ debug "Unprotected list: $UNPROTECTED_NS_JSON"
 ### Restore Actions History (NEW v1.5)
 ### -------------------------
 RESTORE_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null)")
+printf '%s' "$RESTORE_ACTIONS_JSON" > "$TEMP_DIR/restoreactions_clean.json"  # for jq --slurpfile (see runactions note)
 
 RESTORE_ACTIONS_TOTAL=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '.items | length // 0')")
 RESTORE_ACTIONS_COMPLETED=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')")
@@ -1251,7 +1534,7 @@ ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --argjson policies "$POLICY_NAM
     ) |
     {
       name: .metadata.name,
-      namespace: (.spec.subject.namespace // "unknown"),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "unknown"),
       created: .metadata.creationTimestamp,
       actions: [.spec.source.actionName]
     }
@@ -1277,13 +1560,14 @@ debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT"
 #
 # IMPORTANT: In modern K10 versions (verified on 8.5.8), RestorePoint
 # .spec.subject is null — the namespace lives in metadata.labels under
-# k10.kasten.io/appNamespace. Falling back to .spec.subject.namespace
-# preserves compatibility with any older K10 version that still populated it.
+# k10.kasten.io/appNamespace. Now that RestorePoints are fetched cluster-wide
+# (-A, #10), .metadata.namespace is the CR's own namespace (the source app
+# namespace) and is a reliable fallback when the label is absent.
 
 RP_BY_NAMESPACE_TOP5=$(_ep "$RESTORE_POINTS_JSON" | jq -c '
   [(.items // [])[]?
     | (.metadata.labels["k10.kasten.io/appNamespace"]
-       // .spec.subject.namespace
+       // .metadata.namespace
        // "unknown")
   ]
   | group_by(.)
@@ -1348,11 +1632,15 @@ debug "TransformSets: $TRANSFORMSET_COUNT"
 ### -------------------------
 ### Prometheus Monitoring
 ### -------------------------
-# Check for Prometheus in common namespaces/labels
-PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+# Detect the K10-bundled Prometheus ONLY (issue #16). A cluster-wide
+# `-l app=prometheus` search matches any Prometheus (cluster monitoring, user
+# workload monitoring, app instances) — on OpenShift it is true 100% of the
+# time regardless of whether K10 monitoring is enabled. Scope the lookup to the
+# K10 namespace and use the K10 chart pod labels.
+PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 if [ "$PROMETHEUS_RUNNING" -eq 0 ]; then
-  PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app.kubernetes.io/name=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=k10" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 fi
 
@@ -1383,6 +1671,8 @@ debug "Pods: $PODS (Running: $PODS_RUNNING, Ready: $PODS_READY)"
 ### -------------------------
 BACKUP_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/backupactions_raw.json" 2>/dev/null)")
 EXPORT_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/exportactions_raw.json" 2>/dev/null)")
+printf '%s' "$BACKUP_ACTIONS_JSON" > "$TEMP_DIR/backupactions_clean.json"  # for jq --slurpfile (see runactions note)
+printf '%s' "$EXPORT_ACTIONS_JSON" > "$TEMP_DIR/exportactions_clean.json"  # for jq --slurpfile (see runactions note)
 
 BACKUP_ACTIONS_TOTAL=$(_ep "$BACKUP_ACTIONS_JSON" | jq '.items | length // 0')
 [ -z "$BACKUP_ACTIONS_TOTAL" ] && BACKUP_ACTIONS_TOTAL=0
@@ -1424,6 +1714,9 @@ debug "Actions - Total: $TOTAL_ACTIONS, Finished: $FINISHED_ACTIONS, Completed: 
 # All sources already loaded above — no extra kubectl calls.
 
 FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
+  ($backupArr[0] // {"items":[]}) as $backup |
+  ($exportArr[0] // {"items":[]}) as $export |
+  ($restoreArr[0] // {"items":[]}) as $restore |
   [
     ($backup.items // []) | .[] | select((.status.state // "") == "Failed") | {
       kind: "BackupAction",
@@ -1457,9 +1750,9 @@ FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
   | sort_by(.timestamp) | reverse | .[0:5]
   | map(.message |= (if length > 180 then .[0:180] + "..." else . end))
 ' \
-  --argjson backup "$BACKUP_ACTIONS_JSON" \
-  --argjson export "$EXPORT_ACTIONS_JSON" \
-  --argjson restore "$RESTORE_ACTIONS_JSON" \
+  --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
+  --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
+  --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$FAILED_ACTIONS_TOP5" | jq -e '.' >/dev/null 2>&1; then
@@ -1479,6 +1772,9 @@ debug "Failed actions top 5 collected: $FAILED_ACTIONS_TOP5_COUNT entries"
 # GNU/BSD without invoking date(1).
 
 STUCK_ACTIONS=$(jq -cn --argjson threshold "$STUCK_HOURS_THRESHOLD" '
+  ($backupArr[0] // {"items":[]}) as $backup |
+  ($exportArr[0] // {"items":[]}) as $export |
+  ($restoreArr[0] // {"items":[]}) as $restore |
   [
     ($backup.items // []) | .[] | select((.status.state // "") == "Running") | {
       kind: "BackupAction",
@@ -1524,9 +1820,9 @@ STUCK_ACTIONS=$(jq -cn --argjson threshold "$STUCK_HOURS_THRESHOLD" '
   | map(select(.ageHours >= $threshold))
   | sort_by(.ageHours) | reverse | .[0:5]
 ' \
-  --argjson backup "$BACKUP_ACTIONS_JSON" \
-  --argjson export "$EXPORT_ACTIONS_JSON" \
-  --argjson restore "$RESTORE_ACTIONS_JSON" \
+  --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
+  --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
+  --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$STUCK_ACTIONS" | jq -e '.' >/dev/null 2>&1; then
@@ -1572,6 +1868,9 @@ if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
+  ($exportArr[0] // {"items":[]}) as $export |
+  ($restoreArr[0] // {"items":[]}) as $restore |
+  ($runsArr[0] // {"items":[]}) as $runs |
   ($appNamespaces // []) as $ns_list |
   ($export.items // []) as $export_items |
   ($restore.items // []) as $restore_items |
@@ -1615,9 +1914,9 @@ NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
     })
 ' \
   --argjson appNamespaces "$NS_PROTECTION_INPUT" \
-  --argjson export "$EXPORT_ACTIONS_JSON" \
-  --argjson restore "$RESTORE_ACTIONS_JSON" \
-  --argjson runs "$RUNACTIONS_JSON" \
+  --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
+  --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
+  --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$NS_PROTECTION_STATUS" | jq -e '.' >/dev/null 2>&1; then
@@ -2347,12 +2646,11 @@ debug "Non-default settings: $NON_DEFAULT_COUNT ($NON_DEFAULT_ITEMS)"
 ### -------------------------
 ### Best Practices Assessment
 ### -------------------------
-# DR Assessment
-if [ "$KDR_ENABLED" = true ]; then
-  BP_DR_STATUS="ENABLED"
-else
-  BP_DR_STATUS="NOT_ENABLED"
-fi
+# DR Assessment — carry the effective KDR verdict (#13) so JSON/HTML/text all
+# agree. Only ENABLED passes; CONFIGURED_INCOMPLETE / CONFIGURED_NOT_HEALTHY /
+# NOT_ENABLED each fail the (critical) check with an accurate label instead of a
+# blanket "NOT_ENABLED".
+BP_DR_STATUS="$KDR_STATUS"
 
 # Immutability Assessment
 if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
@@ -2603,21 +2901,16 @@ if [ "$MODE" = "json" ]; then
     --arg exportDataSource "$EXPORT_DATA_SOURCE" \
     --arg dedupRatio "$DEDUP_RATIO" \
     --arg dedupDisplay "$DEDUP_DISPLAY" \
-    --arg licenseCustomer "$LICENSE_CUSTOMER" \
-    --arg licenseStart "$LICENSE_START" \
-    --arg licenseEnd "$LICENSE_END" \
-    --arg licenseNodes "$LICENSE_NODES" \
-    --arg licenseId "$LICENSE_ID" \
-    --arg licenseStatus "$LICENSE_STATUS" \
-    --argjson clusterNodeCount "$CLUSTER_NODE_COUNT" \
-    --arg licenseNodesLimit "$LICENSE_NODES_LIMIT" \
-    --arg licenseConsumptionStatus "$LICENSE_CONSUMPTION_STATUS" \
+    --argjson licenseBlock "$LICENSE_JSON" \
     --argjson kdrEnabled "$KDR_ENABLED" \
+    --arg kdrStatus "$KDR_STATUS" \
     --arg kdrMode "$KDR_MODE" \
     --arg kdrFrequency "$KDR_FREQUENCY" \
     --arg kdrProfile "$KDR_PROFILE" \
     --arg kdrLocalSnapshot "$KDR_LOCAL_SNAPSHOT" \
     --arg kdrExportCatalog "$KDR_EXPORT_CATALOG" \
+    --arg kdrLastRunState "$KDR_LAST_RUN_STATE" \
+    --arg kdrLastSuccessfulRun "$KDR_LAST_SUCCESS_TS" \
     --argjson presetCount "$PRESET_COUNT" \
     --argjson presets "$(_ep "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})')" \
     --argjson blueprintCount "$BLUEPRINT_COUNT" \
@@ -2783,21 +3076,7 @@ if [ "$MODE" = "json" ]; then
       platform: $platform,
       kastenVersion: $version,
 
-      license: {
-        customer: $licenseCustomer,
-        id: $licenseId,
-        status: $licenseStatus,
-        dateStart: $licenseStart,
-        dateEnd: $licenseEnd,
-        restrictions: {
-          nodes: $licenseNodes
-        },
-        consumption: {
-          currentNodes: $clusterNodeCount,
-          nodeLimit: $licenseNodesLimit,
-          status: $licenseConsumptionStatus
-        }
-      },
+      license: $licenseBlock,
 
       health: {
         pods: {
@@ -2842,11 +3121,14 @@ if [ "$MODE" = "json" ]; then
 
       disasterRecovery: {
         enabled: $kdrEnabled,
+        status: $kdrStatus,
         mode: $kdrMode,
         frequency: $kdrFrequency,
         profile: $kdrProfile,
         localCatalogSnapshot: ($kdrLocalSnapshot == "true"),
-        exportCatalogSnapshot: ($kdrExportCatalog == "true")
+        exportCatalogSnapshot: ($kdrExportCatalog == "true"),
+        lastRunState: $kdrLastRunState,
+        lastSuccessfulRun: (if $kdrLastSuccessfulRun == "" then null else $kdrLastSuccessfulRun end)
       },
 
       policyPresets: {
@@ -3231,26 +3513,47 @@ fi
 ### License
 printf "\n${COLOR_BOLD}[LICENSE] License Information${COLOR_RESET}\n"
 if [ "$LICENSE_STATUS" = "NOT_FOUND" ]; then
-  printf "  ${COLOR_YELLOW}[WARN]  No license detected${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}[WARN]  No license secret detected${COLOR_RESET}\n"
 else
-  printf "  Customer:    $LICENSE_CUSTOMER\n"
-  printf "  License ID:  $LICENSE_ID\n"
-  if [ "$LICENSE_STATUS" = "VALID" ]; then
-    printf "  Status:      ${COLOR_GREEN}[OK] VALID${COLOR_RESET}\n"
-  elif [ "$LICENSE_STATUS" = "EXPIRED" ]; then
-    printf "  Status:      ${COLOR_RED}[FAIL] EXPIRED${COLOR_RESET}\n"
-  else
-    printf "  Status:      ${COLOR_YELLOW}[WARN]  UNKNOWN${COLOR_RESET}\n"
+  _lic_parseable=$(_ep "$LICENSE_JSON" | jq -r '.parseableCount // 0')
+  _lic_unparseable=$(_ep "$LICENSE_JSON" | jq -r '(.unparseable | length) // 0')
+  printf "  Secrets found:    %s (%s parseable, %s unparseable)\n" \
+    "$(_ep "$LICENSE_JSON" | jq -r '.secretCount // 0')" "$_lic_parseable" "$_lic_unparseable"
+  if [ "${_lic_unparseable:-0}" -gt 0 ] 2>/dev/null; then
+    _ep "$LICENSE_JSON" | jq -r '.unparseable[]? | "  Unparseable:      \(.secret) (\(.reason))"'
   fi
-  printf "  Valid From:  $LICENSE_START\n"
-  printf "  Valid Until: $LICENSE_END\n"
-  # License consumption (NEW v1.6)
-  if [ "$LICENSE_NODES_LIMIT" = "unlimited" ]; then
-    printf "  Node Usage:  ${COLOR_GREEN}$CLUSTER_NODE_COUNT${COLOR_RESET} / unlimited\n"
-  elif [ "$LICENSE_CONSUMPTION_STATUS" = "EXCEEDED" ]; then
-    printf "  Node Usage:  ${COLOR_RED}$CLUSTER_NODE_COUNT / $LICENSE_NODES_LIMIT (EXCEEDED!)${COLOR_RESET}\n"
+
+  # Per-license detail
+  _ep "$LICENSE_JSON" | jq -r '
+    .licenses | to_entries[] | .key as $i | .value as $l |
+    "\n  License #\($i + 1): \($l.secret)"
+    + "\n    Customer:       \($l.customer)"
+    + "\n    License ID:     \($l.id)"
+    + "\n    Type:           \($l.type)"
+    + "\n    Product:        \($l.product)"
+    + "\n    Valid:          \($l.dateStart | sub("T.*"; "")) -> \($l.dateEnd | sub("T.*"; ""))"
+      + (if $l.daysRemaining == null then "" else " (\($l.daysRemaining) days remaining)" end)
+    + "\n    Status:         \($l.status)"
+    + "\n    Node Limit:     \($l.nodes)"
+    + "\n    Features:       \($l.features)"
+  '
+
+  # Node limit reconciliation
+  printf "\n  Node Limit Reconciliation:\n"
+  printf "    From secrets:   %s (sum across %s license(s))\n" \
+    "$(_ep "$LICENSE_JSON" | jq -r '.nodeLimitAggregate.fromSecrets')" "$_lic_parseable"
+  printf "    From Report CR: %s\n" "$(_ep "$LICENSE_JSON" | jq -r '.nodeLimitAggregate.fromReportCR // "n/a"')"
+  if [ "$(_ep "$LICENSE_JSON" | jq -r '.nodeLimitAggregate.mismatch')" = "true" ]; then
+    printf "    ${COLOR_YELLOW}[WARN]          Mismatch detected — K10 may apply internal caps or license\n                    logic not visible from the secret payload${COLOR_RESET}\n"
+  fi
+
+  # Node consumption
+  _cons_cur=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.current')
+  _cons_lim=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.limit')
+  if [ "$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.status')" = "EXCEEDED" ]; then
+    printf "\n  Node Consumption: ${COLOR_RED}[FAIL] %s / %s (EXCEEDED)${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
   else
-    printf "  Node Usage:  ${COLOR_GREEN}$CLUSTER_NODE_COUNT / $LICENSE_NODES_LIMIT${COLOR_RESET}\n"
+    printf "\n  Node Consumption: ${COLOR_GREEN}[OK] %s / %s${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
   fi
 fi
 
@@ -3358,10 +3661,24 @@ fi
 ### Disaster Recovery
 printf "\n${COLOR_BOLD}[SHIELD] Disaster Recovery (KDR)${COLOR_RESET}\n"
 if [ "$KDR_ENABLED" = true ]; then
-  printf "  Status:    ${COLOR_GREEN}[OK] ENABLED${COLOR_RESET}\n"
+  case "$KDR_STATUS" in
+    ENABLED)
+      printf "  Status:    ${COLOR_GREEN}[OK] ENABLED${COLOR_RESET}\n" ;;
+    CONFIGURED_NOT_HEALTHY)
+      printf "  Status:    ${COLOR_RED}[WARN] CONFIGURED_NOT_HEALTHY${COLOR_RESET} ${COLOR_CYAN}(last run: %s)${COLOR_RESET}\n" "$KDR_LAST_RUN_STATE" ;;
+    CONFIGURED_INCOMPLETE)
+      printf "  Status:    ${COLOR_YELLOW}[WARN] CONFIGURED_INCOMPLETE${COLOR_RESET} ${COLOR_CYAN}(config cannot protect data)${COLOR_RESET}\n" ;;
+    *)
+      printf "  Status:    ${COLOR_YELLOW}[WARN] %s${COLOR_RESET}\n" "$KDR_STATUS" ;;
+  esac
   printf "  Mode:      $KDR_MODE\n"
   printf "  Frequency: $KDR_FREQUENCY\n"
   printf "  Profile:   $KDR_PROFILE\n"
+  if [ -n "$KDR_LAST_SUCCESS_TS" ]; then
+    printf "  Last OK:   $KDR_LAST_SUCCESS_TS\n"
+  else
+    printf "  Last OK:   ${COLOR_YELLOW}none${COLOR_RESET}\n"
+  fi
 else
   printf "  ${COLOR_RED}[FAIL] NOT CONFIGURED${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}[WARN]  This is critical for Kasten platform resilience${COLOR_RESET}\n"
@@ -4008,6 +4325,8 @@ printf "\n${COLOR_BOLD}[LIST] Best Practices Compliance${COLOR_RESET}\n"
 # Disaster Recovery
 if [ "$BP_DR_STATUS" = "ENABLED" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($KDR_MODE)\n"
+elif [ "$KDR_ENABLED" = true ]; then
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Disaster Recovery:    ${COLOR_YELLOW}%s${COLOR_RESET} ($KDR_MODE)\n" "$KDR_STATUS"
 else
   printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Disaster Recovery:    ${COLOR_RED}NOT ENABLED${COLOR_RESET}\n"
 fi

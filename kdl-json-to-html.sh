@@ -2,15 +2,19 @@
 set -eu
 
 ##############################################################################
-# KDL JSON -> HTML Report Generator v1.9.1
+# KDL JSON -> HTML Report Generator v1.9.2
 #
 # Usage:
 #   ./kdl-json-to-html.sh input.json output.html
 #
-# Compatible with Kasten Discovery Lite v1.8.1 through v1.9.1 JSON output.
-# Backward compatible: a v1.9.1 generator on v1.8.x JSON simply omits the
-# v1.9 sections (uses `if .field` guards everywhere). A v1.8.3 generator on
-# v1.9.1 JSON ignores the new sections (verified).
+# Compatible with Kasten Discovery Lite v1.8.1 through v1.9.2 JSON output.
+# Backward compatible: a v1.9.2 generator on v1.8.x JSON simply omits the
+# newer sections (uses `if .field` guards everywhere).
+#
+# New in v1.9.2:
+#   - KDR card renders the 4-state verdict (badge) + Last Run / Last Successful Run
+#   - License section: multi-license layout (summary + reconciliation, one card
+#     per license, muted list of unparseable secrets) for the reshaped `license` key
 #
 # New in v1.9.1 (generator alignment with KDL v1.9.x schema):
 #   - Header subtitle: K8s server version + distribution from .cluster
@@ -133,9 +137,9 @@ jq -r '
 def badge(v):
   if v == true or v == "VALID" or v == "ENABLED" or v == "IN_USE" or v == "COMPLIANT" or v == "CONFIGURED" or v == "COMPLETE" or v == "OK" then 
     "<span class=\"badge ok\">\u2713 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" then 
+  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" or v == "CONFIGURED_NOT_HEALTHY" then
     "<span class=\"badge error\">\u2717 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "WARN" then 
+  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "WARN" or v == "CONFIGURED_INCOMPLETE" then
     "<span class=\"badge warn\">\u26a0 " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == false then
     "<span class=\"badge warn\">\u2717 false</span>"
@@ -628,12 +632,14 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + (if .disasterRecovery then
     (if .disasterRecovery.enabled then
       "<div class=\"card dr-card\">
-        <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\"><span class=\"badge ok\">\u2713 ENABLED</span></span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\">" + badge(.disasterRecovery.status // "ENABLED") + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Mode</span><span class=\"stat-value\">" + .disasterRecovery.mode + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Frequency</span><span class=\"stat-value\"><code>" + .disasterRecovery.frequency + "</code></span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Profile</span><span class=\"stat-value\">" + .disasterRecovery.profile + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Local Catalog Snapshot</span><span class=\"stat-value\">" + boolBadge(.disasterRecovery.localCatalogSnapshot) + "</span></div>
-      </div>"
+        <div class=\"stat-row\"><span class=\"stat-label\">Local Catalog Snapshot</span><span class=\"stat-value\">" + boolBadge(.disasterRecovery.localCatalogSnapshot) + "</span></div>"
+        + (if .disasterRecovery.lastRunState then "<div class=\"stat-row\"><span class=\"stat-label\">Last Run</span><span class=\"stat-value\">" + badge(.disasterRecovery.lastRunState) + "</span></div>" else "" end)
+        + (if .disasterRecovery.lastSuccessfulRun then "<div class=\"stat-row\"><span class=\"stat-label\">Last Successful Run</span><span class=\"stat-value\"><code>" + .disasterRecovery.lastSuccessfulRun + "</code></span></div>" else "" end)
+      + "</div>"
     else
       "<div class=\"error-box\">\u274C <strong>Disaster Recovery is NOT CONFIGURED</strong><br>This is critical for Kasten platform resilience.</div>"
     end)
@@ -899,23 +905,42 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + "
 
 <h2>\uD83D\uDCDC License Information</h2>"
-+ (if .license.status == "NOT_FOUND" then
-    "<div class=\"warning-box\">\u26a0 <strong>License not found</strong></div>"
++ (if (.license == null) then
+    "<div class=\"info-box\">License data not available.</div>"
+  elif .license.status == "NOT_FOUND" then
+    "<div class=\"warning-box\">\u26a0 <strong>No license secret detected</strong></div>"
   else
+    # Summary card: secret counts + node-limit reconciliation + consumption
     "<div class=\"card license-card\">
-      <div class=\"stat-row\"><span class=\"stat-label\">Customer</span><span class=\"stat-value\">" + .license.customer + "</span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">License ID</span><span class=\"stat-value\"><code>" + .license.id + "</code></span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\">" + statusBadge(.license.status) + "</span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">Valid Period</span><span class=\"stat-value\">" + .license.dateStart + " \u2192 " + .license.dateEnd + "</span></div>
-      <div class=\"stat-row\"><span class=\"stat-label\">Node Limit</span><span class=\"stat-value\">" + 
-        (if .license.restrictions.nodes == "unlimited" or .license.restrictions.nodes == "0" then "<span class=\"badge ok\">\u221E Unlimited</span>" else .license.restrictions.nodes + " nodes" end) + 
-      "</span></div>" +
-      (if .license.consumption then
-        "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + 
-          (.license.consumption.currentNodes | tostring) + " / " + .license.consumption.nodeLimit + " " + badge(.license.consumption.status) +
-        "</span></div>"
-      else "" end) +
-    "</div>"
+      <div class=\"stat-row\"><span class=\"stat-label\">Secrets found</span><span class=\"stat-value\">" + (.license.secretCount | tostring) + " (" + (.license.parseableCount | tostring) + " parseable, " + ((.license.unparseable | length) | tostring) + " unparseable)</span></div>"
+    + (if .license.nodeLimitAggregate then
+        "<div class=\"stat-row\"><span class=\"stat-label\">Node Limit (secrets sum)</span><span class=\"stat-value\">" + (.license.nodeLimitAggregate.fromSecrets | tostring) + (if .license.nodeLimitAggregate.hasUnlimited then " <span class=\"badge ok\">\u221E includes unlimited</span>" else "" end) + "</span></div>"
+        + "<div class=\"stat-row\"><span class=\"stat-label\">Node Limit (Report CR)</span><span class=\"stat-value\">" + ((.license.nodeLimitAggregate.fromReportCR // "n/a") | tostring) + (if .license.nodeLimitAggregate.mismatch then " <span class=\"badge warn\">\u26a0 mismatch</span>" else "" end) + "</span></div>"
+      else "" end)
+    + (if .license.nodeConsumption then
+        "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.limit | tostring) + " " + badge(.license.nodeConsumption.status) + "</span></div>"
+      else "" end)
+    + "</div>"
+    # One card per parseable license
+    + ((.license.licenses // []) | to_entries | map(
+        "<div class=\"card license-card\">
+          <div class=\"stat-row\"><span class=\"stat-label\">License #" + ((.key + 1) | tostring) + "</span><span class=\"stat-value\"><code>" + .value.secret + "</code></span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Customer</span><span class=\"stat-value\">" + .value.customer + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">License ID</span><span class=\"stat-value\"><code>" + .value.id + "</code></span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Type</span><span class=\"stat-value\">" + badge(.value.type) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Product</span><span class=\"stat-value\">" + .value.product + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\">" + badge(.value.status) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Valid Period</span><span class=\"stat-value\">" + (.value.dateStart | sub("T.*"; "")) + " \u2192 " + (.value.dateEnd | sub("T.*"; "")) + (if .value.daysRemaining == null then "" else " (" + (.value.daysRemaining | tostring) + " days remaining)" end) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Node Limit</span><span class=\"stat-value\">" + (if .value.nodes == "unlimited" then "<span class=\"badge ok\">\u221E Unlimited</span>" else (.value.nodes + " nodes") end) + "</span></div>
+          <div class=\"stat-row\"><span class=\"stat-label\">Features</span><span class=\"stat-value\">" + .value.features + "</span></div>
+        </div>"
+      ) | join(""))
+    # Muted list of unparseable secrets
+    + (if ((.license.unparseable // []) | length) > 0 then
+        "<div class=\"card\" style=\"opacity:0.75\"><div class=\"stat-row\"><span class=\"stat-label\">Unparseable secrets</span><span class=\"stat-value\"></span></div>"
+        + (.license.unparseable | map("<div class=\"stat-row\"><span class=\"stat-label\"><code>" + .secret + "</code></span><span class=\"stat-value\">" + .reason + "</span></div>") | join(""))
+        + "</div>"
+      else "" end)
   end)
 + "
 
