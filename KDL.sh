@@ -1348,11 +1348,15 @@ debug "TransformSets: $TRANSFORMSET_COUNT"
 ### -------------------------
 ### Prometheus Monitoring
 ### -------------------------
-# Check for Prometheus in common namespaces/labels
-PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+# Detect the K10-bundled Prometheus ONLY (issue #16). A cluster-wide
+# `-l app=prometheus` search matches any Prometheus (cluster monitoring, user
+# workload monitoring, app instances) — on OpenShift it is true 100% of the
+# time regardless of whether K10 monitoring is enabled. Scope the lookup to the
+# K10 namespace and use the K10 chart pod labels.
+PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 if [ "$PROMETHEUS_RUNNING" -eq 0 ]; then
-  PROMETHEUS_RUNNING=$(kubectl get pods --all-namespaces -l "app.kubernetes.io/name=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=k10" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 fi
 
