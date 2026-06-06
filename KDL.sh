@@ -541,10 +541,19 @@ progress "K10 resources"
 
 kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
 kubectl -n "$NAMESPACE" get policies -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get runactions.actions.kio.kasten.io -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get restoreactions.actions.kio.kasten.io -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get backupactions.actions.kio.kasten.io -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get exportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
+# Action CRs are cluster-wide (#15): on K10 8.x, policy-driven actions are
+# created in the source application namespace, not in the K10 namespace.
+# Fetching with `-n $NAMESPACE` reported zero Failed Actions and under-counted
+# the action totals / success rate on clusters with real failures. The
+# downstream jq already resolves the namespace from
+# .metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace, so -A
+# is a drop-in. NOTE (#15): for very large clusters (>~1k actions) a future
+# optimization is a 2-step fetch (custom-columns for counters, full JSON only
+# for namespaces with Failed/Running actions) — deferred, needs live benchmark.
+kubectl get runactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
+kubectl get restoreactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
+kubectl get backupactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
+kubectl get exportactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
 # RestorePoints are cluster-wide (#10): on K10 8.5.x the RestorePoint CRs live
 # in the source application namespace, not in the K10 namespace. Fetch with -A
 # so the by-namespace Top 5 and the total count match the K10 UI dashboard.
