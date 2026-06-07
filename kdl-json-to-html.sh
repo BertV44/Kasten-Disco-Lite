@@ -1244,7 +1244,10 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 <!-- Effective RPO per Policy (NEW v2.0) -->
 <h2>\u23F3 Effective RPO per Policy<span class=\"new-badge\">v2.0</span></h2>"
 + (if (.policyRunStats.effectiveRpo // null) != null then
-    (.policyRunStats.effectiveRpo) as $rpo |
+    # effectiveRpo is an object {items:[...], summary:{...}}; iterate .items.
+    # (Type guard keeps a bare array tolerated defensively.)
+    (.policyRunStats.effectiveRpo) as $rpoObj |
+    (if ($rpoObj | type) == "object" then ($rpoObj.items // []) else ($rpoObj // []) end) as $rpo |
     "<div class=\"grid\">
        <div class=\"card new-feature\"><strong>Policies analysed</strong><div class=\"card-value\">" + (($rpo | length) | tostring) + "</div></div>
        <div class=\"card\"><strong>With theoretical frequency</strong><div class=\"card-value\">" + ([$rpo[] | select(.frequencyTheoreticalSeconds != null)] | length | tostring) + "</div></div>
