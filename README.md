@@ -62,7 +62,7 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 | Immutability       | 20         | At least one Location Profile with `protectionPeriod`       |
 | Off-cluster export | 15         | At least one policy with an `export` action                  |
 | Authentication     | 15         | `AUTH_METHOD != "none"` (OIDC, LDAP, OpenShift, Basic, Token) |
-| Disaster Recovery  | 15         | `k10-disaster-recovery-policy` present                       |
+| Disaster Recovery  | 15         | `k10-disaster-recovery-policy` present **and effectively healthy** (KDR verdict `ENABLED`) |
 | Audit logging      | 10         | Cluster logging or S3 export configured                      |
 | KMS Encryption     | 10         | AWS KMS, Azure Key Vault, or HashiCorp Vault Transit         |
 | Network Policies   | 10         | At least one NetworkPolicy in the K10 namespace              |
@@ -725,7 +725,7 @@ This split (50/40/10) reflects an opinionated stance: **even with perfect access
 
 **Why 15**: restores from immutable backups cannot proceed without a functioning K10 control plane. If the catalog and metadata are lost with the cluster, the backups become unindexed blob storage. KDR (Quick DR or Legacy) is the mechanism that restores the catalog itself.
 
-**Evidence rule**: presence of `k10-disaster-recovery-policy`. Mode (Quick DR Local / Quick DR Exported / Legacy) is not differentiated at this version.
+**Evidence rule** *(v2.0, tightened)*: the `k10-disaster-recovery-policy` must be present **and the KDR effective-health verdict must be `ENABLED`** — i.e. the config can actually protect data and the last KDR run succeeded recently. A present-but-incomplete (`CONFIGURED_INCOMPLETE`, e.g. *Quick DR — No Snapshot*) or unhealthy (`CONFIGURED_NOT_HEALTHY`) KDR earns **0 points**, since it would not restore the catalog in a real incident. This avoids a misleading full DR score next to a "config cannot protect data" verdict. See the KDR verdict definition in the Disaster Recovery output section.
 
 #### Audit logging (10 points)
 

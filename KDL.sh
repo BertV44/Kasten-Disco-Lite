@@ -3407,9 +3407,13 @@ if [ "$AUTH_METHOD" != "none" ] && [ -n "$AUTH_METHOD" ]; then
   RANSOM_AUTH=$RANSOM_AUTH_MAX
 fi
 
+# Award DR points only when KDR is *effectively healthy* (#13), not merely
+# present. A configured-but-incomplete or unhealthy KDR cannot protect data, so
+# it earns no ransomware-readiness credit (avoids a misleading 15/15 next to a
+# CONFIGURED_INCOMPLETE verdict).
 RANSOM_DR=0
 RANSOM_DR_MAX=15
-if [ "$KDR_ENABLED" = "true" ]; then
+if [ "$KDR_STATUS" = "ENABLED" ]; then
   RANSOM_DR=$RANSOM_DR_MAX
 fi
 
@@ -4114,7 +4118,7 @@ if [ "$MODE" = "json" ]; then
           immutability:     {score: $ransomImmut,   max: $ransomImmutMax,   evidence: ($immutability == "true" and $immutableProfiles > 0)},
           offClusterExport: {score: $ransomExport,  max: $ransomExportMax,  evidence: ($policiesWithExport > 0)},
           authentication:   {score: $ransomAuth,    max: $ransomAuthMax,    evidence: ($authMethod != "none" and $authMethod != "")},
-          disasterRecovery: {score: $ransomDr,      max: $ransomDrMax,      evidence: $kdrEnabled},
+          disasterRecovery: {score: $ransomDr,      max: $ransomDrMax,      evidence: ($kdrStatus == "ENABLED")},
           auditLogging:     {score: $ransomAudit,   max: $ransomAuditMax,   evidence: ($auditEnabled == "true")},
           kmsEncryption:    {score: $ransomKms,     max: $ransomKmsMax,     evidence: ($encryptionProvider != "none" and $encryptionProvider != "")},
           networkPolicies:  {score: $ransomNetpol, max: $ransomNetpolMax, evidence: ($netpolEnabled == "true")},
@@ -5316,7 +5320,7 @@ _pillar_line() {
 _pillar_line "Immutability"        "$RANSOM_IMMUT"   "$RANSOM_IMMUT_MAX"   "$([ "$IMMUTABILITY" = "true" ] && [ "$IMMUTABLE_PROFILES" -gt 0 ] && echo "$IMMUTABLE_PROFILES profile(s) with retention lock" || echo "no immutable profile configured")"
 _pillar_line "Off-cluster export"  "$RANSOM_EXPORT"  "$RANSOM_EXPORT_MAX"  "$([ "$POLICIES_WITH_EXPORT" -gt 0 ] && echo "$POLICIES_WITH_EXPORT policy/policies export to remote location" || echo "no policy with export action")"
 _pillar_line "Authentication"      "$RANSOM_AUTH"    "$RANSOM_AUTH_MAX"    "$([ "$AUTH_METHOD" != "none" ] && [ -n "$AUTH_METHOD" ] && echo "$AUTH_METHOD" || echo "dashboard may be unauthenticated")"
-_pillar_line "Disaster Recovery"   "$RANSOM_DR"     "$RANSOM_DR_MAX"      "$([ "$KDR_ENABLED" = "true" ] && echo "KDR enabled ($KDR_MODE)" || echo "KDR not configured")"
+_pillar_line "Disaster Recovery"   "$RANSOM_DR"     "$RANSOM_DR_MAX"      "$([ "$KDR_STATUS" = "ENABLED" ] && echo "KDR healthy ($KDR_MODE)" || { [ "$KDR_ENABLED" = "true" ] && echo "KDR present but $KDR_STATUS — no credit" || echo "KDR not configured"; })"
 _pillar_line "Audit logging"       "$RANSOM_AUDIT"  "$RANSOM_AUDIT_MAX"   "$([ "$AUDIT_ENABLED" = "true" ] && echo "SIEM targets: $AUDIT_TARGETS" || echo "no audit/SIEM configured")"
 _pillar_line "KMS encryption"      "$RANSOM_KMS"    "$RANSOM_KMS_MAX"     "$([ "$ENCRYPTION_PROVIDER" != "none" ] && [ -n "$ENCRYPTION_PROVIDER" ] && echo "$ENCRYPTION_PROVIDER" || echo "no KMS provider configured")"
 _pillar_line "Network policies"    "$RANSOM_NETPOL" "$RANSOM_NETPOL_MAX"  "$([ "$NETPOL_ENABLED" = "true" ] && echo "NetworkPolicies present" || echo "no NetworkPolicies on K10 namespace")"
