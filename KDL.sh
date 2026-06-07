@@ -5339,6 +5339,8 @@ printf "\n${COLOR_BOLD}[LIST] Best Practices Compliance${COLOR_RESET}\n"
 # Disaster Recovery
 if [ "$BP_DR_STATUS" = "ENABLED" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($KDR_MODE)\n"
+elif [ "$KDR_ENABLED" = true ]; then
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Disaster Recovery:    ${COLOR_YELLOW}%s${COLOR_RESET} ($KDR_MODE)\n" "$KDR_STATUS"
 else
   printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Disaster Recovery:    ${COLOR_RED}NOT ENABLED${COLOR_RESET}\n"
 fi
