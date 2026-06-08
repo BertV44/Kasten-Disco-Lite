@@ -3491,9 +3491,15 @@ fi
 ##############################################################################
 # VALIDATE JSON ARGUMENTS (prevent silent failures in the big jq call)
 ##############################################################################
-_safe_arg() { echo "$1" | jq -c '.' 2>/dev/null || echo "$2"; }
+_safe_arg() { printf '%s' "$1" | jq -c '.' 2>/dev/null || printf '%s' "$2"; }
 PROFILES_JSON=$(_safe_arg "$PROFILES_JSON" '{"items":[]}')
 POLICIES_JSON=$(_safe_arg "$POLICIES_JSON" '{"items":[]}')
+# The full raw profiles/policies JSON can be large (many CRs with annotations /
+# managedFields). Hand them to the main jq via --slurpfile (file-based) instead
+# of --argjson on the command line: avoids E2BIG (ARG_MAX) on big clusters and
+# any shell echo/quoting round-trip. (#policies-empty fix)
+printf '%s' "$PROFILES_JSON" > "$TEMP_DIR/profiles_clean.json"
+printf '%s' "$POLICIES_JSON" > "$TEMP_DIR/policies_clean.json"
 POLICY_LAST_RUN=$(_safe_arg "$POLICY_LAST_RUN" '[]')
 UNPROTECTED_NS_JSON=$(_safe_arg "$UNPROTECTED_NS_JSON" '[]')
 K10_RESOURCES_SUMMARY=$(_safe_arg "$K10_RESOURCES_SUMMARY" '{"pods":[]}')
@@ -3540,8 +3546,8 @@ if [ "$MODE" = "json" ]; then
     --arg kdlVersion "$KDL_VERSION" \
     --arg platform "$PLATFORM" \
     --arg version "$KASTEN_VERSION" \
-    --argjson profiles "$(_ep "$PROFILES_JSON" | jq -c '.')" \
-    --argjson policies "$(_ep "$POLICIES_JSON" | jq -c '.')" \
+    --slurpfile profilesArr "$TEMP_DIR/profiles_clean.json" \
+    --slurpfile policiesArr "$TEMP_DIR/policies_clean.json" \
     --arg immutability "$IMMUTABILITY" \
     --argjson immutabilityDays "${IMMUTABILITY_DAYS:-0}" \
     --argjson immutableProfiles "$IMMUTABLE_PROFILES" \
@@ -3791,6 +3797,8 @@ if [ "$MODE" = "json" ]; then
     --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
     --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
     '
+    ($policiesArr[0] // {"items":[]}) as $policies |
+    ($profilesArr[0] // {"items":[]}) as $profiles |
     {
       kdlVersion: $kdlVersion,
       platform: $platform,
