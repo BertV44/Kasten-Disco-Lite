@@ -695,13 +695,29 @@ debug "Parallel fetch complete"
 progress "license"
 
 # Extract a top-level scalar field, case-insensitive on the key, quotes stripped.
+# Top-level keys only (no leading indent), so nested keys such as
+# restrictions.nodes never collide with a same-named top-level lookup. The value
+# is everything after the FIRST ':' — ISO timestamps embed their own ':' and
+# must not be truncated. Tolerates camelCase and lowercase keys, single or
+# double quotes.
 _lic_field() { # $1 = raw payload, $2 = lowercased field name
-  printf '%s' "$1" | awk -F': ' -v f="$2" '
-    tolower($1) == f { v = $2; gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/["'\'']/, "", v); print v; exit }'
+  printf '%s' "$1" | awk -v f="$2" '
+    /^[^[:space:]]/ {
+      key = $0; sub(/:.*/, "", key); gsub(/[ \t]+$/, "", key)
+      if (tolower(key) == f) {
+        v = $0; sub(/^[^:]*:/, "", v)
+        gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/^["'\'']|["'\'']$/, "", v)
+        print v; exit
+      }
+    }'
 }
 
+# Enumerate every secret whose name contains "license" (case-insensitive). The
+# narrower "k10-license" prefix missed renamed variants such as
+# "k10-trial-license"; the payload signature check below (customerName + id +
+# product) is the real guard against swallowing non-license secrets.
 LICENSE_SECRET_NAMES=$(kubectl -n "$NAMESPACE" get secrets -o json 2>/dev/null \
-  | jq -r '[.items[]? | select(.metadata.name | startswith("k10-license")) | .metadata.name] | .[]' 2>/dev/null || echo "")
+  | jq -r '[.items[]? | select(.metadata.name | ascii_downcase | test("license")) | .metadata.name] | .[]' 2>/dev/null || echo "")
 LICENSE_SECRET_COUNT=$(printf '%s\n' "$LICENSE_SECRET_NAMES" | awk 'NF{c++} END{print c+0}')
 
 LICENSES_PARSED='[]'
@@ -717,35 +733,45 @@ for _lic_name in $LICENSE_SECRET_NAMES; do
 
   CUSTOMER=$(_lic_field "$RAW" "customername")
   ID=$(_lic_field "$RAW" "id")
+  PRODUCT=$(_lic_field "$RAW" "product")
 
-  # Minimum viable license signature; otherwise record and move on.
-  if [ -z "$CUSTOMER" ] || [ -z "$ID" ]; then
-    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "missing customerName or id" '. + [{secret: $s, reason: $r}]')
+  # Minimum viable license signature. Now that enumeration matches any secret
+  # named *license*, require customerName + id + product together so unrelated
+  # secrets are recorded and skipped rather than mis-parsed as licenses.
+  if [ -z "$CUSTOMER" ] || [ -z "$ID" ] || [ -z "$PRODUCT" ]; then
+    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "missing customerName/id/product signature" '. + [{secret: $s, reason: $r}]')
     continue
   fi
 
-  PRODUCT=$(_lic_field "$RAW" "product")
   START_DATE=$(_lic_field "$RAW" "datestart")
   END_DATE=$(_lic_field "$RAW" "dateend")
-  # restrictions.nodes is nested (indented); match the indented key only.
-  NODES=$(printf '%s' "$RAW" | awk -F': ' '/^[[:space:]]+nodes:/ {v=$2; gsub(/^[ \t]+|[ \t]+$/,"",v); gsub(/["'\'']/,"",v); print v; exit}')
-  FEATURES_RAW=$(printf '%s' "$RAW" | awk -F': ' 'tolower($1)=="features" {print $2; exit}')
+  # restrictions.nodes is nested (indented); match the indented key only, but
+  # case-insensitively and tolerant of quoted ("5") or bare (500) values. Value
+  # is taken after the first ':' for consistency with _lic_field.
+  NODES=$(printf '%s' "$RAW" | awk '
+    tolower($0) ~ /^[[:space:]]+nodes:[[:space:]]*/ {
+      v=$0; sub(/^[^:]*:/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); gsub(/^["'\'']|["'\'']$/,"",v); print v; exit
+    }')
+  FEATURES_RAW=$(printf '%s' "$RAW" | awk 'tolower($0) ~ /^features:/ {v=$0; sub(/^[^:]*:/,"",v); print v; exit}')
 
-  [ -z "$PRODUCT" ] && PRODUCT="N/A"
   [ -z "$START_DATE" ] && START_DATE="N/A"
   [ -z "$END_DATE" ] && END_DATE="N/A"
   [ -z "$NODES" ] && NODES="unlimited"
 
-  # Type derivation. Only "starter" is confirmed against a real payload; other
-  # prefixes are [unverified] and default to UNKNOWN rather than guessing.
-  if [ "$CUSTOMER" = "starter-license" ] || printf '%s' "$ID" | grep -q '^starter-'; then
+  # Type derivation (ORDER MATTERS). TRIAL is tested first, on two independent
+  # signals (id "trial-" prefix OR "trial" anywhere in the customer name), so a
+  # trial whose customer name also contains "starter" can never fall through to
+  # STARTER. STARTER uses an EXACT customer-name match (or an explicit "starter-"
+  # id prefix) — never a substring test on "starter". A valid license that is
+  # neither trial nor starter is commercial: its id is a bare UUID with no
+  # type-bearing prefix, so it is classified ENTERPRISE instead of UNKNOWN.
+  _cust_lc=$(printf '%s' "$CUSTOMER" | tr '[:upper:]' '[:lower:]')
+  if printf '%s' "$ID" | grep -q '^trial-' || printf '%s' "$_cust_lc" | grep -q 'trial'; then
+    TYPE="TRIAL"
+  elif [ "$_cust_lc" = "starter-license" ] || printf '%s' "$ID" | grep -q '^starter-'; then
     TYPE="STARTER"
-  elif printf '%s' "$ID" | grep -q '^trial-'; then
-    TYPE="TRIAL"        # [unverified] prefix — confirm against a real trial dump
-  elif printf '%s' "$ID" | grep -q '^enterprise-'; then
-    TYPE="ENTERPRISE"   # [unverified] prefix — confirm against a real commercial dump
   else
-    TYPE="UNKNOWN"
+    TYPE="ENTERPRISE"
   fi
 
   # Features: null -> "-"; otherwise pass through trimmed (further parsing TBD
@@ -986,17 +1012,23 @@ SYSTEM_POLICY_COUNT=$((POLICY_COUNT - APP_POLICY_COUNT))
 debug "Policies detected: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)"
 debug "App policy names: $(_ep "$APP_POLICIES_JSON" | jq -r '[.items[]?.metadata.name] | join(", ")')"
 
-# Count app policies targeting all namespaces (excluding system policies)
+# Count app policies targeting all namespaces (excluding system policies).
+# Only BACKUP policies count as coverage: an import/restore-only catch-all
+# (e.g. multi-cluster import policies, which have no selector) does not protect
+# anything and must not be reported as covering all namespaces.
 ALL_NS_POLICIES="$(_ep "$APP_POLICIES_JSON" | jq '[
-  .items[]? | 
+  .items[]? |
   select(
-    .spec.selector == null or
-    (.spec.selector.matchExpressions == null and 
-     .spec.selector.matchNames == null and
-     .spec.selector.matchLabels == null) or
-    (.spec.selector.matchExpressions == [] and 
-     .spec.selector.matchNames == [] and
-     (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
+    (
+      .spec.selector == null or
+      (.spec.selector.matchExpressions == null and
+       .spec.selector.matchNames == null and
+       .spec.selector.matchLabels == null) or
+      (.spec.selector.matchExpressions == [] and
+       .spec.selector.matchNames == [] and
+       (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
+    )
+    and ([.spec.actions[]?.action] | index("backup"))
   )
 ] | length // 0')"
 [ -z "$ALL_NS_POLICIES" ] && ALL_NS_POLICIES=0
@@ -1432,20 +1464,30 @@ COMPLEX_SELECTOR_POLICIES=""
 
 if [ "$APP_POLICY_COUNT" -gt 0 ]; then
   # Find catch-all policies (no selector)
+  # A catch-all that confers protection must include a backup action. Import-
+  # and restore-only catch-all policies are excluded so they do not mask genuine
+  # coverage gaps (which made `unprotectedNamespaces` report 0 while the
+  # per-namespace protection status showed namespaces never backed up).
   CATCHALL_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -r '
     [.items[]? | select(
-      .spec.selector == null or
-      .spec.selector == {} or
-      (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
-      (.spec.selector | keys | length == 0)
+      (
+        .spec.selector == null or
+        .spec.selector == {} or
+        (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
+        (.spec.selector | keys | length == 0)
+      )
+      and ([.spec.actions[]?.action] | index("backup"))
     ) | .metadata.name] | join(", ")
   ')
   CATCHALL_COUNT=$(_ep "$APP_POLICIES_JSON" | jq '
     [.items[]? | select(
-      .spec.selector == null or
-      .spec.selector == {} or
-      (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
-      (.spec.selector | keys | length == 0)
+      (
+        .spec.selector == null or
+        .spec.selector == {} or
+        (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
+        (.spec.selector | keys | length == 0)
+      )
+      and ([.spec.actions[]?.action] | index("backup"))
     )] | length
   ')
   
@@ -1482,18 +1524,27 @@ debug "Has complex selector: $HAS_COMPLEX_SELECTOR"
 
 # Get namespaces explicitly targeted by app policies (matchNames or matchExpressions with namespace values)
 PROTECTED_NAMESPACES=$(_ep "$APP_POLICIES_JSON" | jq -c '
-  [.items[]? | 
+  [.items[]? |
     if .spec.selector.matchNames then
       .spec.selector.matchNames[]?
     elif .spec.selector.matchExpressions then
-      (.spec.selector.matchExpressions[]? | 
-        select(.key == "k10.kasten.io/appNamespace" and .operator == "In") | 
-        .values[]?
+      (.spec.selector.matchExpressions[]? |
+        select(.operator == "In") |
+        if .key == "k10.kasten.io/appNamespace" then
+          .values[]?
+        elif .key == "k10.kasten.io/virtualMachineRef" then
+          # VM-ref values are "namespace/vmName" (or "namespace/*"); the
+          # protected namespace is the part before the first "/". Without this,
+          # VM-protection policies left their namespaces looking unprotected.
+          (.values[]? | split("/")[0])
+        else
+          empty
+        end
       )
     else
       empty
     end
-  ] | unique // []
+  ] | map(select(. != null and . != "")) | unique // []
 ' 2>/dev/null || echo '[]')
 
 # Validate
@@ -1606,6 +1657,12 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAM
       ([$sel.matchExpressions[]? |
         if .key == "k10.kasten.io/appNamespace" and .operator == "In" then
           {ns: .values[]?, unresolvable: false}
+        elif .key == "k10.kasten.io/virtualMachineRef" and .operator == "In" then
+          # VM-ref values are "namespace/vmName" (or "namespace/*"); the target
+          # namespace is the part before the first "/". Without this branch the
+          # generic label-resolution below matched nothing and VM-protection
+          # policies were wrongly flagged isEmpty.
+          {ns: (.values[]? | split("/")[0]), unresolvable: false}
         elif .operator == "In" then
           . as $expr |
           (allNs[]? | select(
@@ -1676,12 +1733,27 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAM
     else empty end
   ]) as $pairs |
 
+  # Output trimming (keeps the JSON lean — see issue on dev-2.0 payload bloat).
+  # existingNamespaces is fully derivable (targeted minus nonExisting) and is not
+  # consumed downstream, so it is dropped from the per-policy output. Counts and
+  # nonExistingReferences are preserved. The pair computation above already used
+  # the full $resolved, so trimming here is output-only.
+  def trim_policy: del(.existingNamespaces);
+
+  # Catch-all pairs overlap every namespace by design and are not rendered; drop
+  # their (large, repeated) sharedNamespaces list but keep a count. Genuine pairs
+  # keep the list (it is small and shown in the report).
+  ($pairs | map(
+    . + {sharedNamespaceCount: (.sharedNamespaces | length)}
+    | if .involvesCatchall then del(.sharedNamespaces) else . end
+  )) as $pairsOut |
+
   {
-    resolved: $resolved,
-    empty: [$resolved[] | select(.isEmpty)],
-    unresolvable: [$resolved[] | select(.resolvable | not)],
-    withNonExistingNs: [$resolved[] | select(.nonExistingReferences | length > 0)],
-    redundantPairs: $pairs,
+    resolved: [$resolved[] | trim_policy],
+    empty: [$resolved[] | select(.isEmpty) | trim_policy],
+    unresolvable: [$resolved[] | select(.resolvable | not) | trim_policy],
+    withNonExistingNs: [$resolved[] | select(.nonExistingReferences | length > 0) | trim_policy],
+    redundantPairs: $pairsOut,
     summary: {
       totalPolicies: ($resolved | length),
       emptyCount: ([$resolved[] | select(.isEmpty)] | length),
@@ -1723,6 +1795,10 @@ RESTORE_ACTIONS_TOTAL=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '.items | l
 RESTORE_ACTIONS_COMPLETED=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')")
 RESTORE_ACTIONS_FAILED=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Failed")] | length // 0')")
 RESTORE_ACTIONS_RUNNING=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Running")] | length // 0')")
+# Remaining states (Pending/Cancelled/Skipped/empty) so the buckets reconcile
+# with total: completed + failed + running + other == total.
+RESTORE_ACTIONS_OTHER=$((RESTORE_ACTIONS_TOTAL - RESTORE_ACTIONS_COMPLETED - RESTORE_ACTIONS_FAILED - RESTORE_ACTIONS_RUNNING))
+[ "$RESTORE_ACTIONS_OTHER" -lt 0 ] 2>/dev/null && RESTORE_ACTIONS_OTHER=0
 
 # Get last 5 restore actions summary
 RESTORE_ACTIONS_RECENT=$(_ep "$RESTORE_ACTIONS_JSON" | jq -c '
@@ -1730,7 +1806,10 @@ RESTORE_ACTIONS_RECENT=$(_ep "$RESTORE_ACTIONS_JSON" | jq -c '
     name: .metadata.name,
     timestamp: .metadata.creationTimestamp,
     state: (.status.state // "Unknown"),
-    targetNamespace: (.spec.subject.namespace // "N/A")
+    # Same resolution chain as Failed Actions Top 5 so a given restore action
+    # reports the same namespace in both sections (was subject.namespace only,
+    # which yielded "N/A" while Top 5 resolved a real namespace).
+    targetNamespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .spec.subject.namespace // .metadata.namespace // "N/A")
   }] // []
 ' 2>/dev/null || echo '[]')
 
@@ -2191,11 +2270,18 @@ debug "Stuck actions (>${STUCK_HOURS_THRESHOLD}h Running): $STUCK_ACTIONS_COUNT"
 #
 # All inputs already in memory — no kubectl calls.
 
+# Keep only namespaces that actually exist on the cluster. PROTECTED_NAMESPACES
+# may include policy targets that do not exist (e.g. a multi-cluster appNamespace
+# value); listing them here would contradict policyAnalysis, which flags the same
+# names as non-existing references. Intersecting with ALL_NAMESPACES makes both
+# sections agree on which namespaces exist.
 NS_PROTECTION_INPUT=$(jq -cn '
   (($app // []) + ($protected // [])) | unique
+  | map(select(. as $n | ($all // []) | index($n)))
 ' \
   --argjson app "$APP_NAMESPACES" \
   --argjson protected "$PROTECTED_NAMESPACES" \
+  --argjson all "$ALL_NAMESPACES" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
@@ -2203,17 +2289,24 @@ if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
+  ($backupArr[0] // {"items":[]}) as $backup |
   ($exportArr[0] // {"items":[]}) as $export |
   ($restoreArr[0] // {"items":[]}) as $restore |
-  ($runsArr[0] // {"items":[]}) as $runs |
   ($appNamespaces // []) as $ns_list |
+  ($backup.items // []) as $backup_items |
   ($export.items // []) as $export_items |
   ($restore.items // []) as $restore_items |
-  ($runs.items // []) as $run_items |
 
-  ($run_items | map(select((.status.state // "") == "Complete")) |
-    group_by(.metadata.namespace // "") |
-    map({key: .[0].metadata.namespace, value: (map(.metadata.creationTimestamp) | sort | last)}) |
+  # Last successful backup PER APP NAMESPACE. Derived from BackupActions keyed
+  # by the k10.kasten.io/appNamespace label (same pattern as exports below). The
+  # previous implementation grouped RunActions by .metadata.namespace, which is
+  # always the K10 namespace (e.g. kasten-io) and therefore never matched an app
+  # namespace — every namespace looked "never backed up".
+  ($backup_items | map(select((.status.state // "") == "Complete")) |
+    map({ns: (.metadata.labels["k10.kasten.io/appNamespace"] // ""), ts: (.metadata.creationTimestamp // "")}) |
+    map(select(.ns != "")) |
+    group_by(.ns) |
+    map({key: .[0].ns, value: (map(.ts) | sort | last)}) |
     from_entries) as $last_backup |
 
   ($export_items | map(select((.status.state // "") == "Complete")) |
@@ -2244,14 +2337,15 @@ NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
       stale: (
         if $last_backup[$ns] then
           (((now - ($last_backup[$ns] | fromdateiso8601)) / 86400 | floor) > $threshold)
-        else true end
-      )
+        else false end
+      ),
+      neverBackedUp: ($last_backup[$ns] == null)
     })
 ' \
   --argjson appNamespaces "$NS_PROTECTION_INPUT" \
+  --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
   --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
   --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
-  --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$NS_PROTECTION_STATUS" | jq -e '.' >/dev/null 2>&1; then
@@ -3022,7 +3116,10 @@ if [ "$CR_RAW_VALID" = "true" ]; then
       ) |
       {
         name: .metadata.name,
-        labels: (.metadata.labels // {}),
+        # Dumping the full Helm label set per role was pure payload bloat (the
+        # same ~8 boilerplate labels on every object). Keep only the one useful
+        # signal: whether this is a default K10-managed RBAC object.
+        defaultRbacObject: (((.metadata.labels // {})["k10.kasten.io/default-rbac-object"]) == "true"),
         rulesCount: ((.rules // []) | length),
         verbsAll: ([(.rules // [])[]? | select((.verbs // []) | index("*"))] | length > 0),
         resourcesAll: ([(.rules // [])[]? | select((.resources // []) | index("*"))] | length > 0)
@@ -3584,6 +3681,7 @@ if [ "$MODE" = "json" ]; then
     --argjson restoreActionsCompleted "$RESTORE_ACTIONS_COMPLETED" \
     --argjson restoreActionsFailed "$RESTORE_ACTIONS_FAILED" \
     --argjson restoreActionsRunning "$RESTORE_ACTIONS_RUNNING" \
+    --argjson restoreActionsOther "$RESTORE_ACTIONS_OTHER" \
     --argjson restoreActionsRecent "$RESTORE_ACTIONS_RECENT" \
     --argjson restorePoints "$RESTORE_POINTS_COUNT" \
     --arg successRate "$SUCCESS_RATE" \
@@ -3845,11 +3943,12 @@ if [ "$MODE" = "json" ]; then
             completed: $restoreActionsCompleted,
             failed: $restoreActionsFailed,
             running: $restoreActionsRunning,
+            other: $restoreActionsOther,
             recent: $restoreActionsRecent
           },
           restorePoints: $restorePoints,
           successRate: $successRate,
-          successRateNote: "Calculated from finished actions (Complete + Failed) only"
+          successRateNote: "Covers Backup + Export finished actions only (Complete + Failed). Restore actions are reported separately under restoreActions and are excluded from this rate and from totalActions/completedActions/failedActions."
         }
       },
 
@@ -3999,7 +4098,7 @@ if [ "$MODE" = "json" ]; then
 
       dataUsage: {
         totalPvcs: $totalPvcs,
-        totalCapacityGi: $totalCapacity,
+        totalCapacityGi: ($totalCapacity | tonumber? // 0),
         snapshotDataGi: $snapshotData,
         exportStorage: {
           display: $exportStorage,
@@ -4291,7 +4390,13 @@ if [ "$MODE" = "json" ]; then
               end
             ),
             retention: (.spec.retention // {}),
-            exportRetention: (.spec.actions[] | select(.action == "export") | .retention // null),
+            # Take the first export action retention, or null. Must NOT be a
+            # bare generator: (.spec.actions[] | select(...)) yields nothing
+            # for policies without an export action, which makes the whole
+            # object construction empty and silently drops those policies from
+            # `items` (count/items mismatch). Wrapping in [] + .[0] keeps one
+            # value (null when absent) and de-duplicates multi-export policies.
+            exportRetention: ([.spec.actions[]? | select(.action == "export") | .retention] | .[0] // null),
             presetRef: .spec.presetRef.name
           }
         ]

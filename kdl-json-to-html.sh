@@ -953,7 +953,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 + (if .dataUsage then
     "<div class=\"grid\">
       <div class=\"card\"><strong>Total PVCs</strong><div class=\"card-value\">" + (.dataUsage.totalPvcs | tostring) + "</div></div>
-      <div class=\"card\"><strong>Total Capacity</strong><div class=\"card-value\">" + .dataUsage.totalCapacityGi + " GiB</div></div>
+      <div class=\"card\"><strong>Total Capacity</strong><div class=\"card-value\">" + (.dataUsage.totalCapacityGi | tostring) + " GiB</div></div>
       <div class=\"card\"><strong>Snapshot Data</strong><div class=\"card-value\">~" + (.dataUsage.snapshotDataGi | tostring) + " GiB</div></div>" +
       (if .dataUsage.exportStorage then
         "<div class=\"card new-feature\"><strong>Export Storage</strong><div class=\"card-value\">" + .dataUsage.exportStorage.display + "</div></div>
