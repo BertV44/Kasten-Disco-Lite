@@ -1938,9 +1938,22 @@ debug "Per-NS protection: total=$NS_PROTECTION_TOTAL stale=$NS_STALE_COUNT never
 ### -------------------------
 # Reuse pre-fetched PVC and volume snapshot data
 TOTAL_PVCS=$(safe_int "$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq '.items | length // 0' 2>/dev/null)")
-TOTAL_CAPACITY_GB=$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq '[.items[]?.spec.resources.requests.storage | select(. != null) | gsub("Gi";"") | gsub("G";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+# Normalize a Kubernetes quantity to GiB. Handles binary (Ki/Mi/Gi/Ti/Pi),
+# decimal (K/M/G/T/P) and unit-less raw bytes — the old gsub approach mis-summed
+# byte-valued PVCs as GiB (e.g. a 900 GiB volume reported in bytes showed as
+# ~9.7e11 "GiB") and errored on Mi/Ki suffixes.
+JQ_TO_GIB='def to_gib:
+  (. // "" | tostring | gsub("\\s";"")) as $s
+  | if ($s == "" or $s == "0") then 0
+    else ( ($s | capture("^(?<n>[0-9.]+)(?<u>[A-Za-z]*)$")) as $m
+           | ($m.n | tonumber) as $v
+           | { "Ki":($v/1048576), "Mi":($v/1024), "Gi":$v, "Ti":($v*1024), "Pi":($v*1048576),
+               "K":($v*1e3/1073741824), "M":($v*1e6/1073741824), "G":($v*1e9/1073741824),
+               "T":($v*1e12/1073741824), "P":($v*1e15/1073741824), "":($v/1073741824) }[$m.u] // $v )
+    end;'
+TOTAL_CAPACITY_GB=$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq "$JQ_TO_GIB"' [.items[]?.spec.resources.requests.storage | select(. != null) | (try to_gib catch 0)] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$TOTAL_CAPACITY_GB" ] && TOTAL_CAPACITY_GB=0
-SNAPSHOT_DATA=$(cat "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null | jq '[.items[]?.status.restoreSize // "0" | gsub("Gi";"") | gsub("G";"") | gsub("Mi";"") | gsub("M";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+SNAPSHOT_DATA=$(cat "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null | jq "$JQ_TO_GIB"' [.items[]?.status.restoreSize | select(. != null) | (try to_gib catch 0)] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$SNAPSHOT_DATA" ] && SNAPSHOT_DATA=0
 
 ### -------------------------
@@ -2829,9 +2842,15 @@ fi
 ##############################################################################
 # VALIDATE JSON ARGUMENTS (prevent silent failures in the big jq call)
 ##############################################################################
-_safe_arg() { echo "$1" | jq -c '.' 2>/dev/null || echo "$2"; }
+_safe_arg() { printf '%s' "$1" | jq -c '.' 2>/dev/null || printf '%s' "$2"; }
 PROFILES_JSON=$(_safe_arg "$PROFILES_JSON" '{"items":[]}')
 POLICIES_JSON=$(_safe_arg "$POLICIES_JSON" '{"items":[]}')
+# Full raw profiles/policies JSON can be large (CRs with annotations /
+# managedFields). Hand them to the main jq via --slurpfile (file-based) instead
+# of --argjson on the command line: avoids E2BIG (ARG_MAX) on big clusters and
+# any shell echo/quoting round-trip that could empty them (#policies-empty fix).
+printf '%s' "$PROFILES_JSON" > "$TEMP_DIR/profiles_clean.json"
+printf '%s' "$POLICIES_JSON" > "$TEMP_DIR/policies_clean.json"
 POLICY_LAST_RUN=$(_safe_arg "$POLICY_LAST_RUN" '[]')
 UNPROTECTED_NS_JSON=$(_safe_arg "$UNPROTECTED_NS_JSON" '[]')
 K10_RESOURCES_SUMMARY=$(_safe_arg "$K10_RESOURCES_SUMMARY" '{"pods":[]}')
@@ -2864,8 +2883,8 @@ if [ "$MODE" = "json" ]; then
     --arg kdlVersion "$KDL_VERSION" \
     --arg platform "$PLATFORM" \
     --arg version "$KASTEN_VERSION" \
-    --argjson profiles "$(_ep "$PROFILES_JSON" | jq -c '.')" \
-    --argjson policies "$(_ep "$POLICIES_JSON" | jq -c '.')" \
+    --slurpfile profilesArr "$TEMP_DIR/profiles_clean.json" \
+    --slurpfile policiesArr "$TEMP_DIR/policies_clean.json" \
     --arg immutability "$IMMUTABILITY" \
     --argjson immutabilityDays "${IMMUTABILITY_DAYS:-0}" \
     --argjson immutableProfiles "$IMMUTABLE_PROFILES" \
@@ -3071,6 +3090,8 @@ if [ "$MODE" = "json" ]; then
     --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
     --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
     '
+    ($policiesArr[0] // {"items":[]}) as $policies |
+    ($profilesArr[0] // {"items":[]}) as $profiles |
     {
       kdlVersion: $kdlVersion,
       platform: $platform,
