@@ -1606,6 +1606,12 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAM
       ([$sel.matchExpressions[]? |
         if .key == "k10.kasten.io/appNamespace" and .operator == "In" then
           {ns: .values[]?, unresolvable: false}
+        elif .key == "k10.kasten.io/virtualMachineRef" and .operator == "In" then
+          # VM-ref values are "namespace/vmName" (or "namespace/*"); the target
+          # namespace is the part before the first "/". Without this branch the
+          # generic label-resolution below matched nothing and VM-protection
+          # policies were wrongly flagged isEmpty.
+          {ns: (.values[]? | split("/")[0]), unresolvable: false}
         elif .operator == "In" then
           . as $expr |
           (allNs[]? | select(
@@ -1676,12 +1682,27 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAM
     else empty end
   ]) as $pairs |
 
+  # Output trimming (keeps the JSON lean — see issue on dev-2.0 payload bloat).
+  # existingNamespaces is fully derivable (targeted minus nonExisting) and is not
+  # consumed downstream, so it is dropped from the per-policy output. Counts and
+  # nonExistingReferences are preserved. The pair computation above already used
+  # the full $resolved, so trimming here is output-only.
+  def trim_policy: del(.existingNamespaces);
+
+  # Catch-all pairs overlap every namespace by design and are not rendered; drop
+  # their (large, repeated) sharedNamespaces list but keep a count. Genuine pairs
+  # keep the list (it is small and shown in the report).
+  ($pairs | map(
+    . + {sharedNamespaceCount: (.sharedNamespaces | length)}
+    | if .involvesCatchall then del(.sharedNamespaces) else . end
+  )) as $pairsOut |
+
   {
-    resolved: $resolved,
-    empty: [$resolved[] | select(.isEmpty)],
-    unresolvable: [$resolved[] | select(.resolvable | not)],
-    withNonExistingNs: [$resolved[] | select(.nonExistingReferences | length > 0)],
-    redundantPairs: $pairs,
+    resolved: [$resolved[] | trim_policy],
+    empty: [$resolved[] | select(.isEmpty) | trim_policy],
+    unresolvable: [$resolved[] | select(.resolvable | not) | trim_policy],
+    withNonExistingNs: [$resolved[] | select(.nonExistingReferences | length > 0) | trim_policy],
+    redundantPairs: $pairsOut,
     summary: {
       totalPolicies: ($resolved | length),
       emptyCount: ([$resolved[] | select(.isEmpty)] | length),
@@ -2191,11 +2212,18 @@ debug "Stuck actions (>${STUCK_HOURS_THRESHOLD}h Running): $STUCK_ACTIONS_COUNT"
 #
 # All inputs already in memory — no kubectl calls.
 
+# Keep only namespaces that actually exist on the cluster. PROTECTED_NAMESPACES
+# may include policy targets that do not exist (e.g. a multi-cluster appNamespace
+# value); listing them here would contradict policyAnalysis, which flags the same
+# names as non-existing references. Intersecting with ALL_NAMESPACES makes both
+# sections agree on which namespaces exist.
 NS_PROTECTION_INPUT=$(jq -cn '
   (($app // []) + ($protected // [])) | unique
+  | map(select(. as $n | ($all // []) | index($n)))
 ' \
   --argjson app "$APP_NAMESPACES" \
   --argjson protected "$PROTECTED_NAMESPACES" \
+  --argjson all "$ALL_NAMESPACES" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
@@ -3022,7 +3050,10 @@ if [ "$CR_RAW_VALID" = "true" ]; then
       ) |
       {
         name: .metadata.name,
-        labels: (.metadata.labels // {}),
+        # Dumping the full Helm label set per role was pure payload bloat (the
+        # same ~8 boilerplate labels on every object). Keep only the one useful
+        # signal: whether this is a default K10-managed RBAC object.
+        defaultRbacObject: (((.metadata.labels // {})["k10.kasten.io/default-rbac-object"]) == "true"),
         rulesCount: ((.rules // []) | length),
         verbsAll: ([(.rules // [])[]? | select((.verbs // []) | index("*"))] | length > 0),
         resourcesAll: ([(.rules // [])[]? | select((.resources // []) | index("*"))] | length > 0)
