@@ -2273,9 +2273,22 @@ debug "Per-NS protection: total=$NS_PROTECTION_TOTAL stale=$NS_STALE_COUNT never
 ### -------------------------
 # Reuse pre-fetched PVC and volume snapshot data
 TOTAL_PVCS=$(safe_int "$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq '.items | length // 0' 2>/dev/null)")
-TOTAL_CAPACITY_GB=$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq '[.items[]?.spec.resources.requests.storage | select(. != null) | gsub("Gi";"") | gsub("G";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+# Normalize a Kubernetes quantity to GiB. Handles binary (Ki/Mi/Gi/Ti/Pi),
+# decimal (K/M/G/T/P) and unit-less raw bytes — the old gsub approach mis-summed
+# byte-valued PVCs as GiB (e.g. a 900 GiB volume reported in bytes showed as
+# ~9.7e11 "GiB") and errored on Mi/Ki suffixes.
+JQ_TO_GIB='def to_gib:
+  (. // "" | tostring | gsub("\\s";"")) as $s
+  | if ($s == "" or $s == "0") then 0
+    else ( ($s | capture("^(?<n>[0-9.]+)(?<u>[A-Za-z]*)$")) as $m
+           | ($m.n | tonumber) as $v
+           | { "Ki":($v/1048576), "Mi":($v/1024), "Gi":$v, "Ti":($v*1024), "Pi":($v*1048576),
+               "K":($v*1e3/1073741824), "M":($v*1e6/1073741824), "G":($v*1e9/1073741824),
+               "T":($v*1e12/1073741824), "P":($v*1e15/1073741824), "":($v/1073741824) }[$m.u] // $v )
+    end;'
+TOTAL_CAPACITY_GB=$(cat "$TEMP_DIR/pvcs_raw.json" 2>/dev/null | jq "$JQ_TO_GIB"' [.items[]?.spec.resources.requests.storage | select(. != null) | (try to_gib catch 0)] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$TOTAL_CAPACITY_GB" ] && TOTAL_CAPACITY_GB=0
-SNAPSHOT_DATA=$(cat "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null | jq '[.items[]?.status.restoreSize // "0" | gsub("Gi";"") | gsub("G";"") | gsub("Mi";"") | gsub("M";"") | gsub("Ti";"000") | gsub("T";"000") | tonumber] | add // 0 | floor' 2>/dev/null || echo "0")
+SNAPSHOT_DATA=$(cat "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null | jq "$JQ_TO_GIB"' [.items[]?.status.restoreSize | select(. != null) | (try to_gib catch 0)] | add // 0 | floor' 2>/dev/null || echo "0")
 [ -z "$SNAPSHOT_DATA" ] && SNAPSHOT_DATA=0
 
 ### -------------------------
