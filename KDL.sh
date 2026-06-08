@@ -632,13 +632,29 @@ debug "Parallel fetch complete"
 progress "license"
 
 # Extract a top-level scalar field, case-insensitive on the key, quotes stripped.
+# Top-level keys only (no leading indent), so nested keys such as
+# restrictions.nodes never collide with a same-named top-level lookup. The value
+# is everything after the FIRST ':' — ISO timestamps embed their own ':' and
+# must not be truncated. Tolerates camelCase and lowercase keys, single or
+# double quotes.
 _lic_field() { # $1 = raw payload, $2 = lowercased field name
-  printf '%s' "$1" | awk -F': ' -v f="$2" '
-    tolower($1) == f { v = $2; gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/["'\'']/, "", v); print v; exit }'
+  printf '%s' "$1" | awk -v f="$2" '
+    /^[^[:space:]]/ {
+      key = $0; sub(/:.*/, "", key); gsub(/[ \t]+$/, "", key)
+      if (tolower(key) == f) {
+        v = $0; sub(/^[^:]*:/, "", v)
+        gsub(/^[ \t]+|[ \t]+$/, "", v); gsub(/^["'\'']|["'\'']$/, "", v)
+        print v; exit
+      }
+    }'
 }
 
+# Enumerate every secret whose name contains "license" (case-insensitive). The
+# narrower "k10-license" prefix missed renamed variants such as
+# "k10-trial-license"; the payload signature check below (customerName + id +
+# product) is the real guard against swallowing non-license secrets.
 LICENSE_SECRET_NAMES=$(kubectl -n "$NAMESPACE" get secrets -o json 2>/dev/null \
-  | jq -r '[.items[]? | select(.metadata.name | startswith("k10-license")) | .metadata.name] | .[]' 2>/dev/null || echo "")
+  | jq -r '[.items[]? | select(.metadata.name | ascii_downcase | test("license")) | .metadata.name] | .[]' 2>/dev/null || echo "")
 LICENSE_SECRET_COUNT=$(printf '%s\n' "$LICENSE_SECRET_NAMES" | awk 'NF{c++} END{print c+0}')
 
 LICENSES_PARSED='[]'
@@ -654,35 +670,45 @@ for _lic_name in $LICENSE_SECRET_NAMES; do
 
   CUSTOMER=$(_lic_field "$RAW" "customername")
   ID=$(_lic_field "$RAW" "id")
+  PRODUCT=$(_lic_field "$RAW" "product")
 
-  # Minimum viable license signature; otherwise record and move on.
-  if [ -z "$CUSTOMER" ] || [ -z "$ID" ]; then
-    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "missing customerName or id" '. + [{secret: $s, reason: $r}]')
+  # Minimum viable license signature. Now that enumeration matches any secret
+  # named *license*, require customerName + id + product together so unrelated
+  # secrets are recorded and skipped rather than mis-parsed as licenses.
+  if [ -z "$CUSTOMER" ] || [ -z "$ID" ] || [ -z "$PRODUCT" ]; then
+    LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "missing customerName/id/product signature" '. + [{secret: $s, reason: $r}]')
     continue
   fi
 
-  PRODUCT=$(_lic_field "$RAW" "product")
   START_DATE=$(_lic_field "$RAW" "datestart")
   END_DATE=$(_lic_field "$RAW" "dateend")
-  # restrictions.nodes is nested (indented); match the indented key only.
-  NODES=$(printf '%s' "$RAW" | awk -F': ' '/^[[:space:]]+nodes:/ {v=$2; gsub(/^[ \t]+|[ \t]+$/,"",v); gsub(/["'\'']/,"",v); print v; exit}')
-  FEATURES_RAW=$(printf '%s' "$RAW" | awk -F': ' 'tolower($1)=="features" {print $2; exit}')
+  # restrictions.nodes is nested (indented); match the indented key only, but
+  # case-insensitively and tolerant of quoted ("5") or bare (500) values. Value
+  # is taken after the first ':' for consistency with _lic_field.
+  NODES=$(printf '%s' "$RAW" | awk '
+    tolower($0) ~ /^[[:space:]]+nodes:[[:space:]]*/ {
+      v=$0; sub(/^[^:]*:/,"",v); gsub(/^[ \t]+|[ \t]+$/,"",v); gsub(/^["'\'']|["'\'']$/,"",v); print v; exit
+    }')
+  FEATURES_RAW=$(printf '%s' "$RAW" | awk 'tolower($0) ~ /^features:/ {v=$0; sub(/^[^:]*:/,"",v); print v; exit}')
 
-  [ -z "$PRODUCT" ] && PRODUCT="N/A"
   [ -z "$START_DATE" ] && START_DATE="N/A"
   [ -z "$END_DATE" ] && END_DATE="N/A"
   [ -z "$NODES" ] && NODES="unlimited"
 
-  # Type derivation. Only "starter" is confirmed against a real payload; other
-  # prefixes are [unverified] and default to UNKNOWN rather than guessing.
-  if [ "$CUSTOMER" = "starter-license" ] || printf '%s' "$ID" | grep -q '^starter-'; then
+  # Type derivation (ORDER MATTERS). TRIAL is tested first, on two independent
+  # signals (id "trial-" prefix OR "trial" anywhere in the customer name), so a
+  # trial whose customer name also contains "starter" can never fall through to
+  # STARTER. STARTER uses an EXACT customer-name match (or an explicit "starter-"
+  # id prefix) — never a substring test on "starter". A valid license that is
+  # neither trial nor starter is commercial: its id is a bare UUID with no
+  # type-bearing prefix, so it is classified ENTERPRISE instead of UNKNOWN.
+  _cust_lc=$(printf '%s' "$CUSTOMER" | tr '[:upper:]' '[:lower:]')
+  if printf '%s' "$ID" | grep -q '^trial-' || printf '%s' "$_cust_lc" | grep -q 'trial'; then
+    TYPE="TRIAL"
+  elif [ "$_cust_lc" = "starter-license" ] || printf '%s' "$ID" | grep -q '^starter-'; then
     TYPE="STARTER"
-  elif printf '%s' "$ID" | grep -q '^trial-'; then
-    TYPE="TRIAL"        # [unverified] prefix — confirm against a real trial dump
-  elif printf '%s' "$ID" | grep -q '^enterprise-'; then
-    TYPE="ENTERPRISE"   # [unverified] prefix — confirm against a real commercial dump
   else
-    TYPE="UNKNOWN"
+    TYPE="ENTERPRISE"
   fi
 
   # Features: null -> "-"; otherwise pass through trimmed (further parsing TBD
