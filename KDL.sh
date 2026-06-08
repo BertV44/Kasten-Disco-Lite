@@ -908,17 +908,23 @@ SYSTEM_POLICY_COUNT=$((POLICY_COUNT - APP_POLICY_COUNT))
 debug "Policies detected: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)"
 debug "App policy names: $(_ep "$APP_POLICIES_JSON" | jq -r '[.items[]?.metadata.name] | join(", ")')"
 
-# Count app policies targeting all namespaces (excluding system policies)
+# Count app policies targeting all namespaces (excluding system policies).
+# Only BACKUP policies count as coverage: an import/restore-only catch-all
+# (e.g. multi-cluster import policies, which have no selector) does not protect
+# anything and must not be reported as covering all namespaces.
 ALL_NS_POLICIES="$(_ep "$APP_POLICIES_JSON" | jq '[
-  .items[]? | 
+  .items[]? |
   select(
-    .spec.selector == null or
-    (.spec.selector.matchExpressions == null and 
-     .spec.selector.matchNames == null and
-     .spec.selector.matchLabels == null) or
-    (.spec.selector.matchExpressions == [] and 
-     .spec.selector.matchNames == [] and
-     (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
+    (
+      .spec.selector == null or
+      (.spec.selector.matchExpressions == null and
+       .spec.selector.matchNames == null and
+       .spec.selector.matchLabels == null) or
+      (.spec.selector.matchExpressions == [] and
+       .spec.selector.matchNames == [] and
+       (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
+    )
+    and ([.spec.actions[]?.action] | index("backup"))
   )
 ] | length // 0')"
 [ -z "$ALL_NS_POLICIES" ] && ALL_NS_POLICIES=0
@@ -1241,20 +1247,30 @@ COMPLEX_SELECTOR_POLICIES=""
 
 if [ "$APP_POLICY_COUNT" -gt 0 ]; then
   # Find catch-all policies (no selector)
+  # A catch-all that confers protection must include a backup action. Import-
+  # and restore-only catch-all policies are excluded so they do not mask genuine
+  # coverage gaps (which made `unprotectedNamespaces` report 0 while the
+  # per-namespace protection status showed namespaces never backed up).
   CATCHALL_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -r '
     [.items[]? | select(
-      .spec.selector == null or
-      .spec.selector == {} or
-      (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
-      (.spec.selector | keys | length == 0)
+      (
+        .spec.selector == null or
+        .spec.selector == {} or
+        (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
+        (.spec.selector | keys | length == 0)
+      )
+      and ([.spec.actions[]?.action] | index("backup"))
     ) | .metadata.name] | join(", ")
   ')
   CATCHALL_COUNT=$(_ep "$APP_POLICIES_JSON" | jq '
     [.items[]? | select(
-      .spec.selector == null or
-      .spec.selector == {} or
-      (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
-      (.spec.selector | keys | length == 0)
+      (
+        .spec.selector == null or
+        .spec.selector == {} or
+        (.spec.selector.matchExpressions == null and .spec.selector.matchNames == null and .spec.selector.matchLabels == null) or
+        (.spec.selector | keys | length == 0)
+      )
+      and ([.spec.actions[]?.action] | index("backup"))
     )] | length
   ')
   
@@ -1291,18 +1307,27 @@ debug "Has complex selector: $HAS_COMPLEX_SELECTOR"
 
 # Get namespaces explicitly targeted by app policies (matchNames or matchExpressions with namespace values)
 PROTECTED_NAMESPACES=$(_ep "$APP_POLICIES_JSON" | jq -c '
-  [.items[]? | 
+  [.items[]? |
     if .spec.selector.matchNames then
       .spec.selector.matchNames[]?
     elif .spec.selector.matchExpressions then
-      (.spec.selector.matchExpressions[]? | 
-        select(.key == "k10.kasten.io/appNamespace" and .operator == "In") | 
-        .values[]?
+      (.spec.selector.matchExpressions[]? |
+        select(.operator == "In") |
+        if .key == "k10.kasten.io/appNamespace" then
+          .values[]?
+        elif .key == "k10.kasten.io/virtualMachineRef" then
+          # VM-ref values are "namespace/vmName" (or "namespace/*"); the
+          # protected namespace is the part before the first "/". Without this,
+          # VM-protection policies left their namespaces looking unprotected.
+          (.values[]? | split("/")[0])
+        else
+          empty
+        end
       )
     else
       empty
     end
-  ] | unique // []
+  ] | map(select(. != null and . != "")) | unique // []
 ' 2>/dev/null || echo '[]')
 
 # Validate
@@ -1387,6 +1412,10 @@ RESTORE_ACTIONS_TOTAL=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '.items | l
 RESTORE_ACTIONS_COMPLETED=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')")
 RESTORE_ACTIONS_FAILED=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Failed")] | length // 0')")
 RESTORE_ACTIONS_RUNNING=$(safe_int "$(_ep "$RESTORE_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Running")] | length // 0')")
+# Remaining states (Pending/Cancelled/Skipped/empty) so the buckets reconcile
+# with total: completed + failed + running + other == total.
+RESTORE_ACTIONS_OTHER=$((RESTORE_ACTIONS_TOTAL - RESTORE_ACTIONS_COMPLETED - RESTORE_ACTIONS_FAILED - RESTORE_ACTIONS_RUNNING))
+[ "$RESTORE_ACTIONS_OTHER" -lt 0 ] 2>/dev/null && RESTORE_ACTIONS_OTHER=0
 
 # Get last 5 restore actions summary
 RESTORE_ACTIONS_RECENT=$(_ep "$RESTORE_ACTIONS_JSON" | jq -c '
@@ -1394,7 +1423,10 @@ RESTORE_ACTIONS_RECENT=$(_ep "$RESTORE_ACTIONS_JSON" | jq -c '
     name: .metadata.name,
     timestamp: .metadata.creationTimestamp,
     state: (.status.state // "Unknown"),
-    targetNamespace: (.spec.subject.namespace // "N/A")
+    # Same resolution chain as Failed Actions Top 5 so a given restore action
+    # reports the same namespace in both sections (was subject.namespace only,
+    # which yielded "N/A" while Top 5 resolved a real namespace).
+    targetNamespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .spec.subject.namespace // .metadata.namespace // "N/A")
   }] // []
 ' 2>/dev/null || echo '[]')
 
@@ -1868,17 +1900,24 @@ if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
+  ($backupArr[0] // {"items":[]}) as $backup |
   ($exportArr[0] // {"items":[]}) as $export |
   ($restoreArr[0] // {"items":[]}) as $restore |
-  ($runsArr[0] // {"items":[]}) as $runs |
   ($appNamespaces // []) as $ns_list |
+  ($backup.items // []) as $backup_items |
   ($export.items // []) as $export_items |
   ($restore.items // []) as $restore_items |
-  ($runs.items // []) as $run_items |
 
-  ($run_items | map(select((.status.state // "") == "Complete")) |
-    group_by(.metadata.namespace // "") |
-    map({key: .[0].metadata.namespace, value: (map(.metadata.creationTimestamp) | sort | last)}) |
+  # Last successful backup PER APP NAMESPACE. Derived from BackupActions keyed
+  # by the k10.kasten.io/appNamespace label (same pattern as exports below). The
+  # previous implementation grouped RunActions by .metadata.namespace, which is
+  # always the K10 namespace (e.g. kasten-io) and therefore never matched an app
+  # namespace — every namespace looked "never backed up".
+  ($backup_items | map(select((.status.state // "") == "Complete")) |
+    map({ns: (.metadata.labels["k10.kasten.io/appNamespace"] // ""), ts: (.metadata.creationTimestamp // "")}) |
+    map(select(.ns != "")) |
+    group_by(.ns) |
+    map({key: .[0].ns, value: (map(.ts) | sort | last)}) |
     from_entries) as $last_backup |
 
   ($export_items | map(select((.status.state // "") == "Complete")) |
@@ -1909,14 +1948,15 @@ NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
       stale: (
         if $last_backup[$ns] then
           (((now - ($last_backup[$ns] | fromdateiso8601)) / 86400 | floor) > $threshold)
-        else true end
-      )
+        else false end
+      ),
+      neverBackedUp: ($last_backup[$ns] == null)
     })
 ' \
   --argjson appNamespaces "$NS_PROTECTION_INPUT" \
+  --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
   --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
   --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
-  --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" \
   2>/dev/null || echo '[]')
 
 if ! _ep "$NS_PROTECTION_STATUS" | jq -e '.' >/dev/null 2>&1; then
@@ -2889,6 +2929,7 @@ if [ "$MODE" = "json" ]; then
     --argjson restoreActionsCompleted "$RESTORE_ACTIONS_COMPLETED" \
     --argjson restoreActionsFailed "$RESTORE_ACTIONS_FAILED" \
     --argjson restoreActionsRunning "$RESTORE_ACTIONS_RUNNING" \
+    --argjson restoreActionsOther "$RESTORE_ACTIONS_OTHER" \
     --argjson restoreActionsRecent "$RESTORE_ACTIONS_RECENT" \
     --argjson restorePoints "$RESTORE_POINTS_COUNT" \
     --arg successRate "$SUCCESS_RATE" \
@@ -3104,11 +3145,12 @@ if [ "$MODE" = "json" ]; then
             completed: $restoreActionsCompleted,
             failed: $restoreActionsFailed,
             running: $restoreActionsRunning,
+            other: $restoreActionsOther,
             recent: $restoreActionsRecent
           },
           restorePoints: $restorePoints,
           successRate: $successRate,
-          successRateNote: "Calculated from finished actions (Complete + Failed) only"
+          successRateNote: "Covers Backup + Export finished actions only (Complete + Failed). Restore actions are reported separately under restoreActions and are excluded from this rate and from totalActions/completedActions/failedActions."
         }
       },
 
@@ -3230,7 +3272,7 @@ if [ "$MODE" = "json" ]; then
 
       dataUsage: {
         totalPvcs: $totalPvcs,
-        totalCapacityGi: $totalCapacity,
+        totalCapacityGi: ($totalCapacity | tonumber? // 0),
         snapshotDataGi: $snapshotData,
         exportStorage: {
           display: $exportStorage,
@@ -3463,7 +3505,13 @@ if [ "$MODE" = "json" ]; then
               end
             ),
             retention: (.spec.retention // {}),
-            exportRetention: (.spec.actions[] | select(.action == "export") | .retention // null),
+            # Take the first export action retention, or null. Must NOT be a
+            # bare generator: (.spec.actions[] | select(...)) yields nothing
+            # for policies without an export action, which makes the whole
+            # object construction empty and silently drops those policies from
+            # `items` (count/items mismatch). Wrapping in [] + .[0] keeps one
+            # value (null when absent) and de-duplicates multi-export policies.
+            exportRetention: ([.spec.actions[]? | select(.action == "export") | .retention] | .[0] // null),
             presetRef: .spec.presetRef.name
           }
         ]
