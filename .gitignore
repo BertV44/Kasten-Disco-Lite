@@ -8,5 +8,7 @@ discovery.json
 discovery.html
 *-discovery.json
 *-discovery.html
+discovery-*.json
+discovery-*.html
 report-*.txt
 *.report.html
