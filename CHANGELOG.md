@@ -3,7 +3,7 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [2.0.0] - UNRELEASED (pre-release)
+## [2.0.0] - 2026-06-09
 
 First 2.x release. Builds on the v1.9.2 baseline (all v1.9.2 fixes are reconciled
 in — see below) and adds five analytical capabilities.
@@ -54,9 +54,11 @@ in — see below) and adds five analytical capabilities.
   (`k10Rbac.*.items[].labels`, `policyAnalysis.resolved[].existingNamespaces`,
   `policyAnalysis.redundantPairs[].sharedNamespaces` on catch-all pairs). The
   bundled `kdl-json-to-html.sh` does not depend on the removed fields.
-- Validated on a real K10 8.5.9 / OpenShift cluster. Broader validation
-  (restricted-RBAC kubeconfig, non-OpenShift distribution) recommended before
-  the official switch — see `RELEASING.md`.
+- Validated on a real K10 8.5.9 / OpenShift cluster (full smoke-test in
+  `RELEASING.md`). Broader validation (restricted-RBAC kubeconfig, non-OpenShift
+  distribution) was **not** performed for this release and remains a known gap —
+  the cluster-wide RBAC reads added in 2.0 have only been exercised on the
+  access-granted path.
 
 ## [1.9.2]
 
