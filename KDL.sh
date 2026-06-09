@@ -263,7 +263,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="2.0"
+KDL_VERSION="2.0.1"
 OUTPUT_FILE=""
 SKIP_HELM=false
 
@@ -494,9 +494,30 @@ cleanup() { rm -rf "$TEMP_DIR"; }
 trap cleanup EXIT INT TERM
 
 ### -------------------------
+### Cluster CLI selection + platform detection
+### -------------------------
+# Detect OpenShift once, then choose the cluster CLI: prefer `oc` on OpenShift
+# when the binary is present, otherwise `kubectl`. Every cluster call below runs
+# through "$CLI". The detection probe uses whichever client is installed, so the
+# script also works in oc-only environments. kubectl works on OpenShift too, so
+# this is a convenience/consistency choice rather than a hard requirement.
+_probe="kubectl"; command -v kubectl >/dev/null 2>&1 || _probe="oc"
+if "$_probe" api-resources 2>/dev/null | grep -q "route.*openshift"; then
+  PLATFORM="OpenShift"
+else
+  PLATFORM="Kubernetes"
+fi
+if [ "$PLATFORM" = "OpenShift" ] && command -v oc >/dev/null 2>&1; then
+  CLI="oc"
+else
+  CLI="kubectl"
+fi
+debug "Platform: $PLATFORM | cluster CLI: $CLI"
+
+### -------------------------
 ### Namespace validation
 ### -------------------------
-if ! kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+if ! $CLI get namespace "$NAMESPACE" >/dev/null 2>&1; then
   error "Namespace '$NAMESPACE' does not exist"
   exit 1
 fi
@@ -513,29 +534,21 @@ debug "Namespace '$NAMESPACE' validated"
 # actionable warning. Non-fatal: KDL still runs and reports what it can.
 # Warnings go to stderr so JSON output (stdout) stays clean.
 RBAC_MISSING=""
-kubectl auth can-i list namespaces                                   >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list namespaces (cluster-wide)"
-kubectl auth can-i list persistentvolumeclaims --all-namespaces      >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list persistentvolumeclaims --all-namespaces"
-kubectl auth can-i list nodes                                        >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list nodes"
-kubectl auth can-i list storageclasses.storage.k8s.io                >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list storageclasses"
-kubectl auth can-i list volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list volumesnapshotclasses"
+$CLI auth can-i list namespaces                                   >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list namespaces (cluster-wide)"
+$CLI auth can-i list persistentvolumeclaims --all-namespaces      >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list persistentvolumeclaims --all-namespaces"
+$CLI auth can-i list nodes                                        >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list nodes"
+$CLI auth can-i list storageclasses.storage.k8s.io                >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list storageclasses"
+$CLI auth can-i list volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list volumesnapshotclasses"
 
 if [ -n "$RBAC_MISSING" ]; then
   warn "Insufficient cluster-scoped RBAC: the following reads are denied, so related sections will be EMPTY (not necessarily zero):"
   printf '%s' "$RBAC_MISSING" | tr ';' '\n' | while IFS= read -r _rbac_item; do
     [ -n "$_rbac_item" ] && printf '%s    - %s%s\n' "$COLOR_YELLOW" "$_rbac_item" "$COLOR_RESET" >&2
   done
-  warn "Fix: apply the bundled least-privilege role -> kubectl apply -f kdl-rbac.yaml (see README, section 'RBAC requirements')."
+  warn "Fix: apply the bundled least-privilege role -> $CLI apply -f kdl-rbac.yaml (see README, section 'RBAC requirements')."
 fi
 
-### -------------------------
-### Platform detection
-### -------------------------
-if kubectl api-resources 2>/dev/null | grep -q "route.*openshift"; then
-  PLATFORM="OpenShift"
-else
-  PLATFORM="Kubernetes"
-fi
-debug "Platform: $PLATFORM"
+# (Platform detection moved above, alongside CLI selection.)
 
 ### -------------------------
 ### Kubernetes Server Version + Distribution (NEW v1.9)
@@ -545,7 +558,7 @@ debug "Platform: $PLATFORM"
 # namespaces. Reads only one node's spec — already part of the existing
 # RBAC footprint (KDL already lists nodes for license consumption).
 
-K8S_SERVER_VERSION=$(kubectl version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion // "unknown"' 2>/dev/null || echo "unknown")
+K8S_SERVER_VERSION=$($CLI version -o json 2>/dev/null | jq -r '.serverVersion.gitVersion // "unknown"' 2>/dev/null || echo "unknown")
 [ -z "$K8S_SERVER_VERSION" ] && K8S_SERVER_VERSION="unknown"
 
 # Default distribution from PLATFORM detection above
@@ -556,7 +569,7 @@ else
 fi
 
 # Refine via providerID on the first node (cloud-managed offerings)
-NODE0_PROVIDER_ID=$(kubectl get nodes -o json 2>/dev/null | jq -r '.items[0].spec.providerID // ""' 2>/dev/null || echo "")
+NODE0_PROVIDER_ID=$($CLI get nodes -o json 2>/dev/null | jq -r '.items[0].spec.providerID // ""' 2>/dev/null || echo "")
 case "$NODE0_PROVIDER_ID" in
   azure*|*://azure*) [ "$K8S_DISTRIBUTION" = "Kubernetes" ] && K8S_DISTRIBUTION="AKS" ;;
   aws*|*://aws*)    [ "$K8S_DISTRIBUTION" = "Kubernetes" ] && K8S_DISTRIBUTION="EKS" ;;
@@ -566,9 +579,9 @@ esac
 
 # Refine via well-known namespaces (vendor-specific signals)
 if [ "$K8S_DISTRIBUTION" = "Kubernetes" ]; then
-  if kubectl get namespace cattle-system >/dev/null 2>&1; then
+  if $CLI get namespace cattle-system >/dev/null 2>&1; then
     K8S_DISTRIBUTION="Rancher/RKE"
-  elif kubectl get namespace k3s-upgrader >/dev/null 2>&1; then
+  elif $CLI get namespace k3s-upgrader >/dev/null 2>&1; then
     K8S_DISTRIBUTION="K3s"
   fi
 fi
@@ -594,15 +607,15 @@ MC_ROLE="none"
 MC_PRIMARY_NAME=""
 MC_CLUSTER_ID=""
 
-if kubectl get namespace kasten-io-mc >/dev/null 2>&1; then
+if $CLI get namespace kasten-io-mc >/dev/null 2>&1; then
   MC_ROLE="primary"
   # Try to get cluster info from mc namespace
-  MC_CLUSTER_COUNT=$(kubectl -n kasten-io-mc get clusters.dist.kio.kasten.io --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  MC_CLUSTER_COUNT=$($CLI -n kasten-io-mc get clusters.dist.kio.kasten.io --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$MC_CLUSTER_COUNT" ] && MC_CLUSTER_COUNT=0
-elif kubectl -n "$NAMESPACE" get configmap mc-join-config >/dev/null 2>&1; then
+elif $CLI -n "$NAMESPACE" get configmap mc-join-config >/dev/null 2>&1; then
   MC_ROLE="secondary"
   # Try to extract primary info from join config
-  MC_JOIN_CONFIG=$(kubectl -n "$NAMESPACE" get configmap mc-join-config -o json 2>/dev/null || echo '{}')
+  MC_JOIN_CONFIG=$($CLI -n "$NAMESPACE" get configmap mc-join-config -o json 2>/dev/null || echo '{}')
   MC_PRIMARY_NAME=$(_ep "$MC_JOIN_CONFIG" | jq -r '.data.primaryClusterName // .data.primary // empty' 2>/dev/null)
   MC_CLUSTER_ID=$(_ep "$MC_JOIN_CONFIG" | jq -r '.data.clusterId // .data.clusterID // empty' 2>/dev/null)
   MC_CLUSTER_COUNT=0
@@ -616,11 +629,11 @@ debug "Multi-Cluster: Role=$MC_ROLE, Clusters=$MC_CLUSTER_COUNT"
 ### -------------------------
 ### Kasten version
 ### -------------------------
-KASTEN_IMAGE=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
+KASTEN_IMAGE=$($CLI -n "$NAMESPACE" get deployment -l component=catalog -o jsonpath='{.items[0].spec.template.spec.containers[0].image}' 2>/dev/null || echo "unknown")
 # Extract version - handle both tag format (gcr.io/image:7.5.3) and digest format (gcr.io/image@sha256:...)
 if _ep "$KASTEN_IMAGE" | grep -q '@sha256:'; then
   # Digest format - try to get version from labels
-  KASTEN_VERSION=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o jsonpath='{.items[0].metadata.labels.app\.kubernetes\.io/version}' 2>/dev/null || echo "unknown")
+  KASTEN_VERSION=$($CLI -n "$NAMESPACE" get deployment -l component=catalog -o jsonpath='{.items[0].metadata.labels.app\.kubernetes\.io/version}' 2>/dev/null || echo "unknown")
   [ -z "$KASTEN_VERSION" ] && KASTEN_VERSION="digest-based"
 else
   KASTEN_VERSION=$(_ep "$KASTEN_IMAGE" | sed 's/.*://')
@@ -632,8 +645,8 @@ debug "Kasten version: $KASTEN_VERSION"
 ### Shared data collection (fetch once, reuse everywhere)
 ### -------------------------
 progress "pods & deployments"
-kubectl -n "$NAMESPACE" get pods -o json > "$TEMP_DIR/pods.json" 2>/dev/null || echo '{"items":[]}' > "$TEMP_DIR/pods.json"
-kubectl -n "$NAMESPACE" get deployments -o json > "$TEMP_DIR/deploys.json" 2>/dev/null || echo '{"items":[]}' > "$TEMP_DIR/deploys.json"
+$CLI -n "$NAMESPACE" get pods -o json > "$TEMP_DIR/pods.json" 2>/dev/null || echo '{"items":[]}' > "$TEMP_DIR/pods.json"
+$CLI -n "$NAMESPACE" get deployments -o json > "$TEMP_DIR/deploys.json" 2>/dev/null || echo '{"items":[]}' > "$TEMP_DIR/deploys.json"
 
 # Validate shared data
 jq -e '.items' "$TEMP_DIR/pods.json" >/dev/null 2>&1 || echo '{"items":[]}' > "$TEMP_DIR/pods.json"
@@ -644,41 +657,41 @@ jq -e '.items' "$TEMP_DIR/deploys.json" >/dev/null 2>&1 || echo '{"items":[]}' >
 ### -------------------------
 progress "K10 resources"
 
-kubectl -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get policies -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get policies -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
 # Action CRs and RestorePoints are cluster-wide (#10/#15): on K10 8.x,
 # policy-driven actions and RP CRs live in the source application namespace,
 # not the K10 namespace. Fetch with -A. Downstream jq resolves the namespace
 # from the k10.kasten.io/appNamespace label // .metadata.namespace.
-kubectl get runactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
-kubectl get restoreactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
-kubectl get backupactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
-kubectl get exportactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
-kubectl get restorepoints.apps.kio.kasten.io -A -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json > "$TEMP_DIR/presets_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json > "$TEMP_DIR/transformsets_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json > "$TEMP_DIR/reports_raw.json" 2>/dev/null &
-kubectl get namespaces -o json > "$TEMP_DIR/namespaces_raw.json" 2>/dev/null &
-kubectl get pvc --all-namespaces -o json > "$TEMP_DIR/pvcs_raw.json" 2>/dev/null &
-kubectl get volumesnapshots --all-namespaces -o json > "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null &
+$CLI get runactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/runactions_raw.json" 2>/dev/null &
+$CLI get restoreactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/restoreactions_raw.json" 2>/dev/null &
+$CLI get backupactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/backupactions_raw.json" 2>/dev/null &
+$CLI get exportactions.actions.kio.kasten.io -A -o json > "$TEMP_DIR/exportactions_raw.json" 2>/dev/null &
+$CLI get restorepoints.apps.kio.kasten.io -A -o json > "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json > "$TEMP_DIR/presets_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json > "$TEMP_DIR/transformsets_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json > "$TEMP_DIR/reports_raw.json" 2>/dev/null &
+$CLI get namespaces -o json > "$TEMP_DIR/namespaces_raw.json" 2>/dev/null &
+$CLI get pvc --all-namespaces -o json > "$TEMP_DIR/pvcs_raw.json" 2>/dev/null &
+$CLI get volumesnapshots --all-namespaces -o json > "$TEMP_DIR/volsnaps_raw.json" 2>/dev/null &
 # Blueprints & bindings: cluster-wide first, namespace-scoped as fallback
-kubectl get blueprints.cr.kanister.io -A -o json > "$TEMP_DIR/blueprints_all_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get blueprints.cr.kanister.io -o json > "$TEMP_DIR/blueprints_ns_raw.json" 2>/dev/null &
-kubectl get blueprintbindings.config.kio.kasten.io -A -o json > "$TEMP_DIR/bindings_all_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get blueprintbindings.config.kio.kasten.io -o json > "$TEMP_DIR/bindings_ns_raw.json" 2>/dev/null &
+$CLI get blueprints.cr.kanister.io -A -o json > "$TEMP_DIR/blueprints_all_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get blueprints.cr.kanister.io -o json > "$TEMP_DIR/blueprints_ns_raw.json" 2>/dev/null &
+$CLI get blueprintbindings.config.kio.kasten.io -A -o json > "$TEMP_DIR/bindings_all_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get blueprintbindings.config.kio.kasten.io -o json > "$TEMP_DIR/bindings_ns_raw.json" 2>/dev/null &
 # v1.9 additions: ReportActions (for k10-system-reports-policy state),
 # StorageClasses + VolumeSnapshotClasses (for SC/VSC inventory & cross-check)
-kubectl -n "$NAMESPACE" get reportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/reportactions_raw.json" 2>/dev/null &
-kubectl get storageclass -o json > "$TEMP_DIR/sc_raw.json" 2>/dev/null &
-kubectl get volumesnapshotclass -o json > "$TEMP_DIR/vsc_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get reportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/reportactions_raw.json" 2>/dev/null &
+$CLI get storageclass -o json > "$TEMP_DIR/sc_raw.json" 2>/dev/null &
+$CLI get volumesnapshotclass -o json > "$TEMP_DIR/vsc_raw.json" 2>/dev/null &
 # v2.0 additions: RBAC inventory for K10 ClusterRoles + Roles.
 # ClusterRoleBindings/RoleBindings cluster-wide are NOT in the K10 standard
 # ClusterRole — graceful degradation if read denied (handled at extraction).
 # k10-namespaced RoleBindings are usually readable via K10's own ClusterRole.
-kubectl get clusterroles -o json > "$TEMP_DIR/clusterroles_raw.json" 2>/dev/null &
-kubectl get clusterrolebindings -o json > "$TEMP_DIR/clusterrolebindings_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get roles -o json > "$TEMP_DIR/roles_raw.json" 2>/dev/null &
-kubectl -n "$NAMESPACE" get rolebindings -o json > "$TEMP_DIR/rolebindings_raw.json" 2>/dev/null &
+$CLI get clusterroles -o json > "$TEMP_DIR/clusterroles_raw.json" 2>/dev/null &
+$CLI get clusterrolebindings -o json > "$TEMP_DIR/clusterrolebindings_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get roles -o json > "$TEMP_DIR/roles_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get rolebindings -o json > "$TEMP_DIR/rolebindings_raw.json" 2>/dev/null &
 wait
 
 debug "Parallel fetch complete"
@@ -716,7 +729,7 @@ _lic_field() { # $1 = raw payload, $2 = lowercased field name
 # narrower "k10-license" prefix missed renamed variants such as
 # "k10-trial-license"; the payload signature check below (customerName + id +
 # product) is the real guard against swallowing non-license secrets.
-LICENSE_SECRET_NAMES=$(kubectl -n "$NAMESPACE" get secrets -o json 2>/dev/null \
+LICENSE_SECRET_NAMES=$($CLI -n "$NAMESPACE" get secrets -o json 2>/dev/null \
   | jq -r '[.items[]? | select(.metadata.name | ascii_downcase | test("license")) | .metadata.name] | .[]' 2>/dev/null || echo "")
 LICENSE_SECRET_COUNT=$(printf '%s\n' "$LICENSE_SECRET_NAMES" | awk 'NF{c++} END{print c+0}')
 
@@ -724,7 +737,7 @@ LICENSES_PARSED='[]'
 LICENSES_UNPARSEABLE='[]'
 
 for _lic_name in $LICENSE_SECRET_NAMES; do
-  RAW=$(kubectl -n "$NAMESPACE" get secret "$_lic_name" -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null)
+  RAW=$($CLI -n "$NAMESPACE" get secret "$_lic_name" -o jsonpath='{.data.license}' 2>/dev/null | base64 -d 2>/dev/null)
 
   if [ -z "$RAW" ]; then
     LICENSES_UNPARSEABLE=$(_ep "$LICENSES_UNPARSEABLE" | jq -c --arg s "$_lic_name" --arg r "no .data.license field" '. + [{secret: $s, reason: $r}]')
@@ -818,7 +831,7 @@ NEAREST_EXPIRY=$(_ep "$LICENSES_PARSED" | jq -c '
 SECRETS_NODE_TOTAL=$(_ep "$LICENSES_PARSED" | jq '[.[] | (.nodes | if . == "unlimited" then 0 else (tonumber? // 0) end)] | add // 0')
 HAS_UNLIMITED=$(_ep "$LICENSES_PARSED" | jq 'any(.nodes == "unlimited") // false')
 
-REPORT_LICENSE=$(kubectl -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null | jq '
+REPORT_LICENSE=$($CLI -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null | jq '
   [.items[] | select(.results.licensing != null)] | sort_by(.metadata.creationTimestamp) | last | .results.licensing // {}
 ' 2>/dev/null || echo '{}')
 REPORT_NODE_LIMIT=$(_ep "$REPORT_LICENSE" | jq -r '.nodeLimit // empty')
@@ -827,7 +840,7 @@ REPORT_NODE_COUNT=$(_ep "$REPORT_LICENSE" | jq '.nodeCount // 0')
 if [ "${REPORT_NODE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
   CLUSTER_NODE_COUNT="$REPORT_NODE_COUNT"
 else
-  CLUSTER_NODE_COUNT=$(kubectl get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  CLUSTER_NODE_COUNT=$($CLI get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 fi
 [ -z "$CLUSTER_NODE_COUNT" ] && CLUSTER_NODE_COUNT=0
 
@@ -1570,7 +1583,7 @@ if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
     LABEL_RESOLVED_NS=$(
       printf '%s\n' "$MATCHLABELS_SELECTORS" | while IFS= read -r _sel; do
         [ -z "$_sel" ] && continue
-        kubectl get namespaces -l "$_sel" \
+        $CLI get namespaces -l "$_sel" \
           -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
       done
     )
@@ -1881,10 +1894,10 @@ debug "K10 deployments: $K10_DEPLOYMENTS_TOTAL (multi-replica: $K10_MULTI_REPLIC
 ### Catalog Size (NEW v1.5) + Free Space (NEW v1.6)
 ### -------------------------
 # Try multiple methods to find catalog PVC
-CATALOG_PVC=$(kubectl -n "$NAMESPACE" get pvc -l component=catalog -o json 2>/dev/null || echo '{"items":[]}')
+CATALOG_PVC=$($CLI -n "$NAMESPACE" get pvc -l component=catalog -o json 2>/dev/null || echo '{"items":[]}')
 if [ "$(_ep "$CATALOG_PVC" | jq '.items | length')" -eq 0 ]; then
   # Try by name pattern
-  CATALOG_PVC=$(kubectl -n "$NAMESPACE" get pvc -o json 2>/dev/null | jq '{items: [.items[]? | select(.metadata.name | test("catalog"; "i"))]}' 2>/dev/null || echo '{"items":[]}')
+  CATALOG_PVC=$($CLI -n "$NAMESPACE" get pvc -o json 2>/dev/null | jq '{items: [.items[]? | select(.metadata.name | test("catalog"; "i"))]}' 2>/dev/null || echo '{"items":[]}')
 fi
 CATALOG_SIZE=$(_ep "$CATALOG_PVC" | jq -r '.items[0].status.capacity.storage // .items[0].spec.resources.requests.storage // "N/A"')
 CATALOG_PVC_NAME=$(_ep "$CATALOG_PVC" | jq -r '.items[0].metadata.name // "N/A"')
@@ -1903,15 +1916,15 @@ CATALOG_POD=""
 # the `component=catalog` label doesn't match any pod (label scheme
 # varies across K10 chart versions and deployment methods), never
 # reaching the fallback or any subsequent section.
-CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -l component=catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
+CATALOG_POD=$($CLI -n "$NAMESPACE" get pods -l component=catalog -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || echo "")
 if [ -z "$CATALOG_POD" ]; then
-  CATALOG_POD=$(kubectl -n "$NAMESPACE" get pods -o json 2>/dev/null | jq -r '[.items[]? | select(.metadata.name | test("catalog"; "i")) | .metadata.name][0] // empty' 2>/dev/null)
+  CATALOG_POD=$($CLI -n "$NAMESPACE" get pods -o json 2>/dev/null | jq -r '[.items[]? | select(.metadata.name | test("catalog"; "i")) | .metadata.name][0] // empty' 2>/dev/null)
 fi
 
 if [ -n "$CATALOG_POD" ]; then
   # Exec into catalog pod and get disk usage for /kasten-io (or /mnt/data common mount points)
   # Try common mount points for catalog data
-  DF_OUTPUT=$(kubectl -n "$NAMESPACE" exec "$CATALOG_POD" -- df -h 2>/dev/null | grep -E '/kasten|/mnt|/data|/var/lib' | head -1)
+  DF_OUTPUT=$($CLI -n "$NAMESPACE" exec "$CATALOG_POD" -- df -h 2>/dev/null | grep -E '/kasten|/mnt|/data|/var/lib' | head -1)
   
   if [ -n "$DF_OUTPUT" ]; then
     # Parse df output: Filesystem Size Used Avail Use% Mounted
@@ -2051,10 +2064,10 @@ debug "TransformSets: $TRANSFORMSET_COUNT"
 # any Prometheus (cluster/user-workload monitoring, app instances) — on
 # OpenShift it is true 100% of the time regardless of K10 monitoring state.
 # Scope to the K10 namespace and use the K10 chart pod labels.
-PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+PROMETHEUS_RUNNING=$($CLI -n "$NAMESPACE" get pods -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 if [ "$PROMETHEUS_RUNNING" -eq 0 ]; then
-  PROMETHEUS_RUNNING=$(kubectl -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=k10" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$($CLI -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=k10" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 fi
 
@@ -2541,7 +2554,7 @@ debug "PVCs: $TOTAL_PVCS, Capacity: ${TOTAL_CAPACITY_GB}Gi"
 
 # Check if VirtualMachine CRD exists (KubeVirt / OpenShift Virtualization)
 VM_CRD_EXISTS="false"
-if kubectl get crd virtualmachines.kubevirt.io >/dev/null 2>&1; then
+if $CLI get crd virtualmachines.kubevirt.io >/dev/null 2>&1; then
   VM_CRD_EXISTS="true"
 fi
 
@@ -2555,7 +2568,7 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
 
   # Check for OpenShift Virtualization (CNV)
   if [ "$PLATFORM" = "OpenShift" ]; then
-    OCP_VIRT_CSV="$(kubectl get csv -n openshift-cnv -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | test("kubevirt-hyperconverged"))] | sort_by(.metadata.creationTimestamp) | last | .spec.version // empty' 2>/dev/null || echo '')"
+    OCP_VIRT_CSV="$($CLI get csv -n openshift-cnv -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | test("kubevirt-hyperconverged"))] | sort_by(.metadata.creationTimestamp) | last | .spec.version // empty' 2>/dev/null || echo '')"
     if [ -n "$OCP_VIRT_CSV" ]; then
       VIRT_PLATFORM="OpenShift Virtualization"
       VIRT_VERSION="$OCP_VIRT_CSV"
@@ -2563,9 +2576,9 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
   fi
 
   # Check for SUSE Virtualization (Harvester)
-  if kubectl get namespace harvester-system >/dev/null 2>&1; then
+  if $CLI get namespace harvester-system >/dev/null 2>&1; then
     VIRT_PLATFORM="SUSE Virtualization (Harvester)"
-    HARVESTER_VER="$(kubectl get settings.harvesterhci.io server-version -o jsonpath='{.value}' 2>/dev/null || echo 'unknown')"
+    HARVESTER_VER="$($CLI get settings.harvesterhci.io server-version -o jsonpath='{.value}' 2>/dev/null || echo 'unknown')"
     if [ -n "$HARVESTER_VER" ] && [ "$HARVESTER_VER" != "unknown" ]; then
       VIRT_VERSION="$HARVESTER_VER"
     fi
@@ -2573,13 +2586,13 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
 
   # If still unknown, try KubeVirt operator version
   if [ "$VIRT_VERSION" = "unknown" ]; then
-    VIRT_VERSION="$(kubectl get kubevirt -A -o jsonpath='{.items[0].status.observedKubeVirtVersion}' 2>/dev/null || echo 'unknown')"
+    VIRT_VERSION="$($CLI get kubevirt -A -o jsonpath='{.items[0].status.observedKubeVirtVersion}' 2>/dev/null || echo 'unknown')"
   fi
 
   debug "Virtualization platform: $VIRT_PLATFORM $VIRT_VERSION"
 
   # Get all VMs cluster-wide
-  VMS_JSON="$(kubectl get virtualmachines.kubevirt.io -A -o json 2>/dev/null | jq -c '.' || echo '{"items":[]}')"
+  VMS_JSON="$($CLI get virtualmachines.kubevirt.io -A -o json 2>/dev/null | jq -c '.' || echo '{"items":[]}')"
   TOTAL_VMS=$(_ep "$VMS_JSON" | jq '.items | length')
 
   # VM running status
@@ -2676,7 +2689,7 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
   debug "VM protection note: $VM_PROTECTION_NOTE"
 
   # VM-based RestorePoints (appType=virtualMachine label)
-  VM_RESTORE_POINTS=$(kubectl get restorepoints.apps.kio.kasten.io -A -l "k10.kasten.io/appType=virtualMachine" --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+  VM_RESTORE_POINTS=$($CLI get restorepoints.apps.kio.kasten.io -A -l "k10.kasten.io/appType=virtualMachine" --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 
   debug "VM RestorePoints: $VM_RESTORE_POINTS"
 
@@ -2685,13 +2698,13 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
   VMS_FREEZE_ENABLED=$((TOTAL_VMS - VMS_FREEZE_DISABLED))
 
   # Freeze timeout from K10 config
-  FREEZE_TIMEOUT="$(kubectl -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["kubeVirtVMs.snapshot.unfreezeTimeout"] // empty' || echo '')"
+  FREEZE_TIMEOUT="$($CLI -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["kubeVirtVMs.snapshot.unfreezeTimeout"] // empty' || echo '')"
   if [ -z "$FREEZE_TIMEOUT" ]; then
     FREEZE_TIMEOUT="5m0s"
   fi
 
   # VM snapshot concurrency setting
-  VM_SNAPSHOT_CONCURRENCY="$(kubectl -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["limiter.vmSnapshotsPerCluster"] // empty' || echo '')"
+  VM_SNAPSHOT_CONCURRENCY="$($CLI -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["limiter.vmSnapshotsPerCluster"] // empty' || echo '')"
   if [ -z "$VM_SNAPSHOT_CONCURRENCY" ]; then
     VM_SNAPSHOT_CONCURRENCY="1"
   fi
@@ -2762,10 +2775,10 @@ if [ "$SKIP_HELM" = true ]; then
   debug "Helm values extraction skipped (--no-helm)"
 else
   # Helm 3 stores release data in secrets labelled owner=helm
-  HELM_SECRET_NAME=$(kubectl -n "$NAMESPACE" get secrets -l "name=k10,owner=helm" -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || echo "")
+  HELM_SECRET_NAME=$($CLI -n "$NAMESPACE" get secrets -l "name=k10,owner=helm" -o jsonpath='{.items[-1:].metadata.name}' 2>/dev/null || echo "")
 
   if [ -n "$HELM_SECRET_NAME" ]; then
-    HELM_RELEASE_RAW=$(kubectl -n "$NAMESPACE" get secret "$HELM_SECRET_NAME" -o jsonpath='{.data.release}' 2>/dev/null || echo "")
+    HELM_RELEASE_RAW=$($CLI -n "$NAMESPACE" get secret "$HELM_SECRET_NAME" -o jsonpath='{.data.release}' 2>/dev/null || echo "")
     if [ -n "$HELM_RELEASE_RAW" ]; then
       # Helm release encoding: base64 -> base64 -> gzip -> JSON
       HELM_VALUES=$(_ep "$HELM_RELEASE_RAW" | base64 -d 2>/dev/null | base64 -d 2>/dev/null | gunzip 2>/dev/null | jq -c '.config // {}' 2>/dev/null || echo '{}')
@@ -2801,7 +2814,7 @@ helm_bool() {
 }
 
 # k10-config ConfigMap (shared fallback source)
-K10_CM_JSON=$(kubectl -n "$NAMESPACE" get cm k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
+K10_CM_JSON=$($CLI -n "$NAMESPACE" get cm k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
 
 # --- Authentication ---
 AUTH_METHOD="none"
@@ -2829,9 +2842,9 @@ fi
 
 # Fallback detection from secrets/configmap
 if [ "$AUTH_METHOD" = "none" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
-  if kubectl -n "$NAMESPACE" get secret k10-oidc-auth >/dev/null 2>&1; then
+  if $CLI -n "$NAMESPACE" get secret k10-oidc-auth >/dev/null 2>&1; then
     AUTH_METHOD="OIDC"; AUTH_DETAILS="detected from secret"
-  elif kubectl -n "$NAMESPACE" get secret k10-htpasswd >/dev/null 2>&1; then
+  elif $CLI -n "$NAMESPACE" get secret k10-htpasswd >/dev/null 2>&1; then
     AUTH_METHOD="Basic Auth"; AUTH_DETAILS="detected from secret"
   fi
   if [ "$AUTH_METHOD" = "none" ] && [ "$PLATFORM" = "OpenShift" ]; then
@@ -2870,7 +2883,7 @@ debug "Encryption: $ENCRYPTION_PROVIDER ($ENCRYPTION_DETAILS)"
 # --- FIPS Mode ---
 FIPS_ENABLED=$(helm_bool "fips.enabled")
 if [ "$FIPS_ENABLED" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
-  _fips=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
+  _fips=$($CLI -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
     | jq -r '.items[0].spec.template.spec.containers[0].env[]? | select(.name=="K10_FIPS_ENABLED") | .value // empty' 2>/dev/null)
   [ "$_fips" = "true" ] && FIPS_ENABLED="true"
 fi
@@ -2882,7 +2895,7 @@ _np_helm=$(helm_val "networkPolicy.create" "")
 if [ "$_np_helm" = "true" ] || [ "$_np_helm" = "false" ]; then
   NETPOL_ENABLED="$_np_helm"
 else
-  _np_count=$(kubectl -n "$NAMESPACE" get networkpolicies -l "app.kubernetes.io/name=k10" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  _np_count=$($CLI -n "$NAMESPACE" get networkpolicies -l "app.kubernetes.io/name=k10" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$_np_count" ] && _np_count=0
   [ "$_np_count" -gt 0 ] 2>/dev/null && NETPOL_ENABLED="true"
 fi
@@ -2910,7 +2923,7 @@ debug "Audit Logging: $AUDIT_ENABLED ($AUDIT_TARGETS)"
 # --- Custom CA Certificate ---
 CUSTOM_CA=$(helm_val "cacertconfigmap.name" "")
 if [ -z "$CUSTOM_CA" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
-  CUSTOM_CA=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
+  CUSTOM_CA=$($CLI -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
     | jq -r '.items[0].spec.template.spec.volumes[]? | select(.configMap.name | test("ca|cert|ssl"; "i")) | .configMap.name // empty' 2>/dev/null | head -1)
 fi
 debug "Custom CA: ${CUSTOM_CA:-none}"
@@ -2919,20 +2932,20 @@ debug "Custom CA: ${CUSTOM_CA:-none}"
 DASHBOARD_ACCESS="ClusterIP"
 DASHBOARD_HOST=""
 
-_ing_count=$(kubectl -n "$NAMESPACE" get ingress --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+_ing_count=$($CLI -n "$NAMESPACE" get ingress --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$_ing_count" ] && _ing_count=0
 _route_count=0
-[ "$PLATFORM" = "OpenShift" ] && _route_count=$(kubectl -n "$NAMESPACE" get routes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+[ "$PLATFORM" = "OpenShift" ] && _route_count=$($CLI -n "$NAMESPACE" get routes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$_route_count" ] && _route_count=0
-_extgw=$(kubectl -n "$NAMESPACE" get svc gateway-ext --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+_extgw=$($CLI -n "$NAMESPACE" get svc gateway-ext --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$_extgw" ] && _extgw=0
 
 if [ "$_ing_count" -gt 0 ] 2>/dev/null; then
   DASHBOARD_ACCESS="Ingress"
-  DASHBOARD_HOST=$(kubectl -n "$NAMESPACE" get ingress -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || echo "")
+  DASHBOARD_HOST=$($CLI -n "$NAMESPACE" get ingress -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || echo "")
 elif [ "$_route_count" -gt 0 ] 2>/dev/null; then
   DASHBOARD_ACCESS="Route"
-  DASHBOARD_HOST=$(kubectl -n "$NAMESPACE" get routes -o jsonpath='{.items[0].spec.host}' 2>/dev/null || echo "")
+  DASHBOARD_HOST=$($CLI -n "$NAMESPACE" get routes -o jsonpath='{.items[0].spec.host}' 2>/dev/null || echo "")
 elif [ "$_extgw" -gt 0 ] 2>/dev/null; then
   DASHBOARD_ACCESS="External Gateway"
   DASHBOARD_HOST=$(helm_val "externalGateway.fqdn.name" "LoadBalancer")
@@ -3013,7 +3026,7 @@ debug "Excluded apps: $EXCLUDED_APPS_COUNT"
 # --- GVB Sidecar Injection ---
 GVB_SIDECAR=$(helm_bool "injectGenericVolumeBackupSidecar.enabled")
 if [ "$GVB_SIDECAR" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
-  _gvb_wh=$(kubectl get mutatingwebhookconfigurations -l "app=k10" -o json 2>/dev/null \
+  _gvb_wh=$($CLI get mutatingwebhookconfigurations -l "app=k10" -o json 2>/dev/null \
     | jq '[.items[]? | select(.metadata.name | test("generic-volume";"i"))] | length' 2>/dev/null || echo "0")
   [ "$_gvb_wh" -gt 0 ] 2>/dev/null && GVB_SIDECAR="true"
 fi
@@ -3023,7 +3036,7 @@ debug "GVB sidecar: $GVB_SIDECAR"
 SC_RUN_AS_USER=$(helm_val "services.securityContext.runAsUser" "")
 SC_FS_GROUP=$(helm_val "services.securityContext.fsGroup" "")
 if [ -z "$SC_RUN_AS_USER" ]; then
-  _sc=$(kubectl -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
+  _sc=$($CLI -n "$NAMESPACE" get deployment -l component=catalog -o json 2>/dev/null \
     | jq '.items[0].spec.template.spec.securityContext // {}' 2>/dev/null || echo '{}')
   SC_RUN_AS_USER=$(echo "$_sc" | jq -r '.runAsUser // "1000"')
   SC_FS_GROUP=$(echo "$_sc" | jq -r '.fsGroup // "1000"')
@@ -3053,7 +3066,7 @@ SCC_CREATED="false"
 if [ "$PLATFORM" = "OpenShift" ]; then
   SCC_CREATED=$(helm_bool "scc.create")
   if [ "$SCC_CREATED" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
-    _scc=$(kubectl get scc -o json 2>/dev/null | jq '[.items[]? | select(.metadata.name | test("k10|kasten";"i"))] | length' 2>/dev/null || echo "0")
+    _scc=$($CLI get scc -o json 2>/dev/null | jq '[.items[]? | select(.metadata.name | test("k10|kasten";"i"))] | length' 2>/dev/null || echo "0")
     [ "$_scc" -gt 0 ] 2>/dev/null && SCC_CREATED="true"
   fi
 fi
