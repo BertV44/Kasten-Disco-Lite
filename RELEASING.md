@@ -65,7 +65,7 @@ NS=kasten-io   # your K10 namespace
 ./kdl-json-to-html.sh /tmp/disco.json /tmp/disco.html   # must exit 0, end with </html>
 
 J=/tmp/disco.json
-jq -e '.kdlVersion=="2.0"' "$J" >/dev/null && echo "version OK"
+jq -e '(.kdlVersion|startswith("2."))' "$J" >/dev/null && echo "version OK"
 
 # License: no UNKNOWN type; effective limit comes from the report CR
 jq -e '[.license.licenses[]|select(.type=="UNKNOWN")]|length==0' "$J" >/dev/null && echo "license types OK"

@@ -3,6 +3,20 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.0.1] - 2026-06-09
+
+### Added
+- **Cluster CLI auto-selection** — on OpenShift, KDL now uses the `oc` client when
+  it is installed (falling back to `kubectl` otherwise, and on non-OpenShift). A
+  single `$CLI` indirection replaces the ~80 hardcoded `kubectl` invocations; the
+  OpenShift probe uses whichever client is present, so the script also works in
+  `oc`-only environments. `kubectl` still works on OpenShift, so this is a
+  convenience/consistency change, not a behavioral one for the data collected.
+
+### Validation
+- Verified end-to-end on a real K10 8.5.9 / OpenShift cluster: the debug line
+  reports `cluster CLI: oc`, the run exits 0, and the smoke-test passes.
+
 ## [2.0.0] - 2026-06-09
 
 First 2.x release. Builds on the v1.9.2 baseline (all v1.9.2 fixes are reconciled
