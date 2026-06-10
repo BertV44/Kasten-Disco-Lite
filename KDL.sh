@@ -263,7 +263,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="2.0.1"
+KDL_VERSION="2.0.2"
 OUTPUT_FILE=""
 SKIP_HELM=false
 
@@ -831,6 +831,15 @@ NEAREST_EXPIRY=$(_ep "$LICENSES_PARSED" | jq -c '
 SECRETS_NODE_TOTAL=$(_ep "$LICENSES_PARSED" | jq '[.[] | (.nodes | if . == "unlimited" then 0 else (tonumber? // 0) end)] | add // 0')
 HAS_UNLIMITED=$(_ep "$LICENSES_PARSED" | jq 'any(.nodes == "unlimited") // false')
 
+# Paid (non-trial) entitlement (#38). A long-lived/perpetual TRIAL license must
+# not inflate the headline node limit: summing trial + paid limits produces a
+# figure the deployment is not actually entitled to. We track the paid total
+# separately and flag when consumption only fits because of a trial license.
+PAID_LICENSE_COUNT=$(_ep "$LICENSES_PARSED" | jq '[.[] | select(.type != "TRIAL")] | length')
+PAID_NODE_TOTAL=$(_ep "$LICENSES_PARSED" | jq '[.[] | select(.type != "TRIAL") | (.nodes | if . == "unlimited" then 0 else (tonumber? // 0) end)] | add // 0')
+PAID_HAS_UNLIMITED=$(_ep "$LICENSES_PARSED" | jq 'any(.type != "TRIAL" and .nodes == "unlimited") // false')
+TRIAL_PRESENT=$(_ep "$LICENSES_PARSED" | jq 'any(.type == "TRIAL") // false')
+
 REPORT_LICENSE=$($CLI -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json 2>/dev/null | jq '
   [.items[] | select(.results.licensing != null)] | sort_by(.metadata.creationTimestamp) | last | .results.licensing // {}
 ' 2>/dev/null || echo '{}')
@@ -864,6 +873,30 @@ if [ "$EFFECTIVE_LIMIT" != "unlimited" ] && [ "$EFFECTIVE_LIMIT" != "0" ]; then
   [ "$CLUSTER_NODE_COUNT" -gt "$EFFECTIVE_LIMIT" ] 2>/dev/null && CONSUMPTION_STATUS="EXCEEDED"
 fi
 
+# Paid-entitlement view (#38): is consumption actually covered by paid licenses,
+# or only by a trial? PAID_LIMIT is the entitlement excluding trial licenses.
+if [ "$PAID_HAS_UNLIMITED" = "true" ]; then
+  PAID_LIMIT="unlimited"
+elif [ "${PAID_LICENSE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  PAID_LIMIT="$PAID_NODE_TOTAL"
+else
+  PAID_LIMIT="none"
+fi
+
+PAID_STATUS="OK"
+TRIAL_INFLATING="false"
+if [ "$PAID_HAS_UNLIMITED" != "true" ]; then
+  if [ "$PAID_LIMIT" = "none" ]; then
+    # No paid license at all — any consumption relies on a trial license.
+    PAID_STATUS="NO_PAID_LICENSE"
+    [ "$TRIAL_PRESENT" = "true" ] && [ "${CLUSTER_NODE_COUNT:-0}" -gt 0 ] && TRIAL_INFLATING="true"
+  elif [ "$PAID_LIMIT" != "0" ] && [ "${CLUSTER_NODE_COUNT:-0}" -gt "$PAID_LIMIT" ] 2>/dev/null; then
+    PAID_STATUS="EXCEEDS_PAID"
+    # Only flagged as "inflating" when a trial license is what keeps it green.
+    [ "$TRIAL_PRESENT" = "true" ] && TRIAL_INFLATING="true"
+  fi
+fi
+
 if [ "${LICENSE_SECRET_COUNT:-0}" -eq 0 ] && [ "${LICENSES_COUNT:-0}" -eq 0 ]; then
   LICENSE_STATUS="NOT_FOUND"
 elif [ "${LICENSES_COUNT:-0}" -eq 0 ]; then
@@ -886,6 +919,11 @@ LICENSE_JSON=$(jq -cn \
   --argjson current "${CLUSTER_NODE_COUNT:-0}" \
   --arg limit "$EFFECTIVE_LIMIT" \
   --arg consStatus "$CONSUMPTION_STATUS" \
+  --arg paidLimit "$PAID_LIMIT" \
+  --arg paidStatus "$PAID_STATUS" \
+  --argjson paidHasUnlimited "${PAID_HAS_UNLIMITED:-false}" \
+  --argjson trialPresent "${TRIAL_PRESENT:-false}" \
+  --argjson trialInflating "${TRIAL_INFLATING:-false}" \
   --argjson nearestExpiry "$NEAREST_EXPIRY" \
   '{
     status: $overall,
@@ -895,6 +933,7 @@ LICENSE_JSON=$(jq -cn \
     licenses: $licenses,
     nodeLimitAggregate: {
       fromSecrets: $fromSecrets,
+      fromPaidSecrets: ($paidLimit | tonumber? // $paidLimit),
       fromReportCR: (if $fromReportCR == "" then null else ($fromReportCR | tonumber? // $fromReportCR) end),
       mismatch: $mismatch,
       hasUnlimited: $hasUnlimited
@@ -902,12 +941,16 @@ LICENSE_JSON=$(jq -cn \
     nodeConsumption: {
       current: $current,
       limit: ($limit | tonumber? // $limit),
-      status: $consStatus
+      status: $consStatus,
+      paidLimit: ($paidLimit | tonumber? // $paidLimit),
+      paidStatus: $paidStatus,
+      trialPresent: $trialPresent,
+      trialInflating: $trialInflating
     },
     nearestExpiry: $nearestExpiry
   }' 2>/dev/null || echo '{"status":"ERROR","secretCount":0,"parseableCount":0,"unparseable":[],"licenses":[]}')
 
-debug "License: secrets=$LICENSE_SECRET_COUNT parseable=$LICENSES_COUNT status=$LICENSE_STATUS consumption=$CLUSTER_NODE_COUNT/$EFFECTIVE_LIMIT ($CONSUMPTION_STATUS) mismatch=$NODE_LIMIT_MISMATCH"
+debug "License: secrets=$LICENSE_SECRET_COUNT parseable=$LICENSES_COUNT status=$LICENSE_STATUS consumption=$CLUSTER_NODE_COUNT/$EFFECTIVE_LIMIT ($CONSUMPTION_STATUS) paid=$CLUSTER_NODE_COUNT/$PAID_LIMIT ($PAID_STATUS) trialInflating=$TRIAL_INFLATING mismatch=$NODE_LIMIT_MISMATCH"
 
 ### -------------------------
 ### Profiles
@@ -4422,9 +4465,17 @@ if [ "$MODE" = "json" ]; then
           $profiles.items[] | {
             name: .metadata.name,
             backend: (
+              # Broadened detection (#43): K10 profile specs expose the backend
+              # under several shapes depending on version/profile kind. Check the
+              # well-known paths in turn; fall back to a deep scan for any
+              # *Type/*StoreType field before giving up. "Undetermined" (not
+              # "Unknown") signals "could not classify", not a collection failure.
               if .spec.infrastoreBlobStore then "S3"
-              elif .spec.locationSpec.type then .spec.locationSpec.type
-              else "Unknown"
+              elif (.spec.locationSpec.type // "") != "" then .spec.locationSpec.type
+              elif (.spec.locationSpec.objectStore.objectStoreType // "") != "" then .spec.locationSpec.objectStore.objectStoreType
+              elif (.spec.type // "") != "" then .spec.type
+              else
+                ( [ .spec? | .. | objects | (.objectStoreType? // .storeType? // empty) | select(. != null and . != "") ] | first ) // "Undetermined"
               end
             ),
             region: (.spec.infrastoreBlobStore.region // .spec.locationSpec.region // "N/A"),
@@ -4497,6 +4548,22 @@ else
     printf "\n  Node Consumption: ${COLOR_RED}[FAIL] %s / %s (EXCEEDED)${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
   else
     printf "\n  Node Consumption: ${COLOR_GREEN}[OK] %s / %s${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
+  fi
+
+  # Paid-entitlement view (#38): the consumption above can read OK purely because
+  # a trial license inflates the limit. Surface the paid entitlement separately.
+  _paid_lim=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.paidLimit')
+  _paid_status=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.paidStatus')
+  _trial_inflating=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.trialInflating')
+  if [ "$_paid_status" = "EXCEEDS_PAID" ]; then
+    printf "  Paid Entitlement: ${COLOR_RED}[FAIL] %s / %s (consumption exceeds paid licenses)${COLOR_RESET}\n" "$_cons_cur" "$_paid_lim"
+  elif [ "$_paid_status" = "NO_PAID_LICENSE" ]; then
+    printf "  Paid Entitlement: ${COLOR_YELLOW}[WARN] no paid (non-trial) license detected${COLOR_RESET}\n"
+  elif [ "$_paid_lim" != "unlimited" ] && [ "$_paid_lim" != "none" ]; then
+    printf "  Paid Entitlement: ${COLOR_GREEN}[OK] %s / %s${COLOR_RESET}\n" "$_cons_cur" "$_paid_lim"
+  fi
+  if [ "$_trial_inflating" = "true" ]; then
+    printf "    ${COLOR_YELLOW}[WARN]          A TRIAL license is inflating the effective node limit; the\n                    deployment only stays within limit because of it${COLOR_RESET}\n"
   fi
 fi
 

@@ -3,6 +3,47 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.0.2] - 2026-06-10
+
+Fixes and reporting improvements surfaced by analysing a real-world run where the
+HTML report was collecting far more than it displayed, and a few counters did not
+reconcile. Issues #37–#43.
+
+### Added
+- **Failed Actions (root cause)** in the HTML report (#37) — renders
+  `failedActionsTop5` (already in the JSON) directly under Health, so a low
+  success rate is shown alongside the error messages that explain it.
+- **License paid-entitlement view** (#38) — `nodeConsumption` now carries
+  `paidLimit`, `paidStatus`, `trialPresent` and `trialInflating`. A long-lived
+  TRIAL license no longer inflates the headline limit into a misleading "OK":
+  consumption is also checked against the paid (non-trial) entitlement, and a
+  warning is emitted when a trial is what keeps the deployment within limit.
+- **Newly rendered sections** (#41, #42) — `retentionAnalysis`,
+  `policiesWithoutExport`, `profileValidation`, `storageClasses` and
+  `volumeSnapshotClasses` are now shown (data was already collected). Adds an
+  explicit warning when no default VolumeSnapshotClass exists.
+
+### Fixed
+- **Policy Run Statistics** (#39) — summary cards (sampled distribution) and the
+  per-policy table (last run) are now labelled distinctly so they no longer look
+  contradictory.
+- **Restore / Backup health counters** (#40) — Restore cards now include an
+  "Other" state so they total correctly; Backup/Export rows now show the residual
+  ("N other") instead of silently dropping non-terminal actions.
+- **Profile backend "Unknown"** (#43) — broadened detection (objectStore type,
+  `spec.type`, deep-scan fallback); the terminal fallback is now "Undetermined"
+  (could not classify) rather than implying a collection failure.
+- **Unprotected-namespace counts** (#43) — the HTML now explains why the
+  selector-based count and the never-backed-up count can differ.
+
+### Validation
+- `sh -n` + `shellcheck -s sh` clean (no new error-level findings) on both
+  scripts. HTML generator re-run against a real v2.0.1 JSON: all new sections
+  render, restore cards total correctly, backward-compatible degradation verified
+  on JSON with the new keys removed. License logic unit-checked against real
+  license data (paid limit 5, consumption 63 → EXCEEDS_PAID, trial inflating).
+  Not yet validated end-to-end against a live cluster.
+
 ## [2.0.1] - 2026-06-09
 
 ### Added
