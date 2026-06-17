@@ -45,7 +45,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status
-- **Best Practices compliance** summary (16 checks with severity levels)
+- **Best Practices compliance** summary (15 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
@@ -147,7 +147,9 @@ Backwards-compatible: missing keys in the baseline are reported as "newly availa
 
 ### HTML generator updated to v2.0
 
-`kdl-json-to-html.sh` renders the 5 new top-level JSON keys: `ransomwareReadiness`, `policyRunStats.effectiveRpo`, `policyAnalysis`, `k10Rbac`, `coverage.namespacesInventory`. The rest of the report is unchanged — additive only.
+`kdl-json-to-html.sh` renders the 5 new top-level JSON keys: `ransomwareReadiness`, `policyRunStats.effectiveRpo`, `policyAnalysis`, `k10Rbac`, `coverage.namespacesInventory`.
+
+> **v2.0.2 note** — the original v2.0 generator (forked from the v1.8.3 baseline) had stopped rendering several v1.9.x sections and Best-Practices rows even though `KDL.sh` still emitted the data. v2.0.2 restores full v1.9.2 render parity (Stuck Actions, Per-Namespace Protection Status, RestorePoints by Namespace, k10-system-reports-policy, Import Policies, Retention Analysis, Policies without Export, Profile Validation, StorageClasses/VSC, Failed Actions, and the 5 retention/coverage Best-Practices rows) and adds the license paid-entitlement view. See the Version History for the full list.
 
 ### Also includes the v1.9.2 remediations
 
@@ -310,7 +312,7 @@ echo "Regressions: $?"   # exit code = number of regressions
 30. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
 31. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
 32. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
-33. **Best Practices Compliance** — 16 checks with severity-coded indicators
+33. **Best Practices Compliance** — 15 checks with severity-coded indicators
 34. **Execution Time** — Elapsed time display
 
 ### JSON Output
@@ -329,7 +331,7 @@ New in v2.0:
 
 ---
 
-## Best Practices Compliance (16 checks)
+## Best Practices Compliance (15 checks)
 
 | Check                  | Severity | Good                                              | Bad                                                |
 |------------------------|----------|---------------------------------------------------|----------------------------------------------------|
