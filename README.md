@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.0
+# Kasten Discovery Lite v2.0.2
 
 A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
 
@@ -45,7 +45,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status
-- **Best Practices compliance** summary (16 checks with severity levels)
+- **Best Practices compliance** summary (15 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
@@ -147,7 +147,9 @@ Backwards-compatible: missing keys in the baseline are reported as "newly availa
 
 ### HTML generator updated to v2.0
 
-`kdl-json-to-html.sh` renders the 5 new top-level JSON keys: `ransomwareReadiness`, `policyRunStats.effectiveRpo`, `policyAnalysis`, `k10Rbac`, `coverage.namespacesInventory`. The rest of the report is unchanged — additive only.
+`kdl-json-to-html.sh` renders the 5 new top-level JSON keys: `ransomwareReadiness`, `policyRunStats.effectiveRpo`, `policyAnalysis`, `k10Rbac`, `coverage.namespacesInventory`.
+
+> **v2.0.2 note** — the original v2.0 generator (forked from the v1.8.3 baseline) had stopped rendering several v1.9.x sections and Best-Practices rows even though `KDL.sh` still emitted the data. v2.0.2 restores full v1.9.2 render parity (Stuck Actions, Per-Namespace Protection Status, RestorePoints by Namespace, k10-system-reports-policy, Import Policies, Retention Analysis, Policies without Export, Profile Validation, StorageClasses/VSC, Failed Actions, and the 5 retention/coverage Best-Practices rows) and adds the license paid-entitlement view. See the Version History for the full list.
 
 ### Also includes the v1.9.2 remediations
 
@@ -310,7 +312,7 @@ echo "Regressions: $?"   # exit code = number of regressions
 30. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
 31. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
 32. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
-33. **Best Practices Compliance** — 16 checks with severity-coded indicators
+33. **Best Practices Compliance** — 15 checks with severity-coded indicators
 34. **Execution Time** — Elapsed time display
 
 ### JSON Output
@@ -329,7 +331,7 @@ New in v2.0:
 
 ---
 
-## Best Practices Compliance (16 checks)
+## Best Practices Compliance (15 checks)
 
 | Check                  | Severity | Good                                              | Bad                                                |
 |------------------------|----------|---------------------------------------------------|----------------------------------------------------|
@@ -528,7 +530,29 @@ Key portability measures:
 
 ## Version History
 
-- **v2.0** (Current)
+- **v2.0.2** (Current)
+  - **HTML report — license paid-entitlement view**: a long-lived TRIAL license no
+    longer inflates the headline node limit into a misleading "OK"; consumption is
+    also checked against the paid (non-trial) entitlement (`nodeConsumption.paidLimit`,
+    `paidStatus`, `trialInflating`).
+  - **HTML report — counter fixes**: Restore cards now include an "Other" state and
+    total correctly; Backup/Export rows show the residual ("N other"); Failed Actions
+    root-cause messages are rendered under Health; Policy Run Statistics cards
+    (sampled) and table (last run) are labelled distinctly.
+  - **Regression fix vs v1.9.2**: the v2.0 HTML generator (forked from v1.8.3) had
+    stopped rendering several v1.9.x sections although the JSON still carried the
+    data. Restored to full parity: Stuck Actions, Per-Namespace Protection Status,
+    RestorePoints by Namespace, k10-system-reports-policy, Import Policies, Retention
+    Analysis, Policies without Export, Profile Validation, StorageClasses/VSC, Failed
+    Actions — plus 5 Best Practices rows (Snapshot Retention high, Fast Local Recovery,
+    Export Retention, Cluster-scoped Resources, Export Coverage).
+  - **Profile backend detection** broadened; unclassifiable profiles now report
+    `Undetermined` instead of `Unknown`.
+
+- **v2.0.1** — Cluster CLI auto-selection: uses `oc` on OpenShift when present
+  (falls back to `kubectl`); single `$CLI` indirection. No data-collection change.
+
+- **v2.0**
   - **Patch 1/7** — Enriched namespace inventory (`coverage.namespacesInventory`)
   - **Patch 2/7** — K10 RBAC inventory (`k10Rbac`) with graceful degradation
   - **Patch 3/7** — Effective RPO per policy (`policyRunStats.effectiveRpo`)

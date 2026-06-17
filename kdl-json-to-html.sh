@@ -575,7 +575,65 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <td class=\"sev-optional\">Optional</td>
         <td>" + severityBadge("optional"; (.bestPractices.auditLogging // "N/A")) + "</td>
         <td>" + badge(.bestPractices.auditLogging // "N/A") + "</td>
-      </tr>
+      </tr>" +
+      (if .bestPractices.snapshotRetentionHigh then
+      "
+      <tr>
+        <td><strong>Snapshot Retention (high)</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.snapshotRetentionHigh) + "</td>
+        <td>" + badge(.bestPractices.snapshotRetentionHigh) +
+          (if (.retentionAnalysis.snapshotRetentionHigh.count // 0) > 0 then
+            " (" + (.retentionAnalysis.snapshotRetentionHigh.count | tostring) + " policy/policies with snapshot retention >7)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.snapshotRetentionZero then
+      "
+      <tr>
+        <td><strong>Fast Local Recovery</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.snapshotRetentionZero) + "</td>
+        <td>" + badge(.bestPractices.snapshotRetentionZero) +
+          (if (.retentionAnalysis.snapshotRetentionZero.count // 0) > 0 then
+            " (" + (.retentionAnalysis.snapshotRetentionZero.count | tostring) + " policy/policies with zero snapshot retention)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.exportRetentionExplicit then
+      "
+      <tr>
+        <td><strong>Export Retention</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.exportRetentionExplicit) + "</td>
+        <td>" + badge(.bestPractices.exportRetentionExplicit) +
+          (if (.retentionAnalysis.exportWithoutExplicitRetention.count // 0) > 0 then
+            " (" + (.retentionAnalysis.exportWithoutExplicitRetention.count | tostring) + " policy/policies with implicit export retention)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.clusterScopedResources then
+      "
+      <tr>
+        <td><strong>Cluster-scoped Resources</strong></td>
+        <td class=\"sev-optional\">Optional</td>
+        <td>" + severityBadge("optional"; .bestPractices.clusterScopedResources) + "</td>
+        <td>" + badge(.bestPractices.clusterScopedResources) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.policiesWithoutExport then
+      "
+      <tr>
+        <td><strong>Export Coverage</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.policiesWithoutExport) + "</td>
+        <td>" + badge(.bestPractices.policiesWithoutExport) +
+          (if (.policiesWithoutExport.count // 0) > 0 then
+            " (" + (.policiesWithoutExport.count | tostring) + " snapshot-only policy/policies)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      "
     </tbody></table>"
   else
     "<div class=\"info-box\">Best practices data not available.</div>"
@@ -638,12 +696,14 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
 <!-- Policy Run Stats -->
 <h2>\u23F1\uFE0F Policy Run Statistics</h2>"
 + (if .policyRunStats then
-    "<div class=\"grid\">
-      <div class=\"card new-feature\"><strong>Average Duration</strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.seconds) + "</div></div>
-      <div class=\"card\"><strong>Min</strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.min) + "</div></div>
-      <div class=\"card\"><strong>Max</strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.max) + "</div></div>
+    "<p class=\"section-description\">The summary cards describe the duration <strong>distribution over a sample of recent successful runs</strong> (sample size below). The table shows the <strong>most recent run per policy</strong>, which may fall outside that sample &mdash; so a long last run can legitimately exceed the sampled max.</p>
+    <div class=\"grid\">
+      <div class=\"card new-feature\"><strong>Avg Duration <small>(sampled)</small></strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.seconds) + "</div></div>
+      <div class=\"card\"><strong>Min <small>(sampled)</small></strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.min) + "</div></div>
+      <div class=\"card\"><strong>Max <small>(sampled)</small></strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.max) + "</div></div>
       <div class=\"card new-feature\"><strong>Sample Size</strong><div class=\"card-value\">" + (.policyRunStats.averageDuration.sampleCount | tostring) + " runs</div></div>
     </div>
+    <h3>Last run per policy</h3>
     <table>
     <thead><tr><th>Policy</th><th>Last Run</th><th>Status</th><th>Duration</th></tr></thead>
     <tbody>" +
@@ -670,8 +730,11 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
     elif .coverage.unprotectedNamespaces.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>All application namespaces are protected</strong></div>"
     else
-      "<div class=\"warning-box\">\u26a0 <strong>" + (.coverage.unprotectedNamespaces.count | tostring) + " unprotected namespace(s) detected</strong></div>
-      <table>
+      "<div class=\"warning-box\">\u26a0 <strong>" + (.coverage.unprotectedNamespaces.count | tostring) + " unprotected namespace(s) detected</strong></div>" +
+      (if (.namespaceProtectionStatus.neverBackedUp // null) != null and (.namespaceProtectionStatus.neverBackedUp != .coverage.unprotectedNamespaces.count) then
+        "<div class=\"info-box\"><strong>Note &mdash; two methods, two counts:</strong> this figure (" + (.coverage.unprotectedNamespaces.count | tostring) + ") is <em>selector-based</em> (namespaces not matched by any app policy). The Health/protection view counts <em>" + (.namespaceProtectionStatus.neverBackedUp | tostring) + " namespace(s) never actually backed up</em> &mdash; a namespace can be targeted by a policy selector yet still have no successful backup, which is why the two numbers differ.</div>"
+      else "" end) +
+      "<table>
       <thead><tr><th>Unprotected Namespaces</th></tr></thead>
       <tbody>" +
       ([.coverage.unprotectedNamespaces.items[:15][]? | "<tr><td>" + . + "</td></tr>"] | join("")) +
@@ -774,6 +837,7 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       <div class=\"card\"><strong>Completed</strong><div class=\"card-value\" style=\"color:#059669\">" + (.health.backups.restoreActions.completed | tostring) + "</div></div>
       <div class=\"card\"><strong>Failed</strong><div class=\"card-value\" style=\"color:#dc2626\">" + (.health.backups.restoreActions.failed | tostring) + "</div></div>
       <div class=\"card\"><strong>Running</strong><div class=\"card-value\" style=\"color:#2563eb\">" + (.health.backups.restoreActions.running | tostring) + "</div></div>
+      <div class=\"card\"><strong>Other <small>(e.g. cancelled)</small></strong><div class=\"card-value\" style=\"color:#6b7280\">" + ((.health.backups.restoreActions.other // (.health.backups.restoreActions.total - .health.backups.restoreActions.completed - .health.backups.restoreActions.failed - .health.backups.restoreActions.running)) | tostring) + "</div></div>
     </div>" +
     (if (.health.backups.restoreActions.recent | length) > 0 then
       "<table>
@@ -891,6 +955,15 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
       else "" end)
     + (if .license.nodeConsumption then
         "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.limit | tostring) + " " + badge(.license.nodeConsumption.status) + "</span></div>"
+        + (if (.license.nodeConsumption.paidStatus // null) != null and (.license.nodeConsumption.paidLimit // "none") != "none" then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Paid Entitlement</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.paidLimit | tostring) +
+            (if .license.nodeConsumption.paidStatus == "EXCEEDS_PAID" then " <span class=\"badge error\">✗ EXCEEDS PAID</span>" else " <span class=\"badge ok\">✓ OK</span>" end) + "</span></div>"
+          elif (.license.nodeConsumption.paidStatus // "") == "NO_PAID_LICENSE" then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Paid Entitlement</span><span class=\"stat-value\"><span class=\"badge warn\">⚠ No paid (non-trial) license</span></span></div>"
+          else "" end)
+        + (if (.license.nodeConsumption.trialInflating // false) then
+            "<div class=\"stat-row\"><span class=\"stat-label\"></span><span class=\"stat-value\"><small>⚠ A TRIAL license is inflating the effective limit — the deployment only stays within limit because of it.</small></span></div>"
+          else "" end)
       else "" end)
     + "</div>"
     + ((.license.licenses // []) | to_entries | map(
@@ -928,11 +1001,11 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <strong>Backup Health</strong>
         <div class=\"stat-row\"><span class=\"stat-label\">Total Actions</span><span class=\"stat-value\">" + (.health.backups.totalActions | tostring) + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Finished Actions</span><span class=\"stat-value\">" + ((.health.backups.finishedActions // (.health.backups.completedActions + .health.backups.failedActions)) | tostring) + " <small>(Complete + Failed)</small></span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Backup Actions</span><span class=\"stat-value\">" + 
-          (if .health.backups.backupActions then (.health.backups.backupActions.total | tostring) + " (" + (.health.backups.backupActions.completed | tostring) + " ok, " + (.health.backups.backupActions.failed | tostring) + " failed)" else "N/A" end) + 
+        <div class=\"stat-row\"><span class=\"stat-label\">Backup Actions</span><span class=\"stat-value\">" +
+          (if .health.backups.backupActions then (.health.backups.backupActions.total | tostring) + " (" + (.health.backups.backupActions.completed | tostring) + " ok, " + (.health.backups.backupActions.failed | tostring) + " failed" + ((.health.backups.backupActions.total - .health.backups.backupActions.completed - .health.backups.backupActions.failed) as $o | if $o > 0 then ", " + ($o | tostring) + " other" else "" end) + ")" else "N/A" end) +
         "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Export Actions</span><span class=\"stat-value\">" + 
-          (if .health.backups.exportActions then (.health.backups.exportActions.total | tostring) + " (" + (.health.backups.exportActions.completed | tostring) + " ok, " + (.health.backups.exportActions.failed | tostring) + " failed)" else "N/A" end) + 
+        <div class=\"stat-row\"><span class=\"stat-label\">Export Actions</span><span class=\"stat-value\">" +
+          (if .health.backups.exportActions then (.health.backups.exportActions.total | tostring) + " (" + (.health.backups.exportActions.completed | tostring) + " ok, " + (.health.backups.exportActions.failed | tostring) + " failed" + ((.health.backups.exportActions.total - .health.backups.exportActions.completed - .health.backups.exportActions.failed) as $o | if $o > 0 then ", " + ($o | tostring) + " other" else "" end) + ")" else "N/A" end) +
         "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Success Rate</span><span class=\"stat-value\">" + .health.backups.successRate + "% <small>(based on finished)</small></span></div>
         <div class=\"progress-bar\"><div class=\"progress-fill\" style=\"width: " + .health.backups.successRate + "%\"></div></div>
@@ -941,6 +1014,22 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   else
     "<div class=\"info-box\">Health metrics not available.</div>"
   end)
++ (if (.failedActionsTop5.count // 0) > 0 then
+    "<h2>\u274C Failed Actions <small>(root cause)</small></h2>
+     <p class=\"section-description\">Most recent failed actions and the error message reported by K10. This is the first place to look when the success rate is low.</p>
+     <table>
+       <thead><tr><th>Kind</th><th>Policy</th><th>Date</th><th>Root-cause message</th></tr></thead>
+       <tbody>" +
+     ([.failedActionsTop5.items[]? |
+       "<tr>
+          <td>" + (.kind // "\u2014") + "</td>
+          <td>" + (if (.policy // "") == "" then "<em>\u2014</em>" else (.policy | @html) end) + "</td>
+          <td>" + (if (.timestamp // "") == "" then "\u2014" else (.timestamp | split("T")[0]) end) + "</td>
+          <td><code>" + ((.message // "") | .[0:400] | @html) + (if ((.message // "") | length) > 400 then "\u2026" else "" end) + "</code></td>
+        </tr>"
+     ] | join("")) +
+     "</tbody></table>"
+   else "" end)
 + "
 
 <h2>\uD83D\uDCC8 Monitoring</h2>
@@ -1406,6 +1495,195 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
   else
     "<div class=\"info-box\">K10 RBAC inventory not available. Requires Kasten Discovery Lite v2.0+.</div>"
   end)
++ (if .retentionAnalysis then
+    "<h2>♻️ Retention Analysis</h2>" +
+    (.retentionAnalysis.snapshotRetentionZero as $z |
+     if ($z.count // 0) > 0 then
+       "<div class=\"warning-box\">⚠ <strong>" + ($z.count | tostring) + " policy(ies) with no/zero snapshot retention</strong> — no fast local recovery. <small>" + (($z.note // "") | @html) + "</small><br>" + ([$z.items[]? | "<code>" + (. | @html) + "</code>"] | join(" ")) + "</div>"
+     else "" end) +
+    (.retentionAnalysis.snapshotRetentionHigh as $h |
+     if ($h.count // 0) > 0 then
+       "<div class=\"info-box\">ℹ <strong>" + ($h.count | tostring) + " policy(ies) with high snapshot retention</strong>. <small>" + (($h.note // "") | @html) + "</small><br>" + ([$h.items[]? | "<code>" + (. | @html) + "</code>"] | join(" ")) + "</div>"
+     else "" end) +
+    (.retentionAnalysis.exportWithoutExplicitRetention as $e |
+     if ($e.count // 0) > 0 then
+       "<div class=\"info-box\">ℹ <strong>" + ($e.count | tostring) + " policy(ies) export without explicit retention</strong> (export inherits snapshot retention). <small>" + (($e.note // "") | @html) + "</small><br>" + ([$e.items[]? | "<code>" + (. | @html) + "</code>"] | join(" ")) + "</div>"
+     else "" end)
+  else "" end)
++ (if ((.policiesWithoutExport.count // 0) > 0) then
+    "<h2>📤 Policies Without Export</h2>
+     <div class=\"warning-box\">⚠ <strong>" + (.policiesWithoutExport.count | tostring) + " policy(ies) have no export action</strong> — backups stay on-cluster only (no off-site copy).<br>" +
+     ([.policiesWithoutExport.items[]? | "<code>" + (. | @html) + "</code>"] | join(" ")) +
+     "</div>"
+  else "" end)
++ (if ((.profileValidation.items // []) | length) > 0 then
+    "<h2>📦 Location Profile Validation</h2>" +
+    (if (.profileValidation.failedCount // 0) > 0 then
+       "<div class=\"warning-box\">⚠ <strong>" + (.profileValidation.failedCount | tostring) + " profile(s) failing validation.</strong></div>"
+     else
+       "<div class=\"success-box\">✓ All location profiles pass validation.</div>"
+     end) +
+    "<table><thead><tr><th>Profile</th><th>State</th><th>Error</th></tr></thead><tbody>" +
+    ([.profileValidation.items[]? |
+       "<tr><td><strong>" + (.name | @html) + "</strong></td><td>" + badge(.state) + "</td><td>" + (if (.error // null) == null then "<em>none</em>" else ((.error | tostring) | @html) end) + "</td></tr>"
+    ] | join("")) +
+    "</tbody></table>"
+  else "" end)
++ (if .storageClasses then
+    "<h2>🗄️ Storage Classes</h2>" +
+    (if (.storageClasses.rbacAccessible == false) then
+       "<div class=\"info-box\">StorageClasses read access denied (RBAC).</div>"
+     else
+       "<table><thead><tr><th>Name</th><th>Provisioner</th><th>Default</th><th>Reclaim</th><th>Binding Mode</th><th>Expandable</th></tr></thead><tbody>" +
+       ([.storageClasses.items[]? |
+         "<tr><td><strong>" + (.name | @html) + "</strong></td><td><code>" + (.provisioner | @html) + "</code></td><td>" + (if .isDefault then "<span class=\"badge ok\">✓ default</span>" else "" end) + "</td><td>" + ((.reclaimPolicy // "—") | @html) + "</td><td>" + ((.bindingMode // "—") | @html) + "</td><td>" + (if .expandable then "<span class=\"badge ok\">yes</span>" else "<span class=\"badge warn\">no</span>" end) + "</td></tr>"
+       ] | join("")) +
+       "</tbody></table>"
+     end)
+  else "" end)
++ (if .volumeSnapshotClasses then
+    "<h2>📸 Volume Snapshot Classes</h2>" +
+    (if (.volumeSnapshotClasses.rbacAccessible == false) then
+       "<div class=\"info-box\">VolumeSnapshotClasses read access denied (RBAC).</div>"
+     else
+       (if (((.volumeSnapshotClasses.defaultCount // 0) == 0) and ((.volumeSnapshotClasses.count // 0) > 0)) then
+          "<div class=\"warning-box\">⚠ <strong>No default VolumeSnapshotClass</strong> — a common, easily-overlooked cause of snapshot/backup failures when a policy does not pin a class explicitly.</div>"
+        else "" end) +
+       (if ((.volumeSnapshotClasses.csiDriversWithoutVsc.count // 0) > 0) then
+          "<div class=\"warning-box\">⚠ <strong>" + (.volumeSnapshotClasses.csiDriversWithoutVsc.count | tostring) + " CSI driver(s) without a VolumeSnapshotClass</strong>: " + ([.volumeSnapshotClasses.csiDriversWithoutVsc.drivers[]? | "<code>" + (. | @html) + "</code>"] | join(", ")) + "</div>"
+        else "" end) +
+       "<table><thead><tr><th>Name</th><th>Driver</th><th>Deletion Policy</th><th>Default</th></tr></thead><tbody>" +
+       ([.volumeSnapshotClasses.items[]? |
+         "<tr><td><strong>" + (.name | @html) + "</strong></td><td><code>" + (.driver | @html) + "</code></td><td>" + ((.deletionPolicy // "—") | @html) + "</td><td>" + (if .isDefault then "<span class=\"badge ok\">✓</span>" else "" end) + "</td></tr>"
+       ] | join("")) +
+       "</tbody></table>"
+     end)
+  else "" end)
++ "
+
+<!-- ============================================ -->
+<!-- v1.9.x sections restored in v2.0.2 (regression) -->
+<!-- These were rendered by the v1.9.2 generator but dropped when the v2.0  -->
+<!-- generator forked from v1.8.3. Data was always present in the JSON.     -->
+<!-- ============================================ -->
+
+<!-- Stuck Actions -->
+<h2>⏳ Stuck Actions</h2>"
++ (if .stuckActions and (.stuckActions.count // 0) > 0 then
+    "<p class=\"section-description\">Actions in <code>Running</code> state for more than " + ((.stuckActions.thresholdHours // 24) | tostring) + " hours.</p>
+    <div class=\"warning-box\">⚠ <strong>" + (.stuckActions.count | tostring) + " stuck action(s) detected</strong></div>
+    <table>
+    <thead><tr><th>Kind</th><th>Name</th><th>Namespace</th><th>Policy</th><th>Age</th></tr></thead>
+    <tbody>" +
+    ([.stuckActions.items[]? | "<tr>
+      <td>" + (.kind // "") + "</td>
+      <td><code>" + (.name // "") + "</code></td>
+      <td><code>" + (.namespace // "N/A") + "</code></td>
+      <td>" + (if .policy != "" then "<code>" + .policy + "</code>" else "<em>n/a</em>" end) + "</td>
+      <td>" + ((.ageHours // 0) | tostring) + "h</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .stuckActions then
+    "<div class=\"success-box\">✓ <strong>No stuck actions detected.</strong></div>"
+  else "" end)
++ "
+
+<!-- Per-Namespace Protection Status -->
+<h2>📅 Per-Namespace Protection Status</h2>"
++ (if .namespaceProtectionStatus then
+    "<p class=\"section-description\">Last successful backup / export / restore per application namespace. Stale = backup older than " + ((.namespaceProtectionStatus.thresholdDays // 7) | tostring) + " days.</p>
+    <div class=\"grid\">
+      <div class=\"card\"><strong>Namespaces Analyzed</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.total | tostring) + "</div></div>
+      <div class=\"card\"><strong>Stale</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.stale | tostring) + "</div></div>
+      <div class=\"card\"><strong>Never Backed Up</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.neverBackedUp | tostring) + "</div></div>
+    </div>" +
+    (if (.namespaceProtectionStatus.total // 0) > 0 then
+      "<table>
+      <thead><tr><th>Status</th><th>Namespace</th><th>Last Backup</th><th>Age</th><th>Last Export</th><th>Last Restore</th></tr></thead>
+      <tbody>" +
+      ([.namespaceProtectionStatus.items
+        | sort_by(if .lastBackup == null then "0000" else .lastBackup end)
+        | .[0:20][]? | "<tr>
+        <td>" + (
+          if .lastBackup == null then "<span class=\"badge error\">NEVER</span>"
+          elif .stale then "<span class=\"badge warn\">STALE</span>"
+          else "<span class=\"badge ok\">OK</span>" end
+        ) + "</td>
+        <td><code>" + .namespace + "</code></td>
+        <td>" + (if .lastBackup then (.lastBackup | split("T")[0]) else "<em>never</em>" end) + "</td>
+        <td>" + (if .backupAgeDays != null then (.backupAgeDays | tostring) + "d" else "—" end) + "</td>
+        <td>" + (if .lastExport then (.lastExport | split("T")[0]) else "—" end) + "</td>
+        <td>" + (if .lastRestore then (.lastRestore | split("T")[0]) else "—" end) + "</td>
+      </tr>"] | join("")) +
+      "</tbody></table>" +
+      (if (.namespaceProtectionStatus.total // 0) > 20 then
+        "<p class=\"section-description\"><em>... and " + ((.namespaceProtectionStatus.total - 20) | tostring) + " more (see JSON for full list)</em></p>"
+      else "" end)
+    else
+      "<div class=\"info-box\">No application namespaces to evaluate.</div>"
+    end)
+  else "" end)
++ "
+
+<!-- RestorePoints by Namespace - Top 5 -->
+<h2>📍 RestorePoints by Namespace - Top 5</h2>"
++ (if .restorePointsByNamespace and (.restorePointsByNamespace.top5 // [] | length) > 0 then
+    "<p class=\"section-description\">Namespaces driving the most catalog entries — useful for capacity planning.</p>
+    <table>
+    <thead><tr><th>Namespace</th><th>RestorePoint Count</th></tr></thead>
+    <tbody>" +
+    ([.restorePointsByNamespace.top5[]? | "<tr>
+      <td><code>" + .namespace + "</code></td>
+      <td>" + (.count | tostring) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .restorePointsByNamespace then
+    "<div class=\"info-box\">No RestorePoints found.</div>"
+  else "" end)
++ "
+
+<!-- Import Policies -->
+<h2>📥 Import Policies</h2>"
++ (if .importPolicies and (.importPolicies.count // 0) > 0 then
+    "<p class=\"section-description\">Multi-cluster catalog imports. Most relevant when cluster role is <code>secondary</code>.</p>
+    <table>
+    <thead><tr><th>Policy</th><th>Frequency</th><th>Profile</th></tr></thead>
+    <tbody>" +
+    ([.importPolicies.items[]? | "<tr>
+      <td><code>" + .name + "</code></td>
+      <td>" + (.frequency // "manual") + "</td>
+      <td>" + (if .profile != "" then "<code>" + .profile + "</code>" else "<em>—</em>" end) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .importPolicies and .multiCluster.role == "secondary" then
+    "<div class=\"warning-box\">⚠ Secondary cluster but no import policy configured.</div>"
+  elif .importPolicies then
+    "<div class=\"info-box\">No import policies configured (used for multi-cluster catalog imports).</div>"
+  else "" end)
++ "
+
+<!-- Reports Policy State -->
+<h2>📊 k10-system-reports-policy</h2>"
++ (if .reportsPolicy then
+    (if .reportsPolicy.exists == false then
+      "<div class=\"warning-box\">⚠ <strong>Reports policy not found.</strong> Export Storage and Deduplication metrics will be unavailable without it.</div>"
+    else
+      "<p class=\"section-description\">" + (.reportsPolicy.note // "") + "</p>
+      <div class=\"grid\">
+        <div class=\"card\"><strong>Exists</strong><div class=\"card-value\">" + boolBadge(.reportsPolicy.exists) + "</div></div>
+        <div class=\"card\"><strong>Frequency</strong><div class=\"card-value\">" + (.reportsPolicy.frequency // "N/A") + "</div></div>
+        <div class=\"card\"><strong>ReportActions</strong><div class=\"card-value\">" + ((.reportsPolicy.reportActionsCount // 0) | tostring) + "</div></div>
+        <div class=\"card\"><strong>Last State</strong><div class=\"card-value\">" +
+          (if .reportsPolicy.lastRun.state == "Complete" then "<span class=\"badge ok\">✓ Complete</span>"
+           elif .reportsPolicy.lastRun.state == "Failed" then "<span class=\"badge error\">✗ Failed</span>"
+           else "<span class=\"badge info\">" + (.reportsPolicy.lastRun.state // "N/A") + "</span>" end) +
+          "</div></div>" +
+        (if .reportsPolicy.lastRun.timestamp and .reportsPolicy.lastRun.timestamp != "N/A" then
+          "<div class=\"card\"><strong>Last Run</strong><div class=\"card-value\">" + (.reportsPolicy.lastRun.timestamp | split("T")[0]) + "</div></div>"
+        else "" end) +
+      "</div>"
+    end)
+  else "" end)
 + "
 
 
