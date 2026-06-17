@@ -23,6 +23,18 @@ reconcile. Issues #37–#43.
   `volumeSnapshotClasses` are now shown (data was already collected). Adds an
   explicit warning when no default VolumeSnapshotClass exists.
 
+### Fixed (regression vs v1.9.2)
+- **Restored HTML sections dropped when the v2.0 generator forked from v1.8.3.**
+  The JSON always carried the data, but the v2.0 HTML generator stopped rendering
+  several v1.9.x sections. Restored: **Stuck Actions**, **Per-Namespace Protection
+  Status**, **RestorePoints by Namespace (Top 5)**, **k10-system-reports-policy**,
+  **Import Policies** (the remaining ones — Failed Actions, Retention Analysis,
+  Policies without Export, Profile Validation, StorageClasses/VSC — were already
+  restored above).
+- **Best Practices table: 5 rows restored** — Snapshot Retention (high), Fast
+  Local Recovery, Export Retention, Cluster-scoped Resources, Export Coverage.
+  Full section + BP parity with the v1.9.2 report is now verified.
+
 ### Fixed
 - **Policy Run Statistics** (#39) — summary cards (sampled distribution) and the
   per-policy table (last run) are now labelled distinctly so they no longer look

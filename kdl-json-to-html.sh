@@ -575,7 +575,65 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
         <td class=\"sev-optional\">Optional</td>
         <td>" + severityBadge("optional"; (.bestPractices.auditLogging // "N/A")) + "</td>
         <td>" + badge(.bestPractices.auditLogging // "N/A") + "</td>
-      </tr>
+      </tr>" +
+      (if .bestPractices.snapshotRetentionHigh then
+      "
+      <tr>
+        <td><strong>Snapshot Retention (high)</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.snapshotRetentionHigh) + "</td>
+        <td>" + badge(.bestPractices.snapshotRetentionHigh) +
+          (if (.retentionAnalysis.snapshotRetentionHigh.count // 0) > 0 then
+            " (" + (.retentionAnalysis.snapshotRetentionHigh.count | tostring) + " policy/policies with snapshot retention >7)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.snapshotRetentionZero then
+      "
+      <tr>
+        <td><strong>Fast Local Recovery</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.snapshotRetentionZero) + "</td>
+        <td>" + badge(.bestPractices.snapshotRetentionZero) +
+          (if (.retentionAnalysis.snapshotRetentionZero.count // 0) > 0 then
+            " (" + (.retentionAnalysis.snapshotRetentionZero.count | tostring) + " policy/policies with zero snapshot retention)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.exportRetentionExplicit then
+      "
+      <tr>
+        <td><strong>Export Retention</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.exportRetentionExplicit) + "</td>
+        <td>" + badge(.bestPractices.exportRetentionExplicit) +
+          (if (.retentionAnalysis.exportWithoutExplicitRetention.count // 0) > 0 then
+            " (" + (.retentionAnalysis.exportWithoutExplicitRetention.count | tostring) + " policy/policies with implicit export retention)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.clusterScopedResources then
+      "
+      <tr>
+        <td><strong>Cluster-scoped Resources</strong></td>
+        <td class=\"sev-optional\">Optional</td>
+        <td>" + severityBadge("optional"; .bestPractices.clusterScopedResources) + "</td>
+        <td>" + badge(.bestPractices.clusterScopedResources) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.policiesWithoutExport then
+      "
+      <tr>
+        <td><strong>Export Coverage</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.policiesWithoutExport) + "</td>
+        <td>" + badge(.bestPractices.policiesWithoutExport) +
+          (if (.policiesWithoutExport.count // 0) > 0 then
+            " (" + (.policiesWithoutExport.count | tostring) + " snapshot-only policy/policies)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      "
     </tbody></table>"
   else
     "<div class=\"info-box\">Best practices data not available.</div>"
@@ -1500,6 +1558,131 @@ code { background: #f6f8fa; padding: 0.2rem 0.4rem; border-radius: 4px; font-fam
        ] | join("")) +
        "</tbody></table>"
      end)
+  else "" end)
++ "
+
+<!-- ============================================ -->
+<!-- v1.9.x sections restored in v2.0.2 (regression) -->
+<!-- These were rendered by the v1.9.2 generator but dropped when the v2.0  -->
+<!-- generator forked from v1.8.3. Data was always present in the JSON.     -->
+<!-- ============================================ -->
+
+<!-- Stuck Actions -->
+<h2>⏳ Stuck Actions</h2>"
++ (if .stuckActions and (.stuckActions.count // 0) > 0 then
+    "<p class=\"section-description\">Actions in <code>Running</code> state for more than " + ((.stuckActions.thresholdHours // 24) | tostring) + " hours.</p>
+    <div class=\"warning-box\">⚠ <strong>" + (.stuckActions.count | tostring) + " stuck action(s) detected</strong></div>
+    <table>
+    <thead><tr><th>Kind</th><th>Name</th><th>Namespace</th><th>Policy</th><th>Age</th></tr></thead>
+    <tbody>" +
+    ([.stuckActions.items[]? | "<tr>
+      <td>" + (.kind // "") + "</td>
+      <td><code>" + (.name // "") + "</code></td>
+      <td><code>" + (.namespace // "N/A") + "</code></td>
+      <td>" + (if .policy != "" then "<code>" + .policy + "</code>" else "<em>n/a</em>" end) + "</td>
+      <td>" + ((.ageHours // 0) | tostring) + "h</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .stuckActions then
+    "<div class=\"success-box\">✓ <strong>No stuck actions detected.</strong></div>"
+  else "" end)
++ "
+
+<!-- Per-Namespace Protection Status -->
+<h2>📅 Per-Namespace Protection Status</h2>"
++ (if .namespaceProtectionStatus then
+    "<p class=\"section-description\">Last successful backup / export / restore per application namespace. Stale = backup older than " + ((.namespaceProtectionStatus.thresholdDays // 7) | tostring) + " days.</p>
+    <div class=\"grid\">
+      <div class=\"card\"><strong>Namespaces Analyzed</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.total | tostring) + "</div></div>
+      <div class=\"card\"><strong>Stale</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.stale | tostring) + "</div></div>
+      <div class=\"card\"><strong>Never Backed Up</strong><div class=\"card-value\">" + (.namespaceProtectionStatus.neverBackedUp | tostring) + "</div></div>
+    </div>" +
+    (if (.namespaceProtectionStatus.total // 0) > 0 then
+      "<table>
+      <thead><tr><th>Status</th><th>Namespace</th><th>Last Backup</th><th>Age</th><th>Last Export</th><th>Last Restore</th></tr></thead>
+      <tbody>" +
+      ([.namespaceProtectionStatus.items
+        | sort_by(if .lastBackup == null then "0000" else .lastBackup end)
+        | .[0:20][]? | "<tr>
+        <td>" + (
+          if .lastBackup == null then "<span class=\"badge error\">NEVER</span>"
+          elif .stale then "<span class=\"badge warn\">STALE</span>"
+          else "<span class=\"badge ok\">OK</span>" end
+        ) + "</td>
+        <td><code>" + .namespace + "</code></td>
+        <td>" + (if .lastBackup then (.lastBackup | split("T")[0]) else "<em>never</em>" end) + "</td>
+        <td>" + (if .backupAgeDays != null then (.backupAgeDays | tostring) + "d" else "—" end) + "</td>
+        <td>" + (if .lastExport then (.lastExport | split("T")[0]) else "—" end) + "</td>
+        <td>" + (if .lastRestore then (.lastRestore | split("T")[0]) else "—" end) + "</td>
+      </tr>"] | join("")) +
+      "</tbody></table>" +
+      (if (.namespaceProtectionStatus.total // 0) > 20 then
+        "<p class=\"section-description\"><em>... and " + ((.namespaceProtectionStatus.total - 20) | tostring) + " more (see JSON for full list)</em></p>"
+      else "" end)
+    else
+      "<div class=\"info-box\">No application namespaces to evaluate.</div>"
+    end)
+  else "" end)
++ "
+
+<!-- RestorePoints by Namespace - Top 5 -->
+<h2>📍 RestorePoints by Namespace - Top 5</h2>"
++ (if .restorePointsByNamespace and (.restorePointsByNamespace.top5 // [] | length) > 0 then
+    "<p class=\"section-description\">Namespaces driving the most catalog entries — useful for capacity planning.</p>
+    <table>
+    <thead><tr><th>Namespace</th><th>RestorePoint Count</th></tr></thead>
+    <tbody>" +
+    ([.restorePointsByNamespace.top5[]? | "<tr>
+      <td><code>" + .namespace + "</code></td>
+      <td>" + (.count | tostring) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .restorePointsByNamespace then
+    "<div class=\"info-box\">No RestorePoints found.</div>"
+  else "" end)
++ "
+
+<!-- Import Policies -->
+<h2>📥 Import Policies</h2>"
++ (if .importPolicies and (.importPolicies.count // 0) > 0 then
+    "<p class=\"section-description\">Multi-cluster catalog imports. Most relevant when cluster role is <code>secondary</code>.</p>
+    <table>
+    <thead><tr><th>Policy</th><th>Frequency</th><th>Profile</th></tr></thead>
+    <tbody>" +
+    ([.importPolicies.items[]? | "<tr>
+      <td><code>" + .name + "</code></td>
+      <td>" + (.frequency // "manual") + "</td>
+      <td>" + (if .profile != "" then "<code>" + .profile + "</code>" else "<em>—</em>" end) + "</td>
+    </tr>"] | join("")) +
+    "</tbody></table>"
+  elif .importPolicies and .multiCluster.role == "secondary" then
+    "<div class=\"warning-box\">⚠ Secondary cluster but no import policy configured.</div>"
+  elif .importPolicies then
+    "<div class=\"info-box\">No import policies configured (used for multi-cluster catalog imports).</div>"
+  else "" end)
++ "
+
+<!-- Reports Policy State -->
+<h2>📊 k10-system-reports-policy</h2>"
++ (if .reportsPolicy then
+    (if .reportsPolicy.exists == false then
+      "<div class=\"warning-box\">⚠ <strong>Reports policy not found.</strong> Export Storage and Deduplication metrics will be unavailable without it.</div>"
+    else
+      "<p class=\"section-description\">" + (.reportsPolicy.note // "") + "</p>
+      <div class=\"grid\">
+        <div class=\"card\"><strong>Exists</strong><div class=\"card-value\">" + boolBadge(.reportsPolicy.exists) + "</div></div>
+        <div class=\"card\"><strong>Frequency</strong><div class=\"card-value\">" + (.reportsPolicy.frequency // "N/A") + "</div></div>
+        <div class=\"card\"><strong>ReportActions</strong><div class=\"card-value\">" + ((.reportsPolicy.reportActionsCount // 0) | tostring) + "</div></div>
+        <div class=\"card\"><strong>Last State</strong><div class=\"card-value\">" +
+          (if .reportsPolicy.lastRun.state == "Complete" then "<span class=\"badge ok\">✓ Complete</span>"
+           elif .reportsPolicy.lastRun.state == "Failed" then "<span class=\"badge error\">✗ Failed</span>"
+           else "<span class=\"badge info\">" + (.reportsPolicy.lastRun.state // "N/A") + "</span>" end) +
+          "</div></div>" +
+        (if .reportsPolicy.lastRun.timestamp and .reportsPolicy.lastRun.timestamp != "N/A" then
+          "<div class=\"card\"><strong>Last Run</strong><div class=\"card-value\">" + (.reportsPolicy.lastRun.timestamp | split("T")[0]) + "</div></div>"
+        else "" end) +
+      "</div>"
+    end)
   else "" end)
 + "
 
