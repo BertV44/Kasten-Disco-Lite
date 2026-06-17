@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.0
+# Kasten Discovery Lite v2.0.2
 
 A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
 
@@ -528,7 +528,29 @@ Key portability measures:
 
 ## Version History
 
-- **v2.0** (Current)
+- **v2.0.2** (Current)
+  - **HTML report — license paid-entitlement view**: a long-lived TRIAL license no
+    longer inflates the headline node limit into a misleading "OK"; consumption is
+    also checked against the paid (non-trial) entitlement (`nodeConsumption.paidLimit`,
+    `paidStatus`, `trialInflating`).
+  - **HTML report — counter fixes**: Restore cards now include an "Other" state and
+    total correctly; Backup/Export rows show the residual ("N other"); Failed Actions
+    root-cause messages are rendered under Health; Policy Run Statistics cards
+    (sampled) and table (last run) are labelled distinctly.
+  - **Regression fix vs v1.9.2**: the v2.0 HTML generator (forked from v1.8.3) had
+    stopped rendering several v1.9.x sections although the JSON still carried the
+    data. Restored to full parity: Stuck Actions, Per-Namespace Protection Status,
+    RestorePoints by Namespace, k10-system-reports-policy, Import Policies, Retention
+    Analysis, Policies without Export, Profile Validation, StorageClasses/VSC, Failed
+    Actions — plus 5 Best Practices rows (Snapshot Retention high, Fast Local Recovery,
+    Export Retention, Cluster-scoped Resources, Export Coverage).
+  - **Profile backend detection** broadened; unclassifiable profiles now report
+    `Undetermined` instead of `Unknown`.
+
+- **v2.0.1** — Cluster CLI auto-selection: uses `oc` on OpenShift when present
+  (falls back to `kubectl`); single `$CLI` indirection. No data-collection change.
+
+- **v2.0**
   - **Patch 1/7** — Enriched namespace inventory (`coverage.namespacesInventory`)
   - **Patch 2/7** — K10 RBAC inventory (`k10Rbac`) with graceful degradation
   - **Patch 3/7** — Effective RPO per policy (`policyRunStats.effectiveRpo`)
