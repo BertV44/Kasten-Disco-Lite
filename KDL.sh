@@ -1198,12 +1198,12 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
     KDR_EXPORT_CATALOG="false"
   fi
 
-  # v1.9.1: When KDR is in Quick DR (No Snapshot) mode, the policy has no
-  # export action by design — so there's no exportParameters.profile.name
-  # to read. Make the N/A more informative so operators don't think it's
-  # a missing/broken value.
+  # The KDR export target is not exposed inline as exportParameters.profile.name
+  # (it is configured outside the policy, via the DR secret/config), so it reads
+  # as "N/A" even for a healthy DR that does export. Make the N/A informative so
+  # operators don't mistake it for a missing/broken value.
   if [ "$KDR_PROFILE" = "N/A" ] && [ "$KDR_MODE" = "Quick DR (No Snapshot)" ]; then
-    KDR_PROFILE="N/A (no export in this DR mode)"
+    KDR_PROFILE="N/A (export target set outside policy)"
   fi
 else
   KDR_ENABLED=false
@@ -1268,23 +1268,24 @@ debug "Policy last run info collected (enriched with error messages)"
 ### -------------------------
 ### KDR effective-health verdict (#13)
 ### -------------------------
-# Policy presence alone does not mean DR actually protects anything. Derive a
-# 4-state verdict from config completeness + the last KDR RunAction, instead of
-# the bare KDR_ENABLED boolean (kept above for backward compat).
-#   ENABLED                 configured, last run Complete, success not stale
-#   CONFIGURED_NOT_HEALTHY  configured but last run Failed / never succeeded / stale
-#   CONFIGURED_INCOMPLETE   policy present but config cannot protect data
+# Policy presence alone does not mean DR actually protects anything. Derive the
+# verdict from the last KDR RunAction, instead of the bare KDR_ENABLED boolean
+# (kept above for backward compat).
+#   ENABLED                 enabled, last run Complete, success not stale
+#   CONFIGURED_NOT_HEALTHY  enabled but last run Failed / never succeeded / stale
 #   NOT_ENABLED             no KDR policy
+#
+# The DR verdict is NOT gated on the DR mode or on resolving an inline export
+# profile. Unlike application policies, the KDR export target is configured
+# outside the policy (DR secret/config), and Quick/Legacy DR export the catalog
+# by design once the DR policy runs successfully. Reading
+# .spec.actions[0].exportParameters.profile.name returns "N/A" for a perfectly
+# healthy DR, and "Quick DR (No Snapshot)" (derived from kdrSnapshotConfiguration)
+# does not mean "no export" — the policy still carries an export action. Gating
+# completeness on those signals wrongly reported working clusters as
+# CONFIGURED_INCOMPLETE, so an enabled DR whose last run succeeds is healthy.
 if [ "$KDR_ENABLED" = true ]; then
   KDR_CONFIG_COMPLETE=true
-  case "$KDR_MODE" in
-    "Quick DR (Exported Catalog)"|"Legacy DR")
-      case "$KDR_PROFILE" in ""|"N/A"|"N/A "*) KDR_CONFIG_COMPLETE=false ;; esac
-      ;;
-    "Quick DR (No Snapshot)")
-      KDR_CONFIG_COMPLETE=false
-      ;;
-  esac
 
   KDR_RUN_FACTS=$(_ep "$RUNACTIONS_JSON" | jq -c \
     --arg pol "k10-disaster-recovery-policy" \
