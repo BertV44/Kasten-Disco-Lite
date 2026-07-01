@@ -113,11 +113,9 @@ trap '' PIPE 2>/dev/null || true
 #   storage I/O — without false-positive on standard weekly retention.
 #   Note: this is an empirical threshold; consult Kasten K10 documentation
 #   for production sizing guidance specific to your storage backend.
-# - UX: Disaster Recovery section now displays
-#   "N/A (no export in this DR mode)" instead of bare "N/A" when KDR is in
-#   Quick DR (No Snapshot) mode, where there is by design no export profile.
-#   Not a bugfix — just clarification that N/A is expected, not a missing
-#   value.
+# - UX: Disaster Recovery section shows an informative "N/A" for the export
+#   profile in Quick DR (No Catalog Snapshot) mode, since the DR export target
+#   is configured outside the policy rather than being a missing/broken value.
 #
 # Changes in v1.9:
 # - FEATURES: Failed Actions Top 5 (dedicated section, recursive cause-chain
@@ -1186,14 +1184,14 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
     KDR_LOCAL_SNAPSHOT=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.enabled // false')
     KDR_EXPORT_CATALOG=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.exportData.enabled // false')
     if [ "$KDR_LOCAL_SNAPSHOT" = "true" ]; then
-      KDR_MODE="Quick DR (Local Snapshot)"
+      KDR_MODE="Quick DR (Local Catalog Snapshot)"
     elif [ "$KDR_EXPORT_CATALOG" = "true" ]; then
-      KDR_MODE="Quick DR (Exported Catalog)"
+      KDR_MODE="Quick DR (Exported Catalog Snapshot)"
     else
-      KDR_MODE="Quick DR (No Snapshot)"
+      KDR_MODE="Quick DR (No Catalog Snapshot)"
     fi
   else
-    KDR_MODE="Legacy DR"
+    KDR_MODE="Legacy DR (Full Catalog Exports)"
     KDR_LOCAL_SNAPSHOT="false"
     KDR_EXPORT_CATALOG="false"
   fi
@@ -1202,7 +1200,7 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
   # (it is configured outside the policy, via the DR secret/config), so it reads
   # as "N/A" even for a healthy DR that does export. Make the N/A informative so
   # operators don't mistake it for a missing/broken value.
-  if [ "$KDR_PROFILE" = "N/A" ] && [ "$KDR_MODE" = "Quick DR (No Snapshot)" ]; then
+  if [ "$KDR_PROFILE" = "N/A" ] && [ "$KDR_MODE" = "Quick DR (No Catalog Snapshot)" ]; then
     KDR_PROFILE="N/A (export target set outside policy)"
   fi
 else
@@ -1280,7 +1278,7 @@ debug "Policy last run info collected (enriched with error messages)"
 # outside the policy (DR secret/config), and Quick/Legacy DR export the catalog
 # by design once the DR policy runs successfully. Reading
 # .spec.actions[0].exportParameters.profile.name returns "N/A" for a perfectly
-# healthy DR, and "Quick DR (No Snapshot)" (derived from kdrSnapshotConfiguration)
+# healthy DR, and "Quick DR (No Catalog Snapshot)" (from kdrSnapshotConfiguration)
 # does not mean "no export" — the policy still carries an export action. Gating
 # completeness on those signals wrongly reported working clusters as
 # CONFIGURED_INCOMPLETE, so an enabled DR whose last run succeeds is healthy.
