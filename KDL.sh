@@ -1176,7 +1176,15 @@ KDR_POLICY_JSON=$(_ep "$POLICIES_JSON" | jq -c 'first(.items[]? | select(.metada
 if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
   KDR_ENABLED=true
   KDR_FREQUENCY=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.frequency // "N/A"')
-  KDR_PROFILE=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.actions[0].exportParameters.profile.name // "N/A"')
+  # Resolve the DR location profile from whichever action carries it: modern DR
+  # backs the catalog up via a backup action (backupParameters.profile), while
+  # other shapes use an export action (exportParameters.profile). Scan all
+  # actions and take the first profile found, so a configured DR isn't shown as
+  # "N/A" just because the profile isn't under exportParameters.
+  KDR_PROFILE=$(_ep "$KDR_POLICY_JSON" | jq -r '
+    ( [ .spec.actions[]? | .exportParameters.profile.name | select(. != null and . != "") ] | first )
+    // ( [ .spec.actions[]? | .backupParameters.profile.name | select(. != null and . != "") ] | first )
+    // "N/A"')
 
   # Detect KDR mode from kdrSnapshotConfiguration
   KDR_SNAPSHOT_CONFIG=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration // empty')
