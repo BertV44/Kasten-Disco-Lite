@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.0.2
+# Kasten Discovery Lite v2.1.0
 
 A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
 
@@ -50,6 +50,22 @@ These join the existing v1.9 features:
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New in v2.1
+
+- **Redesigned HTML report** — single self-contained offline file, now with a
+  dark theme (+ light/dark toggle), a Veeam-green sidebar with scroll-spy and
+  per-section severity counts, an executive verdict hero, a remediation worklist,
+  a `Ctrl-K` command palette, and compact sortable/filterable tables. Renders
+  fully with JavaScript disabled; prints light with the sidebar hidden.
+- **Disaster Recovery verdict fixed** — a healthy Quick/Legacy DR is no longer
+  mis-reported as `CONFIGURED_INCOMPLETE`/`CONFIGURED_NOT_HEALTHY`; an enabled DR
+  whose last run succeeds is `ENABLED`, restoring its ransomware-pillar credit.
+- **KDR mode labels** aligned with the Kasten DR API naming, and the **DR
+  location profile** is now resolved from the policy's export or backup action
+  (no more spurious `N/A`).
+
+See [CHANGELOG](CHANGELOG.md#210---2026-07-03) for details.
 
 ## What's New in v2.0
 

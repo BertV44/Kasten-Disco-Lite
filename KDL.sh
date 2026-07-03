@@ -261,7 +261,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="2.0.2"
+KDL_VERSION="2.1.0"
 OUTPUT_FILE=""
 SKIP_HELM=false
 

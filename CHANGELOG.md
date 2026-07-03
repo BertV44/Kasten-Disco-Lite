@@ -3,6 +3,44 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.1.0] - 2026-07-03
+
+Report UI redesign and Disaster Recovery verdict corrections. Validated end-to-end
+against a live cluster (a healthy Quick DR that the previous logic mis-graded).
+
+### Added
+- **Redesigned HTML report.** Still a single self-contained, offline file (all
+  CSS/JS inline), now with a dark theme by default plus a light/dark toggle
+  ("Blizzard" light palette), a persistent Veeam-green sidebar (navigation
+  auto-built from the report sections, scroll-spy, per-section severity counts),
+  an executive **verdict hero** (ransomware grade + Critical/Warning/Passing
+  tally, rendered server-side so it survives with JavaScript disabled), a
+  **remediation worklist** (findings only, no commands), a `Ctrl-K` command
+  palette, compact sortable/filterable tables with density and "only issues"
+  toggles, and a print stylesheet that hides the sidebar and forces light. The
+  full report still renders with JavaScript off (progressive enhancement).
+
+### Fixed
+- **Disaster Recovery no longer reported as `CONFIGURED_INCOMPLETE` when healthy.**
+  The verdict gated completeness on the DR mode and on resolving an inline export
+  profile, but the DR export target is configured outside the policy and
+  Quick/Legacy DR export the catalog by design once the policy runs. An enabled
+  DR whose last run succeeded (and is not stale) is now `ENABLED`; run health
+  alone drives `CONFIGURED_NOT_HEALTHY`. Restores the ransomware DR pillar credit.
+- **DR "success stale" flag corrected.** `KDR_SUCCESS_STALE` read
+  `jq '.successStale // true'`; jq's `//` treats a healthy `false` as absent and
+  substitutes `true`, so every non-stale DR was flagged stale →
+  `CONFIGURED_NOT_HEALTHY`. Masked previously by the mode gate above. Verified
+  live: a cluster with daily-Complete DR now grades C/60 (was D/45).
+
+### Changed
+- **KDR mode labels aligned with the Kasten DR API** (docs.kasten.io/latest/api/dr):
+  `Quick DR (No Catalog Snapshot)`, `Quick DR (Local Catalog Snapshot)`,
+  `Quick DR (Exported Catalog Snapshot)`, `Legacy DR (Full Catalog Exports)`.
+- **DR location profile resolved from the policy's export *or* backup action**
+  (export preferred), so a configured DR no longer displays `N/A` when its
+  profile lives under `backupParameters`.
+
 ## [2.0.2] - 2026-06-10
 
 Fixes and reporting improvements surfaced by analysing a real-world run where the
