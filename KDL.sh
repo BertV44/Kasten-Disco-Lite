@@ -1315,7 +1315,9 @@ if [ "$KDR_ENABLED" = true ]; then
 
   KDR_LAST_RUN_STATE=$(_ep "$KDR_RUN_FACTS" | jq -r '.lastState // "None"')
   KDR_HAS_SUCCESS=$(_ep "$KDR_RUN_FACTS" | jq -r '.hasSuccess // false')
-  KDR_SUCCESS_STALE=$(_ep "$KDR_RUN_FACTS" | jq -r '.successStale // true')
+  # NB: do not use `.successStale // true` — jq's // treats a healthy `false`
+  # as absent and flips it to true, wrongly marking every non-stale DR as stale.
+  KDR_SUCCESS_STALE=$(_ep "$KDR_RUN_FACTS" | jq -r 'if .successStale == null then true else .successStale end')
   KDR_LAST_SUCCESS_TS=$(_ep "$KDR_RUN_FACTS" | jq -r '.lastSuccessTs // ""')
 
   if [ "$KDR_CONFIG_COMPLETE" != true ]; then
