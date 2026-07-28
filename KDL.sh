@@ -261,7 +261,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="2.1.0"
+KDL_VERSION="2.1.1"
 OUTPUT_FILE=""
 SKIP_HELM=false
 
@@ -513,6 +513,27 @@ fi
 debug "Platform: $PLATFORM | cluster CLI: $CLI"
 
 ### -------------------------
+### Dependency preflight (P2a)
+### -------------------------
+# KDL leans on `jq` heavily (first real use is well downstream), so a box
+# without it in PATH would otherwise crash mid-run with a raw
+# "jq: command not found" instead of a clear diagnostic. Same idea for the
+# chosen cluster CLI ($CLI). Fail fast, with actionable hints, before any
+# real work starts. Runs unconditionally for json/text/html modes.
+if ! command -v jq >/dev/null 2>&1; then
+  error "Required dependency 'jq' was not found on PATH."
+  error "Linux/macOS: install it with your package manager, e.g. 'apt install jq', 'dnf install jq', or 'brew install jq'."
+  error "Git-Bash/Windows: download jq-windows-amd64.exe from the jq releases page, rename it to jq.exe, and place it on your PATH."
+  exit 1
+fi
+
+if ! command -v "$CLI" >/dev/null 2>&1; then
+  error "Required cluster CLI '$CLI' was not found on PATH."
+  error "Install $CLI and ensure it is on PATH, then re-run this script."
+  exit 1
+fi
+
+### -------------------------
 ### Namespace validation
 ### -------------------------
 if ! $CLI get namespace "$NAMESPACE" >/dev/null 2>&1; then
@@ -532,18 +553,24 @@ debug "Namespace '$NAMESPACE' validated"
 # actionable warning. Non-fatal: KDL still runs and reports what it can.
 # Warnings go to stderr so JSON output (stdout) stays clean.
 RBAC_MISSING=""
-$CLI auth can-i list namespaces                                   >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list namespaces (cluster-wide)"
+RBAC_NS_DENIED=false
+$CLI auth can-i list namespaces                                   >/dev/null 2>&1 || { RBAC_MISSING="$RBAC_MISSING;list namespaces (cluster-wide)"; RBAC_NS_DENIED=true; }
 $CLI auth can-i list persistentvolumeclaims --all-namespaces      >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list persistentvolumeclaims --all-namespaces"
 $CLI auth can-i list nodes                                        >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list nodes"
 $CLI auth can-i list storageclasses.storage.k8s.io                >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list storageclasses"
 $CLI auth can-i list volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list volumesnapshotclasses"
+
+# Bounded (max 5 entries) RBAC-limitation summary, safe to pass via --argjson.
+RBAC_LIMITED_JSON=$(printf '%s' "$RBAC_MISSING" | jq -R -c 'split(";") | map(select(length>0)) | {any: (length>0), denied: .}' 2>/dev/null) || RBAC_LIMITED_JSON='{"any":false,"denied":[]}'
+[ -n "$RBAC_LIMITED_JSON" ] || RBAC_LIMITED_JSON='{"any":false,"denied":[]}'
 
 if [ -n "$RBAC_MISSING" ]; then
   warn "Insufficient cluster-scoped RBAC: the following reads are denied, so related sections will be EMPTY (not necessarily zero):"
   printf '%s' "$RBAC_MISSING" | tr ';' '\n' | while IFS= read -r _rbac_item; do
     [ -n "$_rbac_item" ] && printf '%s    - %s%s\n' "$COLOR_YELLOW" "$_rbac_item" "$COLOR_RESET" >&2
   done
-  warn "Fix: apply the bundled least-privilege role -> $CLI apply -f kdl-rbac.yaml (see README, section 'RBAC requirements')."
+  warn "Fix: the cluster-scoped part of kdl-rbac.yaml (ClusterRole/ClusterRoleBinding) must be applied ONCE by a cluster-admin; a k10-admin can only apply the namespaced part. See README, section 'RBAC Requirements'."
+  warn "KDL will still complete; affected sections are marked as not assessed in the report rather than showing misleading zeros."
 fi
 
 # (Platform detection moved above, alongside CLI selection.)
@@ -3400,7 +3427,13 @@ else
 fi
 
 # Namespace Protection Assessment (NEW v1.5)
-if [ "$HAS_CATCHALL_POLICY" = "true" ] || [ "$UNPROTECTED_COUNT" -eq 0 ]; then
+# P2b: if the cluster-wide "list namespaces" RBAC probe was denied, the
+# namespace inventory is empty, so UNPROTECTED_COUNT is 0 for the wrong
+# reason (no visibility, not full coverage). Report NOT_ASSESSED instead of
+# the misleading COMPLETE false positive.
+if [ "$RBAC_NS_DENIED" = "true" ]; then
+  BP_COVERAGE_STATUS="NOT_ASSESSED"
+elif [ "$HAS_CATCHALL_POLICY" = "true" ] || [ "$UNPROTECTED_COUNT" -eq 0 ]; then
   BP_COVERAGE_STATUS="COMPLETE"
 else
   BP_COVERAGE_STATUS="GAPS_DETECTED"
@@ -3713,6 +3746,47 @@ POLICY_ANALYSIS=$(_safe_arg "$POLICY_ANALYSIS" '{"resolved":[],"empty":[],"unres
 # v2.0 patch 5 - Ransomware readiness inputs
 PROFILE_TLS_SKIPPED=$(_safe_arg "$PROFILE_TLS_SKIPPED" '[]')
 
+# Route remaining large/variable-size --argjson values through temp files too
+# (same E2BIG/ARG_MAX rationale as profiles/policies above, #argv-limit fix).
+printf '%s' "$IMMUTABLE_PROFILES" > "$TEMP_DIR/immutableProfiles.json"
+printf '%s' "$RESTORE_ACTIONS_RECENT" > "$TEMP_DIR/restoreActionsRecent.json"
+printf '%s' "$SNAPSHOT_DATA" > "$TEMP_DIR/snapshotData.json"
+printf '%s' "$LICENSE_JSON" > "$TEMP_DIR/licenseBlock.json"
+printf '%s' "$POLICY_LAST_RUN" > "$TEMP_DIR/policyLastRun.json"
+printf '%s' "$UNPROTECTED_NS_JSON" > "$TEMP_DIR/unprotectedNs.json"
+printf '%s' "$ALL_NAMESPACES_LABELED" > "$TEMP_DIR/nsInventory.json"
+printf '%s' "$K10_CLUSTERROLES_JSON" > "$TEMP_DIR/k10ClusterRoles.json"
+printf '%s' "$K10_CRB_JSON" > "$TEMP_DIR/k10ClusterRoleBindings.json"
+printf '%s' "$K10_ROLES_JSON" > "$TEMP_DIR/k10Roles.json"
+printf '%s' "$K10_RB_JSON" > "$TEMP_DIR/k10RoleBindings.json"
+printf '%s' "$ALL_RBAC_SUBJECTS" > "$TEMP_DIR/k10RbacSubjects.json"
+printf '%s' "$EFFECTIVE_RPO" > "$TEMP_DIR/effectiveRpo.json"
+printf '%s' "$POLICY_ANALYSIS" > "$TEMP_DIR/policyAnalysis.json"
+printf '%s' "$PROFILE_TLS_SKIPPED" > "$TEMP_DIR/profileTlsSkipped.json"
+printf '%s' "$K10_RESOURCES_SUMMARY" > "$TEMP_DIR/k10Resources.json"
+printf '%s' "$K10_DEPLOYMENTS_SUMMARY" > "$TEMP_DIR/k10Deployments.json"
+printf '%s' "$ORPHANED_RP" > "$TEMP_DIR/orphanedRp.json"
+printf '%s' "$VM_DETAILS_JSON" > "$TEMP_DIR/vmDetails.json"
+printf '%s' "$VM_POLICY_DETAILS_JSON" > "$TEMP_DIR/vmPolicyDetails.json"
+printf '%s' "$EXCLUDED_APPS_JSON" > "$TEMP_DIR/excludedApps.json"
+printf '%s' "$FAILED_ACTIONS_TOP5" > "$TEMP_DIR/failedActionsTop5.json"
+printf '%s' "$STUCK_ACTIONS" > "$TEMP_DIR/stuckActions.json"
+printf '%s' "$NS_PROTECTION_STATUS" > "$TEMP_DIR/nsProtectionStatus.json"
+printf '%s' "$RP_BY_NAMESPACE_TOP5" > "$TEMP_DIR/rpByNamespaceTop5.json"
+printf '%s' "$PROFILE_VALIDATION" > "$TEMP_DIR/profileValidation.json"
+printf '%s' "$SC_SUMMARY" > "$TEMP_DIR/scSummary.json"
+printf '%s' "$VSC_SUMMARY" > "$TEMP_DIR/vscSummary.json"
+printf '%s' "$CSI_DRIVERS_WITHOUT_VSC" > "$TEMP_DIR/csiDriversWithoutVsc.json"
+printf '%s' "$IMPORT_POLICIES_JSON" > "$TEMP_DIR/importPolicies.json"
+printf '%s' "$POLICIES_NO_EXPORT_LIST" > "$TEMP_DIR/policiesNoExportList.json"
+printf '%s' "$HIGH_SNAP_POLICIES" > "$TEMP_DIR/highSnapPolicies.json"
+printf '%s' "$ZERO_SNAP_POLICIES" > "$TEMP_DIR/zeroSnapPolicies.json"
+printf '%s' "$EXPORT_NO_RETENTION_POLICIES" > "$TEMP_DIR/exportNoRetentionPolicies.json"
+_ep "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})' > "$TEMP_DIR/presets.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/presets.json"
+jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: ((.actions // .spec.actions // {}) | keys)})' "$BLUEPRINTS_FILE" > "$TEMP_DIR/blueprints.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/blueprints.json"
+jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: (.spec.blueprintRef.name // "N/A")})' "$BINDINGS_FILE" > "$TEMP_DIR/bindings.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/bindings.json"
+_ep "$TRANSFORMSETS_JSON" | jq -c '.items | map({name: .metadata.name, transformCount: ((.spec.transforms // []) | length)})' > "$TEMP_DIR/transformsets.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/transformsets.json"
+
 ##############################################################################
 # JSON OUTPUT
 ##############################################################################
@@ -3721,11 +3795,12 @@ if [ "$MODE" = "json" ]; then
     --arg kdlVersion "$KDL_VERSION" \
     --arg platform "$PLATFORM" \
     --arg version "$KASTEN_VERSION" \
+    --argjson rbacLimited "$RBAC_LIMITED_JSON" \
     --slurpfile profilesArr "$TEMP_DIR/profiles_clean.json" \
     --slurpfile policiesArr "$TEMP_DIR/policies_clean.json" \
     --arg immutability "$IMMUTABILITY" \
     --argjson immutabilityDays "${IMMUTABILITY_DAYS:-0}" \
-    --argjson immutableProfiles "$IMMUTABLE_PROFILES" \
+    --slurpfile immutableProfiles "$TEMP_DIR/immutableProfiles.json" \
     --argjson allNs "$ALL_NS_POLICIES" \
     --argjson policiesWithExport "$POLICIES_WITH_EXPORT" \
     --argjson policiesWithPresets "$POLICIES_WITH_PRESETS" \
@@ -3747,19 +3822,19 @@ if [ "$MODE" = "json" ]; then
     --argjson restoreActionsFailed "$RESTORE_ACTIONS_FAILED" \
     --argjson restoreActionsRunning "$RESTORE_ACTIONS_RUNNING" \
     --argjson restoreActionsOther "$RESTORE_ACTIONS_OTHER" \
-    --argjson restoreActionsRecent "$RESTORE_ACTIONS_RECENT" \
+    --slurpfile restoreActionsRecent "$TEMP_DIR/restoreActionsRecent.json" \
     --argjson restorePoints "$RESTORE_POINTS_COUNT" \
     --arg successRate "$SUCCESS_RATE" \
     --argjson totalPvcs "$TOTAL_PVCS" \
     --arg totalCapacity "$TOTAL_CAPACITY_GB" \
-    --argjson snapshotData "$SNAPSHOT_DATA" \
+    --slurpfile snapshotData "$TEMP_DIR/snapshotData.json" \
     --arg exportStorage "$EXPORT_STORAGE_DISPLAY" \
     --argjson exportStorageBytes "$EXPORT_PHYSICAL_BYTES" \
     --argjson exportLogicalBytes "$EXPORT_LOGICAL_BYTES" \
     --arg exportDataSource "$EXPORT_DATA_SOURCE" \
     --arg dedupRatio "$DEDUP_RATIO" \
     --arg dedupDisplay "$DEDUP_DISPLAY" \
-    --argjson licenseBlock "$LICENSE_JSON" \
+    --slurpfile licenseBlock "$TEMP_DIR/licenseBlock.json" \
     --argjson kdrEnabled "$KDR_ENABLED" \
     --arg kdrStatus "$KDR_STATUS" \
     --arg kdrMode "$KDR_MODE" \
@@ -3770,13 +3845,13 @@ if [ "$MODE" = "json" ]; then
     --arg kdrLocalSnapshot "$KDR_LOCAL_SNAPSHOT" \
     --arg kdrExportCatalog "$KDR_EXPORT_CATALOG" \
     --argjson presetCount "$PRESET_COUNT" \
-    --argjson presets "$(_ep "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})')" \
+    --slurpfile presets "$TEMP_DIR/presets.json" \
     --argjson blueprintCount "$BLUEPRINT_COUNT" \
-    --argjson blueprints "$(jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: ((.actions // .spec.actions // {}) | keys)})' "$BLUEPRINTS_FILE" 2>/dev/null || echo '[]')" \
+    --slurpfile blueprints "$TEMP_DIR/blueprints.json" \
     --argjson bindingCount "$BINDING_COUNT" \
-    --argjson bindings "$(jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: (.spec.blueprintRef.name // "N/A")})' "$BINDINGS_FILE" 2>/dev/null || echo '[]')" \
+    --slurpfile bindings "$TEMP_DIR/bindings.json" \
     --argjson transformsetCount "$TRANSFORMSET_COUNT" \
-    --argjson transformsets "$(_ep "$TRANSFORMSETS_JSON" | jq -c '.items | map({name: .metadata.name, transformCount: ((.spec.transforms // []) | length)})')" \
+    --slurpfile transformsets "$TEMP_DIR/transformsets.json" \
     --arg prometheusEnabled "$PROMETHEUS_ENABLED" \
     --arg bpDr "$BP_DR_STATUS" \
     --arg bpImmutability "$BP_IMMUTABILITY_STATUS" \
@@ -3784,20 +3859,20 @@ if [ "$MODE" = "json" ]; then
     --arg bpMonitoring "$BP_MONITORING_STATUS" \
     --arg bpResources "$BP_RESOURCES_STATUS" \
     --arg bpCoverage "$BP_COVERAGE_STATUS" \
-    --argjson policyLastRun "$POLICY_LAST_RUN" \
+    --slurpfile policyLastRun "$TEMP_DIR/policyLastRun.json" \
     --argjson avgDuration "$AVG_DURATION" \
     --argjson minDuration "$MIN_DURATION" \
     --argjson maxDuration "$MAX_DURATION" \
     --argjson durationSampleCount "$DURATION_SAMPLE_COUNT" \
-    --argjson unprotectedNs "$UNPROTECTED_NS_JSON" \
+    --slurpfile unprotectedNs "$TEMP_DIR/unprotectedNs.json" \
     --argjson unprotectedCount "$UNPROTECTED_COUNT" \
     --arg hasCatchallPolicy "$HAS_CATCHALL_POLICY" \
-    --argjson nsInventory "$ALL_NAMESPACES_LABELED" \
-    --argjson k10ClusterRoles "$K10_CLUSTERROLES_JSON" \
-    --argjson k10ClusterRoleBindings "$K10_CRB_JSON" \
-    --argjson k10Roles "$K10_ROLES_JSON" \
-    --argjson k10RoleBindings "$K10_RB_JSON" \
-    --argjson k10RbacSubjects "$ALL_RBAC_SUBJECTS" \
+    --slurpfile nsInventory "$TEMP_DIR/nsInventory.json" \
+    --slurpfile k10ClusterRoles "$TEMP_DIR/k10ClusterRoles.json" \
+    --slurpfile k10ClusterRoleBindings "$TEMP_DIR/k10ClusterRoleBindings.json" \
+    --slurpfile k10Roles "$TEMP_DIR/k10Roles.json" \
+    --slurpfile k10RoleBindings "$TEMP_DIR/k10RoleBindings.json" \
+    --slurpfile k10RbacSubjects "$TEMP_DIR/k10RbacSubjects.json" \
     --argjson rbacSubjectsTotal "$RBAC_SUBJECTS_TOTAL" \
     --argjson rbacUsers "$RBAC_USERS" \
     --argjson rbacGroups "$RBAC_GROUPS" \
@@ -3807,12 +3882,12 @@ if [ "$MODE" = "json" ]; then
     --arg rolesAccessible "$ROLES_RBAC_ACCESSIBLE" \
     --arg rbAccessible "$RB_RBAC_ACCESSIBLE" \
     --arg rbacFullyAccessible "$RBAC_FULLY_ACCESSIBLE" \
-    --argjson effectiveRpo "$EFFECTIVE_RPO" \
+    --slurpfile effectiveRpo "$TEMP_DIR/effectiveRpo.json" \
     --argjson rpoTotal "$RPO_TOTAL" \
     --argjson rpoWithFreq "$RPO_WITH_FREQ" \
     --argjson rpoWithSamples "$RPO_WITH_SAMPLES" \
     --argjson rpoInDrift "$RPO_IN_DRIFT" \
-    --argjson policyAnalysis "$POLICY_ANALYSIS" \
+    --slurpfile policyAnalysis "$TEMP_DIR/policyAnalysis.json" \
     --argjson ransomImmut "$RANSOM_IMMUT" \
     --argjson ransomImmutMax "$RANSOM_IMMUT_MAX" \
     --argjson ransomExport "$RANSOM_EXPORT" \
@@ -3834,10 +3909,10 @@ if [ "$MODE" = "json" ]; then
     --arg ransomGrade "$RANSOM_GRADE" \
     --arg ransomBiggestGap "$RANSOM_BIGGEST_GAP" \
     --argjson ransomBiggestGapPoints "$RANSOM_BIGGEST_GAP_POINTS" \
-    --argjson profileTlsSkipped "$PROFILE_TLS_SKIPPED" \
+    --slurpfile profileTlsSkipped "$TEMP_DIR/profileTlsSkipped.json" \
     --argjson profileTlsSkippedCount "$PROFILE_TLS_SKIPPED_COUNT" \
-    --argjson k10Resources "$K10_RESOURCES_SUMMARY" \
-    --argjson k10Deployments "$K10_DEPLOYMENTS_SUMMARY" \
+    --slurpfile k10Resources "$TEMP_DIR/k10Resources.json" \
+    --slurpfile k10Deployments "$TEMP_DIR/k10Deployments.json" \
     --argjson k10ContainersTotal "$K10_CONTAINERS_TOTAL" \
     --argjson k10ContainersWithLimits "$K10_CONTAINERS_WITH_LIMITS" \
     --argjson k10ContainersWithoutLimits "$K10_CONTAINERS_WITHOUT_LIMITS" \
@@ -3845,7 +3920,7 @@ if [ "$MODE" = "json" ]; then
     --arg catalogPvcName "$CATALOG_PVC_NAME" \
     --arg catalogFreePercent "$CATALOG_FREE_PERCENT" \
     --arg catalogUsedPercent "$CATALOG_USED_PERCENT" \
-    --argjson orphanedRp "$ORPHANED_RP" \
+    --slurpfile orphanedRp "$TEMP_DIR/orphanedRp.json" \
     --argjson orphanedRpCount "$ORPHANED_RP_COUNT" \
     --arg mcRole "$MC_ROLE" \
     --argjson mcClusterCount "${MC_CLUSTER_COUNT:-0}" \
@@ -3867,8 +3942,8 @@ if [ "$MODE" = "json" ]; then
     --argjson vmsFreezeDisabled "$VMS_FREEZE_DISABLED" \
     --arg freezeTimeout "$FREEZE_TIMEOUT" \
     --arg vmSnapshotConcurrency "$VM_SNAPSHOT_CONCURRENCY" \
-    --argjson vmDetails "$VM_DETAILS_JSON" \
-    --argjson vmPolicyDetails "$VM_POLICY_DETAILS_JSON" \
+    --slurpfile vmDetails "$TEMP_DIR/vmDetails.json" \
+    --slurpfile vmPolicyDetails "$TEMP_DIR/vmPolicyDetails.json" \
     --arg bpVmProtection "$BP_VM_PROTECTION_STATUS" \
     --arg helmValuesSource "$HELM_VALUES_SOURCE" \
     --arg authMethod "$AUTH_METHOD" \
@@ -3903,7 +3978,7 @@ if [ "$MODE" = "json" ]; then
     --arg dsDownloads "$DS_DOWNLOADS" \
     --arg dsBlkUploads "$DS_BLK_UPLOADS" \
     --arg dsBlkDownloads "$DS_BLK_DOWNLOADS" \
-    --argjson excludedApps "$EXCLUDED_APPS_JSON" \
+    --slurpfile excludedApps "$TEMP_DIR/excludedApps.json" \
     --argjson excludedAppsCount "$EXCLUDED_APPS_COUNT" \
     --arg gvbSidecar "$GVB_SIDECAR" \
     --arg scRunAsUser "$SC_RUN_AS_USER" \
@@ -3927,18 +4002,18 @@ if [ "$MODE" = "json" ]; then
     --arg bpAudit "$BP_AUDIT_STATUS" \
     --arg k8sServerVersion "$K8S_SERVER_VERSION" \
     --arg k8sDistribution "$K8S_DISTRIBUTION" \
-    --argjson failedActionsTop5 "$FAILED_ACTIONS_TOP5" \
+    --slurpfile failedActionsTop5 "$TEMP_DIR/failedActionsTop5.json" \
     --argjson failedActionsTop5Count "$FAILED_ACTIONS_TOP5_COUNT" \
-    --argjson stuckActions "$STUCK_ACTIONS" \
+    --slurpfile stuckActions "$TEMP_DIR/stuckActions.json" \
     --argjson stuckActionsCount "$STUCK_ACTIONS_COUNT" \
     --argjson stuckHoursThreshold "$STUCK_HOURS_THRESHOLD" \
-    --argjson nsProtectionStatus "$NS_PROTECTION_STATUS" \
+    --slurpfile nsProtectionStatus "$TEMP_DIR/nsProtectionStatus.json" \
     --argjson nsProtectionTotal "$NS_PROTECTION_TOTAL" \
     --argjson nsStaleCount "$NS_STALE_COUNT" \
     --argjson nsNeverBackedUp "$NS_NEVER_BACKED_UP" \
     --argjson staleDaysThreshold "$STALE_DAYS_THRESHOLD" \
-    --argjson rpByNamespaceTop5 "$RP_BY_NAMESPACE_TOP5" \
-    --argjson profileValidation "$PROFILE_VALIDATION" \
+    --slurpfile rpByNamespaceTop5 "$TEMP_DIR/rpByNamespaceTop5.json" \
+    --slurpfile profileValidation "$TEMP_DIR/profileValidation.json" \
     --argjson profileFailedCount "$PROFILE_FAILED_COUNT" \
     --arg reportsPolicyExists "$REPORTS_POLICY_EXISTS" \
     --arg reportsPolicyFrequency "$REPORTS_POLICY_FREQUENCY" \
@@ -3948,22 +4023,22 @@ if [ "$MODE" = "json" ]; then
     --argjson scCount "$SC_COUNT" \
     --argjson scDefaultCount "$SC_DEFAULT_COUNT" \
     --arg scRbacOk "$SC_RBAC_OK" \
-    --argjson scSummary "$SC_SUMMARY" \
+    --slurpfile scSummary "$TEMP_DIR/scSummary.json" \
     --argjson vscCount "$VSC_COUNT" \
     --argjson vscDefaultCount "$VSC_DEFAULT_COUNT" \
     --arg vscRbacOk "$VSC_RBAC_OK" \
-    --argjson vscSummary "$VSC_SUMMARY" \
-    --argjson csiDriversWithoutVsc "$CSI_DRIVERS_WITHOUT_VSC" \
+    --slurpfile vscSummary "$TEMP_DIR/vscSummary.json" \
+    --slurpfile csiDriversWithoutVsc "$TEMP_DIR/csiDriversWithoutVsc.json" \
     --argjson csiDriversWithoutVscCount "$CSI_DRIVERS_WITHOUT_VSC_COUNT" \
     --argjson importPolicyCount "$IMPORT_POLICY_COUNT" \
-    --argjson importPolicies "$IMPORT_POLICIES_JSON" \
-    --argjson policiesNoExportList "$POLICIES_NO_EXPORT_LIST" \
+    --slurpfile importPolicies "$TEMP_DIR/importPolicies.json" \
+    --slurpfile policiesNoExportList "$TEMP_DIR/policiesNoExportList.json" \
     --argjson policiesNoExportCount "$POLICIES_NO_EXPORT_COUNT" \
-    --argjson highSnapPolicies "$HIGH_SNAP_POLICIES" \
+    --slurpfile highSnapPolicies "$TEMP_DIR/highSnapPolicies.json" \
     --argjson highSnapCount "$HIGH_SNAP_COUNT" \
-    --argjson zeroSnapPolicies "$ZERO_SNAP_POLICIES" \
+    --slurpfile zeroSnapPolicies "$TEMP_DIR/zeroSnapPolicies.json" \
     --argjson zeroSnapCount "$ZERO_SNAP_COUNT" \
-    --argjson exportNoRetentionPolicies "$EXPORT_NO_RETENTION_POLICIES" \
+    --slurpfile exportNoRetentionPolicies "$TEMP_DIR/exportNoRetentionPolicies.json" \
     --argjson exportNoRetentionCount "$EXPORT_NO_RETENTION_COUNT" \
     --arg hasClusterScopedPolicy "$HAS_CLUSTER_SCOPED_POLICY" \
     --arg skipHelm "$([ "$SKIP_HELM" = true ] && echo true || echo false)" \
@@ -3973,12 +4048,51 @@ if [ "$MODE" = "json" ]; then
     --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
     --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
     '
+    ( $immutableProfiles[0] ) as $immutableProfiles |
+    ( $restoreActionsRecent[0] ) as $restoreActionsRecent |
+    ( $snapshotData[0] ) as $snapshotData |
+    ( $licenseBlock[0] ) as $licenseBlock |
+    ( $policyLastRun[0] ) as $policyLastRun |
+    ( $unprotectedNs[0] ) as $unprotectedNs |
+    ( $nsInventory[0] ) as $nsInventory |
+    ( $k10ClusterRoles[0] ) as $k10ClusterRoles |
+    ( $k10ClusterRoleBindings[0] ) as $k10ClusterRoleBindings |
+    ( $k10Roles[0] ) as $k10Roles |
+    ( $k10RoleBindings[0] ) as $k10RoleBindings |
+    ( $k10RbacSubjects[0] ) as $k10RbacSubjects |
+    ( $effectiveRpo[0] ) as $effectiveRpo |
+    ( $policyAnalysis[0] ) as $policyAnalysis |
+    ( $profileTlsSkipped[0] ) as $profileTlsSkipped |
+    ( $k10Resources[0] ) as $k10Resources |
+    ( $k10Deployments[0] ) as $k10Deployments |
+    ( $orphanedRp[0] ) as $orphanedRp |
+    ( $vmDetails[0] ) as $vmDetails |
+    ( $vmPolicyDetails[0] ) as $vmPolicyDetails |
+    ( $excludedApps[0] ) as $excludedApps |
+    ( $failedActionsTop5[0] ) as $failedActionsTop5 |
+    ( $stuckActions[0] ) as $stuckActions |
+    ( $nsProtectionStatus[0] ) as $nsProtectionStatus |
+    ( $rpByNamespaceTop5[0] ) as $rpByNamespaceTop5 |
+    ( $profileValidation[0] ) as $profileValidation |
+    ( $scSummary[0] ) as $scSummary |
+    ( $vscSummary[0] ) as $vscSummary |
+    ( $csiDriversWithoutVsc[0] ) as $csiDriversWithoutVsc |
+    ( $importPolicies[0] ) as $importPolicies |
+    ( $policiesNoExportList[0] ) as $policiesNoExportList |
+    ( $highSnapPolicies[0] ) as $highSnapPolicies |
+    ( $zeroSnapPolicies[0] ) as $zeroSnapPolicies |
+    ( $exportNoRetentionPolicies[0] ) as $exportNoRetentionPolicies |
+    ( $presets[0] ) as $presets |
+    ( $blueprints[0] ) as $blueprints |
+    ( $bindings[0] ) as $bindings |
+    ( $transformsets[0] ) as $transformsets |
     ($policiesArr[0] // {"items":[]}) as $policies |
     ($profilesArr[0] // {"items":[]}) as $profiles |
     {
       kdlVersion: $kdlVersion,
       platform: $platform,
       kastenVersion: $version,
+      rbacLimited: $rbacLimited,
 
       license: $licenseBlock,
 
@@ -5602,6 +5716,8 @@ fi
 # Namespace Protection (NEW v1.5)
 if [ "$BP_COVERAGE_STATUS" = "COMPLETE" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Namespace Protection: ${COLOR_GREEN}COMPLETE${COLOR_RESET}\n"
+elif [ "$BP_COVERAGE_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED (RBAC-limited - cluster-wide namespace listing was denied)\n"
 else
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Namespace Protection: GAPS DETECTED (optional - $UNPROTECTED_COUNT unprotected)\n"
 fi

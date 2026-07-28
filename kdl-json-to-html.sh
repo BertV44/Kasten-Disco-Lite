@@ -148,6 +148,8 @@ def badge(v):
     "<span class=\"badge warn\">Standalone</span>"
   elif v == "N/A" then
     "<span class=\"badge info\">N/A</span>"
+  elif v == "NOT_ASSESSED" then
+    "<span class=\"badge info\">ℹ Not assessed (RBAC)</span>"
   else "<span class=\"badge info\">" + (v | tostring) + "</span>" end;
 
 def statusBadge(v):
@@ -161,7 +163,9 @@ def boolBadge(v):
   else "<span class=\"badge warn\">\u2717 No</span>" end;
 
 def severityBadge(sev; status):
-  if sev == "critical" then
+  if status == "NOT_ASSESSED" then
+    "<span class=\"badge info\">ℹ N/A</span>"
+  elif sev == "critical" then
     if status == "ENABLED" or status == "CONFIGURED" or status == "COMPLETE" or status == "OK" then
       "<span class=\"badge ok\">\u2713</span>"
     else
@@ -241,16 +245,17 @@ def bpIsOk(v):
   (["CONFIGURED","IN_USE","ENABLED","COMPLETE","OK","VALID","COMPLIANT"] | index(v|tostring)) != null or (v == true);
 def bpFindings:
   (.bestPractices // {}) as $bp |
-  reduce (bpSevMap | to_entries[]) as $e ({"total":0,"crit":0,"warn":0};
+  reduce (bpSevMap | to_entries[]) as $e ({"total":0,"crit":0,"warn":0,"notAssessed":0};
     ($bp[$e.key]) as $v |
     if $v == null then .
+    elif $v == "NOT_ASSESSED" then .total += 1 | .notAssessed += 1
     else .total += 1
       | if bpIsOk($v) then .
         elif $e.value == "crit" then .crit += 1
         elif $e.value == "warn" then .warn += 1
         else . end
     end)
-  | .pass = (.total - .crit - .warn);
+  | .pass = (.total - .crit - .warn - .notAssessed);
 
 "<!DOCTYPE html>
 <html lang=\"en\">
@@ -494,7 +499,13 @@ body.only-issues tbody tr:not(.has-issue) { display:none; }
     <button class=\"btn\" id=\"themeToggle\">Light</button>
   </div>
 </div>
-" + (if .ransomwareReadiness then
+" + ((.rbacLimited // {"any":false,"denied":[]}) as $rbacLimited |
+    if ($rbacLimited.any // false) then
+      "<div class=\"info-box\">ℹ <strong>KDL ran with reduced RBAC permissions.</strong> One or more cluster-scoped reads were denied, so the affected sections of this report could not be assessed &mdash; they are shown as <strong>empty or \"Not assessed (RBAC)\"</strong>, which is <em>not</em> the same as a genuine zero. Grant the permissions in <code>kdl-rbac.yaml</code> (Part A) for a complete report.<br><strong>Denied reads:</strong> " +
+      ([$rbacLimited.denied[]? | "<code>" + (. | tostring | @html) + "</code>"] | join(", ")) +
+      "</div>"
+    else "" end) +
+(if .ransomwareReadiness then
 "<div class=\"verdict\">
   <div class=\"grade grade-" + (.ransomwareReadiness.grade // "na" | ascii_downcase) + "\">" + (.ransomwareReadiness.grade // "?") + "</div>
   <div>
@@ -559,8 +570,8 @@ else "" end) + "
         <td><strong>Namespace Protection</strong></td>
         <td class=\"sev-warning\">Warning</td>
         <td>" + severityBadge("warning"; (.bestPractices.namespaceProtection // "N/A")) + "</td>
-        <td>" + badge(.bestPractices.namespaceProtection // "N/A") + 
-          (if .coverage.unprotectedNamespaces.count > 0 then " (" + (.coverage.unprotectedNamespaces.count | tostring) + " gaps)" else "" end) + "</td>
+        <td>" + badge(.bestPractices.namespaceProtection // "N/A") +
+          (if (.bestPractices.namespaceProtection // "N/A") != "NOT_ASSESSED" and .coverage.unprotectedNamespaces.count > 0 then " (" + (.coverage.unprotectedNamespaces.count | tostring) + " gaps)" else "" end) + "</td>
       </tr>" +
       (if .bestPractices.vmProtection and .bestPractices.vmProtection != "N/A" then
       "
@@ -748,6 +759,8 @@ else "" end) + "
     "<p class=\"section-description\">Based on app policies only (excludes DR/report system policies)</p>" +
     (if .coverage.hasCatchallPolicy then
       "<div class=\"success-box\">\u2713 <strong>Catch-all policy detected</strong> - All namespaces are protected.</div>"
+    elif (.bestPractices.namespaceProtection // "N/A") == "NOT_ASSESSED" then
+      "<div class=\"info-box\">\u2139 <strong>Not assessed (RBAC).</strong> Cluster-wide namespace listing was denied, so namespace coverage could not be evaluated &mdash; this is <em>not</em> the same as \"all namespaces protected\". See the RBAC notice near the top of this report.</div>"
     elif .coverage.unprotectedNamespaces.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>All application namespaces are protected</strong></div>"
     else
@@ -1061,6 +1074,9 @@ else "" end) + "
 <!-- Data Usage -->
 <h2>\uD83D\uDCBE Data Usage</h2>"
 + (if .dataUsage then
+    (if ((.rbacLimited.denied // []) | any(test("persistentvolumeclaims"; "i"))) then
+       "<div class=\"info-box\">ℹ <strong>Not assessed (RBAC).</strong> Cluster-wide PVC listing was denied, so PVC totals/capacity below are incomplete &mdash; not a genuine zero.</div>"
+     else "" end) +
     "<div class=\"grid\">
       <div class=\"card\"><strong>Total PVCs</strong><div class=\"card-value\">" + (.dataUsage.totalPvcs | tostring) + "</div></div>
       <div class=\"card\"><strong>Total Capacity</strong><div class=\"card-value\">" + (.dataUsage.totalCapacityGi | tostring) + " GiB</div></div>

@@ -372,15 +372,68 @@ New in v2.0:
 
 ## RBAC Requirements
 
-The script is **read-only** and requires the following minimal permissions:
+The script is **read-only** and requires the following minimal permissions.
 
-### Quick start: bundled manifest
+KDL **degrades gracefully**: if a cluster-scoped read is denied, the affected
+section of the report is left **empty / marked "not assessed"** — it is
+**not** reported as zero, and the rest of the report still completes
+normally. Seeing an empty RBAC-limited section is expected behavior on a
+kubeconfig that lacks Part A below, not an error.
+
+### Quick start: bundled manifest — two-part / two-persona model
 
 A ready-to-apply, least-privilege manifest ships with the repo:
-[`kdl-rbac.yaml`](kdl-rbac.yaml). It defines a `kasten-discovery-reader`
-ClusterRole (cluster-wide reads, **no Secrets**) plus a namespaced Role for the
-sensitive reads (Secrets/ConfigMaps in the K10 namespace only), with binding
-templates. Edit the binding subjects, then `kubectl apply -f kdl-rbac.yaml`.
+[`kdl-rbac.yaml`](kdl-rbac.yaml). It bundles **two independent RBAC scopes**
+in one file, because in practice they are applied by two different people:
+
+- **Part A — cluster-scoped** (`ClusterRole` + `ClusterRoleBinding`, both
+  named `kasten-discovery-reader`): the cluster-scoped **read** access KDL
+  needs (namespaces, PVCs across all namespaces, nodes, storageclasses,
+  volumesnapshotclasses, CRDs, **no Secrets**). It does **not** grant read
+  access to cluster RBAC objects (ClusterRoles/ClusterRoleBindings) — that
+  is an optional add-on (see "Cluster-scoped — optional, for full RBAC
+  inventory" below); without it, the K10 RBAC-inventory section of the
+  report is best-effort and may show as "not assessed". Creating the
+  ClusterRole/ClusterRoleBinding themselves requires **cluster-admin** (or
+  an equivalent role that can create ClusterRoles/ClusterRoleBindings).
+  Apply this part **once**, cluster-wide.
+- **Part B — namespaced** (`Role` + `RoleBinding`, both named
+  `kasten-discovery-reader-ns`, in `kasten-io`): the sensitive reads
+  (Secrets/ConfigMaps) scoped to the K10 namespace only. Can be applied by
+  **anyone with admin rights on the K10 namespace** — e.g. a K10-admin who
+  is not cluster-admin.
+
+Commands:
+
+```
+# Cluster-admin, once — applies both Part A and Part B:
+oc apply -f kdl-rbac.yaml          # OpenShift
+kubectl apply -f kdl-rbac.yaml     # plain Kubernetes
+```
+
+```
+# K10-admin only (no cluster-admin available) — same command, run as
+# yourself. The namespaced Part B objects apply successfully; the
+# cluster-scoped Part A objects (ClusterRole/ClusterRoleBinding) are
+# rejected with:
+#   Error from server (Forbidden): ... is forbidden: User cannot create
+#   resource "clusterroles" ... at the cluster scope
+# This is EXPECTED for a K10-admin and is safe to ignore. Ask a
+# cluster-admin to run the same command later to add Part A — re-applying
+# is harmless, Part B is idempotent.
+oc apply -f kdl-rbac.yaml
+```
+
+If you only have K10-admin and cannot get a cluster-admin to apply Part A:
+KDL still runs end-to-end. The report will simply show the cluster-scoped
+sections as RBAC-limited/empty (see the graceful-degradation note above)
+until Part A is applied. This is expected, not a bug.
+
+If your K10 namespace is not `kasten-io`, edit the `namespace:` field on
+the `Role` and `RoleBinding` (Part B) in `kdl-rbac.yaml` before applying.
+
+Edit the binding subjects in both Bindings to point at your principal
+(ServiceAccount, User, or Group).
 
 ### Pre-flight check
 
@@ -487,7 +540,11 @@ If denied, KDL still runs — the `k10Rbac.accessibility.clusterRoles` / `cluste
   verbs: ["get", "list"]
 ```
 
-Cluster-admin privileges are **not required**.
+Cluster-admin privileges are **not required to run KDL** once the above
+permissions are bound to your principal. Cluster-admin (or equivalent) IS
+required to *create* the cluster-scoped ClusterRole/ClusterRoleBinding in
+the first place — see "Quick start: bundled manifest" above for the
+two-part apply model if you only have K10-admin.
 
 ---
 

@@ -5,17 +5,55 @@
 # nothing more, so it can be handed to a restricted (e.g. K10-admin-only)
 # kubeconfig without over-provisioning.
 #
-# It is split intentionally:
-#   - ClusterRole  kasten-discovery-reader        cluster-wide read (no secrets)
-#   - Role         kasten-discovery-reader-ns      namespaced read of the
-#                                                  sensitive bits (Secrets,
-#                                                  ConfigMaps) in the K10
-#                                                  namespace ONLY
+# ============================================================================
+# TWO-PART / TWO-PERSONA MODEL — READ THIS BEFORE APPLYING
+# ============================================================================
+# This file bundles TWO independent RBAC scopes because, in practice, they
+# are usually applied by two different people:
+#
+#   PART A — cluster-scoped   (ClusterRole + ClusterRoleBinding, both named
+#                              "kasten-discovery-reader")
+#     - Grants cluster-wide read access KDL needs: namespaces, PVCs across
+#       ALL namespaces, nodes, storageclasses, volumesnapshotclasses, CRDs,
+#       etc. Does NOT grant read access to cluster RBAC objects
+#       (ClusterRoles/ClusterRoleBindings) — that's an optional add-on (see
+#       README.md "Cluster-scoped — optional, for full RBAC inventory");
+#       without it the K10 RBAC-inventory section is best-effort and may
+#       show as "not assessed".
+#     - Creating cluster-scoped objects requires CLUSTER-ADMIN (or an
+#       equivalent cluster-scoped role that can create ClusterRole/
+#       ClusterRoleBinding). Apply this part ONCE, cluster-wide.
+#     - A K10-admin (namespace-scoped admin on kasten-io, NOT cluster-admin)
+#       CANNOT apply this part. `oc apply`/`kubectl apply` will fail on these
+#       two objects with:
+#         Error from server (Forbidden): ... is forbidden: User cannot
+#         create resource "clusterroles" ... at the cluster scope
+#       This is EXPECTED, not a bug in KDL or in this manifest — ask a
+#       cluster-admin to apply Part A.
+#
+#   PART B — namespaced        (Role + RoleBinding, both named
+#                              "kasten-discovery-reader-ns", in kasten-io)
+#     - Grants the sensitive namespaced reads (Secrets, ConfigMaps) scoped
+#       to the K10 namespace ONLY.
+#     - Can be applied by ANYONE with admin rights on the K10 namespace,
+#       e.g. a K10-admin who is not cluster-admin.
+#
+# If you only have K10-admin and `oc apply -f kdl-rbac.yaml` reports the
+# Forbidden error above for the ClusterRole/ClusterRoleBinding: that is
+# fine — Part B still applies successfully. KDL still runs; the
+# cluster-scoped sections of its report will simply be left EMPTY /
+# marked "not assessed" (not zero) until a cluster-admin applies Part A.
+# See README.md "RBAC Requirements" for the full explanation and commands.
+# ============================================================================
 #
 # Usage:
 #   1. Edit the two *Binding* objects at the bottom to point at your principal
 #      (ServiceAccount, User or Group) and the K10 namespace (default kasten-io).
-#   2. kubectl apply -f kdl-rbac.yaml
+#   2. kubectl apply -f kdl-rbac.yaml   (or: oc apply -f kdl-rbac.yaml)
+#      - Cluster-admin: applies both Part A and Part B in one shot.
+#      - K10-admin only: Part B applies; Part A objects are rejected with the
+#        Forbidden error above — expected, safe to ignore, or hand this file
+#        to a cluster-admin to apply Part A separately.
 #
 # Notes:
 #   - The namespaced Role covers `secrets` (k10-license, Helm release secret).
@@ -25,6 +63,10 @@
 #     (OpenShift routes/scc, KubeVirt/Harvester virtualization, Kanister
 #     blueprints). They are harmless to grant on clusters that lack the CRDs.
 ---
+# ============================================================================
+# PART A — CLUSTER-SCOPED (apply ONCE, by a CLUSTER-ADMIN)
+# A K10-admin cannot create these two objects — see header note above.
+# ============================================================================
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -140,7 +182,11 @@ rules:
       - settings
     verbs: ["get", "list"]
 ---
+# ============================================================================
+# PART B — NAMESPACED (apply by anyone with admin on the K10 namespace,
+# e.g. a K10-admin who is NOT cluster-admin)
 # Sensitive reads, scoped to the K10 namespace ONLY (not cluster-wide).
+# ============================================================================
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -160,6 +206,7 @@ rules:
 # Bindings — EDIT the subjects to match your principal before applying.
 # Examples below bind a ServiceAccount named "kdl" in namespace "kasten-io".
 # ---------------------------------------------------------------------------
+# --- PART A binding (cluster-scoped — CLUSTER-ADMIN only) ------------------
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
@@ -179,6 +226,7 @@ subjects:
   #   name: alice@example.com
   #   apiGroup: rbac.authorization.k8s.io
 ---
+# --- PART B binding (namespaced — K10-admin or any namespace admin) --------
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:

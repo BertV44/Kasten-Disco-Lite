@@ -3,6 +3,47 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.1.1] - 2026-07-28
+
+Field-reliability fixes for Windows/Git-Bash and least-privilege (K10-admin-only)
+runs. No change to the JSON schema beyond one additive key; existing consumers and
+older reports are unaffected.
+
+### Fixed
+- **Windows `Argument list too long` when generating JSON.** The final `jq -n`
+  assembly passed ~254 `--arg`/`--argjson` values on a single command line, which
+  overflows the Windows `CreateProcess` ~32 KB command-line cap on non-trivial
+  clusters (a single large array, e.g. the namespace inventory or RBAC subjects,
+  can exceed it on its own). All 38 array/object values are now streamed through
+  temp files via `--slurpfile` (extending the pattern already used for
+  profiles/policies), keeping only bounded scalars on the command line. The jq
+  program body is unchanged and output is byte-identical to before.
+- **`jq: command not found` crashed mid-run.** Added an up-front dependency
+  preflight (`jq` and the chosen `oc`/`kubectl`) that fails fast with an
+  actionable message (incl. a Git-Bash/Windows `jq.exe` hint) instead of aborting
+  partway through.
+- **Namespace-coverage false positive under restricted RBAC.** When cluster-wide
+  namespace listing is denied, the inventory is empty, so the coverage check
+  previously reported `COMPLETE` (0 unprotected) — a misleading pass. It now
+  reports `NOT_ASSESSED`, rendered as a neutral badge/box (not a green success),
+  and excluded from the pass/warn tallies.
+
+### Added
+- **RBAC transparency in the output.** New top-level JSON key
+  `rbacLimited: { any, denied[] }` lists the cluster-scoped reads that were denied.
+  The HTML report shows a banner and per-section "Not assessed (RBAC)" markers so
+  an empty section is never mistaken for a genuine zero. Read-only behaviour and
+  graceful degradation are unchanged — this only surfaces what was already
+  happening.
+
+### Changed
+- **`kdl-rbac.yaml` split into a two-persona model.** Part A (cluster-scoped
+  `ClusterRole`/`ClusterRoleBinding`) must be applied once by a cluster-admin;
+  Part B (namespaced `Role`/`RoleBinding`) can be applied by a K10-admin. The
+  README RBAC section and the in-tool warning were rewritten accordingly, and an
+  overstated claim that Part A grants cluster RBAC-object reads was corrected (it
+  does not — that inventory is best-effort and may show as not assessed).
+
 ## [2.1.0] - 2026-07-03
 
 Report UI redesign and Disaster Recovery verdict corrections. Validated end-to-end
