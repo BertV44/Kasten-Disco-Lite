@@ -28,6 +28,12 @@ older reports are unaffected.
   reports `NOT_ASSESSED`, rendered as a neutral badge/box (not a green success),
   and excluded from the pass/warn tallies.
 
+- **HTML generation failed on stricter `jq` builds (`unexpected label`).** The
+  ransomware-pillar renderer bound a jq variable named `$label`, which is a
+  reserved keyword; lenient `jq` builds tolerated it, stricter ones rejected the
+  whole program at compile time. Renamed to `$pillarLabel`. (Pre-existing issue,
+  also present on `main`; surfaced now via a client's `jq` build.)
+
 ### Added
 - **RBAC transparency in the output.** New top-level JSON key
   `rbacLimited: { any, denied[] }` lists the cluster-scoped reads that were denied.

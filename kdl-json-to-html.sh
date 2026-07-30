@@ -1340,10 +1340,10 @@ else "" end) + "
           kmsEncryption: "KMS encryption",
           networkPolicies: "Network policies",
           tlsVerification: "TLS verification"
-        }[$k] // $k) as $label |
+        }[$k] // $k) as $pillarLabel |
         "<div class=\"pillar-row\">
            " + $status + "
-           <span><strong>" + $label + "</strong></span>
+           <span><strong>" + $pillarLabel + "</strong></span>
            <span class=\"pillar-score\">" + ($s | tostring) + "/" + ($m | tostring) + "</span>
            <span class=\"pillar-evidence\">" + (if $v.evidence then "detected" else "not detected" end) + "</span>
          </div>"
