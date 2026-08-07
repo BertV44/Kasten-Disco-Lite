@@ -28,6 +28,16 @@ older reports are unaffected.
   reports `NOT_ASSESSED`, rendered as a neutral badge/box (not a green success),
   and excluded from the pass/warn tallies.
 
+- **Empty Policies / KDR / Reports sections on hardened clusters.** The policy
+  fetch used the bare resource name (`get policies`) while every other Kasten CRD
+  was already fully qualified. On hardened clusters that reject ambiguous short
+  names (and where `policies` collides across API groups), that read failed
+  silently (`2>/dev/null`), leaving the Policies, Disaster Recovery and Reports
+  sections empty for the wrong reason (all three derive from the policy list).
+  Fully qualified to `policies.config.kio.kasten.io`, and every remaining bare
+  custom-resource/OpenShift name (`crd`, `csv`, `kubevirt`, `networkpolicies`,
+  `ingress`, `mutatingwebhookconfigurations`, `scc`, plus `cm`/`svc`) was
+  fully qualified for the same robustness.
 - **HTML generation failed on stricter `jq` builds (`unexpected label`).** The
   ransomware-pillar renderer bound a jq variable named `$label`, which is a
   reserved keyword; lenient `jq` builds tolerated it, stricter ones rejected the

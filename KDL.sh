@@ -683,7 +683,7 @@ jq -e '.items' "$TEMP_DIR/deploys.json" >/dev/null 2>&1 || echo '{"items":[]}' >
 progress "K10 resources"
 
 $CLI -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
-$CLI -n "$NAMESPACE" get policies -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
+$CLI -n "$NAMESPACE" get policies.config.kio.kasten.io -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
 # Action CRs and RestorePoints are cluster-wide (#10/#15): on K10 8.x,
 # policy-driven actions and RP CRs live in the source application namespace,
 # not the K10 namespace. Fetch with -A. Downstream jq resolves the namespace
@@ -2633,7 +2633,7 @@ debug "PVCs: $TOTAL_PVCS, Capacity: ${TOTAL_CAPACITY_GB}Gi"
 
 # Check if VirtualMachine CRD exists (KubeVirt / OpenShift Virtualization)
 VM_CRD_EXISTS="false"
-if $CLI get crd virtualmachines.kubevirt.io >/dev/null 2>&1; then
+if $CLI get customresourcedefinitions.apiextensions.k8s.io virtualmachines.kubevirt.io >/dev/null 2>&1; then
   VM_CRD_EXISTS="true"
 fi
 
@@ -2647,7 +2647,7 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
 
   # Check for OpenShift Virtualization (CNV)
   if [ "$PLATFORM" = "OpenShift" ]; then
-    OCP_VIRT_CSV="$($CLI get csv -n openshift-cnv -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | test("kubevirt-hyperconverged"))] | sort_by(.metadata.creationTimestamp) | last | .spec.version // empty' 2>/dev/null || echo '')"
+    OCP_VIRT_CSV="$($CLI get clusterserviceversions.operators.coreos.com -n openshift-cnv -o json 2>/dev/null | jq -r '[.items[] | select(.metadata.name | test("kubevirt-hyperconverged"))] | sort_by(.metadata.creationTimestamp) | last | .spec.version // empty' 2>/dev/null || echo '')"
     if [ -n "$OCP_VIRT_CSV" ]; then
       VIRT_PLATFORM="OpenShift Virtualization"
       VIRT_VERSION="$OCP_VIRT_CSV"
@@ -2665,7 +2665,7 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
 
   # If still unknown, try KubeVirt operator version
   if [ "$VIRT_VERSION" = "unknown" ]; then
-    VIRT_VERSION="$($CLI get kubevirt -A -o jsonpath='{.items[0].status.observedKubeVirtVersion}' 2>/dev/null || echo 'unknown')"
+    VIRT_VERSION="$($CLI get kubevirts.kubevirt.io -A -o jsonpath='{.items[0].status.observedKubeVirtVersion}' 2>/dev/null || echo 'unknown')"
   fi
 
   debug "Virtualization platform: $VIRT_PLATFORM $VIRT_VERSION"
@@ -2893,7 +2893,7 @@ helm_bool() {
 }
 
 # k10-config ConfigMap (shared fallback source)
-K10_CM_JSON=$($CLI -n "$NAMESPACE" get cm k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
+K10_CM_JSON=$($CLI -n "$NAMESPACE" get configmaps k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
 
 # --- Authentication ---
 AUTH_METHOD="none"
@@ -2974,7 +2974,7 @@ _np_helm=$(helm_val "networkPolicy.create" "")
 if [ "$_np_helm" = "true" ] || [ "$_np_helm" = "false" ]; then
   NETPOL_ENABLED="$_np_helm"
 else
-  _np_count=$($CLI -n "$NAMESPACE" get networkpolicies -l "app.kubernetes.io/name=k10" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  _np_count=$($CLI -n "$NAMESPACE" get networkpolicies.networking.k8s.io -l "app.kubernetes.io/name=k10" --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$_np_count" ] && _np_count=0
   [ "$_np_count" -gt 0 ] 2>/dev/null && NETPOL_ENABLED="true"
 fi
@@ -3011,17 +3011,17 @@ debug "Custom CA: ${CUSTOM_CA:-none}"
 DASHBOARD_ACCESS="ClusterIP"
 DASHBOARD_HOST=""
 
-_ing_count=$($CLI -n "$NAMESPACE" get ingress --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+_ing_count=$($CLI -n "$NAMESPACE" get ingresses.networking.k8s.io --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$_ing_count" ] && _ing_count=0
 _route_count=0
 [ "$PLATFORM" = "OpenShift" ] && _route_count=$($CLI -n "$NAMESPACE" get routes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$_route_count" ] && _route_count=0
-_extgw=$($CLI -n "$NAMESPACE" get svc gateway-ext --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+_extgw=$($CLI -n "$NAMESPACE" get services gateway-ext --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$_extgw" ] && _extgw=0
 
 if [ "$_ing_count" -gt 0 ] 2>/dev/null; then
   DASHBOARD_ACCESS="Ingress"
-  DASHBOARD_HOST=$($CLI -n "$NAMESPACE" get ingress -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || echo "")
+  DASHBOARD_HOST=$($CLI -n "$NAMESPACE" get ingresses.networking.k8s.io -o jsonpath='{.items[0].spec.rules[0].host}' 2>/dev/null || echo "")
 elif [ "$_route_count" -gt 0 ] 2>/dev/null; then
   DASHBOARD_ACCESS="Route"
   DASHBOARD_HOST=$($CLI -n "$NAMESPACE" get routes -o jsonpath='{.items[0].spec.host}' 2>/dev/null || echo "")
@@ -3105,7 +3105,7 @@ debug "Excluded apps: $EXCLUDED_APPS_COUNT"
 # --- GVB Sidecar Injection ---
 GVB_SIDECAR=$(helm_bool "injectGenericVolumeBackupSidecar.enabled")
 if [ "$GVB_SIDECAR" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
-  _gvb_wh=$($CLI get mutatingwebhookconfigurations -l "app=k10" -o json 2>/dev/null \
+  _gvb_wh=$($CLI get mutatingwebhookconfigurations.admissionregistration.k8s.io -l "app=k10" -o json 2>/dev/null \
     | jq '[.items[]? | select(.metadata.name | test("generic-volume";"i"))] | length' 2>/dev/null || echo "0")
   [ "$_gvb_wh" -gt 0 ] 2>/dev/null && GVB_SIDECAR="true"
 fi
@@ -3145,7 +3145,7 @@ SCC_CREATED="false"
 if [ "$PLATFORM" = "OpenShift" ]; then
   SCC_CREATED=$(helm_bool "scc.create")
   if [ "$SCC_CREATED" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
-    _scc=$($CLI get scc -o json 2>/dev/null | jq '[.items[]? | select(.metadata.name | test("k10|kasten";"i"))] | length' 2>/dev/null || echo "0")
+    _scc=$($CLI get securitycontextconstraints.security.openshift.io -o json 2>/dev/null | jq '[.items[]? | select(.metadata.name | test("k10|kasten";"i"))] | length' 2>/dev/null || echo "0")
     [ "$_scc" -gt 0 ] 2>/dev/null && SCC_CREATED="true"
   fi
 fi
