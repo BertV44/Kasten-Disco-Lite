@@ -152,6 +152,9 @@ def badge(v):
     "<span class=\"badge info\">ℹ Not assessed (RBAC)</span>"
   else "<span class=\"badge info\">" + (v | tostring) + "</span>" end;
 
+def licenseNodeConsumptionNotAssessed(nc):
+  ((nc.status // "") == "NOT_ASSESSED") or ((nc.assessed // true) == false);
+
 def statusBadge(v):
   if v == "VALID" then "<span class=\"badge ok\">\u2713 Valid</span>"
   elif v == "EXPIRED" then "<span class=\"badge error\">\u2717 Expired</span>"
@@ -509,7 +512,7 @@ body.only-issues tbody tr:not(.has-issue) { display:none; }
 "<div class=\"verdict\">
   <div class=\"grade grade-" + (.ransomwareReadiness.grade // "na" | ascii_downcase) + "\">" + (.ransomwareReadiness.grade // "?") + "</div>
   <div>
-    <div class=\"head\">Ransomware readiness: <strong>Grade " + (.ransomwareReadiness.grade // "?") + "</strong> &mdash; " + (bpFindings.crit | tostring) + " critical gap(s) to close on this cluster.</div>
+    <div class=\"head\">Ransomware readiness: <strong>Grade " + (.ransomwareReadiness.grade // "?") + "</strong>. Critical best-practice checks failing: " + (bpFindings.crit | tostring) + ".</div>
     <div class=\"sub\">" + (bpFindings.total | tostring) + " best-practice checks | weighted ransomware score " + (.ransomwareReadiness.score // 0 | tostring) + "/" + (.ransomwareReadiness.maxScore // 100 | tostring) + "</div>
     <div class=\"findings\">
       <div class=\"finding crit\"><span class=\"n\">" + (bpFindings.crit | tostring) + "</span><span class=\"l\">Critical</span></div>
@@ -571,7 +574,13 @@ else "" end) + "
         <td class=\"sev-warning\">Warning</td>
         <td>" + severityBadge("warning"; (.bestPractices.namespaceProtection // "N/A")) + "</td>
         <td>" + badge(.bestPractices.namespaceProtection // "N/A") +
-          (if (.bestPractices.namespaceProtection // "N/A") != "NOT_ASSESSED" and .coverage.unprotectedNamespaces.count > 0 then " (" + (.coverage.unprotectedNamespaces.count | tostring) + " gaps)" else "" end) + "</td>
+          (if (.bestPractices.namespaceProtection // "N/A") != "NOT_ASSESSED" and .coverage.unprotectedNamespaces.count > 0 then
+            (if (.coverage.unprotectedBreakdown // null) != null then
+              " (" + (.coverage.unprotectedBreakdown.actionable // 0 | tostring) + " actionable / " + (.coverage.unprotectedNamespaces.count | tostring) + " total)"
+            else
+              " (" + (.coverage.unprotectedNamespaces.count | tostring) + " gaps)"
+            end)
+          else "" end) + "</td>
       </tr>" +
       (if .bestPractices.vmProtection and .bestPractices.vmProtection != "N/A" then
       "
@@ -764,16 +773,35 @@ else "" end) + "
     elif .coverage.unprotectedNamespaces.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>All application namespaces are protected</strong></div>"
     else
-      "<div class=\"warning-box\">\u26a0 <strong>" + (.coverage.unprotectedNamespaces.count | tostring) + " unprotected namespace(s) detected</strong></div>" +
+      (if (.coverage.unprotectedBreakdown // null) != null then
+        (.coverage.unprotectedBreakdown) as $b |
+        (if ($b.actionable // 0) == 0 then
+          "<div class=\"success-box\">\u2713 <strong>" + ($b.total // 0 | tostring) + " unprotected namespace(s) detected, all deliberately excluded</strong> &mdash; " + ($b.excludedByHelm // 0 | tostring) + " via Helm exclusions, " + ($b.excludedByPolicy // 0 | tostring) + " via policy selector exceptions. <strong>0 actionable.</strong></div>"
+        else
+          "<div class=\"warning-box\">\u26a0 <strong>" + ($b.total // 0 | tostring) + " unprotected namespace(s) detected</strong> &mdash; " + ($b.deliberatelyExcluded // 0 | tostring) + " deliberately excluded (" + ($b.excludedByHelm // 0 | tostring) + " via Helm exclusions, " + ($b.excludedByPolicy // 0 | tostring) + " via policy selector exceptions), leaving <strong style=\"font-size:1.2rem;color:var(--warn-fg)\">" + ($b.actionable // 0 | tostring) + " actionable</strong>.</div>"
+        end)
+      else
+        "<div class=\"warning-box\">\u26a0 <strong>" + (.coverage.unprotectedNamespaces.count | tostring) + " unprotected namespace(s) detected</strong></div>"
+      end) +
       (if (.namespaceProtectionStatus.neverBackedUp // null) != null and (.namespaceProtectionStatus.neverBackedUp != .coverage.unprotectedNamespaces.count) then
         "<div class=\"info-box\"><strong>Note &mdash; two methods, two counts:</strong> this figure (" + (.coverage.unprotectedNamespaces.count | tostring) + ") is <em>selector-based</em> (namespaces not matched by any app policy). The Health/protection view counts <em>" + (.namespaceProtectionStatus.neverBackedUp | tostring) + " namespace(s) never actually backed up</em> &mdash; a namespace can be targeted by a policy selector yet still have no successful backup, which is why the two numbers differ.</div>"
       else "" end) +
-      "<table>
-      <thead><tr><th>Unprotected Namespaces</th></tr></thead>
-      <tbody>" +
-      ([.coverage.unprotectedNamespaces.items[:15][]? | "<tr><td>" + . + "</td></tr>"] | join("")) +
-      (if .coverage.unprotectedNamespaces.count > 15 then "<tr><td><em>... and " + ((.coverage.unprotectedNamespaces.count - 15) | tostring) + " more</em></td></tr>" else "" end) +
-      "</tbody></table>"
+      (if (.coverage.unprotectedBreakdown // null) != null and ((.coverage.unprotectedBreakdown.actionable // 0) == 0) then
+        ""
+      else
+        "<table>
+        <thead><tr><th>" + (if (.coverage.unprotectedBreakdown // null) != null then "Actionable Unprotected Namespaces" else "Unprotected Namespaces" end) + "</th></tr></thead>
+        <tbody>" +
+        (if (.coverage.unprotectedBreakdown // null) != null then
+          ((.coverage.unprotectedBreakdown.actionableNamespaces // []) as $ans |
+            ([$ans[:15][]? | "<tr><td>" + . + "</td></tr>"] | join(""))
+            + (if ($ans | length) > 15 then "<tr><td><em>... and " + (($ans | length) - 15 | tostring) + " more</em></td></tr>" else "" end))
+        else
+          ([.coverage.unprotectedNamespaces.items[:15][]? | "<tr><td>" + . + "</td></tr>"] | join(""))
+          + (if .coverage.unprotectedNamespaces.count > 15 then "<tr><td><em>... and " + ((.coverage.unprotectedNamespaces.count - 15) | tostring) + " more</em></td></tr>" else "" end)
+        end) +
+        "</tbody></table>"
+      end)
     end)
   else
     "<div class=\"info-box\">Namespace protection data not available.</div>"
@@ -988,13 +1016,18 @@ else "" end) + "
         + "<div class=\"stat-row\"><span class=\"stat-label\">Node Limit (Report CR)</span><span class=\"stat-value\">" + ((.license.nodeLimitAggregate.fromReportCR // "n/a") | tostring) + (if .license.nodeLimitAggregate.mismatch then " <span class=\"badge warn\">\u26a0 mismatch</span>" else "" end) + "</span></div>"
       else "" end)
     + (if .license.nodeConsumption then
-        "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.limit | tostring) + " " + badge(.license.nodeConsumption.status) + "</span></div>"
-        + (if (.license.nodeConsumption.paidStatus // null) != null and (.license.nodeConsumption.paidLimit // "none") != "none" then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Paid Entitlement</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.paidLimit | tostring) +
-            (if .license.nodeConsumption.paidStatus == "EXCEEDS_PAID" then " <span class=\"badge error\">✗ EXCEEDS PAID</span>" else " <span class=\"badge ok\">✓ OK</span>" end) + "</span></div>"
-          elif (.license.nodeConsumption.paidStatus // "") == "NO_PAID_LICENSE" then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Paid Entitlement</span><span class=\"stat-value\"><span class=\"badge warn\">⚠ No paid (non-trial) license</span></span></div>"
-          else "" end)
+        (if licenseNodeConsumptionNotAssessed(.license.nodeConsumption) then
+          "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + badge(.license.nodeConsumption.status // "NOT_ASSESSED") + " <small>node listing denied by RBAC — count unavailable</small></span></div>"
+          + "<div class=\"stat-row\"><span class=\"stat-label\">Paid Entitlement</span><span class=\"stat-value\">" + badge("NOT_ASSESSED") + " <small>cannot be verified without node data</small></span></div>"
+        else
+          "<div class=\"stat-row\"><span class=\"stat-label\">Node Consumption</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.limit | tostring) + " " + badge(.license.nodeConsumption.status) + "</span></div>"
+          + (if (.license.nodeConsumption.paidStatus // null) != null and (.license.nodeConsumption.paidLimit // "none") != "none" then
+              "<div class=\"stat-row\"><span class=\"stat-label\">Paid Entitlement</span><span class=\"stat-value\">" + (.license.nodeConsumption.current | tostring) + " / " + (.license.nodeConsumption.paidLimit | tostring) +
+              (if .license.nodeConsumption.paidStatus == "EXCEEDS_PAID" then " <span class=\"badge error\">✗ EXCEEDS PAID</span>" else " <span class=\"badge ok\">✓ OK</span>" end) + "</span></div>"
+            elif (.license.nodeConsumption.paidStatus // "") == "NO_PAID_LICENSE" then
+              "<div class=\"stat-row\"><span class=\"stat-label\">Paid Entitlement</span><span class=\"stat-value\"><span class=\"badge warn\">⚠ No paid (non-trial) license</span></span></div>"
+            else "" end)
+        end)
         + (if (.license.nodeConsumption.trialInflating // false) then
             "<div class=\"stat-row\"><span class=\"stat-label\"></span><span class=\"stat-value\"><small>⚠ A TRIAL license is inflating the effective limit — the deployment only stays within limit because of it.</small></span></div>"
           else "" end)
@@ -1295,19 +1328,22 @@ else "" end) + "
     </div>" +
 
     (if .k10Configuration.excludedApps.count > 0 then
+      (.k10Configuration.excludedApps.items // []) as $exAppItems |
       "<h3>Excluded Applications (global / Helm)</h3>
       <div class=\"warning-box\">\u26a0 <strong>" + (.k10Configuration.excludedApps.count | tostring) + " application(s) excluded from backup</strong>: " +
-        ([.k10Configuration.excludedApps.items[]? | "<code>" + . + "</code>"] | join(", ")) +
+        ([$exAppItems[:15][]? | "<code>" + . + "</code>"] | join(", ")) +
+        (if ($exAppItems | length) > 15 then ", <em>... and " + (($exAppItems | length) - 15 | tostring) + " more</em>" else "" end) +
       "</div>"
     else "" end)
     + (if (.k10Configuration.policyExclusions.count // 0) > 0 then
       "<h3>Policy-level Exclusions</h3>
       <div class=\"info-box\">\u2139 <strong>" + (.k10Configuration.policyExclusions.count | tostring) + " policy(ies)</strong> exclude namespaces via a selector exception (<code>!pattern</code>, stored as <code>NotIn</code>). This is <em>not</em> the same as a globally excluded application: another policy may still protect these namespaces.</div>"
       + ([ .k10Configuration.policyExclusions.byPolicy[]? |
+          (.matchedNamespaces // []) as $matchedNs |
           "<div class=\"info-box\"><strong>" + .policy + "</strong> excludes " +
           ([.patterns[]? | "<code>" + . + "</code>"] | join(", ")) +
-          " &rarr; <strong>" + ((.matchedNamespaces | length) | tostring) + "</strong> live namespace(s)" +
-          (if (.matchedNamespaces | length) > 0 then ": " + ([.matchedNamespaces[]? | "<code>" + . + "</code>"] | join(", ")) else "" end) +
+          " &rarr; <strong>" + ($matchedNs | length | tostring) + "</strong> live namespace(s)" +
+          (if ($matchedNs | length) > 0 then ": " + ([$matchedNs[:15][]? | "<code>" + . + "</code>"] | join(", ")) + (if ($matchedNs | length) > 15 then ", <em>... and " + (($matchedNs | length) - 15 | tostring) + " more</em>" else "" end) else "" end) +
           "</div>" ] | join(""))
     else "" end)
   else

@@ -10,6 +10,23 @@ runs. No change to the JSON schema beyond one additive key; existing consumers a
 older reports are unaffected.
 
 ### Fixed
+- **Silent section failures from the same command-line limit (found by reviewing a
+  real 562-namespace report).** The `Argument list too long` fix had only been
+  applied to the final `jq -n` assembly; 14 other cluster-scale payloads were still
+  passed via `--argjson` across 9 jq invocations, each ending in
+  `2>/dev/null || <fallback>`. On a large cluster the invocation fails and the
+  fallback silently yields an empty/zero section that looks legitimate: the
+  reviewed report showed `Policy Analysis: total policies analysed 0` while an app
+  policy existed and was detected elsewhere in the same run. All 14 payloads now go
+  through temp files + `--slurpfile`, and a new `_jq_fail` helper emits a warning
+  (stderr) whenever such a fallback is taken, so a computation error is never again
+  mistaken for "nothing to report".
+- **License verdict computed on RBAC-denied data.** With `list nodes` denied, the
+  node count silently fell back to 0 and the report still printed
+  `Node Consumption 0 / N` with a green OK verdict. Node consumption and paid
+  entitlement now report `NOT_ASSESSED` (JSON `license.nodeConsumption.assessed`)
+  and render neutrally. The count obtained from the K10 Report CR remains valid
+  without that permission, so only the genuine fallback is neutralised.
 - **Windows `Argument list too long` when generating JSON.** The final `jq -n`
   assembly passed ~254 `--arg`/`--argjson` values on a single command line, which
   overflows the Windows `CreateProcess` ~32 KB command-line cap on non-trivial
@@ -45,6 +62,18 @@ older reports are unaffected.
   also present on `main`; surfaced now via a client's `jq` build.)
 
 ### Added
+- **Deliberate exclusions separated from real coverage gaps.** A cluster that
+  intentionally excludes applications (105 via Helm, 115 namespaces via a policy
+  selector exception in the reviewed report) was still told `GAPS DETECTED
+  (562 gaps)`, which is alarming but not actionable. Coverage now reports a
+  breakdown (JSON `coverage.unprotectedBreakdown`): total unprotected, how many are
+  deliberately excluded (Helm and/or policy selector, counted as a union so a
+  namespace in both is not double-counted), and how many are genuinely
+  **actionable**. The best-practice verdict is driven by the actionable count, and
+  the HTML highlights it; when everything unprotected is deliberate, the section is
+  presented neutrally instead of as a warning. If the breakdown cannot be computed
+  it fails safe toward "everything actionable" — an error must never hide real gaps.
+
 - **Policy-level application exclusions surfaced.** The report previously listed
   only the global Helm exclusion (`excludedApps`, apps K10 refuses to manage at
   all). It now also detects per-policy selector exceptions (the "By Name" `!pattern`
@@ -61,6 +90,11 @@ older reports are unaffected.
   happening.
 
 ### Changed
+- **Report readability.** Long lists are truncated with the report's existing
+  "... and N more" convention (the reviewed report inlined 105 excluded
+  applications and 115 namespaces in single paragraphs), and the executive header
+  no longer reads as self-contradictory ("Grade D" next to "0 critical gaps"):
+  the grade and the failing-critical-checks count are now stated as distinct facts.
 - **`kdl-rbac.yaml` split into a two-persona model.** Part A (cluster-scoped
   `ClusterRole`/`ClusterRoleBinding`) must be applied once by a cluster-admin;
   Part B (namespaced `Role`/`RoleBinding`) can be applied by a K10-admin. The

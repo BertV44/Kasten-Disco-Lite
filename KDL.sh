@@ -393,6 +393,14 @@ EMPTY_ITEMS='{"items":[]}'
 # a "write error: Broken pipe" message. This is cosmetic (data is fine) but
 # noisy with set -eu. Redirecting stderr + || true silences it.
 _ep() { printf '%s\n' "$@" 2>/dev/null || true; }
+
+# Signal that a jq invocation failed and its section fell back to an
+# empty/zero placeholder. Without this, a failed jq call (e.g. E2BIG from an
+# oversized --argjson on the command line) is indistinguishable from a
+# genuine "nothing to report" result. ASCII-only, stderr (keeps stdout JSON
+# clean), used only at the specific fallback sites that were converted to
+# --slurpfile for large payloads.
+_jq_fail() { warn "Section '$1' could not be computed (jq error); it is reported as empty/zero - this is NOT necessarily a real zero."; }
 safe_json() {
   _raw="$1"
   _default="${2:-$EMPTY_ITEMS}"
@@ -873,10 +881,25 @@ REPORT_NODE_COUNT=$(_ep "$REPORT_LICENSE" | jq '.nodeCount // 0')
 
 if [ "${REPORT_NODE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
   CLUSTER_NODE_COUNT="$REPORT_NODE_COUNT"
+  NODE_COUNT_SOURCE="report"
 else
   CLUSTER_NODE_COUNT=$($CLI get nodes --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  NODE_COUNT_SOURCE="live"
 fi
 [ -z "$CLUSTER_NODE_COUNT" ] && CLUSTER_NODE_COUNT=0
+
+# Node-count trustworthiness (P1 report-accuracy fix). The Report-CR source
+# (REPORT_NODE_COUNT) is legitimate even without `list nodes` RBAC — K10
+# itself computed it. Only the live `get nodes` fallback is compromised when
+# that specific read was denied: in that case CLUSTER_NODE_COUNT is silently
+# 0 not because the cluster has no nodes, but because RBAC hid them, and that
+# must not be allowed to read as a clean "0 / limit OK" license verdict.
+NODES_ASSESSED="true"
+if [ "$NODE_COUNT_SOURCE" = "live" ]; then
+  case ";${RBAC_MISSING};" in
+    *";list nodes;"*) NODES_ASSESSED="false" ;;
+  esac
+fi
 
 NODE_LIMIT_MISMATCH="false"
 if [ -n "$REPORT_NODE_LIMIT" ] && [ "$REPORT_NODE_LIMIT" != "null" ] && [ "$HAS_UNLIMITED" = "false" ]; then
@@ -894,7 +917,12 @@ else
 fi
 
 CONSUMPTION_STATUS="OK"
-if [ "$EFFECTIVE_LIMIT" != "unlimited" ] && [ "$EFFECTIVE_LIMIT" != "0" ]; then
+if [ "$NODES_ASSESSED" = "false" ]; then
+  # RBAC-denied `get nodes` fallback: 0 is not a real reading, it's a gap in
+  # visibility. Reporting OK/EXCEEDED here would be a verdict on data we
+  # never actually saw.
+  CONSUMPTION_STATUS="NOT_ASSESSED"
+elif [ "$EFFECTIVE_LIMIT" != "unlimited" ] && [ "$EFFECTIVE_LIMIT" != "0" ]; then
   [ "$CLUSTER_NODE_COUNT" -gt "$EFFECTIVE_LIMIT" ] 2>/dev/null && CONSUMPTION_STATUS="EXCEEDED"
 fi
 
@@ -911,7 +939,12 @@ fi
 PAID_STATUS="OK"
 TRIAL_INFLATING="false"
 if [ "$PAID_HAS_UNLIMITED" != "true" ]; then
-  if [ "$PAID_LIMIT" = "none" ]; then
+  if [ "$NODES_ASSESSED" = "false" ]; then
+    # Same RBAC gap as CONSUMPTION_STATUS above: an unlimited paid license
+    # still legitimately reads OK (any count fits), but "none"/"exceeds"
+    # verdicts below would be built on a fabricated 0 — neutralise instead.
+    PAID_STATUS="NOT_ASSESSED"
+  elif [ "$PAID_LIMIT" = "none" ]; then
     # No paid license at all — any consumption relies on a trial license.
     PAID_STATUS="NO_PAID_LICENSE"
     [ "$TRIAL_PRESENT" = "true" ] && [ "${CLUSTER_NODE_COUNT:-0}" -gt 0 ] && TRIAL_INFLATING="true"
@@ -931,12 +964,20 @@ else
 fi
 
 # Single structured object — the source of truth for JSON + text + HTML.
+# LICENSES_UNPARSEABLE / LICENSES_PARSED / NEAREST_EXPIRY are routed through
+# temp files + --slurpfile instead of --argjson: on clusters with many license
+# secrets these can grow past the command-line length limit (Windows
+# CreateProcess ~32KB; ARG_MAX elsewhere), which silently triggers the
+# fallback below and reports an empty/zero license block.
+printf '%s' "${LICENSES_UNPARSEABLE:-[]}" > "$TEMP_DIR/lic_unparseable.json"
+printf '%s' "${LICENSES_PARSED:-[]}" > "$TEMP_DIR/lic_parsed.json"
+printf '%s' "${NEAREST_EXPIRY:-null}" > "$TEMP_DIR/lic_nearestexpiry.json"
 LICENSE_JSON=$(jq -cn \
   --arg overall "$LICENSE_STATUS" \
   --argjson secretCount "${LICENSE_SECRET_COUNT:-0}" \
   --argjson parseableCount "${LICENSES_COUNT:-0}" \
-  --argjson unparseable "$LICENSES_UNPARSEABLE" \
-  --argjson licenses "$LICENSES_PARSED" \
+  --slurpfile unparseable "$TEMP_DIR/lic_unparseable.json" \
+  --slurpfile licenses "$TEMP_DIR/lic_parsed.json" \
   --argjson fromSecrets "${SECRETS_NODE_TOTAL:-0}" \
   --arg fromReportCR "${REPORT_NODE_LIMIT:-}" \
   --argjson mismatch "${NODE_LIMIT_MISMATCH:-false}" \
@@ -949,8 +990,12 @@ LICENSE_JSON=$(jq -cn \
   --argjson paidHasUnlimited "${PAID_HAS_UNLIMITED:-false}" \
   --argjson trialPresent "${TRIAL_PRESENT:-false}" \
   --argjson trialInflating "${TRIAL_INFLATING:-false}" \
-  --argjson nearestExpiry "$NEAREST_EXPIRY" \
-  '{
+  --argjson nodesAssessed "${NODES_ASSESSED:-true}" \
+  --slurpfile nearestExpiry "$TEMP_DIR/lic_nearestexpiry.json" \
+  '( $unparseable[0] ) as $unparseable |
+   ( $licenses[0] ) as $licenses |
+   ( $nearestExpiry[0] ) as $nearestExpiry |
+   {
     status: $overall,
     secretCount: $secretCount,
     parseableCount: $parseableCount,
@@ -967,13 +1012,14 @@ LICENSE_JSON=$(jq -cn \
       current: $current,
       limit: ($limit | tonumber? // $limit),
       status: $consStatus,
+      assessed: $nodesAssessed,
       paidLimit: ($paidLimit | tonumber? // $paidLimit),
       paidStatus: $paidStatus,
       trialPresent: $trialPresent,
       trialInflating: $trialInflating
     },
     nearestExpiry: $nearestExpiry
-  }' 2>/dev/null || echo '{"status":"ERROR","secretCount":0,"parseableCount":0,"unparseable":[],"licenses":[]}')
+  }' 2>/dev/null) || { _jq_fail "license"; LICENSE_JSON='{"status":"ERROR","secretCount":0,"parseableCount":0,"unparseable":[],"licenses":[]}'; }
 
 debug "License: secrets=$LICENSE_SECRET_COUNT parseable=$LICENSES_COUNT status=$LICENSE_STATUS consumption=$CLUSTER_NODE_COUNT/$EFFECTIVE_LIMIT ($CONSUMPTION_STATUS) paid=$CLUSTER_NODE_COUNT/$PAID_LIMIT ($PAID_STATUS) trialInflating=$TRIAL_INFLATING mismatch=$NODE_LIMIT_MISMATCH"
 
@@ -1529,7 +1575,9 @@ fi
 # protect them. Resolve the glob patterns against the live namespace inventory
 # and surface them per policy, kept separate from the Helm exclusions. Scope:
 # APP_POLICIES_JSON only (system DR/reports policies excluded).
-POLICY_EXCLUSIONS_JSON=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsList "$ALL_NAMESPACES" '
+printf '%s' "${ALL_NAMESPACES:-[]}" > "$TEMP_DIR/pe_nslist.json"
+POLICY_EXCLUSIONS_JSON=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsList "$TEMP_DIR/pe_nslist.json" '
+  ( $nsList[0] ) as $nsList |
   [ .items[]?
     | { policy: .metadata.name,
         patterns: [ .spec.selector.matchExpressions[]?
@@ -1541,7 +1589,7 @@ POLICY_EXCLUSIONS_JSON=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsList "$ALL
               [ $nsList[] | . as $ns
                 | select( any($pats[]; . as $p
                     | $ns | test("^" + ($p | gsub("\\."; "\\\\.") | gsub("\\*"; ".*") | gsub("\\?"; ".")) + "$") ) ) ] }
-  ]' 2>/dev/null || echo '[]')
+  ]' 2>/dev/null) || { _jq_fail "policy exclusions"; POLICY_EXCLUSIONS_JSON='[]'; }
 if ! _ep "$POLICY_EXCLUSIONS_JSON" | jq -e '.' >/dev/null 2>&1; then
   POLICY_EXCLUSIONS_JSON='[]'
 fi
@@ -1729,11 +1777,13 @@ if [ "$HAS_CATCHALL_POLICY" = "true" ]; then
   UNPROTECTED_NS_JSON='[]'
   UNPROTECTED_COUNT=0
 else
-  UNPROTECTED_NS_JSON=$(_ep "$APP_NAMESPACES" | jq -c --argjson protected "$PROTECTED_NAMESPACES" '
-    [.[]? | select(. as $ns | 
+  printf '%s' "${PROTECTED_NAMESPACES:-[]}" > "$TEMP_DIR/unp_protected.json"
+  UNPROTECTED_NS_JSON=$(_ep "$APP_NAMESPACES" | jq -c --slurpfile protected "$TEMP_DIR/unp_protected.json" '
+    ( $protected[0] ) as $protected |
+    [.[]? | select(. as $ns |
       (($protected // []) | index($ns) | not)
     )] // []
-  ' 2>/dev/null || echo '[]')
+  ' 2>/dev/null) || { _jq_fail "unprotected namespaces"; UNPROTECTED_NS_JSON='[]'; }
   UNPROTECTED_COUNT=$(_ep "$UNPROTECTED_NS_JSON" | jq 'length // 0')
   [ -z "$UNPROTECTED_COUNT" ] && UNPROTECTED_COUNT=0
 fi
@@ -1766,7 +1816,8 @@ debug "Unprotected list: $UNPROTECTED_NS_JSON"
 # clusters without ALL_NAMESPACES_LABELED data, the analysis runs but
 # matchLabels resolution returns []; matchNames still flag empty correctly.
 
-POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAMESPACES_LABELED" '
+printf '%s' "${ALL_NAMESPACES_LABELED:-[]}" > "$TEMP_DIR/pa_nslabeled.json"
+POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" '
   # Resolve targeted namespaces for a single policy.
   # Returns {namespaces: [...], resolvable: bool, kind: "catchall"|"matchNames"|...}
   def resolve_ns(policy; allNs):
@@ -1814,6 +1865,8 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAM
     else
       {namespaces: [], resolvable: true, kind: "unknown"}
     end;
+
+  ( $nsLabeled[0] ) as $nsLabeled |
 
   # Build list of existing namespace names for cross-reference
   ([$nsLabeled[]?.name]) as $existingNs |
@@ -1887,7 +1940,7 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsLabeled "$ALL_NAM
       redundantPairsWithCatchall: ([$pairs[] | select(.involvesCatchall)] | length)
     }
   }
-' 2>/dev/null || echo '{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0}}')
+' 2>/dev/null) || { _jq_fail "policy analysis"; POLICY_ANALYSIS='{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0}}'; }
 
 # Validate
 if ! _ep "$POLICY_ANALYSIS" | jq -e '.summary' >/dev/null 2>&1; then
@@ -2064,9 +2117,11 @@ if ! _ep "$POLICY_NAMES" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 # Find RestorePoints where the source policy no longer exists
-ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --argjson policies "$POLICY_NAMES" '
-  [(.items // [])[]? | 
-    select(.spec.source.actionName as $action | 
+printf '%s' "${POLICY_NAMES:-[]}" > "$TEMP_DIR/orp_policies.json"
+ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR/orp_policies.json" '
+  ( $policies[0] ) as $policies |
+  [(.items // [])[]? |
+    select(.spec.source.actionName as $action |
       ($action | split("-") | .[:-3] | join("-")) as $policyName |
       (($policies // []) | index($policyName) | not)
     ) |
@@ -2077,7 +2132,7 @@ ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --argjson policies "$POLICY_NAM
       actions: [.spec.source.actionName]
     }
   ] | unique_by(.name) // []
-' 2>/dev/null || echo '[]')
+' 2>/dev/null) || { _jq_fail "orphaned restore points"; ORPHANED_RP='[]'; }
 
 # Validate result
 if ! _ep "$ORPHANED_RP" | jq -e '.' >/dev/null 2>&1; then
@@ -2398,20 +2453,28 @@ debug "Stuck actions (>${STUCK_HOURS_THRESHOLD}h Running): $STUCK_ACTIONS_COUNT"
 # value); listing them here would contradict policyAnalysis, which flags the same
 # names as non-existing references. Intersecting with ALL_NAMESPACES makes both
 # sections agree on which namespaces exist.
+printf '%s' "${APP_NAMESPACES:-[]}" > "$TEMP_DIR/nspi_app.json"
+printf '%s' "${PROTECTED_NAMESPACES:-[]}" > "$TEMP_DIR/nspi_protected.json"
+printf '%s' "${ALL_NAMESPACES:-[]}" > "$TEMP_DIR/nspi_all.json"
 NS_PROTECTION_INPUT=$(jq -cn '
+  ( $app[0] ) as $app |
+  ( $protected[0] ) as $protected |
+  ( $all[0] ) as $all |
   (($app // []) + ($protected // [])) | unique
   | map(select(. as $n | ($all // []) | index($n)))
 ' \
-  --argjson app "$APP_NAMESPACES" \
-  --argjson protected "$PROTECTED_NAMESPACES" \
-  --argjson all "$ALL_NAMESPACES" \
-  2>/dev/null || echo '[]')
+  --slurpfile app "$TEMP_DIR/nspi_app.json" \
+  --slurpfile protected "$TEMP_DIR/nspi_protected.json" \
+  --slurpfile all "$TEMP_DIR/nspi_all.json" \
+  2>/dev/null) || { _jq_fail "namespace protection input"; NS_PROTECTION_INPUT='[]'; }
 
 if ! _ep "$NS_PROTECTION_INPUT" | jq -e '.' >/dev/null 2>&1; then
   NS_PROTECTION_INPUT="$APP_NAMESPACES"
 fi
 
+printf '%s' "${NS_PROTECTION_INPUT:-[]}" > "$TEMP_DIR/nsps_appns.json"
 NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
+  ( $appNamespaces[0] ) as $appNamespaces |
   ($backupArr[0] // {"items":[]}) as $backup |
   ($exportArr[0] // {"items":[]}) as $export |
   ($restoreArr[0] // {"items":[]}) as $restore |
@@ -2465,11 +2528,11 @@ NS_PROTECTION_STATUS=$(jq -cn --argjson threshold "$STALE_DAYS_THRESHOLD" '
       neverBackedUp: ($last_backup[$ns] == null)
     })
 ' \
-  --argjson appNamespaces "$NS_PROTECTION_INPUT" \
+  --slurpfile appNamespaces "$TEMP_DIR/nsps_appns.json" \
   --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
   --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
   --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
-  2>/dev/null || echo '[]')
+  2>/dev/null) || { _jq_fail "namespace protection status"; NS_PROTECTION_STATUS='[]'; }
 
 if ! _ep "$NS_PROTECTION_STATUS" | jq -e '.' >/dev/null 2>&1; then
   NS_PROTECTION_STATUS='[]'
@@ -2574,9 +2637,11 @@ SC_CSI_DRIVERS=$(_ep "$SC_JSON" | jq -c '
 
 VSC_DRIVERS=$(_ep "$VSC_JSON" | jq -c '[.items[]?.driver] | unique' 2>/dev/null || echo '[]')
 
-CSI_DRIVERS_WITHOUT_VSC=$(_ep "$SC_CSI_DRIVERS" | jq -c --argjson vscd "$VSC_DRIVERS" '
+printf '%s' "${VSC_DRIVERS:-[]}" > "$TEMP_DIR/csi_vscd.json"
+CSI_DRIVERS_WITHOUT_VSC=$(_ep "$SC_CSI_DRIVERS" | jq -c --slurpfile vscd "$TEMP_DIR/csi_vscd.json" '
+  ( $vscd[0] ) as $vscd |
   [.[] | select(. as $d | ($vscd | index($d)) == null)]
-' 2>/dev/null || echo '[]')
+' 2>/dev/null) || { _jq_fail "CSI drivers without VSC"; CSI_DRIVERS_WITHOUT_VSC='[]'; }
 
 CSI_DRIVERS_WITHOUT_VSC_COUNT=$(safe_int "$(_ep "$CSI_DRIVERS_WITHOUT_VSC" | jq 'length // 0')")
 
@@ -3133,6 +3198,57 @@ EXCLUDED_APPS_COUNT=$(_ep "$EXCLUDED_APPS_JSON" | jq 'length' 2>/dev/null || ech
 [ -z "$EXCLUDED_APPS_COUNT" ] || [ "$EXCLUDED_APPS_COUNT" = "null" ] && EXCLUDED_APPS_COUNT=0
 debug "Excluded apps: $EXCLUDED_APPS_COUNT"
 
+### -------------------------
+### Unprotected namespace breakdown: deliberate exclusions vs actionable (P2)
+### -------------------------
+# "Unprotected" already means "not matched by ANY app policy" (see
+# UNPROTECTED_NS_JSON above). On clusters that deliberately opt namespaces
+# out of protection — globally via Helm excludedApps, or per-policy via a
+# selector NotIn exception (POLICY_EXCLUSIONS_JSON) — most of that count is
+# by design, not a gap. Split it so the headline figure is actionable:
+#   deliberatelyExcluded = unprotected ns in excludedApps OR any policy's
+#                           matchedNamespaces (union, no double-count)
+#   actionable            = unprotected minus deliberatelyExcluded
+# Computed here because it needs all three inputs: UNPROTECTED_NS_JSON
+# (~L1754), POLICY_EXCLUSIONS_JSON (~L1552), and EXCLUDED_APPS_JSON (just
+# above) — this is the first point after all three exist.
+printf '%s' "${UNPROTECTED_NS_JSON:-[]}" > "$TEMP_DIR/unpbd_unprotected.json"
+printf '%s' "${EXCLUDED_APPS_JSON:-[]}" > "$TEMP_DIR/unpbd_excludedapps.json"
+printf '%s' "${POLICY_EXCLUSIONS_JSON:-[]}" > "$TEMP_DIR/unpbd_policyexclusions.json"
+UNPROTECTED_BREAKDOWN_JSON=$(jq -cn \
+  --slurpfile unprotected "$TEMP_DIR/unpbd_unprotected.json" \
+  --slurpfile excludedApps "$TEMP_DIR/unpbd_excludedapps.json" \
+  --slurpfile policyExclusions "$TEMP_DIR/unpbd_policyexclusions.json" \
+  '
+  ( $unprotected[0] ) as $u |
+  ( $excludedApps[0] ) as $ea |
+  ( $policyExclusions[0] ) as $pe |
+  ( [ $pe[]?.matchedNamespaces[]? ] | unique ) as $polNs |
+  {
+    total: ($u | length),
+    excludedByHelm: ([ $u[] | select(IN($ea[])) ] | length),
+    excludedByPolicy: ([ $u[] | select(IN($polNs[])) ] | length),
+    deliberatelyExcluded: ([ $u[] | select(IN($ea[]) or IN($polNs[])) ] | length),
+    actionable: ([ $u[] | select((IN($ea[]) or IN($polNs[])) | not) ] | length),
+    actionableNamespaces: [ $u[] | select((IN($ea[]) or IN($polNs[])) | not) ]
+  }
+  ' 2>/dev/null) || {
+    _jq_fail "unprotected breakdown"
+    # Fail safe toward "everything actionable" (pre-fix behaviour) rather than
+    # toward "everything excluded" — an error here must never hide real gaps.
+    UNPROTECTED_BREAKDOWN_JSON="{\"total\":${UNPROTECTED_COUNT:-0},\"excludedByHelm\":0,\"excludedByPolicy\":0,\"deliberatelyExcluded\":0,\"actionable\":${UNPROTECTED_COUNT:-0},\"actionableNamespaces\":${UNPROTECTED_NS_JSON:-[]}}"
+  }
+if ! _ep "$UNPROTECTED_BREAKDOWN_JSON" | jq -e '.' >/dev/null 2>&1; then
+  UNPROTECTED_BREAKDOWN_JSON="{\"total\":${UNPROTECTED_COUNT:-0},\"excludedByHelm\":0,\"excludedByPolicy\":0,\"deliberatelyExcluded\":0,\"actionable\":${UNPROTECTED_COUNT:-0},\"actionableNamespaces\":${UNPROTECTED_NS_JSON:-[]}}"
+fi
+
+UNPROTECTED_ACTIONABLE_COUNT=$(_ep "$UNPROTECTED_BREAKDOWN_JSON" | jq '.actionable // 0' 2>/dev/null)
+[ -z "$UNPROTECTED_ACTIONABLE_COUNT" ] || [ "$UNPROTECTED_ACTIONABLE_COUNT" = "null" ] && UNPROTECTED_ACTIONABLE_COUNT="${UNPROTECTED_COUNT:-0}"
+DELIBERATELY_EXCLUDED_COUNT=$(_ep "$UNPROTECTED_BREAKDOWN_JSON" | jq '.deliberatelyExcluded // 0' 2>/dev/null)
+[ -z "$DELIBERATELY_EXCLUDED_COUNT" ] || [ "$DELIBERATELY_EXCLUDED_COUNT" = "null" ] && DELIBERATELY_EXCLUDED_COUNT=0
+
+debug "Unprotected breakdown: total=$UNPROTECTED_COUNT deliberatelyExcluded=$DELIBERATELY_EXCLUDED_COUNT actionable=$UNPROTECTED_ACTIONABLE_COUNT"
+
 # --- GVB Sidecar Injection ---
 GVB_SIDECAR=$(helm_bool "injectGenericVolumeBackupSidecar.enabled")
 if [ "$GVB_SIDECAR" = "false" ] && [ "$HELM_VALUES_SOURCE" = "none" ]; then
@@ -3386,12 +3502,16 @@ debug "K10 Roles: $K10_ROLES_COUNT | RoleBindings: $K10_RB_COUNT"
 
 # --- Aggregate: unique subjects across CRB + RB ---
 # Deduplicate by kind/name/namespace tuple. Counts by kind for quick reading.
+printf '%s' "${K10_CRB_JSON:-[]}" > "$TEMP_DIR/rbac_k10crb.json"
+printf '%s' "${K10_RB_JSON:-[]}" > "$TEMP_DIR/rbac_k10rb.json"
 ALL_RBAC_SUBJECTS=$(jq -c -n \
-  --argjson crb "$K10_CRB_JSON" \
-  --argjson rb "$K10_RB_JSON" '
+  --slurpfile crb "$TEMP_DIR/rbac_k10crb.json" \
+  --slurpfile rb "$TEMP_DIR/rbac_k10rb.json" '
+  ( $crb[0] ) as $crb |
+  ( $rb[0] ) as $rb |
   ([($crb // [])[].subjects[]?] + [($rb // [])[].subjects[]?])
   | unique_by([.kind, .name, (.namespace // "")])
-' 2>/dev/null || echo '[]')
+' 2>/dev/null) || { _jq_fail "K10 RBAC subjects"; ALL_RBAC_SUBJECTS='[]'; }
 
 if ! _ep "$ALL_RBAC_SUBJECTS" | jq -e '.' >/dev/null 2>&1; then
   ALL_RBAC_SUBJECTS='[]'
@@ -3462,9 +3582,14 @@ fi
 # namespace inventory is empty, so UNPROTECTED_COUNT is 0 for the wrong
 # reason (no visibility, not full coverage). Report NOT_ASSESSED instead of
 # the misleading COMPLETE false positive.
+# P2 (report-accuracy): the third branch drives off UNPROTECTED_ACTIONABLE_COUNT
+# rather than the raw UNPROTECTED_COUNT, so namespaces deliberately excluded
+# via Helm excludedApps or a policy-level selector exception no longer read
+# as "gaps". UNPROTECTED_COUNT itself is untouched and still reported as the
+# raw total elsewhere.
 if [ "$RBAC_NS_DENIED" = "true" ]; then
   BP_COVERAGE_STATUS="NOT_ASSESSED"
-elif [ "$HAS_CATCHALL_POLICY" = "true" ] || [ "$UNPROTECTED_COUNT" -eq 0 ]; then
+elif [ "$HAS_CATCHALL_POLICY" = "true" ] || [ "${UNPROTECTED_ACTIONABLE_COUNT:-$UNPROTECTED_COUNT}" -eq 0 ]; then
   BP_COVERAGE_STATUS="COMPLETE"
 else
   BP_COVERAGE_STATUS="GAPS_DETECTED"
@@ -3741,6 +3866,7 @@ printf '%s' "$PROFILES_JSON" > "$TEMP_DIR/profiles_clean.json"
 printf '%s' "$POLICIES_JSON" > "$TEMP_DIR/policies_clean.json"
 POLICY_LAST_RUN=$(_safe_arg "$POLICY_LAST_RUN" '[]')
 UNPROTECTED_NS_JSON=$(_safe_arg "$UNPROTECTED_NS_JSON" '[]')
+UNPROTECTED_BREAKDOWN_JSON=$(_safe_arg "$UNPROTECTED_BREAKDOWN_JSON" '{}')
 K10_RESOURCES_SUMMARY=$(_safe_arg "$K10_RESOURCES_SUMMARY" '{"pods":[]}')
 K10_DEPLOYMENTS_SUMMARY=$(_safe_arg "$K10_DEPLOYMENTS_SUMMARY" '{"total":0,"deployments":[]}')
 ORPHANED_RP=$(_safe_arg "$ORPHANED_RP" '[]')
@@ -3786,6 +3912,7 @@ printf '%s' "$SNAPSHOT_DATA" > "$TEMP_DIR/snapshotData.json"
 printf '%s' "$LICENSE_JSON" > "$TEMP_DIR/licenseBlock.json"
 printf '%s' "$POLICY_LAST_RUN" > "$TEMP_DIR/policyLastRun.json"
 printf '%s' "$UNPROTECTED_NS_JSON" > "$TEMP_DIR/unprotectedNs.json"
+printf '%s' "$UNPROTECTED_BREAKDOWN_JSON" > "$TEMP_DIR/unprotectedBreakdown.json"
 printf '%s' "$ALL_NAMESPACES_LABELED" > "$TEMP_DIR/nsInventory.json"
 printf '%s' "$K10_CLUSTERROLES_JSON" > "$TEMP_DIR/k10ClusterRoles.json"
 printf '%s' "$K10_CRB_JSON" > "$TEMP_DIR/k10ClusterRoleBindings.json"
@@ -3899,6 +4026,7 @@ if [ "$MODE" = "json" ]; then
     --argjson durationSampleCount "$DURATION_SAMPLE_COUNT" \
     --slurpfile unprotectedNs "$TEMP_DIR/unprotectedNs.json" \
     --argjson unprotectedCount "$UNPROTECTED_COUNT" \
+    --slurpfile unprotectedBreakdown "$TEMP_DIR/unprotectedBreakdown.json" \
     --arg hasCatchallPolicy "$HAS_CATCHALL_POLICY" \
     --slurpfile nsInventory "$TEMP_DIR/nsInventory.json" \
     --slurpfile k10ClusterRoles "$TEMP_DIR/k10ClusterRoles.json" \
@@ -4089,6 +4217,7 @@ if [ "$MODE" = "json" ]; then
     ( $licenseBlock[0] ) as $licenseBlock |
     ( $policyLastRun[0] ) as $policyLastRun |
     ( $unprotectedNs[0] ) as $unprotectedNs |
+    ( $unprotectedBreakdown[0] ) as $unprotectedBreakdown |
     ( $nsInventory[0] ) as $nsInventory |
     ( $k10ClusterRoles[0] ) as $k10ClusterRoles |
     ( $k10ClusterRoleBindings[0] ) as $k10ClusterRoleBindings |
@@ -4245,13 +4374,21 @@ if [ "$MODE" = "json" ]; then
           count: $unprotectedCount,
           items: $unprotectedNs
         },
+        unprotectedBreakdown: {
+          total: ($unprotectedBreakdown.total // $unprotectedCount),
+          excludedByHelm: ($unprotectedBreakdown.excludedByHelm // 0),
+          excludedByPolicy: ($unprotectedBreakdown.excludedByPolicy // 0),
+          deliberatelyExcluded: ($unprotectedBreakdown.deliberatelyExcluded // 0),
+          actionable: ($unprotectedBreakdown.actionable // $unprotectedCount),
+          actionableNamespaces: ($unprotectedBreakdown.actionableNamespaces // $unprotectedNs)
+        },
         namespacesInventory: {
           total: ($nsInventory | length),
           system: [$nsInventory[] | select(.isSystem)] | length,
           application: [$nsInventory[] | select(.isSystem | not)] | length,
           items: $nsInventory
         },
-        note: "Excludes system policies (DR, reporting) and system namespaces"
+        note: "Excludes system policies (DR, reporting) and system namespaces. unprotectedBreakdown.deliberatelyExcluded = unprotected namespaces matched by Helm excludedApps or a policy-level selector exception (see k10Configuration.excludedApps / k10Configuration.policyExclusions); actionable = the remainder."
       },
 
       policyAnalysis: {
@@ -4707,7 +4844,10 @@ else
 
   _cons_cur=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.current')
   _cons_lim=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.limit')
-  if [ "$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.status')" = "EXCEEDED" ]; then
+  _cons_status=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.status')
+  if [ "$_cons_status" = "NOT_ASSESSED" ]; then
+    printf "\n  Node Consumption: ${COLOR_YELLOW}[INFO] not assessed (RBAC - node listing denied)${COLOR_RESET}\n"
+  elif [ "$_cons_status" = "EXCEEDED" ]; then
     printf "\n  Node Consumption: ${COLOR_RED}[FAIL] %s / %s (EXCEEDED)${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
   else
     printf "\n  Node Consumption: ${COLOR_GREEN}[OK] %s / %s${COLOR_RESET}\n" "$_cons_cur" "$_cons_lim"
@@ -4718,7 +4858,9 @@ else
   _paid_lim=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.paidLimit')
   _paid_status=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.paidStatus')
   _trial_inflating=$(_ep "$LICENSE_JSON" | jq -r '.nodeConsumption.trialInflating')
-  if [ "$_paid_status" = "EXCEEDS_PAID" ]; then
+  if [ "$_paid_status" = "NOT_ASSESSED" ]; then
+    printf "  Paid Entitlement: ${COLOR_YELLOW}[INFO] not assessed (RBAC - node listing denied)${COLOR_RESET}\n"
+  elif [ "$_paid_status" = "EXCEEDS_PAID" ]; then
     printf "  Paid Entitlement: ${COLOR_RED}[FAIL] %s / %s (consumption exceeds paid licenses)${COLOR_RESET}\n" "$_cons_cur" "$_paid_lim"
   elif [ "$_paid_status" = "NO_PAID_LICENSE" ]; then
     printf "  Paid Entitlement: ${COLOR_YELLOW}[WARN] no paid (non-trial) license detected${COLOR_RESET}\n"
@@ -5124,6 +5266,14 @@ else
   _ep "$UNPROTECTED_NS_JSON" | jq -r '.[:10][] | "    - \(.)"' 2>/dev/null
   if [ "$UNPROTECTED_COUNT" -gt 10 ]; then
     printf "    ... and $((UNPROTECTED_COUNT - 10)) more\n"
+  fi
+  # P2 (report-accuracy): split deliberate exclusions (Helm excludedApps /
+  # policy-level selector NotIn) from genuinely actionable gaps, so the
+  # headline unprotected count is not read as N gaps to fix when most of it
+  # is by design.
+  if [ "${DELIBERATELY_EXCLUDED_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}    Of which deliberately excluded (Helm excludedApps / policy exceptions): $DELIBERATELY_EXCLUDED_COUNT${COLOR_RESET}\n"
+    printf "  ${COLOR_YELLOW}    Actionable: $UNPROTECTED_ACTIONABLE_COUNT${COLOR_RESET}\n"
   fi
   if [ "$PROTECTED_NS_COUNT" -gt 0 ]; then
     printf "  ${COLOR_GREEN}  Protected: $(_ep "$PROTECTED_NAMESPACES" | jq -r 'join(", ")')${COLOR_RESET}\n"
@@ -5765,7 +5915,10 @@ if [ "$BP_COVERAGE_STATUS" = "COMPLETE" ]; then
 elif [ "$BP_COVERAGE_STATUS" = "NOT_ASSESSED" ]; then
   printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED (RBAC-limited - cluster-wide namespace listing was denied)\n"
 else
-  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Namespace Protection: GAPS DETECTED (optional - $UNPROTECTED_COUNT unprotected)\n"
+  # P2: this branch is now driven by the actionable count (deliberate Helm/
+  # policy exclusions are not gaps) - show both figures so the raw total
+  # ($UNPROTECTED_COUNT, reported unchanged elsewhere) is not lost.
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Namespace Protection: GAPS DETECTED (optional - $UNPROTECTED_ACTIONABLE_COUNT actionable of $UNPROTECTED_COUNT unprotected)\n"
 fi
 
 # VM Protection (NEW v1.7)
