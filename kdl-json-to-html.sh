@@ -1295,10 +1295,20 @@ else "" end) + "
     </div>" +
 
     (if .k10Configuration.excludedApps.count > 0 then
-      "<h3>Excluded Applications</h3>
-      <div class=\"warning-box\">\u26a0 <strong>" + (.k10Configuration.excludedApps.count | tostring) + " application(s) excluded from backup</strong>: " + 
+      "<h3>Excluded Applications (global / Helm)</h3>
+      <div class=\"warning-box\">\u26a0 <strong>" + (.k10Configuration.excludedApps.count | tostring) + " application(s) excluded from backup</strong>: " +
         ([.k10Configuration.excludedApps.items[]? | "<code>" + . + "</code>"] | join(", ")) +
       "</div>"
+    else "" end)
+    + (if (.k10Configuration.policyExclusions.count // 0) > 0 then
+      "<h3>Policy-level Exclusions</h3>
+      <div class=\"info-box\">\u2139 <strong>" + (.k10Configuration.policyExclusions.count | tostring) + " policy(ies)</strong> exclude namespaces via a selector exception (<code>!pattern</code>, stored as <code>NotIn</code>). This is <em>not</em> the same as a globally excluded application: another policy may still protect these namespaces.</div>"
+      + ([ .k10Configuration.policyExclusions.byPolicy[]? |
+          "<div class=\"info-box\"><strong>" + .policy + "</strong> excludes " +
+          ([.patterns[]? | "<code>" + . + "</code>"] | join(", ")) +
+          " &rarr; <strong>" + ((.matchedNamespaces | length) | tostring) + "</strong> live namespace(s)" +
+          (if (.matchedNamespaces | length) > 0 then ": " + ([.matchedNamespaces[]? | "<code>" + . + "</code>"] | join(", ")) else "" end) +
+          "</div>" ] | join(""))
     else "" end)
   else
     "<div class=\"info-box\">K10 configuration data not available. Requires Kasten Discovery Lite v1.8+.</div>"

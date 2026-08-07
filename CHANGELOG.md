@@ -45,6 +45,14 @@ older reports are unaffected.
   also present on `main`; surfaced now via a client's `jq` build.)
 
 ### Added
+- **Policy-level application exclusions surfaced.** The report previously listed
+  only the global Helm exclusion (`excludedApps`, apps K10 refuses to manage at
+  all). It now also detects per-policy selector exceptions (the "By Name" `!pattern`
+  form, stored as a `k10.kasten.io/appNamespace` `NotIn` match expression), resolves
+  the glob patterns (`*`, `?`) against the live namespace inventory, and shows them
+  in a separate "Policy-level Exclusions" block (JSON `k10Configuration.policyExclusions`).
+  Kept deliberately distinct from the Helm exclusions: a policy-level exclusion only
+  means that policy skips those namespaces, another policy may still protect them.
 - **RBAC transparency in the output.** New top-level JSON key
   `rbacLimited: { any, denied[] }` lists the cluster-scoped reads that were denied.
   The HTML report shows a banner and per-section "Not assessed (RBAC)" markers so

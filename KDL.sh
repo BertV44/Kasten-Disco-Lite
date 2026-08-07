@@ -1518,6 +1518,37 @@ if ! _ep "$ALL_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
   ALL_NAMESPACES='[]'
 fi
 
+### -------------------------
+### Policy-level application exclusions (NotIn appNamespace) - NEW v2.1.1
+### -------------------------
+# K10 "By Name" application selection with a "!pattern" exception is stored as a
+# matchExpressions entry (key=k10.kasten.io/appNamespace, operator=NotIn,
+# values=[glob,...]). These are DISTINCT from the global Helm excludedApps
+# (which make an application entirely unmanaged): a policy-level exclusion only
+# means *that* policy skips the matching namespaces; another policy may still
+# protect them. Resolve the glob patterns against the live namespace inventory
+# and surface them per policy, kept separate from the Helm exclusions. Scope:
+# APP_POLICIES_JSON only (system DR/reports policies excluded).
+POLICY_EXCLUSIONS_JSON=$(_ep "$APP_POLICIES_JSON" | jq -c --argjson nsList "$ALL_NAMESPACES" '
+  [ .items[]?
+    | { policy: .metadata.name,
+        patterns: [ .spec.selector.matchExpressions[]?
+                    | select(.key == "k10.kasten.io/appNamespace" and .operator == "NotIn")
+                    | .values[]? ] }
+    | select((.patterns | length) > 0)
+    | .patterns as $pats
+    | . + { matchedNamespaces:
+              [ $nsList[] | . as $ns
+                | select( any($pats[]; . as $p
+                    | $ns | test("^" + ($p | gsub("\\."; "\\\\.") | gsub("\\*"; ".*") | gsub("\\?"; ".")) + "$") ) ) ] }
+  ]' 2>/dev/null || echo '[]')
+if ! _ep "$POLICY_EXCLUSIONS_JSON" | jq -e '.' >/dev/null 2>&1; then
+  POLICY_EXCLUSIONS_JSON='[]'
+fi
+POLICY_EXCLUSIONS_COUNT=$(_ep "$POLICY_EXCLUSIONS_JSON" | jq 'length' 2>/dev/null || echo 0)
+[ -z "$POLICY_EXCLUSIONS_COUNT" ] || [ "$POLICY_EXCLUSIONS_COUNT" = "null" ] && POLICY_EXCLUSIONS_COUNT=0
+debug "Policy-level exclusions: $POLICY_EXCLUSIONS_COUNT policy(ies) with NotIn patterns"
+
 # System namespaces to exclude from analysis (extended for OpenShift)
 SYSTEM_NS_PATTERNS="kube-system|kube-public|kube-node-lease|openshift-|openshift$|default|kasten-io|calico-|tigera-|cattle-|fleet-|rancher-|ingress-|cert-manager|istio-|linkerd|gatekeeper-|falco|velero|longhorn-|rook-|portworx|metallb|nvidia-|gpu-operator|local-storage|assisted-installer|multicluster-|hive|rhacs-|stackrox|acs-|sso|keycloak|vault|external-secrets|argocd|gitops|tekton-|pipelines|cicd|monitoring|logging|tracing|jaeger|elastic|splunk|datadog|dynatrace|newrelic|prometheus|grafana|alertmanager|thanos"
 
@@ -3717,6 +3748,7 @@ RESTORE_ACTIONS_RECENT=$(_safe_arg "$RESTORE_ACTIONS_RECENT" '[]')
 VM_DETAILS_JSON=$(_safe_arg "$VM_DETAILS_JSON" '[]')
 VM_POLICY_DETAILS_JSON=$(_safe_arg "$VM_POLICY_DETAILS_JSON" '[]')
 EXCLUDED_APPS_JSON=$(_safe_arg "$EXCLUDED_APPS_JSON" '[]')
+POLICY_EXCLUSIONS_JSON=$(_safe_arg "${POLICY_EXCLUSIONS_JSON:-[]}" '[]')
 # v1.9 additions
 FAILED_ACTIONS_TOP5=$(_safe_arg "$FAILED_ACTIONS_TOP5" '[]')
 STUCK_ACTIONS=$(_safe_arg "$STUCK_ACTIONS" '[]')
@@ -3769,6 +3801,7 @@ printf '%s' "$ORPHANED_RP" > "$TEMP_DIR/orphanedRp.json"
 printf '%s' "$VM_DETAILS_JSON" > "$TEMP_DIR/vmDetails.json"
 printf '%s' "$VM_POLICY_DETAILS_JSON" > "$TEMP_DIR/vmPolicyDetails.json"
 printf '%s' "$EXCLUDED_APPS_JSON" > "$TEMP_DIR/excludedApps.json"
+printf '%s' "$POLICY_EXCLUSIONS_JSON" > "$TEMP_DIR/policyExclusions.json"
 printf '%s' "$FAILED_ACTIONS_TOP5" > "$TEMP_DIR/failedActionsTop5.json"
 printf '%s' "$STUCK_ACTIONS" > "$TEMP_DIR/stuckActions.json"
 printf '%s' "$NS_PROTECTION_STATUS" > "$TEMP_DIR/nsProtectionStatus.json"
@@ -3980,6 +4013,8 @@ if [ "$MODE" = "json" ]; then
     --arg dsBlkDownloads "$DS_BLK_DOWNLOADS" \
     --slurpfile excludedApps "$TEMP_DIR/excludedApps.json" \
     --argjson excludedAppsCount "$EXCLUDED_APPS_COUNT" \
+    --slurpfile policyExclusions "$TEMP_DIR/policyExclusions.json" \
+    --argjson policyExclusionsCount "$POLICY_EXCLUSIONS_COUNT" \
     --arg gvbSidecar "$GVB_SIDECAR" \
     --arg scRunAsUser "$SC_RUN_AS_USER" \
     --arg scFsGroup "$SC_FS_GROUP" \
@@ -4069,6 +4104,7 @@ if [ "$MODE" = "json" ]; then
     ( $vmDetails[0] ) as $vmDetails |
     ( $vmPolicyDetails[0] ) as $vmPolicyDetails |
     ( $excludedApps[0] ) as $excludedApps |
+    ( $policyExclusions[0] ) as $policyExclusions |
     ( $failedActionsTop5[0] ) as $failedActionsTop5 |
     ( $stuckActions[0] ) as $stuckActions |
     ( $nsProtectionStatus[0] ) as $nsProtectionStatus |
@@ -4358,6 +4394,10 @@ if [ "$MODE" = "json" ]; then
         excludedApps: {
           count: $excludedAppsCount,
           items: $excludedApps
+        },
+        policyExclusions: {
+          count: $policyExclusionsCount,
+          byPolicy: $policyExclusions
         },
         features: {
           gvbSidecarInjection: ($gvbSidecar == "true")
@@ -5464,10 +5504,16 @@ printf "  Logging:            $PERSIST_LOGGING | Metering: $PERSIST_METERING\n"
 [ -n "$PERSIST_SC" ] && printf "  Storage class:      $PERSIST_SC\n"
 
 # Excluded Apps
-printf "\n  ${COLOR_BOLD}Excluded Applications:${COLOR_RESET} $EXCLUDED_APPS_COUNT\n"
+printf "\n  ${COLOR_BOLD}Excluded Applications (global / Helm):${COLOR_RESET} $EXCLUDED_APPS_COUNT\n"
 if [ "$EXCLUDED_APPS_COUNT" -gt 0 ] 2>/dev/null; then
   _ep "$EXCLUDED_APPS_JSON" | jq -r '.[:10][] | "    - \(.)"' 2>/dev/null
   [ "$EXCLUDED_APPS_COUNT" -gt 10 ] 2>/dev/null && printf "    ... and $((EXCLUDED_APPS_COUNT - 10)) more\n"
+fi
+
+printf "\n  ${COLOR_BOLD}Policy-level Exclusions (selector NotIn):${COLOR_RESET} $POLICY_EXCLUSIONS_COUNT policy(ies)\n"
+if [ "$POLICY_EXCLUSIONS_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_CYAN}(A policy-level exclusion only means that policy skips these namespaces; another policy may still protect them.)${COLOR_RESET}\n"
+  _ep "$POLICY_EXCLUSIONS_JSON" | jq -r '.[] | "    - \(.policy): patterns [\(.patterns | join(", "))] -> \(.matchedNamespaces | length) namespace(s)" + (if (.matchedNamespaces | length) > 0 then " (\(.matchedNamespaces[:10] | join(", ")))" else "" end)' 2>/dev/null
 fi
 
 # Features
