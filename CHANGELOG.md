@@ -3,7 +3,7 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [2.1.1] - 2026-07-28
+## [2.1.1] - 2026-08-08
 
 Field-reliability fixes for Windows/Git-Bash and least-privilege (K10-admin-only)
 runs. No change to the JSON schema beyond one additive key; existing consumers and
