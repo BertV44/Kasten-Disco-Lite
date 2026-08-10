@@ -37,6 +37,83 @@ Rejected alternatives:
   since dev-2.0 already contains the reconciled fixes.
 - **`git branch -f main dev-2.0` (force)** — rewrites the shared `main` ref; avoid.
 
+## Kasten 9.0 validation (v2.2.0)
+
+v2.2.0 was built against **synthetic 9.0 fixtures only**. It must not be tagged
+before a real 9.0 run. Two phases: Phase A is automated and proves the new code
+paths ran and are self-consistent; **Phase B is manual and is the only thing that
+proves the numbers are right** — internal consistency cannot detect a wrong-but-
+coherent answer, which is exactly the failure mode v2.2.0 fixes.
+
+### Phase A — automated gate
+
+```sh
+NS=kasten-io
+./kdl-v9-validate.sh "$NS"        # exits non-zero on any failed assertion
+```
+
+Expect `FAIL=0`. `SKIP` lines tell you which 9.0 feature is absent from the
+cluster and therefore untested — a skip is not a pass. To exercise everything,
+the cluster needs: at least one VM, one VM policy **by label**
+(`virtualMachineNamespace` + VM `matchLabels`), one VM policy by reference, one
+policy with **two export destinations**, and one **VBR** or **Veeam Vault**
+profile. Also confirm the run printed no
+`[WARN] Section ... could not be computed` on stderr.
+
+The gate is meaningful, not tautological: run it against a v2.1.x report and the
+version, export-accounting, per-VM and empty-policy assertions all fail.
+
+### Phase B — manual ground truth (mandatory)
+
+For each item, compare KDL against the **Kasten dashboard**, which is the
+reference. Record the two numbers.
+
+1. **VM coverage.** Dashboard → Applications, filter type *Virtual Machine*.
+   Count VMs shown as protected and compare with
+   `.virtualization.protection.protectedVMs` / `.unprotectedVMs`.
+   Then check the named gaps: every entry in
+   `.virtualization.protection.unprotectedVmList` must genuinely have **no**
+   policy covering it. This is the assertion v2.1.1 got wrong (it claimed 6/6
+   where the truth was 4/6), so a mismatch here blocks the release.
+2. **Label-based VM policy re-evaluation.** Add the policy's VM label to a
+   previously unmatched VM, re-run KDL, and confirm that VM moves from
+   `unprotectedVmList` into `protectedBy`. Remove the label and confirm it moves
+   back. This proves the selector is re-resolved per run rather than cached.
+3. **Wildcards.** With a policy targeting `prod-*` (namespace or
+   `virtualMachineRef`), confirm all matching namespaces appear protected and
+   that `.coverage.unprotectedNamespaces` does **not** list them.
+4. **`NotIn` exceptions survive.** With a catch-all policy carrying an
+   exception, confirm the excluded namespaces land in
+   `.coverage.unprotectedBreakdown.excludedByPolicy` (deliberate) and **not** in
+   `actionableNamespaces`. If they vanish entirely, the wildcard expansion is
+   swallowing exclusions.
+5. **Additional export.** For a dual-export policy, compare both destinations
+   and their retentions in `.policies.items[].exports[]` against the dashboard.
+   Confirm the HTML "Export destinations" column shows both.
+6. **Profiles.** Confirm each backend is named specifically
+   (`S3`/`VeeamVaultAzure`/`VeeamVaultAWS`/`VBR`), not the generic
+   `ObjectStore`. For a hardened VBR repository, confirm
+   `vbrImmutable: true` and that Immutability reads ENABLED. If a profile still
+   reports `ObjectStore`, Phase A prints the command to capture the real CRD
+   shape — send it rather than guessing.
+7. **Snapshot consistency.** Cross-check
+   `.virtualization.vmRestorePointConsistency` against a few restore points in
+   the dashboard. Optional but valuable: stop the QEMU guest agent on one VM,
+   run its policy, and confirm the new restore point is reported
+   crash-consistent and the best practice flips to WARN.
+8. **Restricted RBAC** (the gate skipped at v2.1.1): re-run Phase A with a
+   `k10-admin`-only kubeconfig. The report must still generate,
+   `.rbacLimited.any` must be `true`, and namespace coverage must read
+   `NOT_ASSESSED` rather than a green `COMPLETE`.
+9. **Regression on the previous line.** Run KDL v2.1.1 and v2.2.0 back-to-back
+   on the same cluster and diff them:
+   `./kdl-diff.sh v211.json v220.json`. Every delta must be explainable by the
+   CHANGELOG's corrected-counting entries (`policies.withExport`, VM protection,
+   ransomware TLS pillar). An unexplained delta is a bug.
+
+If everything passes, bump `KDL_KASTEN_TESTED_MAX` only when a *newer* Kasten
+than 9.0 is validated — it is already `9.0` for this release.
+
 ## Pre-release checklist
 
 - [ ] **2nd-cluster validation** (most important gap): run on at least one
