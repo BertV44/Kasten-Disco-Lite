@@ -261,7 +261,12 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="2.1.1"
+KDL_VERSION="2.2.0"
+
+# Highest Kasten release this build was validated against (#kasten-v9).
+# Surfaced in the report so a newer cluster is flagged as "not yet validated"
+# instead of silently analysed with stale assumptions.
+KDL_KASTEN_TESTED_MAX="9.0"
 OUTPUT_FILE=""
 SKIP_HELM=false
 
@@ -462,6 +467,94 @@ def deepest_msg($depth):
     end
   end;
 def deepest_msg: deepest_msg(5);
+'
+
+# --- Shared selector helpers (v2.2.0, #kasten-v9) -------------------------
+# Kasten 9.0 added a second VM selector shape. A policy now targets either
+# namespaces or VMs, via one of three mutually-exclusive matchExpression keys
+# (Policies API: "Mutually Exclusive Selectors"):
+#
+#   k10.kasten.io/appNamespace          -> namespace-scoped policy
+#   k10.kasten.io/virtualMachineRef     -> VM policy, values "namespace/vmName"
+#   k10.kasten.io/virtualMachineNamespace -> VM policy (NEW 9.0), values are
+#                                          namespaces; spec.selector.matchLabels
+#                                          then filters on *VM* labels
+#
+# The third shape is why matchLabels can no longer be assumed to be namespace
+# labels: on a VM policy they are VM labels and must never be resolved against
+# the namespace inventory. `policy_scope` gives every consumer one answer.
+#
+# Kasten accepts shell-style globs in selector values ("prod-*"); `glob_match`
+# implements the same semantics via jq test() on an anchored, escaped pattern.
+# Prepend to any jq query via:  jq "$JQ_SELECTOR_LIB"' <your filter>'
+JQ_SELECTOR_LIB='
+def vm_ref_key: "k10.kasten.io/virtualMachineRef";
+def vm_ns_key:  "k10.kasten.io/virtualMachineNamespace";
+def app_ns_key: "k10.kasten.io/appNamespace";
+
+# Anchored glob match. Escapes regex metacharacters, then maps "*" -> ".*"
+# and "?" -> ".". Non-string input never matches.
+def glob_match($pattern):
+  if (type != "string") or ($pattern | type) != "string" then false
+  elif $pattern == "*" then true
+  else
+    . as $s |
+    ("^" + ($pattern
+             | gsub("(?<c>[.+^$(){}\\[\\]|\\\\])"; "\\" + .c)
+             | gsub("\\*"; ".*")
+             | gsub("\\?"; ".")) + "$") as $re |
+    (try ($s | test($re)) catch ($s == $pattern))
+  end;
+
+# Does any pattern in the list match the string?
+def glob_any($patterns): . as $s | ($patterns // []) | any(. as $p | $s | glob_match($p));
+
+# Selector scope of a policy object: "virtualMachine" | "namespace".
+# A policy is VM-scoped as soon as it carries either VM selector key.
+def policy_scope:
+  [(.spec.selector.matchExpressions // [])[]?.key] as $keys |
+  if ($keys | any(. == vm_ref_key or . == vm_ns_key)) then "virtualMachine"
+  else "namespace" end;
+
+# Namespaces a policy targets, taken from selector values only (no cluster
+# cross-reference). VM-ref values are "namespace/vmName" -> keep the part
+# before the first "/". Patterns are returned verbatim (may contain globs).
+def selector_ns_patterns:
+  (.spec.selector // {}) as $sel |
+  (
+    ($sel.matchNames // [])
+    + [ ($sel.matchExpressions // [])[]?
+        | select(.operator == "In")
+        | if   .key == app_ns_key then (.values // [])[]?
+          elif .key == vm_ns_key  then (.values // [])[]?
+          elif .key == vm_ref_key then ((.values // [])[]? | split("/")[0])
+          else empty end ]
+  ) | map(select(type == "string" and . != "")) | unique;
+
+# Namespace patterns a policy explicitly EXCLUDES (operator NotIn on a
+# namespace-bearing key). Must be subtracted from selector_ns_patterns: the
+# common catch-all-with-exceptions shape is `appNamespace In ["*"]` plus
+# `appNamespace NotIn [...]`, and expanding the "*" without honouring the NotIn
+# would silently mark deliberately-excluded namespaces as protected.
+def selector_ns_exclusion_patterns:
+  [ ((.spec.selector.matchExpressions // [])[]?
+      | select(.operator == "NotIn")
+      | if   .key == app_ns_key then (.values // [])[]?
+        elif .key == vm_ns_key  then (.values // [])[]?
+        elif .key == vm_ref_key then ((.values // [])[]? | split("/")[0])
+        else empty end) ]
+  | map(select(type == "string" and . != "")) | unique;
+
+# Expand the namespace patterns of a policy against the live namespace list, then
+# drop anything the policy excludes. Literal (glob-free) values are kept even
+# when they do not exist on the cluster, so dangling references stay visible.
+def resolved_ns($allNs):
+  (selector_ns_patterns) as $inc |
+  (selector_ns_exclusion_patterns) as $exc |
+  [ $inc[]
+    | . as $pat
+    | if ($pat | test("[*?]")) then ($allNs[]? | select(glob_match($pat))) else $pat end ]
+  | map(select(glob_any($exc) | not)) | unique;
 '
 
 ### -------------------------
@@ -673,6 +766,28 @@ else
 fi
 [ -z "$KASTEN_VERSION" ] && KASTEN_VERSION="unknown"
 debug "Kasten version: $KASTEN_VERSION"
+
+# Kasten major.minor, and whether it is newer than what this KDL build was
+# validated against (v2.2.0, #kasten-v9). A discovery tool that silently
+# analyses an unknown release is worse than one that says so: CRD fields move
+# between releases (Kasten 9.0 removed `instantRecovery` and
+# `targetVsphereStorage` from the Policy CRD and added a second VM selector),
+# and a "0 policies" section reads identically whether it is accurate or the
+# result of a schema change.
+KASTEN_MAJOR_MINOR=$(_ep "$KASTEN_VERSION" | sed -n 's/^v\{0,1\}\([0-9]\{1,\}\.[0-9]\{1,\}\).*/\1/p')
+KASTEN_NEWER_THAN_TESTED="false"
+if [ -n "$KASTEN_MAJOR_MINOR" ]; then
+  _k_maj=${KASTEN_MAJOR_MINOR%%.*}
+  _k_min=${KASTEN_MAJOR_MINOR#*.}
+  _t_maj=${KDL_KASTEN_TESTED_MAX%%.*}
+  _t_min=${KDL_KASTEN_TESTED_MAX#*.}
+  if [ "$_k_maj" -gt "$_t_maj" ] 2>/dev/null; then
+    KASTEN_NEWER_THAN_TESTED="true"
+  elif [ "$_k_maj" -eq "$_t_maj" ] 2>/dev/null && [ "$_k_min" -gt "$_t_min" ] 2>/dev/null; then
+    KASTEN_NEWER_THAN_TESTED="true"
+  fi
+fi
+debug "Kasten major.minor: ${KASTEN_MAJOR_MINOR:-unparsed} (tested up to $KDL_KASTEN_TESTED_MAX, newer=$KASTEN_NEWER_THAN_TESTED)"
 
 ### -------------------------
 ### Shared data collection (fetch once, reuse everywhere)
@@ -1060,6 +1175,48 @@ IMMUTABLE_PROFILES=$(_ep "$PROFILES_JSON" | jq '
 ')
 [ -z "$IMMUTABLE_PROFILES" ] && IMMUTABLE_PROFILES=0
 
+# Profile backend inventory (v2.2.0, #kasten-v9).
+# Kasten 9.0 makes two backends far more prominent, and neither is described by
+# a `protectionPeriod`:
+#   * Veeam Vault (objectStoreType VeeamVaultAzure / VeeamVaultAWS) — the AWS
+#     variant gained Registration authentication in 9.0.
+#   * Veeam Backup & Replication repositories (locationType VBR) — as of 9.0 a
+#     single VBR profile can receive BOTH Kubernetes metadata and snapshot data,
+#     so VBR is now a complete export target rather than a data-only sidecar.
+# `repoType` values such as LinuxHardened / ObjectLock carry the immutability
+# guarantee on a VBR repository, which no `protectionPeriod` field reflects.
+# Paths are resolved with a bounded deep scan because the exact nesting differs
+# between the documented schema and what live clusters return.
+PROFILE_BACKENDS=$(_ep "$PROFILES_JSON" | jq -c '
+  def deep_first(f): [ .. | objects | (f // empty) | select(. != null and . != "") ] | first;
+  [.items[]? | {
+    name: .metadata.name,
+    locationType: ((.spec.locationSpec | deep_first(.locationType?)) // .spec.locationSpec.type // null),
+    storeType: (.spec | deep_first(.objectStoreType?)),
+    repoType: (.spec | deep_first(.repoType?)),
+    repoName: (.spec | deep_first(.repoName?)),
+    protectionPeriod: (.spec | deep_first(.protectionPeriod?))
+  }]
+' 2>/dev/null || echo '[]')
+
+VBR_PROFILE_COUNT=$(safe_int "$(_ep "$PROFILE_BACKENDS" | jq '
+  [.[] | select((.locationType // "") == "VBR" or (.repoName // null) != null)] | length // 0')")
+VEEAM_VAULT_PROFILE_COUNT=$(safe_int "$(_ep "$PROFILE_BACKENDS" | jq '
+  [.[] | select((.storeType // "") | test("VeeamVault"; "i"))] | length // 0')")
+# VBR repositories whose type conveys immutability (hardened repo / object lock)
+VBR_HARDENED_COUNT=$(safe_int "$(_ep "$PROFILE_BACKENDS" | jq '
+  [.[] | select((.repoType // "") | test("hardened|objectlock|immutab"; "i"))] | length // 0')")
+
+debug "Profile backends: VBR=$VBR_PROFILE_COUNT (hardened: $VBR_HARDENED_COUNT), VeeamVault=$VEEAM_VAULT_PROFILE_COUNT"
+
+# Immutability signal is satisfied by EITHER a protectionPeriod (object store /
+# Veeam Vault) or a hardened VBR repository.
+IMMUTABLE_PROFILES_TOTAL=$((IMMUTABLE_PROFILES + VBR_HARDENED_COUNT))
+if [ "$IMMUTABLE_PROFILES_TOTAL" -gt 0 ] && [ "$IMMUTABILITY" != "true" ]; then
+  IMMUTABILITY="true"
+  debug "Immutability signal from hardened VBR repository (no protectionPeriod present)"
+fi
+
 debug "Profiles: $PROFILE_COUNT (Immutable: $IMMUTABLE_PROFILES, Days: $IMMUTABILITY_DAYS, Raw: $PROTECTION_PERIOD_RAW)"
 
 # Profile validation status (NEW v1.9)
@@ -1081,16 +1238,21 @@ debug "Profile validation: $PROFILE_FAILED_COUNT failed/failing"
 
 # v2.0 patch 5: detect profiles with skipTLSVerify=true (used in ransomware
 # readiness scoring). K10 profile schema uses skipSSLVerify (legacy) or
-# skipCertVerification (newer); we check both common paths under locationSpec
-# and infrastoreBlobStore.
+# skipCertVerification (newer).
+#
+# v2.2.0 (#kasten-v9): replaced the fixed path list with a bounded deep scan.
+# The previous version only looked under `locationSpec.objectStore` and
+# `infrastoreBlobStore`, so a Veeam Backup & Replication profile — where the
+# flag lives under `locationSpec.vbr.skipSSLVerify`, and which Kasten 9.0 turns
+# into a first-class single-profile export target — always reported TLS
+# verification as enabled. That handed a free 5/5 on the ransomware TLS pillar
+# to clusters exporting to VBR over unverified TLS.
 PROFILE_TLS_SKIPPED=$(_ep "$PROFILES_JSON" | jq -c '
   [.items[]? |
     . as $p |
-    (
-      ($p.spec.locationSpec.objectStore.skipSSLVerify // false) or
-      ($p.spec.locationSpec.objectStore.skipCertVerification // false) or
-      ($p.spec.infrastoreBlobStore.skipSSLVerify // false) or
-      ($p.spec.infrastoreBlobStore.skipCertVerification // false)
+    ( [ $p.spec | .. | objects
+        | (.skipSSLVerify? // .skipCertVerification? // empty)
+        | select(. == true) ] | length > 0
     ) as $skip |
     if $skip then {name: $p.metadata.name} else empty end
   ]
@@ -1160,9 +1322,43 @@ ALL_NS_POLICIES="$(_ep "$APP_POLICIES_JSON" | jq '[
 ] | length // 0')"
 [ -z "$ALL_NS_POLICIES" ] && ALL_NS_POLICIES=0
 
-# Count policies with export action
-POLICIES_WITH_EXPORT=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select(.spec.actions[]?.action == "export")] | length // 0')
+# Count policies with export action.
+# v2.2.0 (#kasten-v9): `select(.spec.actions[]?.action == "export")` is a
+# generator inside select, so it emitted the policy ONCE PER matching action.
+# That was invisible while Kasten allowed a single export action per policy;
+# with 9.0 additional export it inflated the count (a cluster with 3 exporting
+# policies, two of them dual-export, reported 5). Counted via index() instead.
+POLICIES_WITH_EXPORT=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select([.spec.actions[]?.action] | index("export"))] | length // 0')
 [ -z "$POLICIES_WITH_EXPORT" ] && POLICIES_WITH_EXPORT=0
+
+# Additional / dual export (Kasten 9.0 Technical Preview, #kasten-v9).
+# A policy may now carry MORE THAN ONE export action, each with its own
+# profile, frequency and retention, to replicate restore points to two
+# location profiles. Everything downstream that used `first` on the export
+# action list therefore reported only half the picture; these variables expose
+# the full set. Kasten currently caps this at two export locations.
+MULTI_EXPORT_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
+  [.items[]?
+    | . as $p
+    | ([.spec.actions[]? | select(.action == "export")]) as $exports
+    | select(($exports | length) > 1)
+    | {
+        name: $p.metadata.name,
+        exportCount: ($exports | length),
+        profiles: [$exports[] | .exportParameters.profile.name // "unnamed"]
+      }
+  ]
+' 2>/dev/null || echo '[]')
+MULTI_EXPORT_COUNT=$(safe_int "$(_ep "$MULTI_EXPORT_POLICIES" | jq 'length // 0')")
+
+# Policies whose two export actions point at the SAME profile: a copy-paste
+# mistake that doubles export cost and RPO pressure without adding redundancy.
+MULTI_EXPORT_SAME_PROFILE=$(_ep "$MULTI_EXPORT_POLICIES" | jq -c '
+  [.[] | select((.profiles | unique | length) < (.profiles | length)) | .name]
+' 2>/dev/null || echo '[]')
+MULTI_EXPORT_SAME_PROFILE_COUNT=$(safe_int "$(_ep "$MULTI_EXPORT_SAME_PROFILE" | jq 'length // 0')")
+
+debug "Multi-export policies: $MULTI_EXPORT_COUNT (same profile twice: $MULTI_EXPORT_SAME_PROFILE_COUNT)"
 POLICIES_BACKUP_ONLY=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select((.spec.actions | map(.action) | contains(["export"]) | not) and (.spec.actions | map(.action) | contains(["backup"])))] | length // 0')
 
 # Count policies using presets
@@ -1174,11 +1370,11 @@ POLICIES_WITH_PRESETS=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select(.spec.pre
 # catalog of cluster A). Tracking them separately makes multi-cluster
 # import workflows visible — particularly relevant when MC_ROLE=secondary.
 IMPORT_POLICY_COUNT=$(safe_int "$(_ep "$POLICIES_JSON" | jq '
-  [.items[]? | select(.spec.actions[]?.action == "import")] | length // 0
+  [.items[]? | select([.spec.actions[]?.action] | index("import"))] | length // 0
 ')")
 
 IMPORT_POLICIES_JSON=$(_ep "$POLICIES_JSON" | jq -c '
-  [.items[]? | select(.spec.actions[]?.action == "import") | {
+  [.items[]? | select([.spec.actions[]?.action] | index("import")) | {
     name: .metadata.name,
     frequency: (.spec.frequency // "manual"),
     profile: (
@@ -1662,18 +1858,27 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
     )] | length
   ')
   
-  # Find policies with complex selectors (matchLabels or matchExpressions not targeting namespaces directly)
-  # Simplified logic to avoid jq iteration errors
-  COMPLEX_SELECTOR_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -r '
+  # Find policies with complex selectors (matchLabels that select target
+  # NAMESPACES by label, and so must be resolved against the API server).
+  #
+  # v2.2.0 (#kasten-v9): VM-scoped policies are excluded here. On a Kasten 9.0
+  # label-based VM policy, matchLabels filters *VirtualMachines*, not
+  # namespaces — feeding those labels to `get namespaces -l ...` below either
+  # resolves nothing or, worse, matches unrelated namespaces that happen to
+  # carry the same label. VM label selectors are resolved in the
+  # virtualization section instead, against the VM inventory.
+  COMPLEX_SELECTOR_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -r "$JQ_SELECTOR_LIB"'
     [.items[]? | select(
       .spec.selector != null and
-      (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0)
+      (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0) and
+      (policy_scope == "namespace")
     ) | .metadata.name] | join(", ")
   ' 2>/dev/null || echo "")
-  COMPLEX_COUNT=$(_ep "$APP_POLICIES_JSON" | jq '
+  COMPLEX_COUNT=$(_ep "$APP_POLICIES_JSON" | jq "$JQ_SELECTOR_LIB"'
     [.items[]? | select(
       .spec.selector != null and
-      (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0)
+      (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0) and
+      (policy_scope == "namespace")
     )] | length
   ' 2>/dev/null || echo "0")
   
@@ -1693,29 +1898,27 @@ fi
 debug "Has catch-all app policy: $HAS_CATCHALL_POLICY"
 debug "Has complex selector: $HAS_COMPLEX_SELECTOR"
 
-# Get namespaces explicitly targeted by app policies (matchNames or matchExpressions with namespace values)
-PROTECTED_NAMESPACES=$(_ep "$APP_POLICIES_JSON" | jq -c '
-  [.items[]? |
-    if .spec.selector.matchNames then
-      .spec.selector.matchNames[]?
-    elif .spec.selector.matchExpressions then
-      (.spec.selector.matchExpressions[]? |
-        select(.operator == "In") |
-        if .key == "k10.kasten.io/appNamespace" then
-          .values[]?
-        elif .key == "k10.kasten.io/virtualMachineRef" then
-          # VM-ref values are "namespace/vmName" (or "namespace/*"); the
-          # protected namespace is the part before the first "/". Without this,
-          # VM-protection policies left their namespaces looking unprotected.
-          (.values[]? | split("/")[0])
-        else
-          empty
-        end
-      )
-    else
-      empty
-    end
-  ] | map(select(. != null and . != "")) | unique // []
+# Get namespaces explicitly targeted by app policies (matchNames or
+# matchExpressions with namespace values).
+#
+# v2.2.0 (#kasten-v9): two changes, both required by Kasten 9.0 selectors.
+#   1. `k10.kasten.io/virtualMachineNamespace` (new in 9.0) is now recognised
+#      alongside `virtualMachineRef` — its values ARE namespaces. Without it,
+#      every namespace protected by a label-based VM policy was reported as an
+#      unprotected gap.
+#   2. Selector values are glob-expanded against the real namespace inventory.
+#      Kasten accepts `prod-*` in appNamespace, virtualMachineRef and
+#      virtualMachineNamespace values (the 9.0 VM docs use exactly that form),
+#      but the previous exact-match `index($ns)` downstream could never match a
+#      pattern, so wildcard-protected namespaces read as gaps. Literal values
+#      are still kept as-is so a reference to a non-existing namespace stays
+#      visible to the policy-analysis section.
+printf '%s' "${ALL_NAMESPACES:-[]}" > "$TEMP_DIR/pn_allns.json"
+PROTECTED_NAMESPACES=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP_DIR/pn_allns.json" "$JQ_SELECTOR_LIB"'
+  ($allNs[0] // []) as $allNs |
+  # Resolve per policy (so a NotIn exception on one policy cannot cancel another
+  # policy that genuinely does protect that namespace), then union.
+  [ .items[]? | resolved_ns($allNs)[] ] | map(select(type == "string" and . != "")) | unique
 ' 2>/dev/null || echo '[]')
 
 # Validate
@@ -1730,8 +1933,11 @@ fi
 # gaps). For each matchLabels policy, build a comma-separated label selector and
 # ask the API server which namespaces carry those labels, then union the result.
 if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
-  MATCHLABELS_SELECTORS=$(_ep "$APP_POLICIES_JSON" | jq -r '
+  # VM-scoped policies are skipped: their matchLabels select VirtualMachines,
+  # not namespaces (Kasten 9.0 label-based VM policies, #kasten-v9).
+  MATCHLABELS_SELECTORS=$(_ep "$APP_POLICIES_JSON" | jq -r "$JQ_SELECTOR_LIB"'
     .items[]?
+    | select(policy_scope == "namespace")
     | (.spec.selector.matchLabels // {})
     | select(length > 0)
     | to_entries | map("\(.key)=\(.value)") | join(",")
@@ -1817,7 +2023,7 @@ debug "Unprotected list: $UNPROTECTED_NS_JSON"
 # matchLabels resolution returns []; matchNames still flag empty correctly.
 
 printf '%s' "${ALL_NAMESPACES_LABELED:-[]}" > "$TEMP_DIR/pa_nslabeled.json"
-POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" '
+POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" "$JQ_SELECTOR_LIB"'
   # Resolve targeted namespaces for a single policy.
   # Returns {namespaces: [...], resolvable: bool, kind: "catchall"|"matchNames"|...}
   def resolve_ns(policy; allNs):
@@ -1829,29 +2035,58 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
       {namespaces: $sel.matchNames, resolvable: true, kind: "matchNames"}
     elif $sel.matchExpressions then
       ([$sel.matchExpressions[]? |
-        if .key == "k10.kasten.io/appNamespace" and .operator == "In" then
-          {ns: .values[]?, unresolvable: false}
-        elif .key == "k10.kasten.io/virtualMachineRef" and .operator == "In" then
+        if .key == app_ns_key and .operator == "In" then
+          # Glob-expand ("myApp-*" is valid Kasten syntax) against live
+          # namespaces; keep literals verbatim so dead references stay visible.
+          . as $expr |
+          ($expr.values // [])[] as $pat |
+          if ($pat | test("[*?]")) then
+            (allNs[]? | select(.name | glob_match($pat)) | {ns: .name, unresolvable: false})
+          else {ns: $pat, unresolvable: false} end
+        elif .key == vm_ref_key and .operator == "In" then
           # VM-ref values are "namespace/vmName" (or "namespace/*"); the target
           # namespace is the part before the first "/". Without this branch the
           # generic label-resolution below matched nothing and VM-protection
           # policies were wrongly flagged isEmpty.
-          {ns: (.values[]? | split("/")[0]), unresolvable: false}
+          . as $expr |
+          (($expr.values // [])[] | split("/")[0]) as $pat |
+          if ($pat | test("[*?]")) then
+            (allNs[]? | select(.name | glob_match($pat)) | {ns: .name, unresolvable: false})
+          else {ns: $pat, unresolvable: false} end
+        elif .key == vm_ns_key and .operator == "In" then
+          # NEW Kasten 9.0 (#kasten-v9): label-based VM policy. Values are
+          # namespaces (globs allowed). Previously this key fell through to the
+          # generic "label In" branch below, which looked for a NAMESPACE
+          # carrying the label `k10.kasten.io/virtualMachineNamespace` — never
+          # true — so every 9.0 label-based VM policy resolved to zero
+          # namespaces and was reported as an empty/orphan policy.
+          . as $expr |
+          ($expr.values // [])[] as $pat |
+          if ($pat | test("[*?]")) then
+            (allNs[]? | select(.name | glob_match($pat)) | {ns: .name, unresolvable: false})
+          else {ns: $pat, unresolvable: false} end
         elif .operator == "In" then
           . as $expr |
           (allNs[]? | select(
             (.labels // {}) as $lbls |
             ($expr.values | any(. as $v | $lbls[$expr.key] == $v))
           ) | {ns: .name, unresolvable: false})
+        elif .operator == "NotIn" and (.key == app_ns_key or .key == vm_ns_key or .key == vm_ref_key) then
+          # Handled exactly below via selector_ns_exclusion_patterns, so it no
+          # longer forces the whole selector to "unresolvable" (v2.2.0). Other
+          # operators (Exists / DoesNotExist / NotIn on a label key) still do.
+          empty
         else
           {ns: null, unresolvable: true}
         end
       ]) as $exprs |
+      # Subtract the NotIn exceptions of this policy from the resolved set.
+      ((policy | selector_ns_exclusion_patterns)) as $excl |
+      ([$exprs[]? | select(.ns != null) | .ns] | map(select(glob_any($excl) | not)) | unique) as $kept |
       if ($exprs | any(.unresolvable)) then
-        {namespaces: [$exprs[]? | select(.ns != null) | .ns] | unique,
-         resolvable: false, kind: "matchExpressions(complex)"}
+        {namespaces: $kept, resolvable: false, kind: "matchExpressions(complex)"}
       else
-        {namespaces: [$exprs[]?.ns] | unique, resolvable: true, kind: "matchExpressions"}
+        {namespaces: $kept, resolvable: true, kind: "matchExpressions"}
       end
     elif $sel.matchLabels then
       {
@@ -1880,6 +2115,12 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
       name: $p.metadata.name,
       actions: ([$p.spec.actions[]?.action] | unique),
       frequency: ($p.spec.frequency // null),
+      # scope distinguishes namespace-scoped from VM-scoped policies (Kasten
+      # 9.0 label-based VM policies, #kasten-v9). For a VM-scoped policy the
+      # namespaces below are the CANDIDATE namespaces; spec.selector.matchLabels
+      # further filters which VMs inside them are protected, so "not empty"
+      # here means "the namespaces exist", not "at least one VM matches".
+      scope: ($p | policy_scope),
       selectorKind: $r.kind,
       resolvable: $r.resolvable,
       targetedNamespaces: $r.namespaces,
@@ -1898,9 +2139,16 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
     $resolved[$j] as $p2 |
     ($p1.existingNamespaces | map(. as $n | select($p2.existingNamespaces | index($n)))) as $sharedNs |
     ($p1.actions | map(. as $a | select($p2.actions | index($a)))) as $sharedActions |
-    if ($sharedNs | length) > 0 and ($sharedActions | length) > 0 then
+    # v2.2.0 (#kasten-v9): only compare policies of the same scope. A VM policy
+    # and a namespace policy sharing a namespace are not redundant — they
+    # protect different Kasten application types (appType=virtualMachine vs the
+    # namespace app), so pairing them produced noise on every 9.0 cluster that
+    # mixes VM and namespace protection.
+    if ($sharedNs | length) > 0 and ($sharedActions | length) > 0
+       and ($p1.scope == $p2.scope) then
       {
         policies: [$p1.name, $p2.name],
+        scope: $p1.scope,
         sharedNamespaces: $sharedNs,
         sharedActions: $sharedActions,
         sameFrequency: ($p1.frequency == $p2.frequency),
@@ -2776,97 +3024,187 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
 
   debug "Total VMs: $TOTAL_VMS (Running: $VMS_RUNNING, Stopped: $VMS_STOPPED)"
 
-  # Detect VM-based policies (using virtualMachineRef selector - Kasten 8.5+)
-  VM_POLICIES_JSON="$(_ep "$POLICIES_JSON" | jq -c '[
-    .items[] | select(
-      .spec.selector.matchExpressions[]? |
-      select(.key == "k10.kasten.io/virtualMachineRef")
-    )
-  ]')"
-  VM_POLICY_COUNT=$(_ep "$VM_POLICIES_JSON" | jq 'length')
+  # Detect VM-based policies. Two selector shapes exist (#kasten-v9):
+  #   - k10.kasten.io/virtualMachineRef        (Kasten 8.5+)  values "ns/vmName"
+  #   - k10.kasten.io/virtualMachineNamespace  (Kasten 9.0+)  values are
+  #     namespaces, and spec.selector.matchLabels filters on VM labels
+  VM_POLICIES_JSON="$(_ep "$POLICIES_JSON" | jq -c "$JQ_SELECTOR_LIB"'
+    [.items[]? | select(policy_scope == "virtualMachine")]
+  ' 2>/dev/null || echo '[]')"
+  VM_POLICY_COUNT=$(safe_int "$(_ep "$VM_POLICIES_JSON" | jq 'length // 0')")
 
-  debug "VM-based policies: $VM_POLICY_COUNT"
+  # Split by selector shape so the report can show which mechanism is in use.
+  VM_POLICY_REF_COUNT=$(safe_int "$(_ep "$VM_POLICIES_JSON" | jq "$JQ_SELECTOR_LIB"'
+    [.[] | select([(.spec.selector.matchExpressions // [])[]?.key] | any(. == vm_ref_key))] | length // 0
+  ' 2>/dev/null || echo 0)")
+  VM_POLICY_LABEL_COUNT=$(safe_int "$(_ep "$VM_POLICIES_JSON" | jq "$JQ_SELECTOR_LIB"'
+    [.[] | select([(.spec.selector.matchExpressions // [])[]?.key] | any(. == vm_ns_key))] | length // 0
+  ' 2>/dev/null || echo 0)")
+
+  debug "VM-based policies: $VM_POLICY_COUNT (byRef: $VM_POLICY_REF_COUNT, byLabel: $VM_POLICY_LABEL_COUNT)"
 
   # Extract explicitly protected VM references from VM policies
-  PROTECTED_VM_REFS="$(_ep "$VM_POLICIES_JSON" | jq -c '[
-    .[] | .spec.selector.matchExpressions[]? |
-    select(.key == "k10.kasten.io/virtualMachineRef") |
-    .values[]?
-  ] | unique')"
+  PROTECTED_VM_REFS="$(_ep "$VM_POLICIES_JSON" | jq -c "$JQ_SELECTOR_LIB"'
+    [.[] | (.spec.selector.matchExpressions // [])[]? |
+     select(.key == vm_ref_key) | (.values // [])[]?] | unique
+  ' 2>/dev/null || echo '[]')"
 
   # Count explicitly protected VMs (via virtualMachineRef)
-  PROTECTED_VM_COUNT_EXPLICIT=$(_ep "$PROTECTED_VM_REFS" | jq 'length')
+  PROTECTED_VM_COUNT_EXPLICIT=$(safe_int "$(_ep "$PROTECTED_VM_REFS" | jq 'length // 0')")
 
   # Check for wildcard patterns in VM policies
   VM_HAS_WILDCARDS="false"
-  WILDCARD_COUNT=$(_ep "$PROTECTED_VM_REFS" | jq '[.[] | select(test("\\*"))] | length')
+  WILDCARD_COUNT=$(safe_int "$(_ep "$PROTECTED_VM_REFS" | jq '[.[] | select(test("[*?]"))] | length // 0')")
   if [ "$WILDCARD_COUNT" -gt 0 ] 2>/dev/null; then
     VM_HAS_WILDCARDS="true"
   fi
 
-  # Check if any namespace-based (catch-all) policies also cover VMs
-  # VMs in namespaces covered by app policies are also protected
-  VM_NAMESPACES="$(_ep "$VMS_JSON" | jq -r '[.items[].metadata.namespace] | unique | .[]')"
-  VM_COVERED_BY_NS_POLICY=0
+  # --- Per-VM protection resolution (v2.2.0, #kasten-v9) -------------------
+  # Replaces the previous estimate (explicitRefs + nsCovered, capped at total,
+  # with "wildcards present" short-circuiting to 100% protected). That estimate
+  # could not express Kasten 9.0 label-based VM policies at all, double-counted
+  # a VM protected by both a VM policy and a namespace policy, and reported
+  # every VM as protected as soon as a single wildcard ref existed.
+  #
+  # Each VM is now matched individually against every candidate policy:
+  #   * VM policy by ref    -> glob match on "namespace/name"
+  #   * VM policy by label  -> namespace glob match AND all matchLabels present
+  #                            on the VM with the same value (subset semantics,
+  #                            as Kasten re-evaluates the selector each run)
+  #   * namespace policy    -> catch-all, matchNames, or appNamespace In,
+  #                            minus any appNamespace NotIn exclusion
+  # Only policies carrying a backup action confer protection.
+  printf '%s' "$VMS_JSON" > "$TEMP_DIR/vms_raw_for_cov.json"
+  printf '%s' "$APP_POLICIES_JSON" > "$TEMP_DIR/apppol_for_vmcov.json"
+  VM_COVERAGE_JSON="$(jq -nc \
+      --slurpfile vms "$TEMP_DIR/vms_raw_for_cov.json" \
+      --slurpfile pols "$TEMP_DIR/apppol_for_vmcov.json" \
+      "$JQ_SELECTOR_LIB"'
+    (($vms[0] // {"items":[]}).items // []) as $vms |
+    (($pols[0] // {"items":[]}).items // []) as $pols |
 
-  if [ "$HAS_CATCHALL_POLICY" = "true" ]; then
-    # All VMs are covered by namespace-level catch-all policy
-    VM_COVERED_BY_NS_POLICY=$TOTAL_VMS
-  else
-    # Check which VM namespaces are covered by app policies
-    for vm_ns in $VM_NAMESPACES; do
-      NS_COVERED="false"
-      # Check if this namespace is in the protected list
-      if _ep "$APP_POLICIES_JSON" | jq -e --arg ns "$vm_ns" '
-        .items[] | select(
-          .spec.selector == null or
-          (.spec.selector.matchNames // [] | index($ns)) or
-          (.spec.selector.matchExpressions[]? | select(
-            .key == "k10.kasten.io/appNamespace" and .operator == "In" and
-            (.values | index($ns))
+    # Namespaces explicitly excluded by a policy-level NotIn on appNamespace.
+    def ns_exclusions:
+      [ (.spec.selector.matchExpressions // [])[]?
+        | select(.key == app_ns_key and .operator == "NotIn")
+        | (.values // [])[]? ];
+
+    # Does this namespace-scoped policy cover $ns?
+    def ns_policy_covers($ns):
+      (.spec.selector // null) as $sel |
+      (ns_exclusions) as $excl |
+      if ($ns | glob_any($excl)) then false
+      elif $sel == null or $sel == {} or
+           ($sel.matchNames == null and $sel.matchExpressions == null and $sel.matchLabels == null)
+        then true
+      elif ($sel.matchNames // []) | length > 0 then ($ns | glob_any($sel.matchNames))
+      else
+        [ ($sel.matchExpressions // [])[]?
+          | select(.key == app_ns_key and .operator == "In")
+          | (.values // [])[]? ] as $pats |
+        (($pats | length) > 0) and ($ns | glob_any($pats))
+      end;
+
+    # Does this VM policy cover the given VM?
+    def vm_policy_covers($ns; $name; $labels):
+      (.spec.selector // {}) as $sel |
+      ([ ($sel.matchExpressions // [])[]? | select(.key == vm_ref_key and .operator == "In")
+         | (.values // [])[]? ]) as $refPats |
+      ([ ($sel.matchExpressions // [])[]? | select(.key == vm_ns_key and .operator == "In")
+         | (.values // [])[]? ]) as $nsPats |
+      (
+        (($refPats | length) > 0 and (($ns + "/" + $name) | glob_any($refPats)))
+        or
+        (($nsPats | length) > 0
+          and ($ns | glob_any($nsPats))
+          and (
+            ($sel.matchLabels // {}) as $ml |
+            (($ml | length) == 0) or all(($ml | to_entries)[]; ($labels[.key] // null) == .value)
           ))
-        )' >/dev/null 2>&1; then
-        NS_COVERED="true"
-      fi
-      if [ "$NS_COVERED" = "true" ]; then
-        NS_VM_COUNT=$(_ep "$VMS_JSON" | jq --arg ns "$vm_ns" '[.items[] | select(.metadata.namespace == $ns)] | length')
-        VM_COVERED_BY_NS_POLICY=$((VM_COVERED_BY_NS_POLICY + NS_VM_COUNT))
-      fi
-    done
+      );
+
+    [ $vms[] | . as $vm |
+      (.metadata.namespace // "") as $ns |
+      (.metadata.name // "") as $name |
+      (.metadata.labels // {}) as $labels |
+      ([ $pols[]
+         | select([.spec.actions[]?.action] | index("backup"))
+         | . as $p
+         | if ($p | policy_scope) == "virtualMachine"
+           then (if ($p | vm_policy_covers($ns; $name; $labels)) then {n: $p.metadata.name, k: "vm"} else empty end)
+           else (if ($p | ns_policy_covers($ns))               then {n: $p.metadata.name, k: "namespace"} else empty end)
+           end ]) as $matches |
+      {
+        name: $name,
+        namespace: $ns,
+        protectedBy: ([$matches[].n] | unique),
+        protectedByVmPolicy: (([$matches[] | select(.k == "vm")] | length) > 0),
+        protectedByNsPolicy: (([$matches[] | select(.k == "namespace")] | length) > 0)
+      }
+    ]
+  ' 2>/dev/null)" || { _jq_fail "VM protection coverage"; VM_COVERAGE_JSON='[]'; }
+  if ! _ep "$VM_COVERAGE_JSON" | jq -e 'type == "array"' >/dev/null 2>&1; then
+    _jq_fail "VM protection coverage"
+    VM_COVERAGE_JSON='[]'
   fi
 
-  # Total protected VMs = unique VMs covered by either VM policies or namespace policies
-  # For simplicity, if wildcards exist, mark as "partial" coverage
-  if [ "$VM_HAS_WILDCARDS" = "true" ]; then
-    PROTECTED_VM_COUNT="$TOTAL_VMS"
-    VM_PROTECTION_NOTE="wildcard patterns detected - verify coverage"
-  elif [ "$VM_COVERED_BY_NS_POLICY" -ge "$TOTAL_VMS" ] 2>/dev/null; then
-    PROTECTED_VM_COUNT="$TOTAL_VMS"
-    VM_PROTECTION_NOTE="covered by namespace-level policies"
-  elif [ "$PROTECTED_VM_COUNT_EXPLICIT" -gt 0 ] || [ "$VM_COVERED_BY_NS_POLICY" -gt 0 ]; then
-    # Combine explicit VM refs and namespace coverage (estimate)
-    PROTECTED_VM_COUNT=$((PROTECTED_VM_COUNT_EXPLICIT + VM_COVERED_BY_NS_POLICY))
-    if [ "$PROTECTED_VM_COUNT" -gt "$TOTAL_VMS" ]; then
-      PROTECTED_VM_COUNT=$TOTAL_VMS
-    fi
-    VM_PROTECTION_NOTE="via VM policies and namespace policies"
-  else
-    PROTECTED_VM_COUNT=0
-    VM_PROTECTION_NOTE="no VM-specific or namespace coverage detected"
-  fi
+  PROTECTED_VM_COUNT=$(safe_int "$(_ep "$VM_COVERAGE_JSON" | jq '[.[] | select((.protectedBy | length) > 0)] | length // 0')")
+  VM_PROTECTED_BY_VM_POLICY=$(safe_int "$(_ep "$VM_COVERAGE_JSON" | jq '[.[] | select(.protectedByVmPolicy)] | length // 0')")
+  VM_COVERED_BY_NS_POLICY=$(safe_int "$(_ep "$VM_COVERAGE_JSON" | jq '[.[] | select(.protectedByNsPolicy)] | length // 0')")
+  UNPROTECTED_VM_LIST=$(_ep "$VM_COVERAGE_JSON" | jq -c '[.[] | select((.protectedBy | length) == 0) | (.namespace + "/" + .name)]' 2>/dev/null || echo '[]')
 
   UNPROTECTED_VM_COUNT=$((TOTAL_VMS - PROTECTED_VM_COUNT))
   if [ "$UNPROTECTED_VM_COUNT" -lt 0 ]; then
     UNPROTECTED_VM_COUNT=0
   fi
 
+  # Human-readable summary of *how* coverage is achieved.
+  if [ "$TOTAL_VMS" -eq 0 ]; then
+    VM_PROTECTION_NOTE="no VMs on this cluster"
+  elif [ "$PROTECTED_VM_COUNT" -eq 0 ]; then
+    VM_PROTECTION_NOTE="no VM-specific or namespace coverage detected"
+  elif [ "$VM_PROTECTED_BY_VM_POLICY" -gt 0 ] && [ "$VM_COVERED_BY_NS_POLICY" -gt 0 ]; then
+    VM_PROTECTION_NOTE="via VM policies and namespace policies"
+  elif [ "$VM_PROTECTED_BY_VM_POLICY" -gt 0 ]; then
+    VM_PROTECTION_NOTE="via VM-based policies"
+  else
+    VM_PROTECTION_NOTE="covered by namespace-level policies"
+  fi
+
   debug "Protected VMs: $PROTECTED_VM_COUNT / $TOTAL_VMS (unprotected: $UNPROTECTED_VM_COUNT)"
+  debug "VM coverage: byVmPolicy=$VM_PROTECTED_BY_VM_POLICY byNsPolicy=$VM_COVERED_BY_NS_POLICY"
   debug "VM protection note: $VM_PROTECTION_NOTE"
 
   # VM-based RestorePoints (appType=virtualMachine label)
   VM_RESTORE_POINTS=$($CLI get restorepoints.apps.kio.kasten.io -A -l "k10.kasten.io/appType=virtualMachine" --no-headers 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 
   debug "VM RestorePoints: $VM_RESTORE_POINTS"
+
+  # Snapshot consistency of VM RestorePoints (v2.2.0, #kasten-v9).
+  # Kasten records status.vmInfo.snapshotConsistency per VM RestorePoint:
+  # ApplicationConsistent (guest quiesced via the QEMU guest agent) or
+  # CrashConsistent (freeze unavailable or timed out). A silent fallback to
+  # crash-consistent is the single most common cause of "the restore worked but
+  # the database needed recovery" support cases, so it is surfaced explicitly.
+  # Derived from the already-fetched restorepoints_raw.json: no extra call.
+  VM_RP_CONSISTENCY=$(jq -c '
+    [ (.items // [])[]
+      | select((.metadata.labels["k10.kasten.io/appType"] // "") == "virtualMachine")
+      | (.status.vmInfo.snapshotConsistency // "Unknown") ]
+    | {
+        applicationConsistent: ([.[] | select(. == "ApplicationConsistent")] | length),
+        crashConsistent:       ([.[] | select(. == "CrashConsistent")] | length),
+        unknown:               ([.[] | select(. != "ApplicationConsistent" and . != "CrashConsistent")] | length),
+        total:                 length
+      }
+  ' "$TEMP_DIR/restorepoints_raw.json" 2>/dev/null) \
+    || { _jq_fail "VM snapshot consistency"; VM_RP_CONSISTENCY='{"applicationConsistent":0,"crashConsistent":0,"unknown":0,"total":0}'; }
+  if ! _ep "$VM_RP_CONSISTENCY" | jq -e '.total' >/dev/null 2>&1; then
+    VM_RP_CONSISTENCY='{"applicationConsistent":0,"crashConsistent":0,"unknown":0,"total":0}'
+  fi
+  VM_RP_CRASH_CONSISTENT=$(safe_int "$(_ep "$VM_RP_CONSISTENCY" | jq '.crashConsistent // 0')")
+
+  debug "VM RestorePoint consistency: $VM_RP_CONSISTENCY"
 
   # Guest filesystem freeze detection
   VMS_FREEZE_DISABLED=$(_ep "$VMS_JSON" | jq '[.items[] | select(.metadata.annotations["k10.kasten.io/freezeVM"] == "false")] | length')
@@ -2887,22 +3225,50 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
   debug "VM Freeze: $VMS_FREEZE_ENABLED enabled, $VMS_FREEZE_DISABLED disabled (timeout: $FREEZE_TIMEOUT)"
   debug "VM Snapshot Concurrency: $VM_SNAPSHOT_CONCURRENCY"
 
-  # Build VM details JSON for output
-  VM_DETAILS_JSON="$(_ep "$VMS_JSON" | jq -c '[.items[] | {
-    name: .metadata.name,
-    namespace: .metadata.namespace,
-    status: (.status.printableStatus // "Unknown"),
-    ready: (.status.ready // false),
-    freezeDisabled: (.metadata.annotations["k10.kasten.io/freezeVM"] == "false")
-  }]')"
+  # Build VM details JSON for output. Per-VM protection (from VM_COVERAGE_JSON)
+  # is merged in so the report can name the unprotected VMs instead of only
+  # printing a count (#kasten-v9).
+  printf '%s' "$VM_COVERAGE_JSON" > "$TEMP_DIR/vm_coverage.json"
+  VM_DETAILS_JSON="$(_ep "$VMS_JSON" | jq -c --slurpfile cov "$TEMP_DIR/vm_coverage.json" '
+    (($cov[0] // []) | map({key: (.namespace + "/" + .name), value: .}) | from_entries) as $cov |
+    [.items[] |
+      (($cov[(.metadata.namespace + "/" + .metadata.name)]) // {protectedBy: [], protectedByVmPolicy: false, protectedByNsPolicy: false}) as $c |
+      {
+        name: .metadata.name,
+        namespace: .metadata.namespace,
+        status: (.status.printableStatus // "Unknown"),
+        ready: (.status.ready // false),
+        freezeDisabled: (.metadata.annotations["k10.kasten.io/freezeVM"] == "false"),
+        protected: (($c.protectedBy | length) > 0),
+        protectedBy: $c.protectedBy,
+        protectionSource: (
+          if $c.protectedByVmPolicy and $c.protectedByNsPolicy then "vm+namespace"
+          elif $c.protectedByVmPolicy then "vm"
+          elif $c.protectedByNsPolicy then "namespace"
+          else "none" end
+        )
+      }
+    ]' 2>/dev/null || echo '[]')"
 
-  # VM policy details
-  VM_POLICY_DETAILS_JSON="$(_ep "$VM_POLICIES_JSON" | jq -c '[.[] | {
-    name: .metadata.name,
-    frequency: (.spec.frequency // "manual"),
-    actions: [.spec.actions[]?.action],
-    vmRefs: [.spec.selector.matchExpressions[]? | select(.key == "k10.kasten.io/virtualMachineRef") | .values[]?]
-  }]')"
+  # VM policy details. selectorKind tells the reader which Kasten mechanism the
+  # policy uses: byRef (8.5+), byLabel (9.0+), or both.
+  VM_POLICY_DETAILS_JSON="$(_ep "$VM_POLICIES_JSON" | jq -c "$JQ_SELECTOR_LIB"'[.[] |
+    ([(.spec.selector.matchExpressions // [])[]? | select(.key == vm_ref_key) | (.values // [])[]?]) as $refs |
+    ([(.spec.selector.matchExpressions // [])[]? | select(.key == vm_ns_key)  | (.values // [])[]?]) as $nsPats |
+    {
+      name: .metadata.name,
+      frequency: (.spec.frequency // "manual"),
+      actions: [.spec.actions[]?.action],
+      vmRefs: $refs,
+      vmNamespaces: $nsPats,
+      vmLabels: (.spec.selector.matchLabels // {}),
+      selectorKind: (
+        if (($refs | length) > 0) and (($nsPats | length) > 0) then "byRef+byLabel"
+        elif ($nsPats | length) > 0 then "byLabel"
+        elif ($refs | length) > 0 then "byRef"
+        else "unknown" end
+      )
+    }]' 2>/dev/null || echo '[]')"
 
 else
   # No VM CRD - virtualization not present
@@ -2912,19 +3278,26 @@ else
   VMS_RUNNING=0
   VMS_STOPPED=0
   VM_POLICY_COUNT=0
+  VM_POLICY_REF_COUNT=0
+  VM_POLICY_LABEL_COUNT=0
   PROTECTED_VM_COUNT=0
   UNPROTECTED_VM_COUNT=0
   PROTECTED_VM_COUNT_EXPLICIT=0
+  VM_PROTECTED_BY_VM_POLICY=0
   VM_COVERED_BY_NS_POLICY=0
   VM_HAS_WILDCARDS="false"
   VM_PROTECTION_NOTE="N/A"
   VM_RESTORE_POINTS=0
+  VM_RP_CONSISTENCY='{"applicationConsistent":0,"crashConsistent":0,"unknown":0,"total":0}'
+  VM_RP_CRASH_CONSISTENT=0
   VMS_FREEZE_DISABLED=0
   VMS_FREEZE_ENABLED=0
   FREEZE_TIMEOUT="N/A"
   VM_SNAPSHOT_CONCURRENCY="N/A"
   VM_DETAILS_JSON="[]"
   VM_POLICY_DETAILS_JSON="[]"
+  VM_COVERAGE_JSON="[]"
+  UNPROTECTED_VM_LIST="[]"
 fi
 
 debug "Virtualization summary: platform=$VIRT_PLATFORM, VMs=$TOTAL_VMS, policies=$VM_POLICY_COUNT"
@@ -3146,8 +3519,11 @@ LIM_EXEC_REPLICAS=$(get_limiter "executorReplicas" "3")
 LIM_EXEC_THREADS=$(get_limiter "executorThreads" "8")
 LIM_WL_SNAP=$(get_limiter "workloadSnapshotsPerAction" "5")
 LIM_WL_RESTORE=$(get_limiter "workloadRestoresPerAction" "3")
+# New in Kasten 9.0.2 (#kasten-v9): caps concurrent volume retirement, which
+# competes with backup/export work on the same executor pool.
+LIM_VOL_RETIRES=$(get_limiter "volumeRetiresPerCluster" "10")
 
-debug "Limiters: CSI=$LIM_CSI_SNAP Exports=$LIM_EXPORTS VM=$LIM_VM_SNAP Exec=${LIM_EXEC_REPLICAS}x${LIM_EXEC_THREADS}"
+debug "Limiters: CSI=$LIM_CSI_SNAP Exports=$LIM_EXPORTS VM=$LIM_VM_SNAP Exec=${LIM_EXEC_REPLICAS}x${LIM_EXEC_THREADS} VolRetires=$LIM_VOL_RETIRES"
 
 # --- Timeouts ---
 get_timeout() {
@@ -3164,7 +3540,21 @@ TO_BP_DELETE=$(get_timeout "blueprintDelete" "45")
 TO_WORKER=$(get_timeout "workerPodReady" "15")
 TO_JOB=$(get_timeout "jobWait" "600")
 
-debug "Timeouts: BP-backup=${TO_BP_BACKUP}m BP-restore=${TO_BP_RESTORE}m worker=${TO_WORKER}m job=${TO_JOB}m"
+# CSI snapshot timeouts, new Helm values in Kasten 9.0 (#kasten-v9). They live
+# under `executor.` rather than `timeout.`, so they need their own lookup.
+# Surfacing them matters on slow storage backends, where the default 10m/30m is
+# the difference between a backup that completes and one that times out.
+get_exec_cfg() {
+  _h=$(helm_val "executor.$1" "")
+  [ -n "$_h" ] && echo "$_h" && return
+  _c=$(echo "$K10_CM_JSON" | jq -r ".\"executor.$1\" // empty" 2>/dev/null)
+  [ -n "$_c" ] && echo "$_c" && return
+  echo "$2"
+}
+TO_CSI_SNAP_CREATE=$(get_exec_cfg "csiSnapshotCreationTimeout" "10m")
+TO_CSI_SNAP_READY=$(get_exec_cfg "csiSnapshotReadyTimeout" "30m")
+
+debug "Timeouts: BP-backup=${TO_BP_BACKUP}m BP-restore=${TO_BP_RESTORE}m worker=${TO_WORKER}m job=${TO_JOB}m csiCreate=${TO_CSI_SNAP_CREATE} csiReady=${TO_CSI_SNAP_READY}"
 
 # --- Datastore Parallelism ---
 get_ds() {
@@ -3178,8 +3568,13 @@ DS_UPLOADS=$(get_ds "parallelUploads" "8")
 DS_DOWNLOADS=$(get_ds "parallelDownloads" "8")
 DS_BLK_UPLOADS=$(get_ds "parallelBlockUploads" "8")
 DS_BLK_DOWNLOADS=$(get_ds "parallelBlockDownloads" "8")
+# Datastore cache sizing, new Helm values in Kasten 9.0.2 (#kasten-v9). Empty
+# when unset — reported as "default" rather than inventing a number, since the
+# release notes do not document the built-in defaults.
+DS_CONTENT_CACHE=$(get_ds "contentCacheSizeMB" "")
+DS_METADATA_CACHE=$(get_ds "metadataCacheSizeMB" "")
 
-debug "Datastore: up=$DS_UPLOADS down=$DS_DOWNLOADS blk-up=$DS_BLK_UPLOADS blk-down=$DS_BLK_DOWNLOADS"
+debug "Datastore: up=$DS_UPLOADS down=$DS_DOWNLOADS blk-up=$DS_BLK_UPLOADS blk-down=$DS_BLK_DOWNLOADS contentCache=${DS_CONTENT_CACHE:-default} metadataCache=${DS_METADATA_CACHE:-default}"
 
 # --- Excluded Applications ---
 EXCLUDED_APPS_JSON='[]'
@@ -3550,7 +3945,10 @@ debug "RBAC fully accessible: $RBAC_FULLY_ACCESSIBLE"
 BP_DR_STATUS="$KDR_STATUS"
 
 # Immutability Assessment
-if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
+# Counts protectionPeriod-based profiles (object store / Veeam Vault) AND
+# hardened VBR repositories (#kasten-v9) — the latter carry immutability
+# without ever exposing a protectionPeriod field.
+if [ "$IMMUTABLE_PROFILES_TOTAL" -gt 0 ]; then
   BP_IMMUTABILITY_STATUS="ENABLED"
 else
   BP_IMMUTABILITY_STATUS="NOT_CONFIGURED"
@@ -3608,6 +4006,20 @@ else
   BP_VM_PROTECTION_STATUS="N/A"
 fi
 
+# BP-VM-CONSISTENCY (NEW v2.2.0, #kasten-v9): VM RestorePoints captured
+# crash-consistent rather than application-consistent. Kasten quiesces the
+# guest via the QEMU guest agent and falls back to a crash-consistent snapshot
+# when the freeze is unavailable or times out — silently. A crash-consistent
+# copy still restores, but the application inside the guest may need its own
+# recovery, which is why this belongs in the report rather than in a log.
+if [ "$(_ep "$VM_RP_CONSISTENCY" | jq '.total // 0')" -eq 0 ] 2>/dev/null; then
+  BP_VM_CONSISTENCY_STATUS="N/A"
+elif [ "$VM_RP_CRASH_CONSISTENT" -gt 0 ] 2>/dev/null; then
+  BP_VM_CONSISTENCY_STATUS="WARN"
+else
+  BP_VM_CONSISTENCY_STATUS="OK"
+fi
+
 debug "Best Practices - DR: $BP_DR_STATUS, Immutability: $BP_IMMUTABILITY_STATUS, Resources: $BP_RESOURCES_STATUS, VM: $BP_VM_PROTECTION_STATUS"
 
 # Authentication Assessment (NEW v1.8)
@@ -3646,7 +4058,7 @@ debug "Best Practices v1.8 - Auth: $BP_AUTH_STATUS, KMS Encryption: $BP_ENCRYPTI
 # consult Kasten K10 documentation for backend-specific sizing guidance.
 HIGH_SNAP_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
   [.items[]?
-    | select(.spec.actions[]?.action == "backup")
+    | select([.spec.actions[]?.action] | index("backup"))
     | . as $p
     | (.spec.retention // {} | to_entries | map(.value) | map(select(type == "number")))
     | select((. | length) > 0 and (max > 7))
@@ -3658,7 +4070,7 @@ HIGH_SNAP_COUNT=$(safe_int "$(_ep "$HIGH_SNAP_POLICIES" | jq 'length // 0')")
 # BP-RET-ZERO: snapshot retention == 0 on all keys (no fast local recovery)
 ZERO_SNAP_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
   [.items[]?
-    | select(.spec.actions[]?.action == "backup")
+    | select([.spec.actions[]?.action] | index("backup"))
     | . as $p
     | (.spec.retention // {} | to_entries | map(.value) | map(select(type == "number")))
     | select((. | length) == 0 or (all(. == 0)))
@@ -3668,13 +4080,17 @@ ZERO_SNAP_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
 ZERO_SNAP_COUNT=$(safe_int "$(_ep "$ZERO_SNAP_POLICIES" | jq 'length // 0')")
 
 # BP-EXPORT-NORET: export action without explicit .retention (silently inherits
-# snapshot retention, often involuntary)
+# snapshot retention, often involuntary).
+# v2.2.0 (#kasten-v9): `all` -> `any`. With Kasten 9.0 additional export, a
+# policy can carry two export actions; if only one declares retention the
+# other still silently inherits the snapshot retention. The `all` form passed
+# such a policy as compliant, hiding exactly the case the check exists for.
 EXPORT_NO_RETENTION_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
   [.items[]?
-    | select(.spec.actions[]? | (.action == "export"))
+    | select([.spec.actions[]?.action] | index("export"))
     | . as $p
     | select(
-        ([.spec.actions[] | select(.action == "export") | .retention // null] | all(. == null))
+        ([.spec.actions[] | select(.action == "export") | .retention // null] | any(. == null))
       )
     | $p.metadata.name
   ]
@@ -3755,7 +4171,7 @@ debug "Best Practices v1.9 - SnapHigh: $BP_SNAP_RETENTION_HIGH_STATUS ($HIGH_SNA
 # Score each pillar (0 = absent, max = configured)
 RANSOM_IMMUT=0
 RANSOM_IMMUT_MAX=20
-if [ "$IMMUTABILITY" = "true" ] && [ "$IMMUTABLE_PROFILES" -gt 0 ] 2>/dev/null; then
+if [ "$IMMUTABILITY" = "true" ] && [ "$IMMUTABLE_PROFILES_TOTAL" -gt 0 ] 2>/dev/null; then
   RANSOM_IMMUT=$RANSOM_IMMUT_MAX
 fi
 
@@ -3873,6 +4289,8 @@ ORPHANED_RP=$(_safe_arg "$ORPHANED_RP" '[]')
 RESTORE_ACTIONS_RECENT=$(_safe_arg "$RESTORE_ACTIONS_RECENT" '[]')
 VM_DETAILS_JSON=$(_safe_arg "$VM_DETAILS_JSON" '[]')
 VM_POLICY_DETAILS_JSON=$(_safe_arg "$VM_POLICY_DETAILS_JSON" '[]')
+VM_RP_CONSISTENCY=$(_safe_arg "$VM_RP_CONSISTENCY" '{"applicationConsistent":0,"crashConsistent":0,"unknown":0,"total":0}')
+UNPROTECTED_VM_LIST=$(_safe_arg "${UNPROTECTED_VM_LIST:-[]}" '[]')
 EXCLUDED_APPS_JSON=$(_safe_arg "$EXCLUDED_APPS_JSON" '[]')
 POLICY_EXCLUSIONS_JSON=$(_safe_arg "${POLICY_EXCLUSIONS_JSON:-[]}" '[]')
 # v1.9 additions
@@ -3889,6 +4307,8 @@ POLICIES_NO_EXPORT_LIST=$(_safe_arg "$POLICIES_NO_EXPORT_LIST" '[]')
 HIGH_SNAP_POLICIES=$(_safe_arg "$HIGH_SNAP_POLICIES" '[]')
 ZERO_SNAP_POLICIES=$(_safe_arg "$ZERO_SNAP_POLICIES" '[]')
 EXPORT_NO_RETENTION_POLICIES=$(_safe_arg "$EXPORT_NO_RETENTION_POLICIES" '[]')
+MULTI_EXPORT_POLICIES=$(_safe_arg "${MULTI_EXPORT_POLICIES:-[]}" '[]')
+MULTI_EXPORT_SAME_PROFILE=$(_safe_arg "${MULTI_EXPORT_SAME_PROFILE:-[]}" '[]')
 # v2.0 additions
 ALL_NAMESPACES_LABELED=$(_safe_arg "$ALL_NAMESPACES_LABELED" '[]')
 # v2.0 patch 2 - RBAC inventory
@@ -3927,6 +4347,8 @@ printf '%s' "$K10_DEPLOYMENTS_SUMMARY" > "$TEMP_DIR/k10Deployments.json"
 printf '%s' "$ORPHANED_RP" > "$TEMP_DIR/orphanedRp.json"
 printf '%s' "$VM_DETAILS_JSON" > "$TEMP_DIR/vmDetails.json"
 printf '%s' "$VM_POLICY_DETAILS_JSON" > "$TEMP_DIR/vmPolicyDetails.json"
+printf '%s' "$VM_RP_CONSISTENCY" > "$TEMP_DIR/vmRpConsistency.json"
+printf '%s' "$UNPROTECTED_VM_LIST" > "$TEMP_DIR/unprotectedVmList.json"
 printf '%s' "$EXCLUDED_APPS_JSON" > "$TEMP_DIR/excludedApps.json"
 printf '%s' "$POLICY_EXCLUSIONS_JSON" > "$TEMP_DIR/policyExclusions.json"
 printf '%s' "$FAILED_ACTIONS_TOP5" > "$TEMP_DIR/failedActionsTop5.json"
@@ -3942,6 +4364,8 @@ printf '%s' "$POLICIES_NO_EXPORT_LIST" > "$TEMP_DIR/policiesNoExportList.json"
 printf '%s' "$HIGH_SNAP_POLICIES" > "$TEMP_DIR/highSnapPolicies.json"
 printf '%s' "$ZERO_SNAP_POLICIES" > "$TEMP_DIR/zeroSnapPolicies.json"
 printf '%s' "$EXPORT_NO_RETENTION_POLICIES" > "$TEMP_DIR/exportNoRetentionPolicies.json"
+printf '%s' "$MULTI_EXPORT_POLICIES" > "$TEMP_DIR/multiExportPolicies.json"
+printf '%s' "$MULTI_EXPORT_SAME_PROFILE" > "$TEMP_DIR/multiExportSameProfile.json"
 _ep "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})' > "$TEMP_DIR/presets.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/presets.json"
 jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: ((.actions // .spec.actions // {}) | keys)})' "$BLUEPRINTS_FILE" > "$TEMP_DIR/blueprints.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/blueprints.json"
 jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: (.spec.blueprintRef.name // "N/A")})' "$BINDINGS_FILE" > "$TEMP_DIR/bindings.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/bindings.json"
@@ -3955,14 +4379,25 @@ if [ "$MODE" = "json" ]; then
     --arg kdlVersion "$KDL_VERSION" \
     --arg platform "$PLATFORM" \
     --arg version "$KASTEN_VERSION" \
+    --arg kastenMajorMinor "${KASTEN_MAJOR_MINOR:-}" \
+    --arg kdlKastenTestedMax "$KDL_KASTEN_TESTED_MAX" \
+    --arg kastenNewerThanTested "$KASTEN_NEWER_THAN_TESTED" \
     --argjson rbacLimited "$RBAC_LIMITED_JSON" \
     --slurpfile profilesArr "$TEMP_DIR/profiles_clean.json" \
     --slurpfile policiesArr "$TEMP_DIR/policies_clean.json" \
     --arg immutability "$IMMUTABILITY" \
     --argjson immutabilityDays "${IMMUTABILITY_DAYS:-0}" \
     --slurpfile immutableProfiles "$TEMP_DIR/immutableProfiles.json" \
+    --argjson immutableProfilesTotal "$IMMUTABLE_PROFILES_TOTAL" \
+    --argjson vbrProfileCount "$VBR_PROFILE_COUNT" \
+    --argjson vbrHardenedCount "$VBR_HARDENED_COUNT" \
+    --argjson veeamVaultProfileCount "$VEEAM_VAULT_PROFILE_COUNT" \
     --argjson allNs "$ALL_NS_POLICIES" \
     --argjson policiesWithExport "$POLICIES_WITH_EXPORT" \
+    --argjson multiExportCount "$MULTI_EXPORT_COUNT" \
+    --argjson multiExportSameProfileCount "$MULTI_EXPORT_SAME_PROFILE_COUNT" \
+    --slurpfile multiExportPolicies "$TEMP_DIR/multiExportPolicies.json" \
+    --slurpfile multiExportSameProfile "$TEMP_DIR/multiExportSameProfile.json" \
     --argjson policiesWithPresets "$POLICIES_WITH_PRESETS" \
     --argjson pods "$PODS" \
     --argjson podsRunning "$PODS_RUNNING" \
@@ -4093,19 +4528,25 @@ if [ "$MODE" = "json" ]; then
     --argjson vmsRunning "$VMS_RUNNING" \
     --argjson vmsStopped "$VMS_STOPPED" \
     --argjson vmPolicyCount "$VM_POLICY_COUNT" \
+    --argjson vmPolicyRefCount "$VM_POLICY_REF_COUNT" \
+    --argjson vmPolicyLabelCount "$VM_POLICY_LABEL_COUNT" \
     --argjson protectedVmCount "$PROTECTED_VM_COUNT" \
     --argjson unprotectedVmCount "$UNPROTECTED_VM_COUNT" \
     --argjson protectedVmExplicit "$PROTECTED_VM_COUNT_EXPLICIT" \
+    --argjson vmProtectedByVmPolicy "$VM_PROTECTED_BY_VM_POLICY" \
     --argjson vmCoveredByNsPolicy "$VM_COVERED_BY_NS_POLICY" \
     --arg vmHasWildcards "$VM_HAS_WILDCARDS" \
     --arg vmProtectionNote "$VM_PROTECTION_NOTE" \
     --argjson vmRestorePoints "$VM_RESTORE_POINTS" \
+    --slurpfile vmRpConsistency "$TEMP_DIR/vmRpConsistency.json" \
+    --slurpfile unprotectedVmList "$TEMP_DIR/unprotectedVmList.json" \
     --argjson vmsFreezeDisabled "$VMS_FREEZE_DISABLED" \
     --arg freezeTimeout "$FREEZE_TIMEOUT" \
     --arg vmSnapshotConcurrency "$VM_SNAPSHOT_CONCURRENCY" \
     --slurpfile vmDetails "$TEMP_DIR/vmDetails.json" \
     --slurpfile vmPolicyDetails "$TEMP_DIR/vmPolicyDetails.json" \
     --arg bpVmProtection "$BP_VM_PROTECTION_STATUS" \
+    --arg bpVmConsistency "$BP_VM_CONSISTENCY_STATUS" \
     --arg helmValuesSource "$HELM_VALUES_SOURCE" \
     --arg authMethod "$AUTH_METHOD" \
     --arg authDetails "$AUTH_DETAILS" \
@@ -4129,16 +4570,21 @@ if [ "$MODE" = "json" ]; then
     --arg limExecThreads "$LIM_EXEC_THREADS" \
     --arg limWlSnap "$LIM_WL_SNAP" \
     --arg limWlRestore "$LIM_WL_RESTORE" \
+    --arg limVolRetires "$LIM_VOL_RETIRES" \
     --arg toBpBackup "$TO_BP_BACKUP" \
     --arg toBpRestore "$TO_BP_RESTORE" \
     --arg toBpHooks "$TO_BP_HOOKS" \
     --arg toBpDelete "$TO_BP_DELETE" \
     --arg toWorker "$TO_WORKER" \
     --arg toJob "$TO_JOB" \
+    --arg toCsiSnapCreate "$TO_CSI_SNAP_CREATE" \
+    --arg toCsiSnapReady "$TO_CSI_SNAP_READY" \
     --arg dsUploads "$DS_UPLOADS" \
     --arg dsDownloads "$DS_DOWNLOADS" \
     --arg dsBlkUploads "$DS_BLK_UPLOADS" \
     --arg dsBlkDownloads "$DS_BLK_DOWNLOADS" \
+    --arg dsContentCache "$DS_CONTENT_CACHE" \
+    --arg dsMetadataCache "$DS_METADATA_CACHE" \
     --slurpfile excludedApps "$TEMP_DIR/excludedApps.json" \
     --argjson excludedAppsCount "$EXCLUDED_APPS_COUNT" \
     --slurpfile policyExclusions "$TEMP_DIR/policyExclusions.json" \
@@ -4210,7 +4656,7 @@ if [ "$MODE" = "json" ]; then
     --arg bpExportRetention "$BP_EXPORT_RETENTION_STATUS" \
     --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
     --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
-    '
+    "$JQ_SELECTOR_LIB"'
     ( $immutableProfiles[0] ) as $immutableProfiles |
     ( $restoreActionsRecent[0] ) as $restoreActionsRecent |
     ( $snapshotData[0] ) as $snapshotData |
@@ -4232,6 +4678,10 @@ if [ "$MODE" = "json" ]; then
     ( $orphanedRp[0] ) as $orphanedRp |
     ( $vmDetails[0] ) as $vmDetails |
     ( $vmPolicyDetails[0] ) as $vmPolicyDetails |
+    ( $vmRpConsistency[0] ) as $vmRpConsistency |
+    ( $unprotectedVmList[0] ) as $unprotectedVmList |
+    ( $multiExportPolicies[0] ) as $multiExportPolicies |
+    ( $multiExportSameProfile[0] ) as $multiExportSameProfile |
     ( $excludedApps[0] ) as $excludedApps |
     ( $policyExclusions[0] ) as $policyExclusions |
     ( $failedActionsTop5[0] ) as $failedActionsTop5 |
@@ -4257,6 +4707,13 @@ if [ "$MODE" = "json" ]; then
       kdlVersion: $kdlVersion,
       platform: $platform,
       kastenVersion: $version,
+      # Compatibility signal (#kasten-v9): highest Kasten release this KDL
+      # build was validated against, and whether the cluster is newer.
+      kastenCompatibility: {
+        detectedMajorMinor: (if $kastenMajorMinor == "" then null else $kastenMajorMinor end),
+        validatedUpTo: $kdlKastenTestedMax,
+        newerThanValidated: ($kastenNewerThanTested == "true")
+      },
       rbacLimited: $rbacLimited,
 
       license: $licenseBlock,
@@ -4348,17 +4805,22 @@ if [ "$MODE" = "json" ]; then
         vmsStopped: $vmsStopped,
         vmPolicies: {
           count: $vmPolicyCount,
+          byRefSelector: $vmPolicyRefCount,
+          byLabelSelector: $vmPolicyLabelCount,
           items: $vmPolicyDetails
         },
         protection: {
           protectedVMs: $protectedVmCount,
           unprotectedVMs: $unprotectedVmCount,
           explicitVmRefs: $protectedVmExplicit,
+          coveredByVmPolicies: $vmProtectedByVmPolicy,
           coveredByNamespacePolicies: $vmCoveredByNsPolicy,
           hasWildcardPatterns: ($vmHasWildcards == "true"),
+          unprotectedVmList: $unprotectedVmList,
           note: $vmProtectionNote
         },
         vmRestorePoints: $vmRestorePoints,
+        vmRestorePointConsistency: $vmRpConsistency,
         freezeConfiguration: {
           timeout: $freezeTimeout,
           vmsWithFreezeDisabled: $vmsFreezeDisabled
@@ -4504,7 +4966,8 @@ if [ "$MODE" = "json" ]; then
           executorReplicas: $limExecReplicas,
           executorThreads: $limExecThreads,
           workloadSnapshotsPerAction: $limWlSnap,
-          workloadRestoresPerAction: $limWlRestore
+          workloadRestoresPerAction: $limWlRestore,
+          volumeRetiresPerCluster: $limVolRetires
         },
         timeouts: {
           blueprintBackup: $toBpBackup,
@@ -4512,13 +4975,17 @@ if [ "$MODE" = "json" ]; then
           blueprintHooks: $toBpHooks,
           blueprintDelete: $toBpDelete,
           workerPodReady: $toWorker,
-          jobWait: $toJob
+          jobWait: $toJob,
+          csiSnapshotCreation: $toCsiSnapCreate,
+          csiSnapshotReady: $toCsiSnapReady
         },
         datastore: {
           parallelUploads: $dsUploads,
           parallelDownloads: $dsDownloads,
           parallelBlockUploads: $dsBlkUploads,
-          parallelBlockDownloads: $dsBlkDownloads
+          parallelBlockDownloads: $dsBlkDownloads,
+          contentCacheSizeMB: (if $dsContentCache == "" then null else $dsContentCache end),
+          metadataCacheSizeMB: (if $dsMetadataCache == "" then null else $dsMetadataCache end)
         },
         persistence: {
           defaultSize: $persistSize,
@@ -4618,6 +5085,7 @@ if [ "$MODE" = "json" ]; then
         resourceLimits: $bpResources,
         namespaceProtection: $bpCoverage,
         vmProtection: $bpVmProtection,
+        vmSnapshotConsistency: $bpVmConsistency,
         authentication: $bpAuth,
         encryption: $bpEncryption,
         auditLogging: $bpAudit,
@@ -4731,17 +5199,34 @@ if [ "$MODE" = "json" ]; then
         count: ($policies.items | length),
         withExport: $policiesWithExport,
         withPresets: $policiesWithPresets,
+        # Kasten 9.0 additional export (Technical Preview): app policies with
+        # more than one export destination (#kasten-v9).
+        additionalExport: {
+          count: $multiExportCount,
+          items: $multiExportPolicies,
+          sameProfileTwice: $multiExportSameProfile
+        },
         items: [
           $policies.items[] | {
             name: .metadata.name,
             frequency: .spec.frequency,
             subFrequency: .spec.subFrequency,
             actions: [.spec.actions[].action],
+            # scope: "virtualMachine" for policies using either VM selector key
+            # (virtualMachineRef, or virtualMachineNamespace new in Kasten 9.0).
+            scope: policy_scope,
             selector: (
+              # matchExpressions is tested FIRST: a Kasten 9.0 label-based VM
+              # policy carries BOTH matchExpressions (the namespace patterns)
+              # and matchLabels (the VM labels). The previous order reported
+              # only matchLabels and silently dropped the namespace scope.
               if .spec.selector == null or .spec.selector == {} then "all"
+              elif .spec.selector.matchExpressions then
+                ({matchExpressions: .spec.selector.matchExpressions} +
+                 (if (.spec.selector.matchLabels // {}) | length > 0
+                  then {matchLabels: .spec.selector.matchLabels} else {} end))
               elif .spec.selector.matchNames then {matchNames: .spec.selector.matchNames}
               elif .spec.selector.matchLabels then {matchLabels: .spec.selector.matchLabels}
-              elif .spec.selector.matchExpressions then {matchExpressions: .spec.selector.matchExpressions}
               else "all"
               end
             ),
@@ -4752,7 +5237,22 @@ if [ "$MODE" = "json" ]; then
             # object construction empty and silently drops those policies from
             # `items` (count/items mismatch). Wrapping in [] + .[0] keeps one
             # value (null when absent) and de-duplicates multi-export policies.
+            # Kept for backward compatibility; `exports` below is authoritative
+            # once a policy has more than one export action (Kasten 9.0).
             exportRetention: ([.spec.actions[]? | select(.action == "export") | .retention] | .[0] // null),
+            # Full per-destination export view (#kasten-v9). Kasten 9.0
+            # additional export allows two export actions on one policy, each
+            # with its own profile, frequency and retention.
+            exports: [.spec.actions[]? | select(.action == "export") | {
+              profile: (.exportParameters.profile.name // null),
+              frequency: (.exportParameters.frequency // null),
+              retention: (.retention // null),
+              exportData: (.exportParameters.exportData.enabled // null),
+              # blockModeProfile = send volume snapshot data to a Veeam
+              # Backup & Replication repository while metadata goes to the
+              # profile above (VBR metadata support, Kasten 9.0).
+              blockModeProfile: (.exportParameters.blockModeProfile.name // null)
+            }],
             presetRef: .spec.presetRef.name
           }
         ]
@@ -4760,27 +5260,58 @@ if [ "$MODE" = "json" ]; then
 
       profiles: {
         count: ($profiles.items | length),
+        # immutableCount stays protectionPeriod-based for backward
+        # compatibility; immutableCountTotal adds hardened VBR repositories.
         immutableCount: $immutableProfiles,
+        immutableCountTotal: $immutableProfilesTotal,
+        vbrCount: $vbrProfileCount,
+        vbrHardenedCount: $vbrHardenedCount,
+        veeamVaultCount: $veeamVaultProfileCount,
         items: [
-          $profiles.items[] | {
+          $profiles.items[] |
+          # Bounded deep scan: the live CRD nesting differs from the published
+          # schema (`locationSpec.type` vs `locationSpec.location.locationType`),
+          # so probe by field name rather than by fixed path.
+          ( [ .spec | .. | objects | (.objectStoreType? // empty) | select(. != null and . != "") ] | first ) as $storeType |
+          ( [ .spec | .. | objects | (.locationType? // empty)  | select(. != null and . != "") ] | first ) as $locType |
+          ( [ .spec | .. | objects | (.repoType? // empty)      | select(. != null and . != "") ] | first ) as $repoType |
+          ( [ .spec | .. | objects | (.repoName? // empty)      | select(. != null and . != "") ] | first ) as $repoName |
+          {
             name: .metadata.name,
             backend: (
-              # Broadened detection (#43): K10 profile specs expose the backend
-              # under several shapes depending on version/profile kind. Check the
-              # well-known paths in turn; fall back to a deep scan for any
-              # *Type/*StoreType field before giving up. "Undetermined" (not
-              # "Unknown") signals "could not classify", not a collection failure.
+              # Broadened detection (#43), refined in v2.2.0 (#kasten-v9): the
+              # SPECIFIC store type now wins over the generic location type.
+              # Previously `locationSpec.type` was tested first, so every object
+              # store reported the useless "ObjectStore" and the Veeam Vault
+              # backends (VeeamVaultAzure / VeeamVaultAWS) — the ones that
+              # actually carry immutability — were never named in the report.
+              # "Undetermined" (not "Unknown") signals "could not classify",
+              # not a collection failure.
               if .spec.infrastoreBlobStore then "S3"
+              elif ($storeType // "") != "" then $storeType
+              elif ($locType // "") != "" then $locType
               elif (.spec.locationSpec.type // "") != "" then .spec.locationSpec.type
-              elif (.spec.locationSpec.objectStore.objectStoreType // "") != "" then .spec.locationSpec.objectStore.objectStoreType
               elif (.spec.type // "") != "" then .spec.type
-              else
-                ( [ .spec? | .. | objects | (.objectStoreType? // .storeType? // empty) | select(. != null and . != "") ] | first ) // "Undetermined"
+              else "Undetermined"
               end
             ),
-            region: (.spec.infrastoreBlobStore.region // .spec.locationSpec.region // "N/A"),
-            endpoint: (.spec.infrastoreBlobStore.endpoint // .spec.locationSpec.endpoint // "N/A"),
-            protectionPeriod: .spec.infrastoreBlobStore.protectionPeriod
+            locationType: ($locType // .spec.locationSpec.type // null),
+            # VBR repository details (Kasten 9.0 can send metadata + snapshot
+            # data to a single Veeam repository). repoType conveys immutability
+            # (LinuxHardened, object lock); serverAddress is deliberately NOT
+            # collected to keep infrastructure addresses out of the report.
+            vbrRepoName: $repoName,
+            vbrRepoType: $repoType,
+            vbrImmutable: (($repoType // "") | test("hardened|objectlock|immutab"; "i")),
+            region: (
+              ( [ .spec | .. | objects | (.region? // empty) | select(. != null and . != "") ] | first ) // "N/A"
+            ),
+            endpoint: (
+              ( [ .spec | .. | objects | (.endpoint? // empty) | select(. != null and . != "") ] | first ) // "N/A"
+            ),
+            protectionPeriod: (
+              ( [ .spec | .. | objects | (.protectionPeriod? // empty) | select(. != null and . != "") ] | first )
+            )
           }
         ]
       }
@@ -4801,7 +5332,11 @@ printf "\n${COLOR_BOLD}${COLOR_BLUE}[SEARCH] Kasten Discovery Lite v${KDL_VERSIO
 printf "==============================\n"
 printf "Platform: $PLATFORM\n"
 printf "Namespace: $NAMESPACE\n"
-printf "Kasten Version: $KASTEN_VERSION\n"
+printf "Kasten Version: $KASTEN_VERSION"
+if [ "$KASTEN_NEWER_THAN_TESTED" = "true" ]; then
+  printf " ${COLOR_YELLOW}[WARN] newer than KDL v${KDL_VERSION} validated range (up to ${KDL_KASTEN_TESTED_MAX}) - verify new CRD fields${COLOR_RESET}"
+fi
+printf "\n"
 printf "K8s Version: $K8S_SERVER_VERSION ($K8S_DISTRIBUTION)\n"
 if [ "$SKIP_HELM" = "true" ]; then
   printf "${COLOR_CYAN}Helm extraction: SKIPPED (--no-helm)${COLOR_RESET}\n"
@@ -5005,10 +5540,14 @@ if [ "$IMMUTABILITY" = "true" ]; then
   printf "  Detected:  ${COLOR_GREEN}[OK] Yes${COLOR_RESET}\n"
   if [ "$IMMUTABILITY_DAYS" -gt 0 ]; then
     printf "  Max Protection Period: ${IMMUTABILITY_DAYS} days\n"
-  else
+  elif [ -n "$PROTECTION_PERIOD_RAW" ]; then
     printf "  Max Protection Period: $PROTECTION_PERIOD_RAW\n"
   fi
-  printf "  Profiles with immutability: $IMMUTABLE_PROFILES\n"
+  printf "  Profiles with immutability: $IMMUTABLE_PROFILES_TOTAL"
+  if [ "$VBR_HARDENED_COUNT" -gt 0 ] 2>/dev/null; then
+    printf " (incl. $VBR_HARDENED_COUNT hardened VBR repository/ies)"
+  fi
+  printf "\n"
 else
   printf "  Detected:  ${COLOR_YELLOW}[WARN]  No${COLOR_RESET}\n"
 fi
@@ -5016,19 +5555,36 @@ fi
 ### Profiles
 printf "\n${COLOR_BOLD}[PACKAGE] Location Profiles${COLOR_RESET}\n"
 printf "  Profiles: $PROFILE_COUNT"
-if [ "$IMMUTABLE_PROFILES" -gt 0 ]; then
-  printf " (${COLOR_GREEN}$IMMUTABLE_PROFILES with immutability${COLOR_RESET})"
+if [ "$IMMUTABLE_PROFILES_TOTAL" -gt 0 ]; then
+  printf " (${COLOR_GREEN}$IMMUTABLE_PROFILES_TOTAL with immutability${COLOR_RESET})"
+fi
+if [ "$VBR_PROFILE_COUNT" -gt 0 ] 2>/dev/null || [ "$VEEAM_VAULT_PROFILE_COUNT" -gt 0 ] 2>/dev/null; then
+  printf " | VBR: $VBR_PROFILE_COUNT | Veeam Vault: $VEEAM_VAULT_PROFILE_COUNT"
 fi
 printf "\n"
 
 if [ "$PROFILE_COUNT" -gt 0 ]; then
+  # Backend/region/endpoint are resolved with a bounded deep scan: the live CRD
+  # nesting differs from the published schema, and the previous fixed paths made
+  # every object store report the generic "ObjectStore" while never naming the
+  # Veeam Vault / VBR backends introduced or expanded in Kasten 9.0.
   _ep "$PROFILES_JSON" | jq -r '
+def deep_first(f): [ .spec | .. | objects | (f // empty) | select(. != null and . != "") ] | first;
 .items[]? |
+(deep_first(.objectStoreType?)) as $storeType |
+(deep_first(.locationType?)) as $locType |
+(deep_first(.repoType?)) as $repoType |
+(deep_first(.repoName?)) as $repoName |
 "  - \(.metadata.name)\n" +
-"    Backend: \(.spec.locationSpec.objectStore.objectStoreType // .spec.infrastoreBlobStore.objectStoreType // .spec.locationSpec.type // "unknown")\n" +
-"    Region: \(.spec.locationSpec.objectStore.region // .spec.infrastoreBlobStore.region // "N/A")\n" +
-"    Endpoint: \(.spec.locationSpec.objectStore.endpoint // .spec.infrastoreBlobStore.endpoint // "default")\n" +
-"    Protection period: \(first(.. | .protectionPeriod? // empty) // "not set")\n"
+"    Backend: \($storeType // $locType // .spec.locationSpec.type // "unknown")\n" +
+(if $repoName then "    VBR repository: \($repoName)" +
+   (if $repoType then " (type=\($repoType)" +
+      (if ($repoType | test("hardened|objectlock|immutab"; "i")) then ", immutable" else "" end) + ")"
+    else "" end) + "\n"
+ else "" end) +
+"    Region: \(deep_first(.region?) // "N/A")\n" +
+"    Endpoint: \(deep_first(.endpoint?) // "default")\n" +
+"    Protection period: \(deep_first(.protectionPeriod?) // "not set")\n"
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}Unable to parse profile details${COLOR_RESET}\n"
 fi
 
@@ -5071,9 +5627,16 @@ fi
 printf "\n${COLOR_BOLD}[LICENSE] Kasten Policies${COLOR_RESET}\n"
 printf "  Total: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)\n"
 printf "  With export: $POLICIES_WITH_EXPORT | Using presets: $POLICIES_WITH_PRESETS\n"
+if [ "$MULTI_EXPORT_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  Additional export (Kasten 9.0): ${COLOR_GREEN}$MULTI_EXPORT_COUNT policy(ies) with 2 export destinations${COLOR_RESET}\n"
+  if [ "$MULTI_EXPORT_SAME_PROFILE_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN] %s policy(ies) export twice to the SAME profile (no added redundancy): %s${COLOR_RESET}\n" \
+      "$MULTI_EXPORT_SAME_PROFILE_COUNT" "$(_ep "$MULTI_EXPORT_SAME_PROFILE" | jq -r 'join(", ")')"
+  fi
+fi
 
 if [ "$POLICY_COUNT" -gt 0 ]; then
-  _ep "$POLICIES_JSON" | jq -r '
+  _ep "$POLICIES_JSON" | jq -r "$JQ_SELECTOR_LIB"'
 .items[]? |
 "  - \(.metadata.name)\n" +
 "    Frequency: \(.spec.frequency // "manual")\n" +
@@ -5088,34 +5651,56 @@ if [ "$POLICY_COUNT" -gt 0 ]; then
 else "" end) +
 "    Actions: \([.spec.actions[]?.action] | join(", "))\n" +
 (
-  [.spec.actions[]? | select(.action == "export" and .exportParameters.frequency != null) | .exportParameters.frequency] |
-  if length > 0 then "    Export Frequency: \(first)\n" else "" end
+  # Kasten 9.0 allows a second export action (additional export). Enumerate
+  # every export action instead of only the first, otherwise a dual-export
+  # policy silently reads as a single-destination one (#kasten-v9).
+  [.spec.actions[]? | select(.action == "export")] as $exports |
+  if ($exports | length) == 0 then ""
+  else
+    (if ($exports | length) > 1 then "    Export destinations: \($exports | length) (additional export)\n" else "" end) +
+    ( [ $exports | to_entries[] |
+        "    Export[\(.key + 1)]: profile=\(.value.exportParameters.profile.name // "not set")" +
+        " frequency=\(.value.exportParameters.frequency // "inherits policy")" +
+        (if .value.exportParameters.blockModeProfile.name then " vbrSnapshotData=\(.value.exportParameters.blockModeProfile.name)" else "" end) +
+        (if .value.exportParameters.exportData.enabled == false then " [metadata only]" else "" end) +
+        "\n"
+      ] | join("") )
+  end
 ) +
-(
-  [.spec.actions[]? | select(.action == "export" and .exportParameters.profile.name != null) | .exportParameters.profile.name] |
-  if length > 0 then "    Export Profile: \(first)\n" else "" end
-) +
-"    Namespace selector: " +
+(if policy_scope == "virtualMachine" then "    VM selector: " else "    Namespace selector: " end) +
   (if .spec.selector == null then "all namespaces"
-   elif .spec.selector.matchNames then 
+   elif .spec.selector.matchNames then
      "matchNames: " + (.spec.selector.matchNames | join(", "))
    elif .spec.selector.matchExpressions then
-     (if (.spec.selector.matchExpressions | length) == 1 and 
-         .spec.selector.matchExpressions[0].key == "k10.kasten.io/appNamespace" and
-         .spec.selector.matchExpressions[0].operator == "In" then
-       "namespaces: " + (.spec.selector.matchExpressions[0].values | join(", "))
-     else
-       "matchExpressions (complex selector)"
-     end)
+     # v2.2.0 (#kasten-v9): spell out VM selectors instead of the opaque
+     # "matchExpressions (complex selector)", and render appNamespace In/NotIn
+     # pairs (the catch-all-with-exceptions shape) rather than hiding them.
+     ([.spec.selector.matchExpressions[]? | select(.key == vm_ref_key) | (.values // [])[]?]) as $vmRefs |
+     ([.spec.selector.matchExpressions[]? | select(.key == vm_ns_key)  | (.values // [])[]?]) as $vmNs |
+     ([.spec.selector.matchExpressions[]? | select(.key == app_ns_key and .operator == "In")    | (.values // [])[]?]) as $inNs |
+     ([.spec.selector.matchExpressions[]? | select(.key == app_ns_key and .operator == "NotIn") | (.values // [])[]?]) as $notNs |
+     (if ($vmRefs | length) > 0 then "VMs: " + ($vmRefs | join(", "))
+      elif ($vmNs | length) > 0 then
+        "namespaces: " + ($vmNs | join(", ")) +
+        (if (.spec.selector.matchLabels // {} | length) > 0
+         then " + VM labels: " + ([.spec.selector.matchLabels | to_entries[] | "\(.key)=\(.value)"] | join(", "))
+         else " (all VMs)" end)
+      elif ($inNs | length) > 0 then
+        "namespaces: " + ($inNs | join(", ")) +
+        (if ($notNs | length) > 0 then " EXCEPT " + ($notNs | join(", ")) else "" end)
+      else "matchExpressions (complex selector)"
+      end)
    elif .spec.selector.matchLabels then
      "matchLabels: " + ([.spec.selector.matchLabels | to_entries[] | "\(.key)=\(.value)"] | join(", "))
    else "all namespaces"
    end) + "\n" +
 "    Retention: " +
 (
-  # Helper: extract retention keys in standard order (daily, weekly, monthly, yearly)
+  # Helper: extract retention keys in standard order (hourly..yearly).
+  # "hourly" added in v2.2.0 — it is a valid Kasten retention key and was
+  # silently dropped from the rendered string on @hourly policies.
   def ordered_retention:
-    [["daily","weekly","monthly","yearly"][] as $k |
+    [["hourly","daily","weekly","monthly","yearly"][] as $k |
       if .[$k] then "\($k | ascii_upcase)=\(.[$k])" else empty end
     ] | join(", ");
 
@@ -5129,11 +5714,14 @@ else "" end) +
       ] | first)
     else null end
   ) as $snap |
-  # Build export retention string (from action-level .retention on export actions)
+  # Build export retention string (from action-level .retention on export
+  # actions). Every export action is listed: with Kasten 9.0 additional export
+  # the two destinations commonly carry DIFFERENT retentions, and showing only
+  # the first misrepresented the policy (#kasten-v9).
   (
     [.spec.actions[]? | select(.action == "export" and .retention != null and (.retention | length) > 0) |
       "Export(" + (.retention | ordered_retention) + ")"
-    ] | if length > 0 then first else null end
+    ] | if length > 0 then join(" + ") else null end
   ) as $exp |
   # Combine
   if $snap and $exp then $snap + " | " + $exp
@@ -5517,10 +6105,27 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
   printf "\n"
 
   if [ "$TOTAL_VMS" -gt 0 ]; then
-    printf "  VM Policies:        $VM_POLICY_COUNT\n"
+    printf "  VM Policies:        $VM_POLICY_COUNT"
+    if [ "$VM_POLICY_COUNT" -gt 0 ]; then
+      printf " (byRef: $VM_POLICY_REF_COUNT, byLabel: $VM_POLICY_LABEL_COUNT)"
+    fi
+    printf "\n"
 
     if [ "$VM_POLICY_COUNT" -gt 0 ]; then
-      _ep "$VM_POLICY_DETAILS_JSON" | jq -r '.[] | "    - \(.name) [\(.frequency)] -> \(.vmRefs | join(", "))"'
+      # byLabel policies (Kasten 9.0) select by namespace pattern + VM labels,
+      # so print the label selector rather than a (non-existent) VM ref list.
+      _ep "$VM_POLICY_DETAILS_JSON" | jq -r '.[] |
+        "    - \(.name) [\(.frequency)] (\(.selectorKind)) -> " +
+        (
+          [ (if (.vmRefs | length) > 0 then (.vmRefs | join(", ")) else empty end),
+            (if (.vmNamespaces | length) > 0 then
+               "ns=" + (.vmNamespaces | join(",")) +
+               (if (.vmLabels | length) > 0
+                then " labels=" + ([.vmLabels | to_entries[] | "\(.key)=\(.value)"] | join(","))
+                else " labels=<none: all VMs in namespace>" end)
+             else empty end)
+          ] | join(" | ")
+        )'
     fi
 
     # Protection summary
@@ -5531,11 +6136,30 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
     else
       printf "  Protected VMs:      ${COLOR_RED}0 / $TOTAL_VMS${COLOR_RESET} (no coverage detected)\n"
     fi
-    if [ "$VM_HAS_WILDCARDS" = "true" ]; then
-      printf "  ${COLOR_CYAN}[INFO]  Wildcard patterns detected - verify actual coverage${COLOR_RESET}\n"
+    printf "    via VM policies: $VM_PROTECTED_BY_VM_POLICY | via namespace policies: $VM_COVERED_BY_NS_POLICY\n"
+    if [ "$UNPROTECTED_VM_COUNT" -gt 0 ]; then
+      printf "  ${COLOR_YELLOW}Unprotected:${COLOR_RESET}        "
+      _ep "$UNPROTECTED_VM_LIST" | jq -r 'if length > 10 then (.[0:10] | join(", ")) + " (+\(length - 10) more)" else join(", ") end'
     fi
 
     printf "  VM RestorePoints:   $VM_RESTORE_POINTS\n"
+
+    # Snapshot consistency (v2.2.0) — a crash-consistent VM restore point means
+    # the guest was not quiesced, so the restore may need application recovery.
+    if [ "$(_ep "$VM_RP_CONSISTENCY" | jq '.total // 0')" -gt 0 ] 2>/dev/null; then
+      printf "  Snapshot Consistency: "
+      if [ "$VM_RP_CRASH_CONSISTENT" -gt 0 ] 2>/dev/null; then
+        printf "${COLOR_YELLOW}%s crash-consistent${COLOR_RESET}, %s application-consistent" \
+          "$(_ep "$VM_RP_CONSISTENCY" | jq -r '.crashConsistent')" \
+          "$(_ep "$VM_RP_CONSISTENCY" | jq -r '.applicationConsistent')"
+      else
+        printf "${COLOR_GREEN}%s application-consistent${COLOR_RESET}" \
+          "$(_ep "$VM_RP_CONSISTENCY" | jq -r '.applicationConsistent')"
+      fi
+      _unk=$(_ep "$VM_RP_CONSISTENCY" | jq -r '.unknown')
+      [ "$_unk" -gt 0 ] 2>/dev/null && printf ", %s not reported" "$_unk"
+      printf "\n"
+    fi
 
     # Freeze configuration
     printf "  Guest Freeze:       "

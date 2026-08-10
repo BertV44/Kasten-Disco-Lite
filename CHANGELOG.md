@@ -3,6 +3,140 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.2.0] - 2026-08-10
+
+Compatibility with **Veeam Kasten 9.0** (9.0.0 / 9.0.1 / 9.0.2). Kasten 9.0
+introduced a second VM selector shape and allowed a policy to carry two export
+destinations; both broke assumptions KDL had made since v1.7, in ways that
+produced *silently wrong* verdicts rather than visible errors. Still read-only,
+still no new permissions — `kdl-rbac.yaml` is unchanged and the set of cluster
+reads is byte-identical to 2.1.1.
+
+Verified against synthetic 9.0 fixtures covering both VM selector shapes,
+catch-all-with-exceptions namespace selectors, dual export, Veeam Vault
+(Azure/AWS) and VBR (hardened and plain) profiles. `kdl-json-to-html.sh` was
+re-checked against a real 2.0-era report to confirm older JSON still renders.
+
+### Added
+- **Label-based VM policies (`k10.kasten.io/virtualMachineNamespace`).** Kasten
+  9.0 selects VMs by namespace pattern + VM labels, re-evaluated at every run.
+  KDL only knew `virtualMachineRef`, so these policies were invisible: not
+  counted in `virtualization.vmPolicies`, and contributing nothing to VM
+  coverage. `vmPolicies` now reports `byRefSelector` / `byLabelSelector`, and
+  each item carries `selectorKind`, `vmNamespaces` and `vmLabels`.
+- **Additional export / dual export (9.0 Technical Preview).** A policy may now
+  carry two export actions, each with its own profile, frequency and retention.
+  New `policies.additionalExport` (count, per-policy destinations, and a
+  `sameProfileTwice` list for the copy-paste case that doubles export cost
+  without adding redundancy), plus a per-policy `exports[]` array with
+  `profile`, `frequency`, `retention`, `exportData` and `blockModeProfile`.
+  `exportRetention` is kept unchanged for existing consumers.
+- **VBR and Veeam Vault profiles named explicitly.** `profiles` gains
+  `vbrCount`, `vbrHardenedCount`, `veeamVaultCount`, and each item gains
+  `locationType`, `vbrRepoName`, `vbrRepoType` and `vbrImmutable`. Kasten 9.0
+  makes a Veeam Backup & Replication repository a complete export target (both
+  Kubernetes metadata and snapshot data), so it is no longer adequate to report
+  it as an anonymous location. Repository *addresses* are deliberately not
+  collected.
+- **VM snapshot consistency.** New best practice `vmSnapshotConsistency` and
+  `virtualization.vmRestorePointConsistency`, derived from
+  `status.vmInfo.snapshotConsistency` on the already-fetched RestorePoints.
+  Kasten quiesces the guest via the QEMU guest agent and falls back to a
+  crash-consistent snapshot *silently* when the freeze fails or times out — the
+  usual root cause of "the restore worked but the database needed recovery".
+- **Per-VM protection detail.** `virtualization.protection` gains
+  `coveredByVmPolicies` and `unprotectedVmList`, and each VM in
+  `virtualization.vms` gains `protected`, `protectedBy` and `protectionSource`,
+  so an unprotected VM can be named instead of only counted.
+- **Kasten version compatibility signal.** New `kastenCompatibility`
+  (`detectedMajorMinor`, `validatedUpTo`, `newerThanValidated`) and a header
+  warning when the cluster is newer than the release this build was validated
+  against. A discovery tool that silently analyses an unknown schema is worse
+  than one that says so.
+- **New 9.0 / 9.0.2 Helm settings** surfaced in `k10Configuration`:
+  `limiter.volumeRetiresPerCluster`, `executor.csiSnapshotCreationTimeout`,
+  `executor.csiSnapshotReadyTimeout`, `datastore.contentCacheSizeMB`,
+  `datastore.metadataCacheSizeMB`.
+
+### Fixed
+- **VM coverage reported a false all-clear.** Protected VMs were estimated as
+  `explicitVmRefs + namespacesCovered` capped at the total, and *any* wildcard
+  in a VM reference short-circuited the result to "all VMs protected". On the
+  9.0 fixture this reported **6/6 VMs protected when only 4 were** — the two
+  genuinely unprotected VMs were excluded by a policy-level `NotIn` and by a
+  label selector that did not match them. Each VM is now matched individually
+  against every candidate policy (VM ref globs, VM namespace + label subset,
+  namespace selectors minus exclusions), and only policies with a `backup`
+  action confer protection.
+- **Label-based VM policies were flagged as empty/orphaned.** The
+  `virtualMachineNamespace` key fell through to the generic "label In" branch of
+  the selector resolver, which looked for a *namespace* carrying a label of that
+  name — never true. Every 9.0 label-based VM policy therefore resolved to zero
+  namespaces and was reported as an orphan policy protecting nothing.
+- **VM labels were queried against namespaces.** On a label-based VM policy,
+  `spec.selector.matchLabels` filters VirtualMachines. KDL fed those labels to
+  `get namespaces -l ...`, which either matched nothing or, worse, matched
+  unrelated namespaces carrying the same label. VM-scoped policies are now
+  excluded from namespace-label resolution.
+- **`policies.withExport` counted export *actions*, not policies.** The filter
+  used a generator inside `select`, emitting the policy once per matching
+  action. Harmless while Kasten allowed one export action per policy; with 9.0
+  additional export, a cluster with 3 exporting policies (two dual-export)
+  reported 5. The same pattern was corrected for import policies and for the
+  export-retention and snapshot-retention checks.
+- **Export-retention check passed dual-export policies it should have flagged.**
+  `BP-EXPORT-NORET` required *all* export actions to lack an explicit retention
+  (`all`), so a policy where only the second destination silently inherited the
+  snapshot retention was reported compliant. Now flags if *any* export action
+  lacks one (`any`).
+- **Only the first export destination was ever shown.** Export frequency,
+  profile and retention all used `first`, so a dual-export policy rendered as a
+  single-destination one in text, JSON and HTML.
+- **Wildcards in namespace selectors never matched.** Kasten accepts `prod-*` in
+  `appNamespace`, `virtualMachineRef` and `virtualMachineNamespace` values (the
+  9.0 VM docs use exactly that form), but selector values were compared by exact
+  string equality, so wildcard-protected namespaces were reported as coverage
+  gaps. Values are now glob-expanded against the live namespace inventory —
+  while honouring the policy's own `NotIn` exceptions, so namespaces excluded on
+  purpose still land in `unprotectedBreakdown.excludedByPolicy` rather than
+  being silently absorbed by an expanded `*`.
+- **TLS verification was not checked on VBR profiles.** The scan looked only
+  under `locationSpec.objectStore` and `infrastoreBlobStore`, missing
+  `locationSpec.vbr.skipSSLVerify` — so a cluster exporting to a Veeam
+  repository over unverified TLS still scored a full 5/5 on the ransomware TLS
+  pillar. Replaced with a bounded deep scan.
+- **Immutability missed hardened VBR repositories.** Immutability was inferred
+  solely from a `protectionPeriod`, which a VBR repository never exposes; its
+  guarantee is carried by `repoType` (e.g. `LinuxHardened`). New
+  `profiles.immutableCountTotal` feeds the best practice and the ransomware
+  score; `immutableCount` keeps its original protectionPeriod-only meaning.
+- **Profile backends reported as the useless generic "ObjectStore".** The
+  generic `locationSpec.type` was tested before the specific
+  `objectStoreType`, so every object store looked identical and
+  `VeeamVaultAzure` / `VeeamVaultAWS` — the backends that actually carry
+  immutability — were never named. Region and endpoint had the same problem and
+  read `N/A` on every profile.
+- **VM and namespace policies were paired as "redundant".** They protect
+  different Kasten application types (`appType=virtualMachine` vs the namespace
+  app), so every 9.0 cluster mixing both got noise. Pairs are now compared
+  within the same scope, and `policyAnalysis.resolved[]` exposes `scope`.
+- **`hourly` retention was dropped from the rendered retention string** on
+  `@hourly` policies.
+- **Opaque `matchExpressions (complex selector)`** replaced by the actual
+  targets in both text and HTML, including the `In` + `NotIn`
+  catch-all-with-exceptions shape and VM selectors.
+
+### Notes
+- No Policy CRD field removed in 9.0 (`instantRecovery`, `targetVsphereStorage`)
+  was referenced by KDL, and `MigrateFCD` actions were never collected, so the
+  9.0 schema removals and the Instant Recovery for vSphere FCD withdrawal need
+  no changes.
+- Because several counts were corrected, a diff between a 2.1.x baseline and a
+  2.2.0 run can show deltas on an unchanged cluster (`policies.withExport`, VM
+  protection, the ransomware TLS pillar). `kdl-diff.sh` now prints a note when
+  the two reports come from different KDL versions and exposes
+  `metadata.kdlVersionMismatch`.
+
 ## [2.1.1] - 2026-08-08
 
 Field-reliability fixes for Windows/Git-Bash and least-privilege (K10-admin-only)

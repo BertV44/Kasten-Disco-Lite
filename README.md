@@ -1,6 +1,10 @@
-# Kasten Discovery Lite v2.1.0
+# Kasten Discovery Lite v2.2.0
 
-A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
+A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
+
+**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2). On a newer
+cluster the report prints a warning and sets `kastenCompatibility.newerThanValidated`,
+rather than silently analysing an unknown CRD schema.
 
 ## Overview
 
@@ -20,7 +24,13 @@ These join the existing v1.9 features:
 - **FIPS mode**, **Network Policies**, **Audit Logging** detection
 - **Dashboard access**, **Concurrency limiters**, **Timeouts**, **Datastore parallelism**
 - **KubeVirt / OpenShift Virtualization** VM detection (Kasten 8.5+)
-- **VM-based policy detection** with protected/unprotected VM analysis
+- **VM-based policy detection** — both selector shapes: by reference (8.5+) and
+  by label (`virtualMachineNamespace` + VM labels, Kasten 9.0+), with per-VM
+  protected/unprotected resolution and VM snapshot-consistency reporting
+- **Additional export** (Kasten 9.0) — policies with two export destinations,
+  including same-profile-twice detection
+- **Veeam Vault and VBR profiles** named explicitly, with hardened-repository
+  immutability detection
 - **License information** with **Consumption tracking**
 - **Health status** (pod health, backup success rates based on finished actions)
 - **Multi-Cluster detection** (primary/secondary/standalone)
@@ -335,7 +345,7 @@ echo "Regressions: $?"   # exit code = number of regressions
 
 Top-level keys (v2.0):
 
-`kdlVersion`, `platform`, `kastenVersion`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
+`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
 
 New in v2.0:
 
@@ -603,7 +613,31 @@ Key portability measures:
 
 ## Version History
 
-- **v2.0.2** (Current)
+- **v2.2.0** (Current) — **Veeam Kasten 9.0 compatibility**
+  - **Label-based VM policies** (`k10.kasten.io/virtualMachineNamespace` + VM
+    `matchLabels`): previously invisible to KDL, and wrongly reported as empty
+    /orphaned policies.
+  - **Additional export (dual export)**: policies with two export destinations
+    are now fully reported (`policies.additionalExport`, per-policy `exports[]`);
+    previously only the first destination was ever shown.
+  - **VM coverage is resolved per VM** instead of estimated. The old estimate
+    treated any wildcard reference as "all VMs protected" — a false all-clear.
+  - **VM snapshot consistency** (`ApplicationConsistent` vs `CrashConsistent`)
+    surfaced as a new best practice: Kasten falls back to crash-consistent
+    silently when the guest freeze fails.
+  - **Veeam Vault / VBR profiles** named explicitly; hardened VBR repositories
+    now count as an immutability signal, and their `skipSSLVerify` is finally
+    checked by the ransomware TLS pillar.
+  - **Counting fixes**: `policies.withExport` counted export *actions*, not
+    policies; namespace-selector wildcards (`prod-*`) never matched, producing
+    phantom coverage gaps.
+  - New 9.0/9.0.2 Helm settings surfaced; `kdl-rbac.yaml` unchanged (no new
+    cluster reads). See the CHANGELOG for the complete list.
+
+- **v2.1.1** — Windows/Git-Bash `Argument list too long` hardening, RBAC-limited
+  run transparency, deliberate-exclusion breakdown for coverage gaps.
+- **v2.1.0** — HTML report redesign; DR verdict fixes.
+- **v2.0.2**
   - **HTML report — license paid-entitlement view**: a long-lived TRIAL license no
     longer inflates the headline node limit into a misleading "OK"; consumption is
     also checked against the paid (non-trial) entitlement (`nodeConsumption.paidLimit`,

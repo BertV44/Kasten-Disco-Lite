@@ -213,9 +213,32 @@ def formatNamespaceSelector:
     elif .namespaces then
       (.namespaces | join(", "))
     elif .matchExpressions then
-      "<span class=\"badge info\">Expression-based</span>"
+      # Spell the expression out instead of the opaque "Expression-based" badge.
+      # Kasten selector keys (see the Policies API): appNamespace targets
+      # namespaces, virtualMachineRef targets "namespace/vmName", and
+      # virtualMachineNamespace (new in 9.0) targets namespaces whose VMs are
+      # then filtered by matchLabels.
+      ([.matchExpressions[]? | select(.key == "k10.kasten.io/virtualMachineRef") | (.values // [])[]?]) as $vmRefs |
+      ([.matchExpressions[]? | select(.key == "k10.kasten.io/virtualMachineNamespace") | (.values // [])[]?]) as $vmNs |
+      ([.matchExpressions[]? | select(.key == "k10.kasten.io/appNamespace" and .operator == "In") | (.values // [])[]?]) as $inNs |
+      ([.matchExpressions[]? | select(.key == "k10.kasten.io/appNamespace" and .operator == "NotIn") | (.values // [])[]?]) as $notNs |
+      (.matchLabels // {}) as $labels |
+      if ($vmRefs | length) > 0 then
+        "<code>" + ($vmRefs | join("</code>, <code>")) + "</code>"
+      elif ($vmNs | length) > 0 then
+        "<code>" + ($vmNs | join("</code>, <code>")) + "</code>" +
+        (if ($labels | length) > 0
+         then "<br><small>VM labels: " + ([$labels | to_entries[] | .key + "=" + (.value | tostring)] | join(", ")) + "</small>"
+         else "<br><small>all VMs in namespace</small>" end)
+      elif ($inNs | length) > 0 then
+        "<code>" + ($inNs | join("</code>, <code>")) + "</code>" +
+        (if ($notNs | length) > 0
+         then "<br><small>except <code>" + ($notNs | join("</code>, <code>")) + "</code></small>"
+         else "" end)
+      else "<span class=\"badge info\">Expression-based</span>" end
     elif .matchLabels then
-      "<span class=\"badge info\">Label-based</span>"
+      "<span class=\"badge info\">Label-based</span>: <small>" +
+      ([.matchLabels | to_entries[] | .key + "=" + (.value | tostring)] | join(", ")) + "</small>"
     else "<span class=\"badge ok\">All Namespaces</span>" end
   else "<span class=\"badge ok\">All Namespaces</span>" end;
 
@@ -243,7 +266,7 @@ def tunedBadge(val; dflt):
 
 # v2.1 redesign: severity map + findings tally for the verdict hero.
 def bpSevMap:
-  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
+  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
 def bpIsOk(v):
   (["CONFIGURED","IN_USE","ENABLED","COMPLETE","OK","VALID","COMPLIANT"] | index(v|tostring)) != null or (v == true);
 def bpFindings:
@@ -592,6 +615,18 @@ else "" end) + "
           (if .virtualization.totalVMs > 0 then " (" + (.virtualization.protection.protectedVMs | tostring) + "/" + (.virtualization.totalVMs | tostring) + " VMs)" else "" end) + "</td>
       </tr>"
       else "" end) +
+      (if (.bestPractices.vmSnapshotConsistency // "N/A") != "N/A" then
+      "
+      <tr>
+        <td><strong>VM Snapshot Consistency</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.vmSnapshotConsistency) + "</td>
+        <td>" + badge(.bestPractices.vmSnapshotConsistency) +
+          (if (.virtualization.vmRestorePointConsistency.crashConsistent // 0) > 0
+           then " (" + ((.virtualization.vmRestorePointConsistency.crashConsistent) | tostring) + " crash-consistent VM restore point(s) - guest was not quiesced)"
+           else "" end) + "</td>
+      </tr>"
+      else "" end) +
       "
       <tr>
         <td><strong>Resource Limits</strong></td>
@@ -834,10 +869,31 @@ else "" end) + "
             "<span class=\"badge error\">0 / " + (.virtualization.totalVMs | tostring) + "</span>"
           end) +
         "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">VM RestorePoints</span><span class=\"stat-value\">" + (.virtualization.vmRestorePoints | tostring) + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Note</span><span class=\"stat-value\"><small>" + .virtualization.protection.note + "</small></span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">via VM / namespace policies</span><span class=\"stat-value\">" +
+          ((.virtualization.protection.coveredByVmPolicies // 0) | tostring) + " / " +
+          ((.virtualization.protection.coveredByNamespacePolicies // 0) | tostring) + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">VM RestorePoints</span><span class=\"stat-value\">" + (.virtualization.vmRestorePoints | tostring) + "</span></div>" +
+        # Snapshot consistency (Kasten 9.0 era): a crash-consistent VM restore
+        # point means the guest was not quiesced and may need app-level recovery.
+        (if ((.virtualization.vmRestorePointConsistency.total // 0) > 0) then
+          "<div class=\"stat-row\"><span class=\"stat-label\">Snapshot Consistency</span><span class=\"stat-value\">" +
+          (if (.virtualization.vmRestorePointConsistency.crashConsistent // 0) > 0 then
+            "<span class=\"badge warn\">" + ((.virtualization.vmRestorePointConsistency.crashConsistent) | tostring) + " crash-consistent</span> "
+          else "" end) +
+          "<span class=\"badge ok\">" + ((.virtualization.vmRestorePointConsistency.applicationConsistent // 0) | tostring) + " app-consistent</span>" +
+          "</span></div>"
+        else "" end) +
+        "<div class=\"stat-row\"><span class=\"stat-label\">Note</span><span class=\"stat-value\"><small>" + .virtualization.protection.note + "</small></span></div>
       </div>
     </div>" +
+    (if ((.virtualization.protection.unprotectedVmList // []) | length) > 0 then
+      "<div class=\"info-box\"><strong>Unprotected VMs (" +
+      (((.virtualization.protection.unprotectedVmList) | length) | tostring) + "):</strong> " +
+      ((.virtualization.protection.unprotectedVmList) | .[0:25] | join(", ")) +
+      (if ((.virtualization.protection.unprotectedVmList) | length) > 25
+       then " &hellip; and " + (((.virtualization.protection.unprotectedVmList | length) - 25) | tostring) + " more"
+       else "" end) + "</div>"
+    else "" end) +
     "<div class=\"config-grid\">
       <div class=\"card\">
         <strong>Freeze Configuration</strong>
@@ -855,14 +911,32 @@ else "" end) + "
     (if (.virtualization.vmPolicies.items | length) > 0 then
       "<h3>VM Policies</h3>
       <table>
-      <thead><tr><th>Policy</th><th>Frequency</th><th>Actions</th><th>VM References</th></tr></thead>
+      <thead><tr><th>Policy</th><th>Frequency</th><th>Selector type</th><th>Actions</th><th>Targets</th></tr></thead>
       <tbody>" +
       ([.virtualization.vmPolicies.items[]? |
         "<tr>
           <td><strong>" + .name + "</strong></td>
           <td><code>" + .frequency + "</code></td>
+          <td>" + (
+            # Kasten 8.5+ selects VMs by reference; 9.0 added label-based
+            # selection (namespace pattern + VM labels), which has no vmRefs at
+            # all — the old \"All\" fallback made those policies look unscoped.
+            (.selectorKind // "byRef") as $k |
+            if $k == "byLabel" then "<span class=\"badge info\">by label</span>"
+            elif $k == "byRef+byLabel" then "<span class=\"badge info\">by ref + label</span>"
+            elif $k == "byRef" then "<span class=\"badge info\">by reference</span>"
+            else "<span class=\"badge info\">" + $k + "</span>" end
+          ) + "</td>
           <td>" + (.actions | join(", ")) + "</td>
-          <td>" + (if (.vmRefs | length) > 0 then (.vmRefs | join(", ")) else "<span class=\"badge info\">All</span>" end) + "</td>
+          <td>" + (
+            if ((.vmRefs // []) | length) > 0 then "<code>" + ((.vmRefs) | join("</code>, <code>")) + "</code>"
+            elif ((.vmNamespaces // []) | length) > 0 then
+              "ns <code>" + ((.vmNamespaces) | join("</code>, <code>")) + "</code>" +
+              (if ((.vmLabels // {}) | length) > 0
+               then "<br><small>VM labels: " + ([(.vmLabels) | to_entries[] | .key + "=" + (.value | tostring)] | join(", ")) + "</small>"
+               else "<br><small>all VMs in namespace</small>" end)
+            else "<span class=\"badge info\">All</span>" end
+          ) + "</td>
         </tr>"
       ] | join("")) +
       "</tbody></table>"
@@ -870,7 +944,7 @@ else "" end) + "
     (if (.virtualization.vms | length) > 0 then
       "<h3>VM Inventory</h3>
       <table>
-      <thead><tr><th>Name</th><th>Namespace</th><th>Status</th><th>Ready</th><th>Freeze</th></tr></thead>
+      <thead><tr><th>Name</th><th>Namespace</th><th>Status</th><th>Ready</th><th>Freeze</th><th>Protected by</th></tr></thead>
       <tbody>" +
       ([.virtualization.vms[:20][]? |
         "<tr>
@@ -879,9 +953,16 @@ else "" end) + "
           <td>" + (if .status == "Running" then "<span class=\"badge ok\">Running</span>" elif .status == "Stopped" then "<span class=\"badge warn\">Stopped</span>" else "<span class=\"badge info\">" + .status + "</span>" end) + "</td>
           <td>" + boolBadge(.ready) + "</td>
           <td>" + (if .freezeDisabled then "<span class=\"badge warn\">Disabled</span>" else "<span class=\"badge ok\">Enabled</span>" end) + "</td>
+          <td>" + (
+            # Per-VM protection resolution (KDL v2.2.0). Absent on reports
+            # produced by older KDL versions, hence the null guard.
+            if .protected == null then "<span class=\"badge info\">n/a</span>"
+            elif .protected then "<span class=\"badge ok\">" + ((.protectedBy // []) | join(", ")) + "</span>"
+            else "<span class=\"badge error\">none</span>" end
+          ) + "</td>
         </tr>"
       ] | join("")) +
-      (if (.virtualization.vms | length) > 20 then "<tr><td colspan=\"5\"><em>... and " + ((.virtualization.vms | length) - 20 | tostring) + " more</em></td></tr>" else "" end) +
+      (if (.virtualization.vms | length) > 20 then "<tr><td colspan=\"6\"><em>... and " + ((.virtualization.vms | length) - 20 | tostring) + " more</em></td></tr>" else "" end) +
       "</tbody></table>"
     else "" end)
   elif .virtualization and .virtualization.totalVMs == 0 and .virtualization.platform != "None" then
@@ -1131,15 +1212,25 @@ else "" end) + "
 
 <h2>\uD83D\uDCE6 Location Profiles</h2>
 <table>
-<thead><tr><th>Name</th><th>Backend</th><th>Region</th><th>Protection Period</th></tr></thead>
+<thead><tr><th>Name</th><th>Backend</th><th>Region</th><th>Immutability</th></tr></thead>
 <tbody>"
 + (if (.profiles.items | length) > 0 then
     ([.profiles.items[]? |
       "<tr>
-        <td><strong>" + .name + "</strong></td>
-        <td>" + .backend + "</td>
+        <td><strong>" + .name + "</strong>" +
+          # Veeam Backup & Replication repository name (Kasten 9.0 can send both
+          # metadata and snapshot data to a single Veeam repository).
+          (if .vbrRepoName then "<br><small>\uD83D\uDDC4\uFE0F " + .vbrRepoName + "</small>" else "" end) + "</td>
+        <td>" + .backend +
+          (if .vbrRepoType then " <small>(" + .vbrRepoType + ")</small>" else "" end) + "</td>
         <td>" + (.region // "N/A") + "</td>
-        <td>" + (if .protectionPeriod then "<span class=\"badge ok\">" + .protectionPeriod + "</span>" else "<span class=\"badge warn\">Not Set</span>" end) + "</td>
+        <td>" + (
+          # Immutability comes from a protectionPeriod (object store / Veeam
+          # Vault) OR from a hardened VBR repository, which never exposes one.
+          if .protectionPeriod then "<span class=\"badge ok\">" + .protectionPeriod + "</span>"
+          elif (.vbrImmutable // false) then "<span class=\"badge ok\">Hardened repository</span>"
+          else "<span class=\"badge warn\">Not Set</span>" end
+        ) + "</td>
       </tr>"
     ] | join(""))
   else
@@ -1149,31 +1240,63 @@ else "" end) + "
 
 <h2>\uD83D\uDCDC Backup Policies</h2>
 <table>
-<thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Retention</th></tr></thead>
+<thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Export destinations</th><th>Retention</th></tr></thead>
 <tbody>"
 + (if (.policies.items | length) > 0 then
     ([.policies.items[]? |
+      # `exports` is emitted by KDL v2.2.0+; older reports only carry the single
+      # `exportRetention`. Absent (null) and empty ([]) must NOT be conflated:
+      # on a legacy report `null` means "not collected", and rendering that as
+      # "Snapshot only" would invent a coverage gap on every exporting policy.
+      ((.exports // [])) as $exports |
+      (.exports == null) as $exportsUnknown |
+      ((.actions // []) | index("export")) as $hasExportAction |
       "<tr>
-        <td><strong>" + .name + "</strong>" + (if .presetRef then "<br><small>\uD83D\uDCCB " + .presetRef + "</small>" else "" end) + "</td>
+        <td><strong>" + .name + "</strong>" + (if .presetRef then "<br><small>\uD83D\uDCCB " + .presetRef + "</small>" else "" end) +
+          (if (.scope // "namespace") == "virtualMachine" then "<br><span class=\"badge info\">VM policy</span>" else "" end) + "</td>
         <td><code>" + .frequency + "</code></td>
         <td>" + (.actions | join(", ")) + "</td>
         <td>" + (.selector | formatNamespaceSelector) + "</td>
-        <td>" + 
+        <td>" + (
+          if $exportsUnknown then
+            (if $hasExportAction then "<span class=\"badge info\">export configured</span>"
+             else "<span class=\"badge warn\">Snapshot only</span>" end)
+          elif ($exports | length) == 0 then "<span class=\"badge warn\">Snapshot only</span>"
+          else
+            ([$exports[] |
+              "<code>" + (.profile // "not set") + "</code>" +
+              (if .frequency then " <small>" + .frequency + "</small>" else "" end) +
+              (if .blockModeProfile then "<br><small>\u21B3 volume data \u2192 " + .blockModeProfile + " (VBR)</small>" else "" end)
+            ] | join("<br>")) +
+            # Kasten 9.0 additional export: two destinations on one policy.
+            (if ($exports | length) > 1 then "<br><span class=\"badge info\">additional export</span>" else "" end)
+          end
+        ) + "</td>
+        <td>" +
           (if .retention and (.retention | length) > 0 then
             "Snapshot(" + (.retention | to_entries | map(.key + "=" + (.value | tostring)) | join(", ")) + ")"
           else "" end) +
-          (if .exportRetention and (.exportRetention | length) > 0 then
-            (if .retention and (.retention | length) > 0 then "<br>" else "" end) +
-            "Export(" + (.exportRetention | to_entries | map(.key + "=" + (.value | tostring)) | join(", ")) + ")"
-          else "" end) +
-          (if ((.retention | length) == 0 or .retention == null) and (.exportRetention == null or (.exportRetention | length) == 0) then
+          # Per-destination export retention. Falls back to the legacy single
+          # `exportRetention` field when reading a pre-v2.2.0 report.
+          (([$exports[] | select(.retention != null and ((.retention | length) > 0)) |
+              "Export(" + (.retention | to_entries | map(.key + "=" + (.value | tostring)) | join(", ")) + ")"
+            ]) as $expRet |
+           if ($expRet | length) > 0 then
+             (if .retention and (.retention | length) > 0 then "<br>" else "" end) + ($expRet | join("<br>"))
+           elif .exportRetention and (.exportRetention | length) > 0 then
+             (if .retention and (.retention | length) > 0 then "<br>" else "" end) +
+             "Export(" + (.exportRetention | to_entries | map(.key + "=" + (.value | tostring)) | join(", ")) + ")"
+           else "" end) +
+          (if ((.retention | length) == 0 or .retention == null)
+              and (.exportRetention == null or (.exportRetention | length) == 0)
+              and (([$exports[] | select(.retention != null)] | length) == 0) then
             "<span class=\"badge warn\">Not defined</span>"
           else "" end) +
         "</td>
       </tr>"
     ] | join(""))
   else
-    "<tr><td colspan=\"5\" style=\"text-align:center;color:#57606a;\">No policies found</td></tr>"
+    "<tr><td colspan=\"6\" style=\"text-align:center;color:#57606a;\">No policies found</td></tr>"
   end)
 + "</tbody></table>
 
