@@ -148,20 +148,39 @@ echo "== 6. Profiles: Veeam Vault / VBR classification =="
 a "immutableCountTotal >= immutableCount"  '.profiles.immutableCountTotal >= .profiles.immutableCount'
 a "vbrHardenedCount <= vbrCount"           '.profiles.vbrHardenedCount <= .profiles.vbrCount'
 a "no profile backend left Undetermined"   '[.profiles.items[]|select(.backend=="Undetermined")]|length == 0'
-a "VBR profiles expose a repository name"   '[.profiles.items[]|select(.locationType=="VBR" and .vbrRepoName==null)]|length == 0'
-# DIAGNOSTIC, not a gate. The live Profile CRD nesting is not fully pinned down
-# (the published schema shows locationSpec.location.objectStore, real clusters
-# have shown locationSpec.type), so v2.2.0 resolves the backend with a deep
-# scan for `objectStoreType`. If a profile still reports the generic
-# "ObjectStore", the scan did not find that field -> report the actual shape so
-# the resolver can be corrected. This is information, not necessarily a defect.
+a "locationType resolved for every profile" \
+  '[.profiles.items[]|select(.locationType==null and .backend!="Infra")]|length == 0'
+
+# DIAGNOSTICS, not gates. The live Profile CRD nesting is only partly pinned
+# down. A real 8.5.13 report confirms `spec.type` (Location/Infra) and
+# `spec.locationSpec.type` (ObjectStore/VBR) exist -- i.e. the FLAT shape, not
+# the `locationSpec.location.locationType` of the published schema. But because
+# the old code matched `locationSpec.type` first, it never revealed where
+# objectStoreType / region / repoName actually live. v2.2.0 finds them by
+# deep-scanning the field name; if a scan comes back empty the honest answer is
+# "report the real shape", not "assert a conclusion we cannot justify".
+_diag=0
 if [ "$(jq -r '[.profiles.items[]|select(.backend=="ObjectStore")]|length' "$J")" -gt 0 ] 2>/dev/null; then
-  printf '  [INFO] %s\n' "profile(s) still report the generic \"ObjectStore\" backend:"
-  jq -r '[.profiles.items[]|select(.backend=="ObjectStore")|.name]|"        " + join(", ")' "$J"
-  printf '        %s\n' "Please capture the real shape (redact names/URLs) and send it:"
-  printf '        %s\n' "oc -n $NS get profiles.config.kio.kasten.io <name> -o json | jq '.spec.locationSpec | keys, (.. | objects | keys)'"
+  _diag=1
+  printf '  [INFO] %s\n' 'object-store profile(s) still report the GENERIC "ObjectStore" backend'
+  printf '         %s\n' '(objectStoreType not found by deep scan):'
+  jq -r '[.profiles.items[]|select(.backend=="ObjectStore")|.name]|"           " + join(", ")' "$J"
 else
   ok "every object-store profile named its specific backend (S3/Azure/GCS/VeeamVault*)"
+fi
+if [ "$(jq -r '[.profiles.items[]|select(.locationType=="VBR" and .vbrRepoName==null)]|length' "$J")" -gt 0 ] 2>/dev/null; then
+  _diag=1
+  printf '  [INFO] %s\n' 'VBR profile(s) exposed no repository name (repoName not found by deep scan):'
+  jq -r '[.profiles.items[]|select(.locationType=="VBR" and .vbrRepoName==null)|.name]|"           " + join(", ")' "$J"
+elif [ "$(jq -r '.profiles.vbrCount // 0' "$J")" -gt 0 ] 2>/dev/null; then
+  ok "every VBR profile exposed its repository name"
+fi
+if [ "$_diag" -eq 1 ]; then
+  printf '         %s\n' 'Capture the real structure and send it -- keys only, no values, so'
+  printf '         %s\n' 'no bucket names, endpoints or server addresses leave the cluster:'
+  printf '         %s\n' "  oc -n $NS get profiles.config.kio.kasten.io -o json \\"
+  printf '         %s\n' "    | jq '[.items[] | {name:.metadata.name, paths:"
+  printf '         %s\n' "        [paths(scalars) | join(\".\")] | map(select(test(\"credential|secret\")|not))}]'"
 fi
 show '[.profiles.items[]|.backend] | "backends: " + (unique|join(", "))'
 show '"vbr=" + (.profiles.vbrCount|tostring) + " (hardened=" + (.profiles.vbrHardenedCount|tostring) + ")"

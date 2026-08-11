@@ -14,8 +14,12 @@ reads is byte-identical to 2.1.1.
 
 Verified against synthetic 9.0 fixtures covering both VM selector shapes,
 catch-all-with-exceptions namespace selectors, dual export, Veeam Vault
-(Azure/AWS) and VBR (hardened and plain) profiles. `kdl-json-to-html.sh` was
-re-checked against a real 2.0-era report to confirm older JSON still renders.
+(Azure/AWS) and VBR (hardened and plain) profiles, plus re-analysis of a real
+`kasten-se-lab` report (Kasten 8.5.13 / OpenShift Virtualization 4.18.36) which
+independently confirmed the VM-coverage and export-counting defects on
+production data. `kdl-json-to-html.sh` was re-checked against that same report
+to confirm pre-2.2.0 JSON still renders. Not yet run against a live 9.0 cluster
+-- see `RELEASING.md` for the validation gate.
 
 ### Added
 - **Label-based VM policies (`k10.kasten.io/virtualMachineNamespace`).** Kasten
@@ -61,13 +65,17 @@ re-checked against a real 2.0-era report to confirm older JSON still renders.
 ### Fixed
 - **VM coverage reported a false all-clear.** Protected VMs were estimated as
   `explicitVmRefs + namespacesCovered` capped at the total, and *any* wildcard
-  in a VM reference short-circuited the result to "all VMs protected". On the
-  9.0 fixture this reported **6/6 VMs protected when only 4 were** — the two
-  genuinely unprotected VMs were excluded by a policy-level `NotIn` and by a
-  label selector that did not match them. Each VM is now matched individually
-  against every candidate policy (VM ref globs, VM namespace + label subset,
-  namespace selectors minus exclusions), and only policies with a `backup`
-  action confer protection.
+  in a VM reference short-circuited the result to "all VMs protected".
+  Confirmed on a real `kasten-se-lab` report (Kasten 8.5.13, OpenShift
+  Virtualization 4.18.36): it claimed **16/16 VMs protected, 0 unprotected**,
+  where recomputing from the same report's own data gives **10/16** — the VM
+  policies reference 6 namespaces while VMs live in 12, and there was no
+  catch-all policy. That report **contradicted itself**: its own
+  `namespaceProtectionStatus` already listed `pv-vm-restore`, `smohandass-vms`,
+  `testvm` and `vm-demo` as never backed up while the VM section showed
+  all-green. Each VM is now matched individually against every candidate policy
+  (VM ref globs, VM namespace + label subset, namespace selectors minus
+  exclusions), and only policies with a `backup` action confer protection.
 - **Label-based VM policies were flagged as empty/orphaned.** The
   `virtualMachineNamespace` key fell through to the generic "label In" branch of
   the selector resolver, which looked for a *namespace* carrying a label of that
@@ -80,10 +88,13 @@ re-checked against a real 2.0-era report to confirm older JSON still renders.
   excluded from namespace-label resolution.
 - **`policies.withExport` counted export *actions*, not policies.** The filter
   used a generator inside `select`, emitting the policy once per matching
-  action. Harmless while Kasten allowed one export action per policy; with 9.0
-  additional export, a cluster with 3 exporting policies (two dual-export)
-  reported 5. The same pattern was corrected for import policies and for the
-  export-retention and snapshot-retention checks.
+  action. **This was already producing wrong numbers before 9.0**: a real
+  `kasten-se-lab` report on Kasten **8.5.13** reports `withExport: 23` while only
+  22 policies actually have an export action — the CRD already accepted two
+  export actions, and one policy used them. Kasten 9.0 only made the shape a
+  supported feature, so it turns a latent off-by-N into a routine one. The same
+  pattern was corrected for import policies and for the export-retention and
+  snapshot-retention checks.
 - **Export-retention check passed dual-export policies it should have flagged.**
   `BP-EXPORT-NORET` required *all* export actions to lack an explicit retention
   (`all`), so a policy where only the second destination silently inherited the

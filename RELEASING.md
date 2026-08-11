@@ -73,8 +73,23 @@ reference. Record the two numbers.
    `.virtualization.protection.protectedVMs` / `.unprotectedVMs`.
    Then check the named gaps: every entry in
    `.virtualization.protection.unprotectedVmList` must genuinely have **no**
-   policy covering it. This is the assertion v2.1.1 got wrong (it claimed 6/6
-   where the truth was 4/6), so a mismatch here blocks the release.
+   policy covering it. A mismatch here blocks the release.
+
+   > **Why this is step 1.** Re-analysing a real `kasten-se-lab` report
+   > (KDL v2.0.2, Kasten 8.5.13, OpenShift Virtualization 4.18.36) showed the
+   > pre-2.2.0 estimator claiming **16/16 VMs protected, 0 unprotected**, with
+   > the note "wildcard patterns detected - verify coverage". Recomputing from
+   > the same report's own data gives **10/16**: the VM policies reference
+   > 6 namespaces (`flr-demo-vms`, `from-vsphere`, `pv-vm-test`, `vm-ns-1..3`)
+   > while VMs live in 12, and there was no catch-all policy.
+   > The report **contradicted itself** — its own
+   > `namespaceProtectionStatus` already reported `pv-vm-restore`,
+   > `smohandass-vms`, `testvm` and `vm-demo` as never backed up, while the VM
+   > section next to it showed all-green. The presence of a single wildcard was
+   > enough to short-circuit the old estimate to 100%.
+   > Lesson: a green VM count is not evidence. Cross-read it against
+   > `namespaceProtectionStatus` — if the two disagree, trust neither and
+   > check the dashboard.
 2. **Label-based VM policy re-evaluation.** Add the policy's VM label to a
    previously unmatched VM, re-run KDL, and confirm that VM moves from
    `unprotectedVmList` into `protectedBy`. Remove the label and confirm it moves
@@ -93,9 +108,21 @@ reference. Record the two numbers.
 6. **Profiles.** Confirm each backend is named specifically
    (`S3`/`VeeamVaultAzure`/`VeeamVaultAWS`/`VBR`), not the generic
    `ObjectStore`. For a hardened VBR repository, confirm
-   `vbrImmutable: true` and that Immutability reads ENABLED. If a profile still
-   reports `ObjectStore`, Phase A prints the command to capture the real CRD
-   shape — send it rather than guessing.
+   `vbrImmutable: true` and that Immutability reads ENABLED.
+
+   > **Known open question.** The live Profile CRD nesting is only partly
+   > pinned down. A real 8.5.13 report confirms `spec.type` (`Location`/`Infra`)
+   > and `spec.locationSpec.type` (`ObjectStore`/`VBR`) exist — the **flat**
+   > shape, not the `locationSpec.location.locationType` of the published
+   > schema, which v2.2.0 handles as a fallback. But because the pre-2.2.0 code
+   > matched `locationSpec.type` first, it never revealed where
+   > `objectStoreType`, `region`, `endpoint`, `repoName` and `repoType` actually
+   > live (all profiles read `ObjectStore` / `N/A`). v2.2.0 locates them by
+   > deep-scanning the field name, which is version-proof but unconfirmed.
+   > If Phase A prints an `[INFO]` for a generic `ObjectStore` backend or a
+   > missing VBR `repoName`, it also prints a keys-only dump command — the
+   > output carries no bucket names, endpoints or server addresses, so it is
+   > safe to share. Send that rather than guessing.
 7. **Snapshot consistency.** Cross-check
    `.virtualization.vmRestorePointConsistency` against a few restore points in
    the dashboard. Optional but valuable: stop the QEMU guest agent on one VM,
