@@ -1,11 +1,25 @@
 #!/bin/sh
 # ============================================================================
-# KDL v2.2.0 — Kasten 9.0 validation gate
+# KDL v2.2.0 — validation gate
 #
-# Phase A (this script): internal-consistency assertions on a real 9.0 report.
-#   Proves the new code paths executed and agree with each other. It CANNOT
-#   prove the numbers match reality — that is Phase B (manual, see the report
-#   printed at the end).
+# Runs internal-consistency assertions on a real report. Proves the new code
+# paths executed and agree with each other. It CANNOT prove the numbers match
+# reality — that is Phase B (manual, see RELEASING.md).
+#
+# TWO MODES, selected automatically from the cluster's Kasten version:
+#
+#   GATE mode (Kasten >= 9.0)  — the release gate. Asserts the 9.0-specific
+#       paths ran. FAIL=0 here is the precondition for tagging v2.2.0.
+#
+#   REGRESSION mode (Kasten < 9.0) — the 9.0 features do not exist on this
+#       cluster, so their assertions are SKIPped rather than failed. Everything
+#       version-agnostic still runs, which is worth doing: it exercises the
+#       rewritten VM-coverage, export-accounting, selector-resolution and
+#       profile-classification code against real data. It does NOT validate
+#       9.0 compatibility — only that v2.2.0 did not regress the 8.x path.
+#
+# A "by design" failure teaches people to ignore failures, so the version
+# mismatch is a mode switch, never a FAIL.
 #
 # Usage:
 #   sh kdl-v9-validate.sh <kasten-namespace> [path/to/KDL.sh]
@@ -43,11 +57,31 @@ a "restore buckets reconcile"            '.health.backups.restoreActions | (.com
 a "totalCapacityGi is numeric"           '.dataUsage.totalCapacityGi|type=="number"'
 
 echo
-echo "== 1. Kasten 9.0 detected and inside the validated range =="
+echo "== 1. Mode selection (Kasten version) =="
 a "Kasten major.minor parsed"            '.kastenCompatibility.detectedMajorMinor != null'
-a "cluster is 9.x"                       '.kastenCompatibility.detectedMajorMinor | startswith("9.")'
 a "not flagged newer than validated"     '.kastenCompatibility.newerThanValidated == false'
 show '"detected " + .kastenVersion + " | validated up to " + .kastenCompatibility.validatedUpTo'
+
+# MODE=gate on Kasten >= 9.0, MODE=regression below that.
+KMM="$(jq -r '.kastenCompatibility.detectedMajorMinor // ""' "$J")"
+K_MAJ="${KMM%%.*}"
+MODE="regression"
+case "$K_MAJ" in
+  ''|*[!0-9]*) MODE="unknown" ;;
+  *) [ "$K_MAJ" -ge 9 ] && MODE="gate" ;;
+esac
+
+case "$MODE" in
+  gate)
+    ok "Kasten 9.x detected -> GATE mode (this run is the release gate)" ;;
+  regression)
+    printf '  [MODE] %s\n' "Kasten ${KMM} (< 9.0) -> REGRESSION mode."
+    printf '         %s\n' "9.0-only assertions will SKIP, not fail. This run does NOT"
+    printf '         %s\n' "validate 9.0 compatibility -- it checks the 8.x path for"
+    printf '         %s\n' "regressions and exercises the rewritten code on real data." ;;
+  unknown)
+    printf '  [MODE] %s\n' "Kasten version unparsed -> REGRESSION mode (conservative)." ;;
+esac
 
 echo
 echo "== 2. Export accounting (dual export / additional export) =="
@@ -97,13 +131,15 @@ else
         + " | vmPolicies byRef=" + (.virtualization.vmPolicies.byRefSelector|tostring)
         + " byLabel=" + (.virtualization.vmPolicies.byLabelSelector|tostring)'
 
-  # The headline v2.1.1 bug. If a byLabel policy exists, it MUST be visible.
+  # The headline v2.1.1 blind spot. This is the one genuinely 9.0-only check.
   if [ "$(jq -r '.virtualization.vmPolicies.byLabelSelector // 0' "$J")" -gt 0 ] 2>/dev/null; then
     ok "label-based VM policy present and detected (the v2.1.1 blind spot)"
     a "byLabel policies carry namespace patterns" \
       '[.virtualization.vmPolicies.items[]|select(.selectorKind|test("byLabel"))|select((.vmNamespaces|length)==0)]|length == 0'
+  elif [ "$MODE" = "gate" ]; then
+    skip "no label-based VM policy on this 9.x cluster -- create one, this is the main 9.0 path"
   else
-    skip "no label-based VM policy on this cluster — create one (Phase B step 3)"
+    skip "label-based VM policies need Kasten 9.0 (not applicable here)"
   fi
 
   # Snapshot consistency
@@ -195,7 +231,27 @@ echo "  (also confirm the run printed NO '[WARN] Section ... could not be comput
 
 echo
 echo "=============================================="
-printf 'PASS=%s  FAIL=%s  SKIP=%s\n' "$PASS" "$FAIL" "$SKIP"
+printf 'PASS=%s  FAIL=%s  SKIP=%s   (mode: %s)\n' "$PASS" "$FAIL" "$SKIP" "$MODE"
+if [ "$FAIL" -eq 0 ]; then
+  case "$MODE" in
+    gate)
+      echo "Phase A PASSED on Kasten ${KMM}. v2.2.0 may be tagged only after"
+      echo "Phase B (manual dashboard cross-check) in RELEASING.md." ;;
+    *)
+      echo "No regression on the Kasten ${KMM} path."
+      echo "9.0 COMPATIBILITY IS STILL UNVALIDATED -- re-run on a 9.x cluster." ;;
+  esac
+else
+  echo "Phase A FAILED -- do not tag. Each FAIL above is a real defect;"
+  echo "version mismatch is handled as a mode switch and never fails."
+fi
+echo
+echo "Worth reading in the report even when everything passes:"
+echo "  VM gaps         : jq '.virtualization.protection.unprotectedVmList' $J"
+echo "  self-consistency: compare the VM count above against"
+echo "                    jq '[.namespaceProtectionStatus.items[]|select(.lastSuccessfulBackup==null)|.namespace]' $J"
+echo "                    (a green VM count beside never-backed-up namespaces is the v2.1.1 contradiction)"
+echo
 echo "Report: $J"
 echo "HTML:   $OUT/disco.html"
 echo "=============================================="

@@ -52,13 +52,30 @@ NS=kasten-io
 ./kdl-v9-validate.sh "$NS"        # exits non-zero on any failed assertion
 ```
 
-Expect `FAIL=0`. `SKIP` lines tell you which 9.0 feature is absent from the
-cluster and therefore untested — a skip is not a pass. To exercise everything,
-the cluster needs: at least one VM, one VM policy **by label**
-(`virtualMachineNamespace` + VM `matchLabels`), one VM policy by reference, one
-policy with **two export destinations**, and one **VBR** or **Veeam Vault**
-profile. Also confirm the run printed no
-`[WARN] Section ... could not be computed` on stderr.
+The script picks its own mode from the cluster's Kasten version, so it is safe
+to run anywhere:
+
+| Cluster | Mode | What `FAIL=0` means |
+|---|---|---|
+| Kasten **>= 9.0** | `gate` | Phase A passed — proceed to Phase B |
+| Kasten **< 9.0** | `regression` | The 8.x path did not regress. **9.0 compatibility remains unvalidated.** |
+
+A version mismatch is a **mode switch, never a FAIL** — a gate that fails "by
+design" only teaches people to ignore failures. Every `FAIL` is a real defect.
+
+Expect `FAIL=0`. `SKIP` lines name the feature that is absent and therefore
+untested — **a skip is not a pass**. To exercise everything, the cluster needs:
+at least one VM, one VM policy **by label** (`virtualMachineNamespace` + VM
+`matchLabels`, 9.0 only), one VM policy by reference, one policy with **two
+export destinations**, and one **VBR** or **Veeam Vault** profile. Also confirm
+the run printed no `[WARN] Section ... could not be computed` on stderr.
+
+Running it in `regression` mode on an 8.x cluster is worthwhile even though it
+cannot clear the release: only the label-based VM selector is genuinely
+9.0-only. Everything else the rewrite touched — per-VM coverage, export
+accounting, wildcard and `NotIn` selector resolution, VBR/Veeam Vault
+classification, dual export (which the CRD already accepted on 8.5.13) — is
+exercised against real data.
 
 The gate is meaningful, not tautological: run it against a v2.1.x report and the
 version, export-accounting, per-VM and empty-policy assertions all fail.
