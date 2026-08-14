@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Kasten Discovery Lite Report</title>
+<style>{{.CSS}}</style>
+</head>
+<body>
+<div class="layout">
+
+<aside class="sidebar">
+  <div class="brand">
+    <div class="logo">K</div>
+    <div>
+      <div class="name">Kasten Discovery Lite</div>
+      <div class="ver">{{.SidebarSub}}</div>
+    </div>
+  </div>
+  <button class="btn" id="paletteOpen" style="width:100%;justify-content:flex-start;margin-bottom:0.5rem">Search / jump (Ctrl-K)</button>
+  <nav class="nav" id="nav"></nav>
+</aside>
+
+<main class="content">
+
+<div class="topbar">
+  <div>
+    <h1>Kasten Discovery Lite Report</h1>
+    <div class="subtitle">{{.Subtitle}}</div>
+  </div>
+  <div class="controls">
+    <button class="btn" id="issuesToggle" aria-pressed="false">Only issues</button>
+    <button class="btn" id="densityToggle" aria-pressed="false">Compact</button>
+    <button class="btn" id="themeToggle">Light</button>
+  </div>
+</div>
+
+<div class="verdict">
+  <div class="grade {{.GradeClass}}">{{.Grade}}</div>
+  <div>
+    <div class="head">Ransomware readiness: <strong>Grade {{.Grade}}</strong>. Critical best-practice checks failing: {{.CriticalNo}}.</div>
+    <div class="sub">{{.Summary.Total}} best-practice checks | weighted ransomware score {{.Score}}/{{.MaxScore}}</div>
+    <div class="findings">
+      <div class="finding crit"><span class="n">{{.Summary.Critical}}</span><span class="l">Critical</span></div>
+      <div class="finding warn"><span class="n">{{.Summary.Warnings}}</span><span class="l">Warnings</span></div>
+      <div class="finding ok"><span class="n">{{.Summary.Passing}}</span><span class="l">Passing</span></div>
+    </div>
+  </div>
+</div>
+
+<div class="worklist" id="worklist" style="display:none"></div>
+
+{{if .Compat}}
+<div class="{{if .Compat.Newer}}warning-box{{else}}info-box{{end}}">
+  <strong>Kasten compatibility.</strong>
+  Cluster runs {{.Compat.Detected}}; this KDL build is validated up to {{.Compat.ValidatedUpTo}}.
+  {{if .Compat.Newer}}The cluster is NEWER than the validated version, so findings below may be incomplete.{{end}}
+</div>
+{{end}}
+
+{{if .RBAC}}
+<div class="warning-box">
+  <strong>Restricted RBAC.</strong>
+  {{len .RBAC.Denied}} cluster-scoped read(s) were denied, so the affected sections are
+  <em>empty rather than zero</em>:
+  <ul>{{range .RBAC.Denied}}<li>{{.}}</li>{{end}}</ul>
+</div>
+{{end}}
+
+<div class="grid">{{range .SummaryCards}}<div class="card"><strong>{{.Label}}</strong><br><span class="card-value">{{.Value}}</span></div>{{end}}</div>
+
+{{range $s := .Sections}}
+<h2>{{$s.Title}}{{if $s.NewBadge}}<span class="new-badge">{{$s.NewBadge}}</span>{{end}}</h2>
+{{if $s.Desc}}<p class="section-description">{{$s.Desc}}</p>{{end}}
+
+{{if eq $s.Kind "checks"}}
+  {{template "checks" $.Checks}}
+{{else if eq $s.Kind "pillars"}}
+  {{template "pillars" $.Ransomware}}
+{{else if eq $s.Kind "policies"}}
+  {{template "policies" $.Policies}}
+{{else}}
+  {{if $s.Cards}}<div class="grid">{{range $s.Cards}}<div class="card"><strong>{{.Label}}</strong><div class="card-value">{{.Value}}</div></div>{{end}}</div>{{end}}
+  {{if $s.Rows}}
+  <div class="card{{if $s.CardClass}} {{$s.CardClass}}{{end}}">
+    {{range $s.Rows}}{{template "row" .}}{{end}}
+    {{if $s.Progress}}<div class="progress-bar"><div class="progress-fill" style="width:{{$s.Progress.Percent}}%"></div></div>{{end}}
+  </div>
+  {{end}}
+  {{range $s.Groups}}
+    {{if .Title}}<h3>{{.Title}}</h3>{{end}}
+    {{if .Cards}}<div class="grid">{{range .Cards}}<div class="card"><strong>{{.Label}}</strong><div class="card-value">{{.Value}}</div></div>{{end}}</div>{{end}}
+    {{if .Rows}}<div class="card">{{range .Rows}}{{template "row" .}}{{end}}</div>{{end}}
+    {{with .Table}}{{template "table" .}}{{end}}
+    {{range .Boxes}}{{template "box" .}}{{end}}
+  {{end}}
+  {{range $s.Tables}}{{template "table" .}}{{end}}
+  {{range $s.Boxes}}{{template "box" .}}{{end}}
+{{end}}
+{{end}}
+
+<div class="footer">
+  <strong>Kasten Discovery Lite v{{.KDLVersion}}</strong>
+  <br>
+  This report provides observational signals only and does not assert compliance.<br>
+  Generated from JSON output of Kasten Discovery Lite script on {{.Generated}}.
+</div>
+
+</main>
+</div>
+<script>{{.JS}}</script>
+</body>
+</html>
+
+{{define "row"}}
+<div class="stat-row">
+  <span class="stat-label">{{.Label}}</span>
+  <span class="stat-value">
+    {{- if .Value}}{{if .Code}}<code>{{.Value}}</code>{{else}}{{.Value}}{{end}}{{if .Unit}} {{.Unit}}{{end}}{{if .Tuned}} <span class="tuned-badge">tuned</span>{{end}} {{end -}}
+    {{- if .Badge}}<span class="badge {{.Badge.Class}}">{{.Badge.Text}}</span>{{end -}}
+    {{- if .Suffix}} {{.Suffix}}{{end -}}
+  </span>
+</div>
+{{end}}
+
+{{define "cell"}}
+{{- if .Badge}}<span class="badge {{.Badge.Class}}">{{.Badge.Text}}</span>
+{{- else if .Code}}<code>{{.Text}}</code>
+{{- else if .Bold}}<strong>{{.Text}}</strong>
+{{- else}}{{.Text}}{{end -}}
+{{end}}
+
+{{define "table"}}
+{{if .Title}}<h3>{{.Title}}</h3>{{end}}
+{{if .Rows}}
+<table>
+  <thead><tr>{{range .Headers}}<th>{{.}}</th>{{end}}</tr></thead>
+  <tbody>
+  {{range .Rows}}<tr>{{range .}}<td>{{template "cell" .}}</td>{{end}}</tr>
+  {{end}}
+  </tbody>
+</table>
+{{else if .Empty}}<p class="section-description">{{.Empty}}</p>{{end}}
+{{end}}
+
+{{define "box"}}
+<div class="{{.Kind}}">{{.Text}}{{if .Items}}<ul>{{range .Items}}<li>{{.}}</li>{{end}}</ul>{{end}}</div>
+{{end}}
+
+{{define "checks"}}
+<table class="bp-table">
+  <thead><tr><th>Check</th><th>Severity</th><th>Status</th><th>Details</th></tr></thead>
+  <tbody>
+  {{range .}}
+    <tr>
+      <td><strong>{{.Label}}</strong></td>
+      <td class="{{.Severity.Class}}">{{.Severity.Label}}</td>
+      <td><span class="badge {{.Status.Class}}">{{.Status.Text}}</span></td>
+      <td><span class="badge {{.Detail.Class}}">{{.Detail.Text}}</span>{{if .Context}} {{.Context}}{{end}}</td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}
+
+{{define "pillars"}}
+<div class="card ransomware-card">
+  <div class="grade-display {{.GradeClass}}">{{.Grade}}</div>
+  <div style="display:inline-block; vertical-align:middle;">
+    <strong style="font-size: 1.1rem;">Score: {{.Score}} / {{.MaxScore}}</strong>
+    <br>
+    <span class="pillar-evidence">{{.Note}}</span>
+  </div>
+</div>
+{{if .BiggestGap}}<div class="warning-box">Biggest gap: {{.BiggestGap}}</div>{{end}}
+<h3>Pillar breakdown</h3>
+<div class="card">
+{{range .Pillars}}
+  <div class="pillar-row">
+    <span class="{{.Class}}">{{.Tag}}</span>
+    <span><strong>{{.Name}}</strong></span>
+    <span class="pillar-score">{{.Score}}/{{.Max}}</span>
+    <span class="pillar-evidence">{{.Evidence}}</span>
+  </div>
+{{end}}
+</div>
+{{end}}
+
+{{define "policies"}}
+<div class="grid">
+  <div class="card"><strong>Policies</strong><div class="card-value">{{.Count}}</div></div>
+  <div class="card"><strong>With export</strong><div class="card-value">{{.WithExport}}</div></div>
+  <div class="card"><strong>With presets</strong><div class="card-value">{{.WithPresets}}</div></div>
+  <div class="card"><strong>VM-scoped</strong><div class="card-value">{{.VMScopedCount}}</div></div>
+  <div class="card"><strong>Catch-all</strong><div class="card-value">{{.CatchAllCount}}</div></div>
+  {{if .AdditionalExportKnown}}<div class="card new-feature"><strong>Dual export (9.0)</strong><div class="card-value">{{.DualExportCount}}</div></div>{{end}}
+</div>
+{{if .SameProfileTwice}}
+<div class="warning-box">
+  <strong>Both export actions point at the same profile.</strong>
+  This doubles export cost and RPO pressure without adding redundancy:
+  <ul>{{range .SameProfileTwice}}<li>{{.}}</li>{{end}}</ul>
+</div>
+{{end}}
+<table>
+  <thead><tr><th>Name</th><th>Scope</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Snapshot retention</th><th>Export destinations</th></tr></thead>
+  <tbody>
+  {{range .Rows}}
+    <tr>
+      <td><strong>{{.Name}}</strong></td>
+      <td>{{if .VMScoped}}<span class="badge info">VM</span>{{else}}Namespace{{end}}</td>
+      <td><code>{{.Frequency}}</code></td>
+      <td>{{.Actions}}</td>
+      <td>{{.Selector}}</td>
+      <td>{{.Retention}}</td>
+      <td>
+        {{if .Exports}}
+          {{if .DualExport}}<span class="badge warn">{{len .Exports}} exports</span><br>{{end}}
+          {{range .Exports}}{{.Profile}} &mdash; {{.Frequency}} &mdash; {{.Retention}}{{if .BlockModeProfile}} <span class="badge info">VBR block mode: {{.BlockModeProfile}}</span>{{end}}<br>{{end}}
+        {{else if .HasExport}}<span class="badge info">export configured</span>{{if .LegacyExportRetention}}<br>retention: {{.LegacyExportRetention}}{{end}}
+        {{else}}<span class="badge warn">snapshot only</span>{{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

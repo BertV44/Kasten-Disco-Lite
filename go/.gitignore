@@ -1,0 +1,7 @@
+# Compiled prototype binary (`go build ./cmd/kdl` drops it here)
+/kdl
+/cmd/kdl/kdl
+
+# Go test artefacts
+*.test
+*.out
