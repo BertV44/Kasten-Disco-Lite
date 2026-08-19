@@ -399,6 +399,9 @@ in one file, because in practice they are applied by two different people:
 - **Part A — cluster-scoped** (`ClusterRole` + `ClusterRoleBinding`, both
   named `kasten-discovery-reader`): the cluster-scoped **read** access KDL
   needs (namespaces, PVCs across all namespaces, nodes, storageclasses,
+  csidrivers (optional: used to tell CSI provisioners from legacy in-tree ones
+  when cross-checking VolumeSnapshotClasses; denial only downgrades that
+  classification to a name-based heuristic),
   volumesnapshotclasses, CRDs, **no Secrets**). It does **not** grant read
   access to cluster RBAC objects (ClusterRoles/ClusterRoleBindings) — that
   is an optional add-on (see "Cluster-scoped — optional, for full RBAC
@@ -510,7 +513,7 @@ rules:
   resources: ["volumesnapshots", "volumesnapshotclasses"]
   verbs: ["get", "list"]
 - apiGroups: ["storage.k8s.io"]
-  resources: ["storageclasses"]
+  resources: ["storageclasses", "csidrivers"]
   verbs: ["get", "list"]
 - apiGroups: ["cr.kanister.io"]
   resources: ["blueprints"]

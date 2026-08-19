@@ -137,6 +137,189 @@ to confirm pre-2.2.0 JSON still renders. Not yet run against a live 9.0 cluster
   targets in both text and HTML, including the `In` + `NotIn`
   catch-all-with-exceptions shape and VM selectors.
 
+### Fixed — production report defects (ocp-infra-prd-2, Kasten 8.5 / OpenShift, 789 namespaces)
+
+Five defects found by cross-reading a real support report against the Kasten
+dashboard. Four of them made KDL publish a *confident and wrong* number rather
+than fail visibly, which is the worst failure mode for a discovery tool.
+
+- **A wildcard selector marked the whole cluster unprotected.** The reference
+  cluster's backup policy targets `*` — the catch-all documented by Kasten
+  ("you can select all applications with a `*` wildcard"). v2.1.1 collected
+  selector values without expanding them and then compared namespaces with an
+  exact `index()`, so the literal string `"*"` matched no namespace and the
+  policy protected nothing: **788 unprotected namespaces, 786 "actionable"**,
+  while Kasten reported 846 applications compliant and KDL's own per-namespace
+  section showed those same 786 namespaces backed up the previous day. Glob
+  expansion (already introduced earlier in 2.2.0) fixes the reported symptom;
+  the work below hardens the surrounding logic so the same class of defect
+  cannot return silently.
+- **`matchNames` policies were treated as catch-all.** Introduced and caught
+  during this work, worth recording because it is the dangerous direction: with
+  `matchNames` unhandled, a policy targeting one namespace fell through to the
+  catch-all branch and marked *every* namespace protected, hiding real gaps.
+  `policy_target_ns` now evaluates `matchNames` (glob-aware) as its own clause,
+  and only an genuinely empty selector is a catch-all.
+- **Wildcards in undocumented positions are no longer guessed.** Kasten documents
+  exactly two name-based forms: `*` alone, and a *trailing* wildcard that matches
+  applications whose name *starts with* the prefix. Our anchored glob agrees with
+  both — `prod-*` becomes `^prod-.*$`, precisely "starts with `prod-`". Any other
+  shape (`*-bit`, `bia*bit`) has no documented meaning, and picking one is unsafe
+  in both directions: read as a strict glob, `*-bit` matches `foo-bit` while a
+  prefix engine matches nothing, so KDL would *overstate* protection and hide
+  gaps; read as "contains", it overstates further. Such patterns now mark the
+  policy unresolvable, surface under
+  `coverage.protection.nonStandardPatterns`, and force coverage to
+  `NOT_ASSESSED` — the only answer that is not a guess.
+- **Selectors picking namespaces by an arbitrary label resolved to zero.** A
+  latent blindness in the same resolver: it read selector *values* only, so
+  `appNamespace` and the two VM keys were handled while any other label key hit
+  an `else empty` branch and contributed nothing. Selectors are now evaluated
+  against the labelled namespace inventory (`ALL_NAMESPACES_LABELED`), covering
+  `In`, `NotIn`, `Exists` and `DoesNotExist` on any label key, plus
+  `matchLabels`. This costs one *fewer* API call: the
+  `kubectl get namespaces -l ...` round-trip that partially compensated for
+  `matchLabels` is gone, since the labels were already collected.
+- **matchExpressions entries were unioned instead of intersected.** A Kubernetes
+  LabelSelector ANDs its terms; unioning them overstates coverage, which hides
+  real gaps. `policy_target_ns` now ANDs matchExpressions and matchLabels.
+- **Protection gaps are now reconciled against backup history.** A namespace
+  with a completed backup or export is protected in fact, whatever the selector
+  analysis concluded, and is reported under
+  `coverage.unprotectedBreakdown.backedUpDespiteSelector` instead of being
+  counted as a gap. On the reference cluster the actionable count drops from 786
+  to **0**, matching the dashboard (846 compliant / 0 unmanaged). Every such
+  namespace is still surfaced, because a selector that cannot explain hundreds
+  of protected namespaces is a real finding about the analysis.
+- **Coverage is reported as `NOT_ASSESSED` when a selector cannot be
+  evaluated.** New `coverage.protection` (`status`, `unresolvedPolicyCount`,
+  `unresolvedPolicies`). An unimplemented operator previously produced an empty
+  protected set, i.e. invented gaps out of a selector KDL had simply failed to
+  read. `NOT_ASSESSED` ranks above `GAPS_DETECTED` but below `COMPLETE`, since a
+  `COMPLETE` verdict here rests on positive evidence no unresolved selector can
+  contradict.
+- **Orphaned RestorePoints: a crash reported as a clean zero.** Three cumulative
+  defects. (1) `.spec.source.actionName` is not always present; `null |
+  split("-")` aborted the whole jq pass ("split input and separator must be
+  strings"), so one such RestorePoint blanked the section across 31 155 of them.
+  (2) The source policy was derived by dropping the last three dash-separated
+  segments of the action name — the suffix count is not contractual and policy
+  names contain dashes (`infra-prd-2-backup-policy`), so the derived name was
+  wrong and would flag every RestorePoint as orphaned, or none. Matching is now
+  by prefix against real policy names: dash-safe, no segment arithmetic.
+  (3) On failure the count fell back to 0 and the report rendered
+  "No orphaned RestorePoints detected". Now tracked as
+  `orphanedRestorePoints.status = NOT_ASSESSED` in the JSON, the HTML and the
+  terminal. RestorePoints with no action name are counted separately as
+  `unattributable` rather than dropped (understating) or called orphaned
+  (overstating).
+- **CSI detection missed most CSI drivers, silencing the missing-VSC warning.**
+  The test was `test("\\.csi\\.|csi\\.")`, requiring the literal string `csi.`
+  in the provisioner name — so `pxd.portworx.com`, `topolvm.io` and
+  `driver.longhorn.io` were never classified as CSI. On the reference cluster
+  **8 StorageClasses on `pxd.portworx.com` had no VolumeSnapshotClass at all**
+  and `csiDriversWithoutVsc` was 0, so nothing was reported. Provisioners are
+  now classified from the `CSIDriver` API when readable (`csidrivers` added to
+  `kdl-rbac.yaml` as an optional read, falling back to naming heuristics), and
+  split three ways in `volumeSnapshotClasses.provisionerClassification`: `csi`
+  (missing VSC is a real defect), `inTree` (legacy `kubernetes.io/*`; CSI
+  snapshots do not apply, so a VSC would not help), and `unknown` (surfaced for
+  manual verification instead of silently passing).
+- **Profile count did not match the Kasten UI.** `profiles.count` is the raw CR
+  total and spans both families the UI lists on separate pages, so a cluster
+  with 3 location + 1 infrastructure profile reported 4 under a heading reading
+  "Location Profiles". The count was right, the label was not. New
+  `profiles.locationCount` / `infraCount` / `undeterminedCount` and a per-item
+  `profileType`, with infrastructure profiles rendered in their own HTML table.
+  Classification is multi-signal because no single field is reliable across
+  versions: an 8.x infrastructure profile fell through every backend probe and
+  reported `Unknown`, while 9.0 reports `spec.type = "Infra"`.
+
+### Fixed — defects found by an independent spec audit of the above
+
+The fixes in this section were re-verified by an adversarial review that built its
+own fixtures and a non-empty stub cluster. Six further defects surfaced, four of
+them in code added by this very changeset. Recorded because they are all the same
+family the changeset set out to eliminate: a number that looks authoritative and
+is not.
+
+- **The unprotected breakdown did not always add up.** `deliberatelyExcluded` and
+  `backedUpDespiteSelector` were computed independently, so a namespace that was
+  *both* Helm-excluded *and* demonstrably backed up landed in both buckets and
+  `excluded + backedUp + actionable` exceeded `total`. `actionable` was never
+  wrong (its predicate is idempotent), so protection was never overstated — but
+  the published breakdown contradicted itself. The three buckets now partition
+  the set. The reference numbers (788 / 2 / 786) reconciled only because those
+  two excluded namespaces happened to have no backup: the arithmetic passed on
+  the luck of the data, not by construction.
+- **A selector-caused `NOT_ASSESSED` claimed an RBAC denial that never
+  happened.** The renderer tested `bestPractices.namespaceProtection ==
+  "NOT_ASSESSED"` *before* the selector branch and emitted "Cluster-wide
+  namespace listing was denied" — on clusters with zero denied reads. The
+  carefully written selector explanation was reachable only when
+  `actionable == 0`, i.e. when it mattered least. The RBAC branch is now gated on
+  an actual namespace denial in `rbacLimited.denied`, with a neutral fallback,
+  and the shared best-practice badge no longer hardcodes "(RBAC)" as the reason
+  for every `NOT_ASSESSED` check.
+- **Orphaned RestorePoints were missed when one policy name prefixed another.**
+  Prefix matching against live policy names meant a live `backup` absorbed the
+  RestorePoints of a deleted `backup-daily`, so their orphan status was lost — a
+  false negative hiding a finding, and the old segment-trimming heuristic got it
+  wrong too. Kasten labels the owning policy on the RestorePoint
+  (`k10.kasten.io/policyName`, already read elsewhere in KDL), so that label is
+  now the primary source and prefix matching only a fallback. Each item records
+  `attributedBy` ("label" or "actionName"). The residual ambiguity of the
+  fallback is documented at the call site: without the label, the action name
+  simply does not carry the distinction.
+- **Two selector resolvers disagreed inside the same report.** The AND fix
+  landed in `policy_target_ns`, but `POLICY_ANALYSIS` kept its own resolver,
+  which still unioned matchExpressions. The report could therefore call a
+  namespace unprotected while listing a policy as targeting it, and — worse — a
+  policy that effectively protects *nothing* reported `isEmpty: false`,
+  suppressing the B3 empty-policy warning entirely. There is now one resolver.
+  The value-level pass survives as `dangling_ns_refs`, deliberately:
+  `policy_target_ns` iterates real namespaces and so structurally cannot see a
+  reference to a namespace that does not exist. About 2.7 kB of duplicated
+  selector logic went away with it.
+- **`classificationSource` claimed authority it had not used.** `jq -e '.items'`
+  succeeds on an empty array, so a cluster where the `CSIDriver` read worked but
+  returned nothing reported `csidriver-api` while the verdict actually came from
+  the name fallback — and the HTML then suppressed the "fell back to naming"
+  caveat. It now requires at least one driver.
+- **`provisionerClassification.items[].storageClasses` echoed the provisioner**
+  instead of the StorageClasses using it. Unconsumed, so no rendered number was
+  wrong, but the field promised data it did not carry. It now lists real
+  StorageClass names.
+
+Two safety changes in the same pass: a non-empty selector carrying none of the
+three forms KDL understands is now reported unresolvable instead of being read as
+a catch-all (which would have marked every namespace protected off an unparsed
+shape), and `backedUpDespiteSelectorNamespaces` is rendered rather than merely
+emitted.
+
+Four validation-gate assertions were themselves wrong and are corrected: the
+two-way reconciliation superseded by the three-way one; a check on orphan status
+that fired precisely when `NOT_ASSESSED` worked; a profile check that rejected
+the "undetermined" outcome its own helper documents; and a tautological
+`locationCount + infraCount == count` (the former is derived from the latter),
+now asserted against the items. One further assertion rested on a premise the
+AND fix invalidated — that an empty policy must carry a dangling reference — and
+was replaced by checks that a catch-all never reads as empty and that an empty
+policy never claims an existing namespace.
+
+### Notes on two jq traps met while fixing the above
+
+Both belong to the family already recorded in `CLAUDE.md` and are worth
+recognising on sight, since neither errors out — they silently return a wrong
+answer:
+
+- `["In","NotIn"] | index(.)` searches the array **for itself** and always
+  yields `0`, so a guard written this way never fires. Bind the value first:
+  `. as $o | [...] | index($o)`.
+- A function argument is evaluated against the input **at the call site**. After
+  `$ns | f(.)`, the `.` passed to `f` is `$ns`, not the enclosing generator's
+  current value. Bind it: `. as $e | ($ns | f($e))`.
+
 ### Notes
 - No Policy CRD field removed in 9.0 (`instantRecovery`, `targetVsphereStorage`)
   was referenced by KDL, and `MigrateFCD` actions were never collected, so the

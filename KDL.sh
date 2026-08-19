@@ -509,6 +509,43 @@ def glob_match($pattern):
 # Does any pattern in the list match the string?
 def glob_any($patterns): . as $s | ($patterns // []) | any(. as $p | $s | glob_match($p));
 
+# Namespace-name patterns this policy references, from either In or NotIn on a
+# namespace-bearing key. Used only to validate the wildcard shape.
+def ns_name_patterns:
+  ((.spec.selector.matchNames // [])
+   + [ ((.spec.selector.matchExpressions // [])[]?
+      | select((.operator // "") == "In" or (.operator // "") == "NotIn")
+      | if   (.key // "") == app_ns_key then (.values // [])[]?
+        elif (.key // "") == vm_ns_key  then (.values // [])[]?
+        elif (.key // "") == vm_ref_key then ((.values // [])[]? | tostring | split("/")[0])
+        else empty end) ])
+  | map(select(type == "string" and . != "")) | unique;
+
+# Is this wildcard pattern one of the shapes Kasten actually documents?
+#
+# The Kasten docs define exactly two forms for name-based application selection:
+# `*` alone ("select all applications with a `*` wildcard") and a trailing
+# wildcard, which "will match all application that start with the wildcard
+# specified" — i.e. PREFIX matching. Our anchored glob agrees with both:
+# `prod-*` -> `^prod-.*$` is precisely "starts with prod-".
+#
+# Anything else (`*-bit`, `*mid*`, `pro?-*`) is undocumented, and KDL must not
+# invent an interpretation for it — in either direction:
+#   * reading `*-bit` as a strict glob matches `foo-bit`, whereas a prefix engine
+#     matches nothing -> KDL would OVERSTATE protection and hide real gaps;
+#   * reading it as "contains" overstates even further.
+# So such patterns mark the policy unresolvable and the coverage NOT_ASSESSED,
+# which is the only answer that is not a guess (#glob-shape).
+def glob_is_documented($p):
+  ($p == "*") or ($p | test("^[^*?]+\\*$"));
+
+# Namespace-name patterns of this policy that carry a wildcard in an
+# undocumented position.
+def nonstandard_ns_patterns:
+  [ ns_name_patterns[]
+    | select(test("[*?]"))
+    | select(glob_is_documented(.) | not) ];
+
 # Selector scope of a policy object: "virtualMachine" | "namespace".
 # A policy is VM-scoped as soon as it carries either VM selector key.
 def policy_scope:
@@ -516,23 +553,8 @@ def policy_scope:
   if ($keys | any(. == vm_ref_key or . == vm_ns_key)) then "virtualMachine"
   else "namespace" end;
 
-# Namespaces a policy targets, taken from selector values only (no cluster
-# cross-reference). VM-ref values are "namespace/vmName" -> keep the part
-# before the first "/". Patterns are returned verbatim (may contain globs).
-def selector_ns_patterns:
-  (.spec.selector // {}) as $sel |
-  (
-    ($sel.matchNames // [])
-    + [ ($sel.matchExpressions // [])[]?
-        | select(.operator == "In")
-        | if   .key == app_ns_key then (.values // [])[]?
-          elif .key == vm_ns_key  then (.values // [])[]?
-          elif .key == vm_ref_key then ((.values // [])[]? | split("/")[0])
-          else empty end ]
-  ) | map(select(type == "string" and . != "")) | unique;
-
 # Namespace patterns a policy explicitly EXCLUDES (operator NotIn on a
-# namespace-bearing key). Must be subtracted from selector_ns_patterns: the
+# namespace-bearing key). Must be subtracted from the included set: the
 # common catch-all-with-exceptions shape is `appNamespace In ["*"]` plus
 # `appNamespace NotIn [...]`, and expanding the "*" without honouring the NotIn
 # would silently mark deliberately-excluded namespaces as protected.
@@ -545,16 +567,165 @@ def selector_ns_exclusion_patterns:
         else empty end) ]
   | map(select(type == "string" and . != "")) | unique;
 
-# Expand the namespace patterns of a policy against the live namespace list, then
-# drop anything the policy excludes. Literal (glob-free) values are kept even
-# when they do not exist on the cluster, so dangling references stay visible.
-def resolved_ns($allNs):
-  (selector_ns_patterns) as $inc |
-  (selector_ns_exclusion_patterns) as $exc |
-  [ $inc[]
-    | . as $pat
-    | if ($pat | test("[*?]")) then ($allNs[]? | select(glob_match($pat))) else $pat end ]
-  | map(select(glob_any($exc) | not)) | unique;
+# ---------------------------------------------------------------------------
+# Full selector evaluation against the labelled namespace inventory
+# (v2.2.0, #selector-labels).
+#
+# This replaces a value-only resolver (`resolved_ns`, removed in v2.2.0) that
+# read selector VALUES and nothing else. It could answer "appNamespace In [a,b]"
+# but was structurally blind to a selector picking namespaces by an arbitrary
+# label ("env In [prod]"): those keys hit its `else empty` branch and
+# contributed nothing. A policy selecting its targets by a custom label
+# therefore resolved to ZERO protected namespaces, and every namespace it
+# actually protects was reported as an unprotected gap. Observed on a production
+# cluster where all three app policies were expression-based: KDL reported 788
+# unprotected namespaces while 787 of them had a successful backup from the day
+# before.
+#
+# Two further corrections over the value-only path:
+#
+#   * AND semantics. matchExpressions entries and matchLabels pairs are ANDed,
+#     as in any Kubernetes LabelSelector. Unioning them (the previous
+#     behaviour in POLICY_ANALYSIS) OVERSTATES coverage, which is the dangerous
+#     direction: it hides real gaps.
+#   * Explicit unresolvability. An operator we do not implement yields
+#     resolvable=false so the caller can report NOT_ASSESSED instead of
+#     publishing a confident count built on a selector it did not understand.
+#
+# Input is ALL_NAMESPACES_LABELED: [{name, labels, isSystem}].
+
+# Evaluate one matchExpressions entry against one namespace object.
+# Returns true/false, or null when the operator is not implemented.
+# Literal (glob-free) namespace values a policy references that do NOT exist on
+# the cluster. `policy_target_ns` iterates real namespaces only, so it can never
+# surface a dangling reference — this value-level pass is what can, and it is the
+# reason the two views are deliberately kept separate rather than collapsed.
+def dangling_ns_refs($allNames):
+  ( ns_name_patterns ) as $lits |
+  ( selector_ns_exclusion_patterns ) as $excl |
+  [ $lits[]
+    | select(test("[*?]") | not)
+    # NOTE (jq trap): bind before indexing — after `$allNames |` a bare `.`
+    # would be $allNames itself, not the literal under test.
+    | . as $l
+    | select(($allNames | index($l)) == null) ]
+  | map(select(glob_any($excl) | not)) | unique;
+
+def expr_matches_ns($e):
+  . as $ns |
+  ($ns.name // "") as $n |
+  (($ns.labels // {})) as $l |
+  ($e.key // "") as $k |
+  ($e.operator // "") as $op |
+  ($e.values // []) as $vals |
+  if ($k == app_ns_key or $k == vm_ns_key) then
+    # Values ARE namespace names (globs allowed).
+    if   $op == "In"           then ($n | glob_any($vals))
+    elif $op == "NotIn"        then ($n | glob_any($vals) | not)
+    elif $op == "Exists"       then true
+    elif $op == "DoesNotExist" then false
+    else null end
+  elif $k == vm_ref_key then
+    # Values are "namespace/vmName"; the namespace is the part before the "/".
+    ([$vals[]? | tostring | split("/")[0]]) as $nsv |
+    if   $op == "In"           then ($n | glob_any($nsv))
+    elif $op == "NotIn"        then ($n | glob_any($nsv) | not)
+    elif $op == "Exists"       then true
+    elif $op == "DoesNotExist" then false
+    else null end
+  else
+    # Arbitrary label key, matched against the namespace labels. Label values
+    # are compared exactly: Kasten glob syntax applies to namespace-name
+    # values, not to label values.
+    ($l[$k] // null) as $v |
+    if   $op == "In"           then ($v != null and (($vals | index($v)) != null))
+    # Kubernetes NotIn semantics: an absent label also satisfies NotIn.
+    elif $op == "NotIn"        then ($v == null or (($vals | index($v)) == null))
+    elif $op == "Exists"       then ($l | has($k))
+    elif $op == "DoesNotExist" then (($l | has($k)) | not)
+    else null end
+  end;
+
+# Namespaces a policy effectively targets, evaluated against the live labelled
+# inventory. Returns {namespaces, resolvable, kind}.
+def policy_target_ns($allNs):
+  (.spec.selector // null) as $sel |
+  (policy_scope) as $scope |
+  (nonstandard_ns_patterns) as $oddPatterns |
+  # For a VM-scoped policy, matchLabels/label expressions select VIRTUAL
+  # MACHINES, not namespaces, so they must not filter the namespace set here —
+  # only the namespace-bearing Kasten keys do. VM-level coverage is assessed in
+  # its own section.
+  ( if $scope == "virtualMachine"
+    then [ ($sel.matchExpressions // [])[]?
+           | select((.key // "") == app_ns_key or (.key // "") == vm_ns_key or (.key // "") == vm_ref_key) ]
+    else (($sel.matchExpressions // [])) end ) as $exprs |
+  ( if $scope == "virtualMachine" then {} else (($sel.matchLabels // {})) end ) as $mlabels |
+  # matchNames is a first-class selector form. Omitting it here made a
+  # matchNames-only policy fall through to the catch-all branch below and mark
+  # EVERY namespace protected — the dangerous direction, since it hides gaps.
+  ( ($sel.matchNames // []) ) as $mnames |
+  # NOTE (jq trap): `["In",...] | index(.)` searches the array for ITSELF and
+  # always yields 0, so the operator under test must be bound to a variable
+  # first. Same family as the parenthesisation trap noted in CLAUDE.md.
+  ( [ $exprs[]? | (.operator // "") ]
+    | map(select(. as $o | (["In","NotIn","Exists","DoesNotExist"] | index($o)) == null))
+    | length ) as $badOps |
+  if ($sel == null) or ($sel == {})
+     or (($sel | keys | length) == 0) then
+    # Genuinely empty selector: catch-all over non-system namespaces.
+    { namespaces: [ $allNs[]? | select(.isSystem | not) | .name ], resolvable: true, kind: "catchall", nonStandardPatterns: [] }
+  elif (($exprs | length) == 0) and (($mlabels | length) == 0) and (($mnames | length) == 0) then
+    # Non-empty selector carrying none of the three forms we understand. Reading
+    # it as a catch-all would mark EVERY namespace protected off the back of a
+    # shape we did not parse — the direction that hides gaps. Report it as
+    # unresolvable instead.
+    { namespaces: [], resolvable: false, kind: "unrecognised", nonStandardPatterns: [] }
+  else
+    { namespaces: [ $allNs[]?
+                    | . as $ns
+                    # NOTE (jq trap): the argument of expr_matches_ns is
+                    # evaluated against the input at the call site. After
+                    # `$ns |` that input is $ns, so passing `.` would hand the
+                    # namespace in as the expression — bind $e explicitly.
+                    | select( all($exprs[]?; . as $e | ($ns | expr_matches_ns($e)) == true) )
+                    | select( all($mlabels | to_entries[]?; (($ns.labels // {})[.key]) == .value) )
+                    | select( ($mnames | length) == 0 or (($ns.name // "") | glob_any($mnames)) )
+                    | .name ],
+      # An undocumented wildcard shape makes the namespace set a guess, so the
+      # policy counts as unresolvable exactly like an unimplemented operator.
+      resolvable: (($badOps == 0) and (($oddPatterns | length) == 0)),
+      kind: ([ (if ($mnames | length) > 0 then "matchNames" else empty end),
+               (if ($mlabels | length) > 0 then "matchLabels" else empty end),
+               (if ($exprs  | length) > 0 then "matchExpressions" else empty end) ] | join("+")),
+      # Wildcards in a position Kasten does not document (#glob-shape).
+      nonStandardPatterns: $oddPatterns }
+  end;
+'
+
+# ----------------------------------------------------------------------------
+# Profile kind classification (v2.2.0, #profile-kind)
+#
+# `profiles.config.kio.kasten.io` holds BOTH families the Kasten UI presents on
+# separate pages: Profiles > Location and Profiles > Infrastructure. KDL counted
+# the raw CR total and labelled it "Location Profiles", so a cluster with 3
+# location + 1 infrastructure profile reported 4 where the UI shows 3 — the
+# count was right, the label was not.
+#
+# No single field classifies reliably across versions: on an 8.x cluster an
+# infrastructure profile fell through every backend probe and reported
+# "Unknown", while a 9.0 cluster reports spec.type = "Infra". Hence the ordered
+# multi-signal test, most authoritative first. "undetermined" is counted as a
+# location profile so totals never silently shrink, but stays visible as its own
+# value rather than being quietly folded in.
+JQ_PROFILE_LIB='
+def profile_kind:
+  ((.spec.type // "") | tostring) as $t |
+  if   ($t | test("^infra"; "i"))    then "infrastructure"
+  elif ($t | test("^location"; "i")) then "location"
+  elif (.spec.infraSpec != null)     then "infrastructure"
+  elif (.spec.locationSpec != null)  then "location"
+  else "undetermined" end;
 '
 
 ### -------------------------
@@ -832,6 +1003,10 @@ $CLI -n "$NAMESPACE" get blueprintbindings.config.kio.kasten.io -o json > "$TEMP
 $CLI -n "$NAMESPACE" get reportactions.actions.kio.kasten.io -o json > "$TEMP_DIR/reportactions_raw.json" 2>/dev/null &
 $CLI get storageclass -o json > "$TEMP_DIR/sc_raw.json" 2>/dev/null &
 $CLI get volumesnapshotclass -o json > "$TEMP_DIR/vsc_raw.json" 2>/dev/null &
+# CSIDriver objects are the authoritative answer to "is this provisioner CSI?".
+# Optional read: on denial the classification below degrades to a naming
+# heuristic rather than failing (#csi-detect).
+$CLI get csidrivers.storage.k8s.io -o json > "$TEMP_DIR/csidrivers_raw.json" 2>/dev/null &
 # v2.0 additions: RBAC inventory for K10 ClusterRoles + Roles.
 # ClusterRoleBindings/RoleBindings cluster-wide are NOT in the K10 standard
 # ClusterRole — graceful degradation if read denied (handled at extraction).
@@ -1208,6 +1383,18 @@ VBR_HARDENED_COUNT=$(safe_int "$(_ep "$PROFILE_BACKENDS" | jq '
   [.[] | select((.repoType // "") | test("hardened|objectlock|immutab"; "i"))] | length // 0')")
 
 debug "Profile backends: VBR=$VBR_PROFILE_COUNT (hardened: $VBR_HARDENED_COUNT), VeeamVault=$VEEAM_VAULT_PROFILE_COUNT"
+
+# Location vs Infrastructure split (#profile-kind). PROFILE_COUNT stays the raw
+# CR total for backward compatibility; the two sub-counts are what match the
+# Kasten UI's separate Location / Infrastructure pages.
+PROFILE_INFRA_COUNT=$(safe_int "$(_ep "$PROFILES_JSON" | jq "$JQ_PROFILE_LIB"'
+  [.items[]? | select(profile_kind == "infrastructure")] | length // 0' 2>/dev/null || echo 0)")
+PROFILE_UNDETERMINED_COUNT=$(safe_int "$(_ep "$PROFILES_JSON" | jq "$JQ_PROFILE_LIB"'
+  [.items[]? | select(profile_kind == "undetermined")] | length // 0' 2>/dev/null || echo 0)")
+PROFILE_LOCATION_COUNT=$((PROFILE_COUNT - PROFILE_INFRA_COUNT))
+[ "$PROFILE_LOCATION_COUNT" -lt 0 ] 2>/dev/null && PROFILE_LOCATION_COUNT=0
+
+debug "Profiles: $PROFILE_COUNT total = $PROFILE_LOCATION_COUNT location + $PROFILE_INFRA_COUNT infrastructure (undetermined: $PROFILE_UNDETERMINED_COUNT)"
 
 # Immutability signal is satisfied by EITHER a protectionPeriod (object store /
 # Veeam Vault) or a hardened VBR repository.
@@ -1913,12 +2100,29 @@ debug "Has complex selector: $HAS_COMPLEX_SELECTOR"
 #      pattern, so wildcard-protected namespaces read as gaps. Literal values
 #      are still kept as-is so a reference to a non-existing namespace stays
 #      visible to the policy-analysis section.
-printf '%s' "${ALL_NAMESPACES:-[]}" > "$TEMP_DIR/pn_allns.json"
+# Resolve, per app policy, the namespaces it effectively targets — evaluated
+# against the LABELLED namespace inventory so label-based selectors resolve too.
+#
+# v2.2.0 (#kasten-v9): `k10.kasten.io/virtualMachineNamespace` (new in 9.0) is
+# recognised alongside `virtualMachineRef` (its values ARE namespaces), and
+# selector values are glob-expanded against the real inventory, since Kasten
+# accepts `prod-*` in appNamespace / virtualMachineRef / virtualMachineNamespace.
+#
+# v2.2.0 (#selector-labels): this used to call `resolved_ns`, which reads
+# selector VALUES only and so could not see a policy that selects namespaces by
+# an arbitrary label — those policies resolved to zero protected namespaces and
+# every namespace they protect was published as an unprotected gap. The kubectl
+# `get namespaces -l ...` round-trip that partially compensated for matchLabels
+# is gone with it: the labels are already in ALL_NAMESPACES_LABELED, so this is
+# one fewer API call AND it now covers matchExpressions, not just matchLabels.
+#
+# Resolution is per policy, then unioned, so a NotIn exception on one policy
+# cannot cancel another policy that genuinely does protect that namespace.
+printf '%s' "${ALL_NAMESPACES_LABELED:-[]}" > "$TEMP_DIR/pn_allns.json"
 PROTECTED_NAMESPACES=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP_DIR/pn_allns.json" "$JQ_SELECTOR_LIB"'
-  ($allNs[0] // []) as $allNs |
-  # Resolve per policy (so a NotIn exception on one policy cannot cancel another
-  # policy that genuinely does protect that namespace), then union.
-  [ .items[]? | resolved_ns($allNs)[] ] | map(select(type == "string" and . != "")) | unique
+  ( $allNs[0] // [] ) as $allNs |
+  [ .items[]? | policy_target_ns($allNs).namespaces[]? ]
+  | map(select(type == "string" and . != "")) | unique
 ' 2>/dev/null || echo '[]')
 
 # Validate
@@ -1926,44 +2130,56 @@ if ! _ep "$PROTECTED_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
   PROTECTED_NAMESPACES='[]'
 fi
 
-# Resolve matchLabels selectors to concrete namespaces and merge (#11).
-# PROTECTED_NAMESPACES above only captured matchNames/matchExpressions. K10
-# policies using matchLabels select their target namespaces by label; without
-# resolving them those namespaces were reported as unprotected (false-positive
-# gaps). For each matchLabels policy, build a comma-separated label selector and
-# ask the API server which namespaces carry those labels, then union the result.
-if [ "$HAS_COMPLEX_SELECTOR" = "true" ]; then
-  # VM-scoped policies are skipped: their matchLabels select VirtualMachines,
-  # not namespaces (Kasten 9.0 label-based VM policies, #kasten-v9).
-  MATCHLABELS_SELECTORS=$(_ep "$APP_POLICIES_JSON" | jq -r "$JQ_SELECTOR_LIB"'
-    .items[]?
-    | select(policy_scope == "namespace")
-    | (.spec.selector.matchLabels // {})
-    | select(length > 0)
-    | to_entries | map("\(.key)=\(.value)") | join(",")
-  ' 2>/dev/null || echo "")
+# Did every app policy selector actually resolve? A selector using an operator
+# we do not implement, or an empty namespace inventory (RBAC denial), means the
+# protection gap count is not knowable — it must be reported as NOT_ASSESSED
+# rather than as a confident number derived from a selector we did not
+# understand (#selector-labels).
+PROTECTION_UNRESOLVED_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP_DIR/pn_allns.json" "$JQ_SELECTOR_LIB"'
+  ( $allNs[0] // [] ) as $allNs |
+  [ .items[]? | select((policy_target_ns($allNs)).resolvable | not) | .metadata.name ]
+' 2>/dev/null || echo '[]')
+if ! _ep "$PROTECTION_UNRESOLVED_POLICIES" | jq -e '.' >/dev/null 2>&1; then
+  PROTECTION_UNRESOLVED_POLICIES='[]'
+fi
+PROTECTION_UNRESOLVED_COUNT=$(safe_int "$(_ep "$PROTECTION_UNRESOLVED_POLICIES" | jq 'length // 0')")
 
-  if [ -n "$MATCHLABELS_SELECTORS" ]; then
-    LABEL_RESOLVED_NS=$(
-      printf '%s\n' "$MATCHLABELS_SELECTORS" | while IFS= read -r _sel; do
-        [ -z "$_sel" ] && continue
-        $CLI get namespaces -l "$_sel" \
-          -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null
-      done
-    )
-
-    if [ -n "$LABEL_RESOLVED_NS" ]; then
-      LABEL_NS_JSON=$(printf '%s' "$LABEL_RESOLVED_NS" | jq -R -s 'split("\n") | map(select(length > 0)) | unique' 2>/dev/null || echo '[]')
-      PROTECTED_NAMESPACES=$(printf '%s\n%s\n' "$PROTECTED_NAMESPACES" "$LABEL_NS_JSON" | jq -c -s 'add | unique' 2>/dev/null || echo "$PROTECTED_NAMESPACES")
-      debug "matchLabels resolved namespaces: $LABEL_NS_JSON"
-    fi
-  fi
+# Namespace patterns whose wildcard sits in a position Kasten does not document
+# (#glob-shape). These make the policy's namespace set unknowable rather than
+# wrong-in-a-known-direction, so they force PROTECTION_STATUS to NOT_ASSESSED via
+# the resolvable flag above, and are reported so the policy can be fixed.
+PROTECTION_NONSTANDARD_PATTERNS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP_DIR/pn_allns.json" "$JQ_SELECTOR_LIB"'
+  ( $allNs[0] // [] ) as $allNs |
+  [ .items[]?
+    | . as $p
+    | (policy_target_ns($allNs)).nonStandardPatterns as $np
+    | select(($np | length) > 0)
+    | { policy: ($p.metadata.name // "unknown"), patterns: $np } ]
+' 2>/dev/null || echo '[]')
+if ! _ep "$PROTECTION_NONSTANDARD_PATTERNS" | jq -e '.' >/dev/null 2>&1; then
+  PROTECTION_NONSTANDARD_PATTERNS='[]'
+fi
+PROTECTION_NONSTANDARD_COUNT=$(safe_int "$(_ep "$PROTECTION_NONSTANDARD_PATTERNS" | jq 'length // 0')")
+if [ "$PROTECTION_NONSTANDARD_COUNT" -gt 0 ] 2>/dev/null; then
+  warn "$PROTECTION_NONSTANDARD_COUNT policy selector(s) put a wildcard where Kasten documents none:"
+  _ep "$PROTECTION_NONSTANDARD_PATTERNS" | jq -r '.[] | "    - \(.policy): \(.patterns | join(", "))"' 2>/dev/null
+  warn "Kasten documents only \"*\" (all applications) and a trailing wildcard (prefix match)."
+  warn "Namespace coverage for these policies is reported as NOT ASSESSED rather than guessed."
 fi
 
-# Re-validate after the merge
-if ! _ep "$PROTECTED_NAMESPACES" | jq -e '.' >/dev/null 2>&1; then
-  PROTECTED_NAMESPACES='[]'
+NS_INVENTORY_COUNT=$(safe_int "$(_ep "${ALL_NAMESPACES_LABELED:-[]}" | jq 'length // 0')")
+# An empty inventory only makes coverage unknowable when there were selectors to
+# resolve against it. With no app policies at all the protected set is trivially
+# empty and correctly so — flagging NOT_ASSESSED there would contradict the
+# COMPLETE verdict the same run reports.
+if [ "$PROTECTION_UNRESOLVED_COUNT" -gt 0 ] 2>/dev/null; then
+  PROTECTION_STATUS="NOT_ASSESSED"
+elif [ "$NS_INVENTORY_COUNT" -eq 0 ] 2>/dev/null && [ "${APP_POLICY_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  PROTECTION_STATUS="NOT_ASSESSED"
+else
+  PROTECTION_STATUS="OK"
 fi
+debug "Protection resolution status: $PROTECTION_STATUS (unresolved policies: $PROTECTION_UNRESOLVED_COUNT, nonstandard patterns: $PROTECTION_NONSTANDARD_COUNT, ns inventory: $NS_INVENTORY_COUNT)"
 
 PROTECTED_NS_COUNT=$(_ep "$PROTECTED_NAMESPACES" | jq 'length // 0')
 [ -z "$PROTECTED_NS_COUNT" ] || [ "$PROTECTED_NS_COUNT" = "null" ] && PROTECTED_NS_COUNT=0
@@ -2026,80 +2242,25 @@ printf '%s' "${ALL_NAMESPACES_LABELED:-[]}" > "$TEMP_DIR/pa_nslabeled.json"
 POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" "$JQ_SELECTOR_LIB"'
   # Resolve targeted namespaces for a single policy.
   # Returns {namespaces: [...], resolvable: bool, kind: "catchall"|"matchNames"|...}
+  # v2.2.0 (#one-resolver): this used to be a second, independent selector
+  # resolver that UNIONED matchExpressions where policy_target_ns intersects
+  # them. The two disagreed inside the same report — coverage could call a
+  # namespace unprotected while this section listed a policy as targeting it —
+  # and, worse, the union made a policy that effectively protects NOTHING report
+  # isEmpty:false, suppressing the B3 empty-policy warning. There is now one
+  # resolver for "which namespaces does this policy cover".
+  #
+  # The value-level pass survives, deliberately: policy_target_ns iterates real
+  # namespaces, so only dangling_ns_refs can see a reference to a namespace that
+  # does not exist. Both are merged into `namespaces` so the callers below still
+  # split them into existing / non-existing.
   def resolve_ns(policy; allNs):
-    (policy.spec.selector // null) as $sel |
-    if $sel == null or $sel == {} or
-       ($sel.matchNames == null and $sel.matchExpressions == null and $sel.matchLabels == null) then
-      {namespaces: [allNs[]? | select(.isSystem | not) | .name], resolvable: true, kind: "catchall"}
-    elif $sel.matchNames then
-      {namespaces: $sel.matchNames, resolvable: true, kind: "matchNames"}
-    elif $sel.matchExpressions then
-      ([$sel.matchExpressions[]? |
-        if .key == app_ns_key and .operator == "In" then
-          # Glob-expand ("myApp-*" is valid Kasten syntax) against live
-          # namespaces; keep literals verbatim so dead references stay visible.
-          . as $expr |
-          ($expr.values // [])[] as $pat |
-          if ($pat | test("[*?]")) then
-            (allNs[]? | select(.name | glob_match($pat)) | {ns: .name, unresolvable: false})
-          else {ns: $pat, unresolvable: false} end
-        elif .key == vm_ref_key and .operator == "In" then
-          # VM-ref values are "namespace/vmName" (or "namespace/*"); the target
-          # namespace is the part before the first "/". Without this branch the
-          # generic label-resolution below matched nothing and VM-protection
-          # policies were wrongly flagged isEmpty.
-          . as $expr |
-          (($expr.values // [])[] | split("/")[0]) as $pat |
-          if ($pat | test("[*?]")) then
-            (allNs[]? | select(.name | glob_match($pat)) | {ns: .name, unresolvable: false})
-          else {ns: $pat, unresolvable: false} end
-        elif .key == vm_ns_key and .operator == "In" then
-          # NEW Kasten 9.0 (#kasten-v9): label-based VM policy. Values are
-          # namespaces (globs allowed). Previously this key fell through to the
-          # generic "label In" branch below, which looked for a NAMESPACE
-          # carrying the label `k10.kasten.io/virtualMachineNamespace` — never
-          # true — so every 9.0 label-based VM policy resolved to zero
-          # namespaces and was reported as an empty/orphan policy.
-          . as $expr |
-          ($expr.values // [])[] as $pat |
-          if ($pat | test("[*?]")) then
-            (allNs[]? | select(.name | glob_match($pat)) | {ns: .name, unresolvable: false})
-          else {ns: $pat, unresolvable: false} end
-        elif .operator == "In" then
-          . as $expr |
-          (allNs[]? | select(
-            (.labels // {}) as $lbls |
-            ($expr.values | any(. as $v | $lbls[$expr.key] == $v))
-          ) | {ns: .name, unresolvable: false})
-        elif .operator == "NotIn" and (.key == app_ns_key or .key == vm_ns_key or .key == vm_ref_key) then
-          # Handled exactly below via selector_ns_exclusion_patterns, so it no
-          # longer forces the whole selector to "unresolvable" (v2.2.0). Other
-          # operators (Exists / DoesNotExist / NotIn on a label key) still do.
-          empty
-        else
-          {ns: null, unresolvable: true}
-        end
-      ]) as $exprs |
-      # Subtract the NotIn exceptions of this policy from the resolved set.
-      ((policy | selector_ns_exclusion_patterns)) as $excl |
-      ([$exprs[]? | select(.ns != null) | .ns] | map(select(glob_any($excl) | not)) | unique) as $kept |
-      if ($exprs | any(.unresolvable)) then
-        {namespaces: $kept, resolvable: false, kind: "matchExpressions(complex)"}
-      else
-        {namespaces: $kept, resolvable: true, kind: "matchExpressions"}
-      end
-    elif $sel.matchLabels then
-      {
-        namespaces: [allNs[]? | select(
-          (.labels // {}) as $lbls |
-          all($sel.matchLabels | to_entries[]; $lbls[.key] == .value)
-        ) | .name],
-        resolvable: true,
-        kind: "matchLabels"
-      }
-    else
-      {namespaces: [], resolvable: true, kind: "unknown"}
-    end;
+    ([allNs[]? | .name // ""]) as $allNames |
+    (policy | policy_target_ns(allNs)) as $t |
+    (policy | dangling_ns_refs($allNames)) as $dangling |
+    { namespaces: (($t.namespaces + $dangling) | unique),
+      resolvable: $t.resolvable,
+      kind: $t.kind };
 
   ( $nsLabeled[0] ) as $nsLabeled |
 
@@ -2364,33 +2525,86 @@ if ! _ep "$POLICY_NAMES" | jq -e '.' >/dev/null 2>&1; then
   POLICY_NAMES='[]'
 fi
 
-# Find RestorePoints where the source policy no longer exists
+# Find RestorePoints where the source policy no longer exists.
+#
+# Three defects fixed in v2.2.0 (#orphan-rp), all observed on a 31k-RestorePoint
+# production cluster where this section silently reported a clean zero:
+#
+#   1. CRASH. `.spec.source.actionName` is not guaranteed to be present (manual
+#      RestorePoints, imported/migrated catalogs). `null | split("-")` aborts the
+#      whole jq program with "split input and separator must be strings", so a
+#      single such RestorePoint reduced the entire section to [].
+#   2. WRONG MATCHING. The policy name was derived by dropping the last 3
+#      dash-separated segments of the action name. The suffix count Kasten
+#      appends is not contractual, and policy names legitimately contain dashes
+#      ("infra-prd-2-backup-policy"), so this mis-derived the name and would
+#      flag every RestorePoint as orphaned (or none). Match by PREFIX against
+#      real policy names instead: no segment arithmetic, dash-safe.
+#   3. FALSE GREEN. On jq failure the count fell back to 0 and the report
+#      rendered "No orphaned RestorePoints detected" — a failed computation
+#      presented as a verified result. Now tracked via ORPHANED_RP_STATUS and
+#      surfaced as NOT_ASSESSED, matching the license/coverage convention.
+#
+# RestorePoints with no actionName cannot be attributed to any policy: they are
+# counted separately rather than being dropped (understating) or called orphaned
+# (overstating).
+ORPHANED_RP_STATUS="OK"
 printf '%s' "${POLICY_NAMES:-[]}" > "$TEMP_DIR/orp_policies.json"
 ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR/orp_policies.json" '
-  ( $policies[0] ) as $policies |
+  ( $policies[0] // [] ) as $policies |
   [(.items // [])[]? |
-    select(.spec.source.actionName as $action |
-      ($action | split("-") | .[:-3] | join("-")) as $policyName |
-      (($policies // []) | index($policyName) | not)
+    . as $rp |
+    ((.spec.source.actionName // "") | tostring) as $action |
+    # Kasten labels the owning policy on the RestorePoint. Prefer it: it is
+    # exact, whereas deriving the policy from the action name cannot be.
+    (($rp.metadata.labels // {})["k10.kasten.io/policyName"] // "" | tostring) as $labelPolicy |
+    select($action != "" or $labelPolicy != "") |
+    select(
+      if $labelPolicy != "" then
+        (($policies | index($labelPolicy)) == null)
+      else
+        # Fallback: longest existing policy name that prefixes the action name.
+        # RESIDUAL AMBIGUITY, unavoidable without the label: if a live policy is
+        # a dash-prefix of a DELETED one (live "backup", deleted "backup-daily"),
+        # the deleted policy RestorePoints read as belonging to the live one and
+        # their orphan status is missed. Longest-match narrows this but cannot
+        # remove it — the action name simply does not carry the distinction.
+        ([ $policies[]?
+           | select(type == "string" and . != "")
+           | . as $p
+           | select($action == $p or ($action | startswith($p + "-")))
+         ] | length == 0)
+      end
     ) |
     {
-      name: .metadata.name,
-      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "unknown"),
-      created: .metadata.creationTimestamp,
-      actions: [.spec.source.actionName]
+      name: ($rp.metadata.name // "unknown"),
+      namespace: (($rp.metadata.labels // {})["k10.kasten.io/appNamespace"] // $rp.metadata.namespace // "unknown"),
+      created: ($rp.metadata.creationTimestamp // null),
+      actions: [$action],
+      # "label" is exact; "actionName" is the heuristic fallback above.
+      attributedBy: (if $labelPolicy != "" then "label" else "actionName" end)
     }
   ] | unique_by(.name) // []
-' 2>/dev/null) || { _jq_fail "orphaned restore points"; ORPHANED_RP='[]'; }
+' 2>/dev/null) || { _jq_fail "orphaned restore points"; ORPHANED_RP='[]'; ORPHANED_RP_STATUS="NOT_ASSESSED"; }
 
 # Validate result
 if ! _ep "$ORPHANED_RP" | jq -e '.' >/dev/null 2>&1; then
   ORPHANED_RP='[]'
+  ORPHANED_RP_STATUS="NOT_ASSESSED"
 fi
 
 ORPHANED_RP_COUNT=$(_ep "$ORPHANED_RP" | jq 'length // 0')
 [ -z "$ORPHANED_RP_COUNT" ] && ORPHANED_RP_COUNT=0
 
-debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT"
+# RestorePoints that carry no actionName at all — not orphaned, not attributable.
+RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq '
+  [(.items // [])[]?
+   | select((((.spec.source.actionName // "") | tostring) == "")
+            and ((((.metadata.labels // {})["k10.kasten.io/policyName"] // "") | tostring) == ""))]
+  | length // 0
+' 2>/dev/null || echo 0)")
+
+debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT (status: $ORPHANED_RP_STATUS, unattributable: $RP_UNATTRIBUTABLE_COUNT)"
 
 ### -------------------------
 ### RestorePoints distribution by namespace - Top 5 (NEW v1.9)
@@ -2875,27 +3089,95 @@ VSC_SUMMARY=$(_ep "$VSC_JSON" | jq -c '
 
 VSC_DEFAULT_COUNT=$(safe_int "$(_ep "$VSC_SUMMARY" | jq '[.[] | select(.isDefault)] | length // 0')")
 
-# Cross-check: are there CSI provisioners (StorageClasses with CSI provisioner)
-# that have NO matching VolumeSnapshotClass? Such SCs cannot be backed up by
-# Kasten via CSI snapshots — they would need Kanister blueprints or generic
-# volume backup instead.
-SC_CSI_DRIVERS=$(_ep "$SC_JSON" | jq -c '
-  [.items[]? | select(.provisioner | test("\\.csi\\.|csi\\."; "i")) | .provisioner] | unique
-' 2>/dev/null || echo '[]')
+# Cross-check: which StorageClass provisioners have NO matching
+# VolumeSnapshotClass? Without a VSC, Kasten cannot take a CSI snapshot of
+# those volumes and silently falls back to generic volume backup — one of the
+# most frequent root causes of unexpected backup behaviour.
+#
+# v2.2.0 (#csi-detect): the previous detection was `test("\.csi\.|csi\.")`,
+# i.e. it required the literal string "csi." inside the provisioner name. Real
+# CSI drivers whose names do not contain it — pxd.portworx.com, topolvm.io,
+# driver.longhorn.io — were never classified as CSI, so the cross-check
+# returned 0 and the warning never fired. Observed on a Portworx production
+# cluster: 8 StorageClasses on pxd.portworx.com with zero VolumeSnapshotClass,
+# reported as no finding at all.
+#
+# Provisioners are now classified three ways, because "no VSC" means something
+# different in each case:
+#   csi     -> needs a VSC; missing one is a real defect
+#   inTree  -> legacy kubernetes.io/* provisioner. CSI snapshots do not apply;
+#              a VSC would not help. Informational, not a defect.
+#   unknown -> external non-CSI provisioner (or an unrecognised name). Cannot
+#              be judged automatically; surfaced for manual verification rather
+#              than silently counted as fine.
+# NOTE: `jq -e '.items'` succeeds on an empty array, so testing presence alone
+# reported "csidriver-api" as the classification source on clusters where the
+# read worked but returned nothing — while the verdict actually came from the
+# name fallback. Require at least one driver before claiming that provenance.
+if [ -s "$TEMP_DIR/csidrivers_raw.json" ] && jq -e '(.items | length) > 0' "$TEMP_DIR/csidrivers_raw.json" >/dev/null 2>&1; then
+  CSIDRIVER_RBAC_OK="true"
+else
+  CSIDRIVER_RBAC_OK="false"
+fi
+CSIDRIVER_NAMES=$(jq -c '[(.items // [])[]?.metadata.name] | map(select(type == "string")) | unique' \
+  "$TEMP_DIR/csidrivers_raw.json" 2>/dev/null || echo '[]')
+if ! _ep "$CSIDRIVER_NAMES" | jq -e '.' >/dev/null 2>&1; then
+  CSIDRIVER_NAMES='[]'
+fi
 
-VSC_DRIVERS=$(_ep "$VSC_JSON" | jq -c '[.items[]?.driver] | unique' 2>/dev/null || echo '[]')
+VSC_DRIVERS=$(_ep "$VSC_JSON" | jq -c '[.items[]?.driver] | map(select(type == "string")) | unique' 2>/dev/null || echo '[]')
+if ! _ep "$VSC_DRIVERS" | jq -e '.' >/dev/null 2>&1; then
+  VSC_DRIVERS='[]'
+fi
 
 printf '%s' "${VSC_DRIVERS:-[]}" > "$TEMP_DIR/csi_vscd.json"
-CSI_DRIVERS_WITHOUT_VSC=$(_ep "$SC_CSI_DRIVERS" | jq -c --slurpfile vscd "$TEMP_DIR/csi_vscd.json" '
-  ( $vscd[0] ) as $vscd |
-  [.[] | select(. as $d | ($vscd | index($d)) == null)]
-' 2>/dev/null) || { _jq_fail "CSI drivers without VSC"; CSI_DRIVERS_WITHOUT_VSC='[]'; }
+printf '%s' "${CSIDRIVER_NAMES:-[]}" > "$TEMP_DIR/csi_drivers.json"
 
+PROVISIONER_CLASSES=$(_ep "$SC_JSON" | jq -c \
+  --slurpfile vscd "$TEMP_DIR/csi_vscd.json" \
+  --slurpfile csid "$TEMP_DIR/csi_drivers.json" '
+  ( $vscd[0] // [] ) as $vscd |
+  ( $csid[0] // [] ) as $csid |
+  ( [ (.items // [])[]? ] ) as $sc |
+  # Fallback only, used when the CSIDriver API is unreadable: well-known CSI
+  # driver names that do not contain "csi".
+  ["pxd.portworx.com", "topolvm.io", "driver.longhorn.io"] as $knownCsi |
+  [ (.items // [])[]? | (.provisioner // "unknown") ] | unique
+  | map(. as $prov | {
+      provisioner: $prov,
+      class: (
+        if ($prov | startswith("kubernetes.io/")) then "inTree"
+        elif ($csid | index($prov)) then "csi"
+        elif ($prov | test("csi"; "i")) then "csi"
+        elif ($vscd | index($prov)) then "csi"
+        elif ($knownCsi | index($prov)) then "csi"
+        else "unknown" end
+      ),
+      hasVsc: (($vscd | index($prov)) != null),
+      # Real StorageClass names using this provisioner (the field previously
+      # echoed the provisioner back, promising data it did not carry).
+      storageClasses: [ $sc[]? | select((.provisioner // "unknown") == $prov) | .metadata.name ]
+    })
+' 2>/dev/null) || { _jq_fail "provisioner classification"; PROVISIONER_CLASSES='[]'; }
+if ! _ep "$PROVISIONER_CLASSES" | jq -e '.' >/dev/null 2>&1; then
+  PROVISIONER_CLASSES='[]'
+fi
+
+CSI_DRIVERS_WITHOUT_VSC=$(_ep "$PROVISIONER_CLASSES" | jq -c '
+  [.[] | select(.class == "csi" and (.hasVsc | not)) | .provisioner]
+' 2>/dev/null) || { _jq_fail "CSI drivers without VSC"; CSI_DRIVERS_WITHOUT_VSC='[]'; }
 CSI_DRIVERS_WITHOUT_VSC_COUNT=$(safe_int "$(_ep "$CSI_DRIVERS_WITHOUT_VSC" | jq 'length // 0')")
+
+IN_TREE_PROVISIONERS=$(_ep "$PROVISIONER_CLASSES" | jq -c '[.[] | select(.class == "inTree") | .provisioner]' 2>/dev/null || echo '[]')
+IN_TREE_PROVISIONER_COUNT=$(safe_int "$(_ep "$IN_TREE_PROVISIONERS" | jq 'length // 0')")
+UNKNOWN_PROVISIONERS=$(_ep "$PROVISIONER_CLASSES" | jq -c '[.[] | select(.class == "unknown") | .provisioner]' 2>/dev/null || echo '[]')
+UNKNOWN_PROVISIONER_COUNT=$(safe_int "$(_ep "$UNKNOWN_PROVISIONERS" | jq 'length // 0')")
 
 debug "StorageClasses: $SC_COUNT (default: $SC_DEFAULT_COUNT, RBAC: $SC_RBAC_OK)"
 debug "VolumeSnapshotClasses: $VSC_COUNT (default: $VSC_DEFAULT_COUNT, RBAC: $VSC_RBAC_OK)"
-debug "CSI drivers without matching VSC: $CSI_DRIVERS_WITHOUT_VSC_COUNT"
+debug "CSIDriver API readable: $CSIDRIVER_RBAC_OK ($(_ep "$CSIDRIVER_NAMES" | jq 'length') drivers)"
+debug "CSI drivers without matching VSC: $CSI_DRIVERS_WITHOUT_VSC_COUNT ($CSI_DRIVERS_WITHOUT_VSC)"
+debug "In-tree provisioners: $IN_TREE_PROVISIONER_COUNT / unknown: $UNKNOWN_PROVISIONER_COUNT"
 
 ### -------------------------
 ### Export Storage & Deduplication (NEW v1.6)
@@ -3610,31 +3892,62 @@ debug "Excluded apps: $EXCLUDED_APPS_COUNT"
 printf '%s' "${UNPROTECTED_NS_JSON:-[]}" > "$TEMP_DIR/unpbd_unprotected.json"
 printf '%s' "${EXCLUDED_APPS_JSON:-[]}" > "$TEMP_DIR/unpbd_excludedapps.json"
 printf '%s' "${POLICY_EXCLUSIONS_JSON:-[]}" > "$TEMP_DIR/unpbd_policyexclusions.json"
+printf '%s' "${NS_PROTECTION_STATUS:-[]}" > "$TEMP_DIR/unpbd_nsprotection.json"
 UNPROTECTED_BREAKDOWN_JSON=$(jq -cn \
   --slurpfile unprotected "$TEMP_DIR/unpbd_unprotected.json" \
   --slurpfile excludedApps "$TEMP_DIR/unpbd_excludedapps.json" \
   --slurpfile policyExclusions "$TEMP_DIR/unpbd_policyexclusions.json" \
+  --slurpfile nsProtection "$TEMP_DIR/unpbd_nsprotection.json" \
   '
   ( $unprotected[0] ) as $u |
   ( $excludedApps[0] ) as $ea |
   ( $policyExclusions[0] ) as $pe |
+  ( $nsProtection[0] // [] ) as $nsp |
   ( [ $pe[]?.matchedNamespaces[]? ] | unique ) as $polNs |
+  # Namespaces with hard evidence of protection: a completed backup or export
+  # exists for them. Selector resolution can be wrong; a successful backup
+  # cannot (#selector-evidence).
+  ( [ $nsp[]? | select((.lastBackup != null) or (.lastExport != null)) | .namespace ] | unique ) as $backedUp |
   {
     total: ($u | length),
     excludedByHelm: ([ $u[] | select(IN($ea[])) ] | length),
     excludedByPolicy: ([ $u[] | select(IN($polNs[])) ] | length),
     deliberatelyExcluded: ([ $u[] | select(IN($ea[]) or IN($polNs[])) ] | length),
-    actionable: ([ $u[] | select((IN($ea[]) or IN($polNs[])) | not) ] | length),
-    actionableNamespaces: [ $u[] | select((IN($ea[]) or IN($polNs[])) | not) ]
+    # Reported as unprotected by selector analysis, yet demonstrably backed up.
+    # Every entry here is a selector-resolution miss, not a protection gap.
+    #
+    # Deliberately excluded namespaces are subtracted first, so the three buckets
+    # PARTITION $u and the breakdown always reconciles. Counting a namespace that
+    # is both Helm-excluded and backed up in both buckets made
+    # excluded + backedUp + actionable exceed total (#partition).
+    backedUpDespiteSelector: ([ $u[] | select(IN($backedUp[]) and ((IN($ea[]) or IN($polNs[])) | not)) ] | length),
+    backedUpDespiteSelectorNamespaces: ([ $u[] | select(IN($backedUp[]) and ((IN($ea[]) or IN($polNs[])) | not)) ] | sort),
+    actionable: ([ $u[] | select(((IN($ea[]) or IN($polNs[])) or IN($backedUp[])) | not) ] | length),
+    actionableNamespaces: [ $u[] | select(((IN($ea[]) or IN($polNs[])) or IN($backedUp[])) | not) ]
   }
   ' 2>/dev/null) || {
     _jq_fail "unprotected breakdown"
     # Fail safe toward "everything actionable" (pre-fix behaviour) rather than
     # toward "everything excluded" — an error here must never hide real gaps.
-    UNPROTECTED_BREAKDOWN_JSON="{\"total\":${UNPROTECTED_COUNT:-0},\"excludedByHelm\":0,\"excludedByPolicy\":0,\"deliberatelyExcluded\":0,\"actionable\":${UNPROTECTED_COUNT:-0},\"actionableNamespaces\":${UNPROTECTED_NS_JSON:-[]}}"
+    UNPROTECTED_BREAKDOWN_JSON="{\"total\":${UNPROTECTED_COUNT:-0},\"excludedByHelm\":0,\"excludedByPolicy\":0,\"deliberatelyExcluded\":0,\"backedUpDespiteSelector\":0,\"backedUpDespiteSelectorNamespaces\":[],\"actionable\":${UNPROTECTED_COUNT:-0},\"actionableNamespaces\":${UNPROTECTED_NS_JSON:-[]}}"
   }
 if ! _ep "$UNPROTECTED_BREAKDOWN_JSON" | jq -e '.' >/dev/null 2>&1; then
-  UNPROTECTED_BREAKDOWN_JSON="{\"total\":${UNPROTECTED_COUNT:-0},\"excludedByHelm\":0,\"excludedByPolicy\":0,\"deliberatelyExcluded\":0,\"actionable\":${UNPROTECTED_COUNT:-0},\"actionableNamespaces\":${UNPROTECTED_NS_JSON:-[]}}"
+  UNPROTECTED_BREAKDOWN_JSON="{\"total\":${UNPROTECTED_COUNT:-0},\"excludedByHelm\":0,\"excludedByPolicy\":0,\"deliberatelyExcluded\":0,\"backedUpDespiteSelector\":0,\"backedUpDespiteSelectorNamespaces\":[],\"actionable\":${UNPROTECTED_COUNT:-0},\"actionableNamespaces\":${UNPROTECTED_NS_JSON:-[]}}"
+fi
+
+BACKED_UP_DESPITE_SELECTOR_COUNT=$(safe_int "$(_ep "$UNPROTECTED_BREAKDOWN_JSON" | jq '.backedUpDespiteSelector // 0' 2>/dev/null || echo 0)")
+# A mismatch here is NOT the same as an unknowable verdict, and the two must not
+# be collapsed. Backup evidence RESOLVES the disagreement: those namespaces are
+# demonstrably protected, so they leave the actionable count and the verdict can
+# still stand on the remainder. PROTECTION_STATUS stays reserved for the cases
+# where protection is genuinely not knowable — a selector operator KDL does not
+# evaluate, or no namespace inventory at all. The mismatch is still surfaced,
+# because a selector that misses hundreds of namespaces is a real finding about
+# the ANALYSIS even when the cluster itself is fine.
+if [ "$BACKED_UP_DESPITE_SELECTOR_COUNT" -gt 0 ] 2>/dev/null; then
+  warn "$BACKED_UP_DESPITE_SELECTOR_COUNT namespace(s) matched no policy selector yet have a completed backup or export."
+  warn "They are counted as protected (evidence beats selector inference), not as gaps."
+  warn "The policy selectors are worth checking: KDL could not derive this coverage from them."
 fi
 
 UNPROTECTED_ACTIONABLE_COUNT=$(_ep "$UNPROTECTED_BREAKDOWN_JSON" | jq '.actionable // 0' 2>/dev/null)
@@ -3985,10 +4298,19 @@ fi
 # via Helm excludedApps or a policy-level selector exception no longer read
 # as "gaps". UNPROTECTED_COUNT itself is untouched and still reported as the
 # raw total elsewhere.
+# v2.2.0 (#selector-labels): a fourth input. When a policy selector uses an
+# operator KDL does not evaluate, coverage is unknowable and must not be
+# published as GAPS_DETECTED — that would invent gaps out of a selector KDL
+# simply failed to read. It ranks below COMPLETE, because a COMPLETE verdict
+# here is backed by positive evidence (every unmatched namespace is either
+# deliberately excluded or has a completed backup), which no unresolved
+# selector can contradict.
 if [ "$RBAC_NS_DENIED" = "true" ]; then
   BP_COVERAGE_STATUS="NOT_ASSESSED"
 elif [ "$HAS_CATCHALL_POLICY" = "true" ] || [ "${UNPROTECTED_ACTIONABLE_COUNT:-$UNPROTECTED_COUNT}" -eq 0 ]; then
   BP_COVERAGE_STATUS="COMPLETE"
+elif [ "${PROTECTION_STATUS:-OK}" = "NOT_ASSESSED" ]; then
+  BP_COVERAGE_STATUS="NOT_ASSESSED"
 else
   BP_COVERAGE_STATUS="GAPS_DETECTED"
 fi
@@ -4302,6 +4624,9 @@ PROFILE_VALIDATION=$(_safe_arg "$PROFILE_VALIDATION" '[]')
 SC_SUMMARY=$(_safe_arg "$SC_SUMMARY" '[]')
 VSC_SUMMARY=$(_safe_arg "$VSC_SUMMARY" '[]')
 CSI_DRIVERS_WITHOUT_VSC=$(_safe_arg "$CSI_DRIVERS_WITHOUT_VSC" '[]')
+IN_TREE_PROVISIONERS=$(_safe_arg "$IN_TREE_PROVISIONERS" '[]')
+UNKNOWN_PROVISIONERS=$(_safe_arg "$UNKNOWN_PROVISIONERS" '[]')
+PROVISIONER_CLASSES=$(_safe_arg "$PROVISIONER_CLASSES" '[]')
 IMPORT_POLICIES_JSON=$(_safe_arg "$IMPORT_POLICIES_JSON" '[]')
 POLICIES_NO_EXPORT_LIST=$(_safe_arg "$POLICIES_NO_EXPORT_LIST" '[]')
 HIGH_SNAP_POLICIES=$(_safe_arg "$HIGH_SNAP_POLICIES" '[]')
@@ -4333,6 +4658,8 @@ printf '%s' "$LICENSE_JSON" > "$TEMP_DIR/licenseBlock.json"
 printf '%s' "$POLICY_LAST_RUN" > "$TEMP_DIR/policyLastRun.json"
 printf '%s' "$UNPROTECTED_NS_JSON" > "$TEMP_DIR/unprotectedNs.json"
 printf '%s' "$UNPROTECTED_BREAKDOWN_JSON" > "$TEMP_DIR/unprotectedBreakdown.json"
+printf '%s' "$PROTECTION_UNRESOLVED_POLICIES" > "$TEMP_DIR/protectionUnresolved.json"
+printf '%s' "$(_safe_arg "$PROTECTION_NONSTANDARD_PATTERNS" '[]')" > "$TEMP_DIR/protectionNonStandard.json"
 printf '%s' "$ALL_NAMESPACES_LABELED" > "$TEMP_DIR/nsInventory.json"
 printf '%s' "$K10_CLUSTERROLES_JSON" > "$TEMP_DIR/k10ClusterRoles.json"
 printf '%s' "$K10_CRB_JSON" > "$TEMP_DIR/k10ClusterRoleBindings.json"
@@ -4359,6 +4686,9 @@ printf '%s' "$PROFILE_VALIDATION" > "$TEMP_DIR/profileValidation.json"
 printf '%s' "$SC_SUMMARY" > "$TEMP_DIR/scSummary.json"
 printf '%s' "$VSC_SUMMARY" > "$TEMP_DIR/vscSummary.json"
 printf '%s' "$CSI_DRIVERS_WITHOUT_VSC" > "$TEMP_DIR/csiDriversWithoutVsc.json"
+printf '%s' "$IN_TREE_PROVISIONERS" > "$TEMP_DIR/inTreeProvisioners.json"
+printf '%s' "$UNKNOWN_PROVISIONERS" > "$TEMP_DIR/unknownProvisioners.json"
+printf '%s' "$PROVISIONER_CLASSES" > "$TEMP_DIR/provisionerClasses.json"
 printf '%s' "$IMPORT_POLICIES_JSON" > "$TEMP_DIR/importPolicies.json"
 printf '%s' "$POLICIES_NO_EXPORT_LIST" > "$TEMP_DIR/policiesNoExportList.json"
 printf '%s' "$HIGH_SNAP_POLICIES" > "$TEMP_DIR/highSnapPolicies.json"
@@ -4463,6 +4793,11 @@ if [ "$MODE" = "json" ]; then
     --argjson unprotectedCount "$UNPROTECTED_COUNT" \
     --slurpfile unprotectedBreakdown "$TEMP_DIR/unprotectedBreakdown.json" \
     --arg hasCatchallPolicy "$HAS_CATCHALL_POLICY" \
+    --arg protectionStatus "$PROTECTION_STATUS" \
+    --slurpfile protectionUnresolvedPolicies "$TEMP_DIR/protectionUnresolved.json" \
+    --argjson protectionUnresolvedCount "$PROTECTION_UNRESOLVED_COUNT" \
+    --slurpfile protectionNonStandard "$TEMP_DIR/protectionNonStandard.json" \
+    --argjson protectionNonStandardCount "$PROTECTION_NONSTANDARD_COUNT" \
     --slurpfile nsInventory "$TEMP_DIR/nsInventory.json" \
     --slurpfile k10ClusterRoles "$TEMP_DIR/k10ClusterRoles.json" \
     --slurpfile k10ClusterRoleBindings "$TEMP_DIR/k10ClusterRoleBindings.json" \
@@ -4518,6 +4853,8 @@ if [ "$MODE" = "json" ]; then
     --arg catalogUsedPercent "$CATALOG_USED_PERCENT" \
     --slurpfile orphanedRp "$TEMP_DIR/orphanedRp.json" \
     --argjson orphanedRpCount "$ORPHANED_RP_COUNT" \
+    --arg orphanedRpStatus "$ORPHANED_RP_STATUS" \
+    --argjson rpUnattributableCount "$RP_UNATTRIBUTABLE_COUNT" \
     --arg mcRole "$MC_ROLE" \
     --argjson mcClusterCount "${MC_CLUSTER_COUNT:-0}" \
     --arg mcPrimaryName "${MC_PRIMARY_NAME:-}" \
@@ -4639,6 +4976,12 @@ if [ "$MODE" = "json" ]; then
     --slurpfile vscSummary "$TEMP_DIR/vscSummary.json" \
     --slurpfile csiDriversWithoutVsc "$TEMP_DIR/csiDriversWithoutVsc.json" \
     --argjson csiDriversWithoutVscCount "$CSI_DRIVERS_WITHOUT_VSC_COUNT" \
+    --slurpfile inTreeProvisioners "$TEMP_DIR/inTreeProvisioners.json" \
+    --argjson inTreeProvisionerCount "$IN_TREE_PROVISIONER_COUNT" \
+    --slurpfile unknownProvisioners "$TEMP_DIR/unknownProvisioners.json" \
+    --argjson unknownProvisionerCount "$UNKNOWN_PROVISIONER_COUNT" \
+    --slurpfile provisionerClasses "$TEMP_DIR/provisionerClasses.json" \
+    --arg csiDriverRbacOk "$CSIDRIVER_RBAC_OK" \
     --argjson importPolicyCount "$IMPORT_POLICY_COUNT" \
     --slurpfile importPolicies "$TEMP_DIR/importPolicies.json" \
     --slurpfile policiesNoExportList "$TEMP_DIR/policiesNoExportList.json" \
@@ -4656,7 +4999,10 @@ if [ "$MODE" = "json" ]; then
     --arg bpExportRetention "$BP_EXPORT_RETENTION_STATUS" \
     --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
     --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
-    "$JQ_SELECTOR_LIB"'
+    --argjson profileLocationCount "$PROFILE_LOCATION_COUNT" \
+    --argjson profileInfraCount "$PROFILE_INFRA_COUNT" \
+    --argjson profileUndeterminedCount "$PROFILE_UNDETERMINED_COUNT" \
+    "$JQ_SELECTOR_LIB$JQ_PROFILE_LIB"'
     ( $immutableProfiles[0] ) as $immutableProfiles |
     ( $restoreActionsRecent[0] ) as $restoreActionsRecent |
     ( $snapshotData[0] ) as $snapshotData |
@@ -4664,6 +5010,8 @@ if [ "$MODE" = "json" ]; then
     ( $policyLastRun[0] ) as $policyLastRun |
     ( $unprotectedNs[0] ) as $unprotectedNs |
     ( $unprotectedBreakdown[0] ) as $unprotectedBreakdown |
+    ( $protectionUnresolvedPolicies[0] // [] ) as $protectionUnresolvedPolicies |
+    ( $protectionNonStandard[0] // [] ) as $protectionNonStandard |
     ( $nsInventory[0] ) as $nsInventory |
     ( $k10ClusterRoles[0] ) as $k10ClusterRoles |
     ( $k10ClusterRoleBindings[0] ) as $k10ClusterRoleBindings |
@@ -4692,6 +5040,9 @@ if [ "$MODE" = "json" ]; then
     ( $scSummary[0] ) as $scSummary |
     ( $vscSummary[0] ) as $vscSummary |
     ( $csiDriversWithoutVsc[0] ) as $csiDriversWithoutVsc |
+    ( $inTreeProvisioners[0] ) as $inTreeProvisioners |
+    ( $unknownProvisioners[0] ) as $unknownProvisioners |
+    ( $provisionerClasses[0] ) as $provisionerClasses |
     ( $importPolicies[0] ) as $importPolicies |
     ( $policiesNoExportList[0] ) as $policiesNoExportList |
     ( $highSnapPolicies[0] ) as $highSnapPolicies |
@@ -4841,8 +5192,30 @@ if [ "$MODE" = "json" ]; then
           excludedByHelm: ($unprotectedBreakdown.excludedByHelm // 0),
           excludedByPolicy: ($unprotectedBreakdown.excludedByPolicy // 0),
           deliberatelyExcluded: ($unprotectedBreakdown.deliberatelyExcluded // 0),
+          # Namespaces the selector analysis called unprotected that nonetheless
+          # have a completed backup or export. Each one is a selector-resolution
+          # miss, not a protection gap, and is excluded from actionable
+          # (#selector-evidence).
+          backedUpDespiteSelector: ($unprotectedBreakdown.backedUpDespiteSelector // 0),
+          backedUpDespiteSelectorNamespaces: ($unprotectedBreakdown.backedUpDespiteSelectorNamespaces // []),
           actionable: ($unprotectedBreakdown.actionable // $unprotectedCount),
           actionableNamespaces: ($unprotectedBreakdown.actionableNamespaces // $unprotectedNs)
+        },
+        # OK | NOT_ASSESSED. NOT_ASSESSED means the selector analysis could not
+        # be trusted on this cluster — an unimplemented selector operator, an
+        # empty namespace inventory, or a disagreement with the backup history
+        # of the cluster itself. The gap counts must not be read as verified.
+        protection: {
+          status: $protectionStatus,
+          unresolvedPolicyCount: $protectionUnresolvedCount,
+          unresolvedPolicies: $protectionUnresolvedPolicies,
+          # Selectors placing a wildcard where Kasten documents none
+          # (#glob-shape). Kasten documents "*" (all applications) and a
+          # trailing wildcard (prefix match); anything else has no defined
+          # meaning, so coverage for those policies is NOT_ASSESSED rather than
+          # guessed in either direction.
+          nonStandardPatternCount: $protectionNonStandardCount,
+          nonStandardPatterns: $protectionNonStandard
         },
         namespacesInventory: {
           total: ($nsInventory | length),
@@ -4850,7 +5223,7 @@ if [ "$MODE" = "json" ]; then
           application: [$nsInventory[] | select(.isSystem | not)] | length,
           items: $nsInventory
         },
-        note: "Excludes system policies (DR, reporting) and system namespaces. unprotectedBreakdown.deliberatelyExcluded = unprotected namespaces matched by Helm excludedApps or a policy-level selector exception (see k10Configuration.excludedApps / k10Configuration.policyExclusions); actionable = the remainder."
+        note: "Excludes system policies (DR, reporting) and system namespaces. unprotectedBreakdown.deliberatelyExcluded = unprotected namespaces matched by Helm excludedApps or a policy-level selector exception (see k10Configuration.excludedApps / k10Configuration.policyExclusions). backedUpDespiteSelector = reported unprotected by selector analysis yet demonstrably backed up, i.e. a selector-resolution miss rather than a gap. actionable = the remainder, and is 0 when every reported gap is explained. Read protection.status first: NOT_ASSESSED means these counts are not verified."
       },
 
       policyAnalysis: {
@@ -4907,7 +5280,13 @@ if [ "$MODE" = "json" ]; then
 
       orphanedRestorePoints: {
         count: $orphanedRpCount,
-        items: $orphanedRp
+        items: $orphanedRp,
+        # OK | NOT_ASSESSED. NOT_ASSESSED means the computation failed (jq
+        # error) and count MUST NOT be read as a verified zero (#orphan-rp).
+        status: $orphanedRpStatus,
+        # RestorePoints with no spec.source.actionName: cannot be attributed to
+        # any policy, so neither orphaned nor confirmed-attached.
+        unattributable: $rpUnattributableCount
       },
 
       dataUsage: {
@@ -5157,6 +5536,24 @@ if [ "$MODE" = "json" ]; then
         csiDriversWithoutVsc: {
           count: $csiDriversWithoutVscCount,
           drivers: $csiDriversWithoutVsc
+        },
+        # Provisioner classification (#csi-detect). classificationSource tells
+        # whether the CSI verdict came from the authoritative CSIDriver API or
+        # from the name-based fallback.
+        provisionerClassification: {
+          classificationSource: (if ($csiDriverRbacOk == "true") then "csidriver-api" else "name-heuristic" end),
+          items: $provisionerClasses,
+          # Legacy kubernetes.io/* provisioners: CSI snapshots do not apply, so
+          # Kasten falls back to generic volume backup for these volumes.
+          inTree: {
+            count: $inTreeProvisionerCount,
+            provisioners: $inTreeProvisioners
+          },
+          # Neither CSI nor in-tree: requires manual verification.
+          unrecognised: {
+            count: $unknownProvisionerCount,
+            provisioners: $unknownProvisioners
+          }
         }
       },
 
@@ -5259,7 +5656,13 @@ if [ "$MODE" = "json" ]; then
       },
 
       profiles: {
+        # count is the raw CR total and spans both families. locationCount /
+        # infraCount are the numbers that match the Kasten UI, which lists
+        # Location and Infrastructure profiles on separate pages (#profile-kind).
         count: ($profiles.items | length),
+        locationCount: $profileLocationCount,
+        infraCount: $profileInfraCount,
+        undeterminedCount: $profileUndeterminedCount,
         # immutableCount stays protectionPeriod-based for backward
         # compatibility; immutableCountTotal adds hardened VBR repositories.
         immutableCount: $immutableProfiles,
@@ -5278,6 +5681,8 @@ if [ "$MODE" = "json" ]; then
           ( [ .spec | .. | objects | (.repoName? // empty)      | select(. != null and . != "") ] | first ) as $repoName |
           {
             name: .metadata.name,
+            # "location" | "infrastructure" | "undetermined" (#profile-kind)
+            profileType: profile_kind,
             backend: (
               # Broadened detection (#43), refined in v2.2.0 (#kasten-v9): the
               # SPECIFIC store type now wins over the generic location type.
@@ -5555,6 +5960,11 @@ fi
 ### Profiles
 printf "\n${COLOR_BOLD}[PACKAGE] Location Profiles${COLOR_RESET}\n"
 printf "  Profiles: $PROFILE_COUNT"
+# The Kasten UI splits these across two pages, so report the split rather than a
+# bare total that matches neither page (#profile-kind).
+if [ "${PROFILE_INFRA_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  printf " ($PROFILE_LOCATION_COUNT location + $PROFILE_INFRA_COUNT infrastructure)"
+fi
 if [ "$IMMUTABLE_PROFILES_TOTAL" -gt 0 ]; then
   printf " (${COLOR_GREEN}$IMMUTABLE_PROFILES_TOTAL with immutability${COLOR_RESET})"
 fi
@@ -6038,11 +6448,16 @@ fi
 
 ### Orphaned RestorePoints (NEW v1.5)
 printf "\n${COLOR_BOLD}[TRASH] Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
-if [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
+if [ "$ORPHANED_RP_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} Not assessed - the computation failed; this is NOT a verified zero\n"
+elif [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
   printf "  ${COLOR_GREEN}[OK] No orphaned RestorePoints detected${COLOR_RESET}\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
   _ep "$ORPHANED_RP" | jq -r '.[:5][] | "    - \(.name) [\(.namespace)]"' 2>/dev/null
+fi
+if [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_CYAN}    $RP_UNATTRIBUTABLE_COUNT RestorePoint(s) have no source action name (not attributable)${COLOR_RESET}\n"
 fi
 
 ### RestorePoints by Namespace - Top 5 (NEW v1.9)
@@ -6436,7 +6851,21 @@ fi
 if [ "$CSI_DRIVERS_WITHOUT_VSC_COUNT" -gt 0 ]; then
   printf "\n  ${COLOR_YELLOW}[WARN] $CSI_DRIVERS_WITHOUT_VSC_COUNT CSI driver(s) used by SC have NO matching VolumeSnapshotClass:${COLOR_RESET}\n"
   _ep "$CSI_DRIVERS_WITHOUT_VSC" | jq -r '.[] | "    - " + .' 2>/dev/null
-  printf "  ${COLOR_YELLOW}    These PVCs cannot be CSI-snapshotted by Kasten — Kanister/GVB needed${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    These PVCs cannot be CSI-snapshotted by Kasten - Kanister/GVB needed${COLOR_RESET}\n"
+fi
+
+if [ "${IN_TREE_PROVISIONER_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  printf "\n  ${COLOR_CYAN}[INFO] $IN_TREE_PROVISIONER_COUNT legacy in-tree provisioner(s) in use:${COLOR_RESET}\n"
+  _ep "$IN_TREE_PROVISIONERS" | jq -r '.[] | "    - " + .' 2>/dev/null
+  printf "  ${COLOR_CYAN}    CSI snapshots do not apply - a VolumeSnapshotClass would not help here${COLOR_RESET}\n"
+fi
+
+if [ "${UNKNOWN_PROVISIONER_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  printf "\n  ${COLOR_CYAN}[INFO] $UNKNOWN_PROVISIONER_COUNT provisioner(s) not classifiable as CSI or in-tree:${COLOR_RESET}\n"
+  _ep "$UNKNOWN_PROVISIONERS" | jq -r '.[] | "    - " + .' 2>/dev/null
+  if [ "$CSIDRIVER_RBAC_OK" != "true" ]; then
+    printf "  ${COLOR_CYAN}    CSIDriver API not readable - classification fell back to driver naming${COLOR_RESET}\n"
+  fi
 fi
 
 ### Ransomware Readiness Score (NEW v2.0 - patch 5/7)
@@ -6537,7 +6966,11 @@ fi
 if [ "$BP_COVERAGE_STATUS" = "COMPLETE" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Namespace Protection: ${COLOR_GREEN}COMPLETE${COLOR_RESET}\n"
 elif [ "$BP_COVERAGE_STATUS" = "NOT_ASSESSED" ]; then
-  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED (RBAC-limited - cluster-wide namespace listing was denied)\n"
+  if [ "$RBAC_NS_DENIED" = "true" ]; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED (RBAC-limited - cluster-wide namespace listing was denied)\n"
+  else
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED ($PROTECTION_UNRESOLVED_COUNT policy selector(s) use an operator KDL does not evaluate)\n"
+  fi
 else
   # P2: this branch is now driven by the actionable count (deliberate Helm/
   # policy exclusions are not gaps) - show both figures so the raw total

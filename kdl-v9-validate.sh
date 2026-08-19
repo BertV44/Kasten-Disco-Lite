@@ -156,11 +156,22 @@ fi
 
 echo
 echo "== 4. Policy analysis must not false-flag 9.0 selectors =="
-# Only genuine empties (dangling namespace references) may remain.
 a "no VM-scoped policy reported empty" \
   '[.policyAnalysis.emptyPolicies[]?|select(.scope=="virtualMachine")]|length == 0'
-a "no policy reported empty without a dangling reference" \
-  '[.policyAnalysis.emptyPolicies[]?|select((.nonExistingReferences|length)==0)]|length == 0'
+# The old assertion here required every empty policy to carry a dangling
+# namespace reference. That premise only held while matchExpressions were
+# UNIONED: an intersection could never collapse to zero, so a dangling name was
+# the only route to empty. With AND semantics (v2.2.0, #one-resolver) a policy
+# whose terms intersect to nothing is legitimately empty with no dangling
+# reference — that is the B3 finding, not a false flag. What must still never
+# happen is a CATCH-ALL reading as empty on a cluster that has app namespaces:
+# that would mean catch-all resolution itself broke.
+a "no catch-all policy reported empty while app namespaces exist" \
+  'if ((.coverage.namespacesInventory.application // 0) > 0)
+   then ([.policyAnalysis.emptyPolicies[]?|select(.selectorKind=="catchall")]|length == 0)
+   else true end'
+a "an empty policy never claims to cover an existing namespace" \
+  '[.policyAnalysis.emptyPolicies[]?|select((.existingNamespaces|length)>0)]|length == 0'
 a "every resolved policy carries a scope" \
   '[.policyAnalysis.resolved[]?|select(.scope==null)]|length == 0'
 a "redundant pairs never mix scopes" \
@@ -173,8 +184,9 @@ echo
 echo "== 5. Coverage: wildcards expanded, NotIn exceptions preserved =="
 a "actionable gaps are a subset of unprotected" \
   '(.coverage.unprotectedBreakdown.actionableNamespaces - .coverage.unprotectedNamespaces.items)|length == 0'
-a "deliberate + actionable == total unprotected" \
-  '.coverage.unprotectedBreakdown | (.deliberatelyExcluded + .actionable) == .total'
+# NOTE: the two-way reconciliation that used to live here is superseded by the
+# three-way one in section 8 — backedUpDespiteSelector is carved out of
+# actionable, so deliberate + actionable no longer sums to total by design.
 show '"unprotected=" + (.coverage.unprotectedNamespaces.count|tostring)
       + " (deliberate=" + (.coverage.unprotectedBreakdown.deliberatelyExcluded|tostring)
       + " actionable=" + (.coverage.unprotectedBreakdown.actionable|tostring) + ")"'
@@ -183,9 +195,13 @@ echo
 echo "== 6. Profiles: Veeam Vault / VBR classification =="
 a "immutableCountTotal >= immutableCount"  '.profiles.immutableCountTotal >= .profiles.immutableCount'
 a "vbrHardenedCount <= vbrCount"           '.profiles.vbrHardenedCount <= .profiles.vbrCount'
-a "no profile backend left Undetermined"   '[.profiles.items[]|select(.backend=="Undetermined")]|length == 0'
-a "locationType resolved for every profile" \
-  '[.profiles.items[]|select(.locationType==null and .backend!="Infra")]|length == 0'
+# An 8.x infrastructure profile legitimately falls through every backend probe
+# (see JQ_PROFILE_LIB), so "Undetermined" is an expected outcome, not a defect —
+# section 11 counts it explicitly. Assert only on profiles we DID classify.
+a "no LOCATION profile backend left Undetermined" \
+  '[.profiles.items[]|select((.profileType // "location") == "location" and .backend=="Undetermined")]|length == 0'
+a "locationType resolved for every classified location profile" \
+  '[.profiles.items[]|select((.profileType // "location") == "location" and .locationType==null and .backend!="Infra")]|length == 0'
 
 # DIAGNOSTICS, not gates. The live Profile CRD nesting is only partly pinned
 # down. A real 8.5.13 report confirms `spec.type` (Location/Infra) and
@@ -230,6 +246,108 @@ a "policies section not empty while policies exist" \
 echo "  (also confirm the run printed NO '[WARN] Section ... could not be computed' on stderr)"
 
 echo
+echo "== 8. Selector-based coverage must agree with backup history =="
+# The ocp-infra-prd-2 defect: every app policy was expression-based on a custom
+# label, the value-only resolver saw none of them, and the report published 786
+# "actionable gaps" that were in fact the 786 namespaces backed up daily. These
+# assertions catch that class of contradiction on any cluster.
+a "backedUpDespiteSelector <= unprotected total" \
+  '(.coverage.unprotectedBreakdown.backedUpDespiteSelector // 0) <= (.coverage.unprotectedBreakdown.total // 0)'
+a "breakdown reconciles: excluded + backedUp + actionable == total" \
+  '(.coverage.unprotectedBreakdown | (.deliberatelyExcluded + .backedUpDespiteSelector + .actionable) == .total)'
+a "no namespace is both an actionable gap and demonstrably backed up" \
+  '[ (.coverage.unprotectedBreakdown.actionableNamespaces // [])[] as $n
+     | (.namespaceProtectionStatus.items // [])[]
+     | select(.namespace == $n and ((.lastBackup != null) or (.lastExport != null))) ] | length == 0'
+a "protection.status is OK or NOT_ASSESSED" \
+  '(.coverage.protection.status // "") | . == "OK" or . == "NOT_ASSESSED"'
+a "unresolvedPolicies length matches its count" \
+  '(.coverage.protection.unresolvedPolicies | length) == .coverage.protection.unresolvedPolicyCount'
+a "nonStandardPatterns length matches its count" \
+  '(.coverage.protection.nonStandardPatterns | length) == .coverage.protection.nonStandardPatternCount'
+# Only undocumented wildcard shapes belong here: never "*" and never a plain
+# trailing wildcard, which are the two forms Kasten documents.
+a "every non-standard pattern really is undocumented and names its policy" \
+  '[.coverage.protection.nonStandardPatterns[]?
+    | select((.policy // "") == ""
+             or ([.patterns[]? | select(test("[*?]"))] | length) != (.patterns | length)
+             or ([.patterns[]? | select(. == "*" or test("^[^*?]+\\*$"))] | length) > 0)] | length == 0'
+a "a non-standard pattern forces protection.status to NOT_ASSESSED" \
+  'if (.coverage.protection.nonStandardPatternCount // 0) > 0 then (.coverage.protection.status == "NOT_ASSESSED") else true end'
+a "a GAPS verdict implies at least one actionable namespace" \
+  'if (.bestPractices.namespaceProtection // "") == "GAPS_DETECTED" then ((.coverage.unprotectedBreakdown.actionable // 0) > 0) else true end'
+show '"unprotected=" + ((.coverage.unprotectedBreakdown.total // 0)|tostring)
+      + " excluded=" + ((.coverage.unprotectedBreakdown.deliberatelyExcluded // 0)|tostring)
+      + " backedUpDespiteSelector=" + ((.coverage.unprotectedBreakdown.backedUpDespiteSelector // 0)|tostring)
+      + " actionable=" + ((.coverage.unprotectedBreakdown.actionable // 0)|tostring)
+      + " | status=" + (.coverage.protection.status // "?")'
+if [ "$(jq -r '(.coverage.unprotectedBreakdown.backedUpDespiteSelector // 0)' "$J")" -gt 0 ] 2>/dev/null; then
+  printf '  [NOTE] %s\n' "Some namespaces are protected in fact but not derivable from the"
+  printf '         %s\n' "policy selectors. Not a KDL failure, but the selectors are worth"
+  printf '         %s\n' "reviewing: KDL could not explain that coverage from them."
+fi
+
+echo
+echo "== 9. Orphaned RestorePoints: no silent zero =="
+a "orphan status is OK or NOT_ASSESSED" \
+  '(.orphanedRestorePoints.status // "OK") | . == "OK" or . == "NOT_ASSESSED"'
+# NOTE: no assertion here on "count 0 implies assessed". A failed pass correctly
+# emits count 0 WITH status NOT_ASSESSED, so any such check fires on the healthy
+# output. The guarantee that matters is that status is carried at all, asserted
+# above and rendered by the HTML.
+a "orphans carry an attribution method" \
+  '[.orphanedRestorePoints.items[]? | select((.attributedBy // "") | IN("label","actionName") | not)] | length == 0'
+a "orphan items length == count" \
+  '(.orphanedRestorePoints.items | length) == .orphanedRestorePoints.count'
+a "unattributable <= total RestorePoints" \
+  '(.orphanedRestorePoints.unattributable // 0) <= (.health.backups.restorePoints // 0)'
+show '"orphans=" + ((.orphanedRestorePoints.count // 0)|tostring)
+      + " status=" + (.orphanedRestorePoints.status // "?")
+      + " unattributable=" + ((.orphanedRestorePoints.unattributable // 0)|tostring)'
+
+echo
+echo "== 10. Provisioner classification / VolumeSnapshotClass cross-check =="
+a "classificationSource is known" \
+  '(.volumeSnapshotClasses.provisionerClassification.classificationSource // "") | . == "csidriver-api" or . == "name-heuristic"'
+a "no in-tree provisioner is reported as a CSI driver missing a VSC" \
+  '[ (.volumeSnapshotClasses.csiDriversWithoutVsc.drivers // [])[]
+     | select(startswith("kubernetes.io/")) ] | length == 0'
+a "every classified provisioner is csi, inTree or unknown" \
+  '[ (.volumeSnapshotClasses.provisionerClassification.items // [])[]
+     | select((.class | IN("csi","inTree","unknown")) | not) ] | length == 0'
+# NOTE: the root must be bound first — inside the select, `.` is the item, so
+# reaching for .volumeSnapshotClasses there raises "Cannot index string".
+a "a CSI driver with a VSC is never listed as missing one" \
+  '. as $r | [ ($r.volumeSnapshotClasses.provisionerClassification.items // [])[]
+     | select(.hasVsc == true and (.provisioner | IN(($r.volumeSnapshotClasses.csiDriversWithoutVsc.drivers // [])[]))) ] | length == 0'
+a "every StorageClass provisioner appears in the classification" \
+  '([.storageClasses.items[]?.provisioner] | unique) - [(.volumeSnapshotClasses.provisionerClassification.items // [])[].provisioner] | length == 0'
+show '"csiWithoutVsc=" + ((.volumeSnapshotClasses.csiDriversWithoutVsc.count // 0)|tostring)
+      + " inTree=" + ((.volumeSnapshotClasses.provisionerClassification.inTree.count // 0)|tostring)
+      + " unrecognised=" + ((.volumeSnapshotClasses.provisionerClassification.unrecognised.count // 0)|tostring)
+      + " via=" + (.volumeSnapshotClasses.provisionerClassification.classificationSource // "?")'
+
+echo
+echo "== 11. Profiles: Location vs Infrastructure split =="
+# NOTE: locationCount is derived as count - infraCount, so summing them back is
+# a tautology. Assert against the ITEMS instead, which is what can actually
+# disagree with the counts.
+a "locationCount matches the non-infrastructure items" \
+  '.profiles.locationCount == ([.profiles.items[]? | select((.profileType // "location") != "infrastructure")] | length)'
+a "locationCount + infraCount == count" \
+  '(.profiles.locationCount + .profiles.infraCount) == .profiles.count'
+a "every profile carries a profileType" \
+  '[.profiles.items[]? | select(.profileType == null)] | length == 0'
+a "infraCount == items typed infrastructure" \
+  '.profiles.infraCount == ([.profiles.items[]? | select(.profileType == "infrastructure")] | length)'
+a "undeterminedCount == items typed undetermined" \
+  '(.profiles.undeterminedCount // 0) == ([.profiles.items[]? | select(.profileType == "undetermined")] | length)'
+show '"profiles=" + (.profiles.count|tostring)
+      + " location=" + (.profiles.locationCount|tostring)
+      + " infra=" + (.profiles.infraCount|tostring)
+      + " undetermined=" + ((.profiles.undeterminedCount // 0)|tostring)'
+
+echo
 echo "=============================================="
 printf 'PASS=%s  FAIL=%s  SKIP=%s   (mode: %s)\n' "$PASS" "$FAIL" "$SKIP" "$MODE"
 if [ "$FAIL" -eq 0 ]; then
@@ -249,7 +367,7 @@ echo
 echo "Worth reading in the report even when everything passes:"
 echo "  VM gaps         : jq '.virtualization.protection.unprotectedVmList' $J"
 echo "  self-consistency: compare the VM count above against"
-echo "                    jq '[.namespaceProtectionStatus.items[]|select(.lastSuccessfulBackup==null)|.namespace]' $J"
+echo "                    jq '[.namespaceProtectionStatus.items[]|select(.lastBackup==null)|.namespace]' $J"
 echo "                    (a green VM count beside never-backed-up namespaces is the v2.1.1 contradiction)"
 echo
 echo "Report: $J"

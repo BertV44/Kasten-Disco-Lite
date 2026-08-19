@@ -149,7 +149,7 @@ def badge(v):
   elif v == "N/A" then
     "<span class=\"badge info\">N/A</span>"
   elif v == "NOT_ASSESSED" then
-    "<span class=\"badge info\">ℹ Not assessed (RBAC)</span>"
+    "<span class=\"badge info\">ℹ Not assessed</span>"
   else "<span class=\"badge info\">" + (v | tostring) + "</span>" end;
 
 def licenseNodeConsumptionNotAssessed(nc):
@@ -803,22 +803,63 @@ else "" end) + "
     "<p class=\"section-description\">Based on app policies only (excludes DR/report system policies)</p>" +
     (if .coverage.hasCatchallPolicy then
       "<div class=\"success-box\">\u2713 <strong>Catch-all policy detected</strong> - All namespaces are protected.</div>"
-    elif (.bestPractices.namespaceProtection // "N/A") == "NOT_ASSESSED" then
+    elif ((.bestPractices.namespaceProtection // "N/A") == "NOT_ASSESSED"
+          and (([(.rbacLimited.denied // [])[] | select(test("namespace"; "i"))] | length) > 0)) then
       "<div class=\"info-box\">\u2139 <strong>Not assessed (RBAC).</strong> Cluster-wide namespace listing was denied, so namespace coverage could not be evaluated &mdash; this is <em>not</em> the same as \"all namespaces protected\". See the RBAC notice near the top of this report.</div>"
+    elif ((.coverage.protection.status // "OK") == "NOT_ASSESSED") then
+      # The selector analysis contradicted itself or hit a selector it does not
+      # implement. Publishing a gap list here would be worse than publishing
+      # nothing, so state plainly that the number is not knowable and show what
+      # IS knowable: the evidence-based never-backed-up count.
+      "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> Namespace protection could not be determined reliably on this cluster."
+      + (if ((.coverage.unprotectedBreakdown.backedUpDespiteSelector // 0) > 0) then
+          " Selector analysis flagged " + ((.coverage.unprotectedBreakdown.total // 0) | tostring) + " namespace(s) as unmatched by any policy, but <strong>" + ((.coverage.unprotectedBreakdown.backedUpDespiteSelector) | tostring) + " of them have a completed backup or export</strong> &mdash; so the selectors were not fully resolved, and the gap count derived from them is not trustworthy."
+        else "" end)
+      + (if ((.coverage.protection.nonStandardPatternCount // 0) > 0) then
+          " " + ((.coverage.protection.nonStandardPatternCount) | tostring) + " policy selector(s) put a wildcard where Kasten documents none &mdash; "
+          + ([.coverage.protection.nonStandardPatterns[]? | "<code>" + (.policy | @html) + "</code>: " + ([.patterns[]? | "<code>" + (. | @html) + "</code>"] | join(", "))] | join("; "))
+          + ". Kasten documents <code>*</code> on its own (all applications) and a <em>trailing</em> wildcard such as <code>prod-*</code>, which matches names <em>starting with</em> that prefix. A wildcard elsewhere has no defined behaviour, and guessing one is unsafe in both directions &mdash; read strictly, <code>*-bit</code> matches <code>foo-bit</code>, while a prefix engine matches nothing, which would overstate protection and hide real gaps. Rewrite the selector as <code>*</code> or as an explicit prefix and this becomes a firm number."
+        else "" end)
+      + (if ((.coverage.protection.unresolvedPolicyCount // 0) > 0 and (.coverage.protection.nonStandardPatternCount // 0) == 0) then
+          " " + ((.coverage.protection.unresolvedPolicyCount) | tostring) + " policy selector(s) use an operator KDL does not evaluate: " + ([.coverage.protection.unresolvedPolicies[]? | "<code>" + (. | @html) + "</code>"] | join(", ")) + "."
+        else "" end)
+      + " <strong>What is reliable here:</strong> the evidence-based view below reports " + ((.namespaceProtectionStatus.neverBackedUp // 0) | tostring) + " namespace(s) with no successful backup at all, out of " + ((.namespaceProtectionStatus.total // 0) | tostring) + " analysed. Treat that as the protection gap, and verify the policy selectors before trusting selector-based coverage.</div>"
+    elif ((.bestPractices.namespaceProtection // "N/A") == "NOT_ASSESSED") then
+      "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> Namespace coverage could not be evaluated on this cluster &mdash; this is <em>not</em> the same as \"all namespaces protected\". The evidence-based view below reports " + ((.namespaceProtectionStatus.neverBackedUp // 0) | tostring) + " namespace(s) with no successful backup at all, out of " + ((.namespaceProtectionStatus.total // 0) | tostring) + " analysed.</div>"
     elif .coverage.unprotectedNamespaces.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>All application namespaces are protected</strong></div>"
     else
       (if (.coverage.unprotectedBreakdown // null) != null then
         (.coverage.unprotectedBreakdown) as $b |
         (if ($b.actionable // 0) == 0 then
-          "<div class=\"success-box\">\u2713 <strong>" + ($b.total // 0 | tostring) + " unprotected namespace(s) detected, all deliberately excluded</strong> &mdash; " + ($b.excludedByHelm // 0 | tostring) + " via Helm exclusions, " + ($b.excludedByPolicy // 0 | tostring) + " via policy selector exceptions. <strong>0 actionable.</strong></div>"
+          # "all deliberately excluded" is only true when no namespace landed
+          # here via backup evidence; otherwise name both reasons, or the
+          # summary contradicts the breakdown right below it.
+          "<div class=\"success-box\">\u2713 <strong>" + ($b.total // 0 | tostring) + " unprotected namespace(s) detected, "
+          + (if (($b.backedUpDespiteSelector // 0) > 0) then "all accounted for" else "all deliberately excluded" end)
+          + "</strong> &mdash; " + ($b.excludedByHelm // 0 | tostring) + " via Helm exclusions, " + ($b.excludedByPolicy // 0 | tostring) + " via policy selector exceptions"
+          + (if (($b.backedUpDespiteSelector // 0) > 0) then ", " + (($b.backedUpDespiteSelector) | tostring) + " with a completed backup or export despite matching no selector" else "" end)
+          + ". <strong>0 actionable.</strong></div>"
         else
           "<div class=\"warning-box\">\u26a0 <strong>" + ($b.total // 0 | tostring) + " unprotected namespace(s) detected</strong> &mdash; " + ($b.deliberatelyExcluded // 0 | tostring) + " deliberately excluded (" + ($b.excludedByHelm // 0 | tostring) + " via Helm exclusions, " + ($b.excludedByPolicy // 0 | tostring) + " via policy selector exceptions), leaving <strong style=\"font-size:1.2rem;color:var(--warn-fg)\">" + ($b.actionable // 0 | tostring) + " actionable</strong>.</div>"
         end)
       else
         "<div class=\"warning-box\">\u26a0 <strong>" + (.coverage.unprotectedNamespaces.count | tostring) + " unprotected namespace(s) detected</strong></div>"
       end) +
-      (if (.namespaceProtectionStatus.neverBackedUp // null) != null and (.namespaceProtectionStatus.neverBackedUp != .coverage.unprotectedNamespaces.count) then
+      (if ((.coverage.protection.nonStandardPatternCount // 0) > 0) then
+        "<div class=\"warning-box\">\u26a0 <strong>Selector wildcard in an undocumented position</strong> &mdash; "
+        + ([.coverage.protection.nonStandardPatterns[]? | "<code>" + (.policy | @html) + "</code>: " + ([.patterns[]? | "<code>" + (. | @html) + "</code>"] | join(", "))] | join("; "))
+        + ". Kasten documents two forms for name-based selection: <code>*</code> on its own (all applications) and a <em>trailing</em> wildcard such as <code>prod-*</code>, which matches applications whose name <em>starts with</em> that prefix. A wildcard anywhere else has no defined behaviour, so KDL will not guess one: namespace coverage for these policies is reported as <strong>not assessed</strong> rather than computed. Rewrite the selector as <code>*</code> or as an explicit prefix, and this becomes a firm number.</div>"
+      else "" end) +
+      (if ((.coverage.unprotectedBreakdown.backedUpDespiteSelector // 0) > 0) then
+        "<div class=\"info-box\"><strong>Reconciled with backup history:</strong> " + ((.coverage.unprotectedBreakdown.backedUpDespiteSelector) | tostring) + " of the " + ((.coverage.unprotectedBreakdown.total // 0) | tostring) + " namespace(s) not matched by any policy selector do have a completed backup or export, so they are <em>not</em> gaps &mdash; they are selector-resolution misses and have been removed from the actionable count. The evidence-based view below reports " + ((.namespaceProtectionStatus.neverBackedUp // 0) | tostring) + " namespace(s) never backed up."
+        + (if (((.coverage.unprotectedBreakdown.backedUpDespiteSelectorNamespaces // []) | length) > 0) then
+            "<br><small>" + ([(.coverage.unprotectedBreakdown.backedUpDespiteSelectorNamespaces // [])[:15][] | "<code>" + (. | @html) + "</code>"] | join(", "))
+            + (if (((.coverage.unprotectedBreakdown.backedUpDespiteSelectorNamespaces // []) | length) > 15) then ", and " + ((((.coverage.unprotectedBreakdown.backedUpDespiteSelectorNamespaces // []) | length) - 15) | tostring) + " more" else "" end)
+            + "</small>"
+          else "" end)
+        + "</div>"
+      elif ((.namespaceProtectionStatus.neverBackedUp // null) != null and (.namespaceProtectionStatus.neverBackedUp != .coverage.unprotectedNamespaces.count)) then
         "<div class=\"info-box\"><strong>Note &mdash; two methods, two counts:</strong> this figure (" + (.coverage.unprotectedNamespaces.count | tostring) + ") is <em>selector-based</em> (namespaces not matched by any app policy). The Health/protection view counts <em>" + (.namespaceProtectionStatus.neverBackedUp | tostring) + " namespace(s) never actually backed up</em> &mdash; a namespace can be targeted by a policy selector yet still have no successful backup, which is why the two numbers differ.</div>"
       else "" end) +
       (if (.coverage.unprotectedBreakdown // null) != null and ((.coverage.unprotectedBreakdown.actionable // 0) == 0) then
@@ -1063,7 +1104,12 @@ else "" end) + "
 <!-- Orphaned RestorePoints -->
 <h2>\uD83D\uDDD1\uFE0F Orphaned RestorePoints</h2>"
 + (if .orphanedRestorePoints then
-    (if .orphanedRestorePoints.count == 0 then
+    # A failed computation must never render as a verified zero (#orphan-rp):
+    # status is set to NOT_ASSESSED when the jq pass errored out, in which case
+    # count is a fallback 0 and carries no information.
+    (if .orphanedRestorePoints.status == "NOT_ASSESSED" then
+      "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The orphaned-RestorePoint computation failed, so this section could not be evaluated &mdash; this is <em>not</em> the same as \"no orphans\". Re-run with <code>--debug</code> to surface the underlying error.</div>"
+    elif .orphanedRestorePoints.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>No orphaned RestorePoints detected</strong></div>"
     else
       "<div class=\"warning-box\">\u26a0 <strong>" + (.orphanedRestorePoints.count | tostring) + " orphaned RestorePoint(s) found</strong></div>
@@ -1072,13 +1118,16 @@ else "" end) + "
       <tbody>" +
       ([.orphanedRestorePoints.items[:10][]? |
         "<tr>
-          <td>" + .name + "</td>
-          <td>" + .namespace + "</td>
-          <td>" + (.created | split("T")[0]) + "</td>
+          <td>" + (.name // "unknown") + "</td>
+          <td>" + (.namespace // "unknown") + "</td>
+          <td>" + (if .created then (.created | tostring | split("T")[0]) else "\u2014" end) + "</td>
         </tr>"
       ] | join("")) +
       "</tbody></table>"
     end)
+    + (if ((.orphanedRestorePoints.unattributable // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unattributable) | tostring) + " RestorePoint(s) carry no source action name and cannot be attributed to a policy &mdash; they are counted neither as orphaned nor as attached.</div>"
+      else "" end)
   else
     "<div class=\"info-box\">Orphaned RestorePoints data not available.</div>"
   end)
@@ -1210,12 +1259,19 @@ else "" end) + "
   end)
 + "
 
-<h2>\uD83D\uDCE6 Location Profiles</h2>
-<table>
+<h2>\uD83D\uDCE6 Location Profiles</h2>"
++ (
+  # profiles.count is the raw CR total across BOTH families; the table below
+  # lists location profiles only, matching the Kasten UI Profiles > Location
+  # page. Older reports have no profileType, so fall back to showing everything.
+  if ((.profiles.infraCount // 0) > 0) then
+    "<p class=\"section-description\">" + ((.profiles.locationCount // (.profiles.items | length)) | tostring) + " location profile(s). " + ((.profiles.infraCount) | tostring) + " infrastructure profile(s) exist on this cluster and are listed separately below \u2014 the Kasten UI shows them on Profiles &gt; Infrastructure, so its Location page count is " + ((.profiles.locationCount // 0) | tostring) + ", not " + ((.profiles.count // 0) | tostring) + ".</p>"
+  else "" end)
++ "<table>
 <thead><tr><th>Name</th><th>Backend</th><th>Region</th><th>Immutability</th></tr></thead>
 <tbody>"
-+ (if (.profiles.items | length) > 0 then
-    ([.profiles.items[]? |
++ (if ([.profiles.items[]? | select((.profileType // "location") != "infrastructure")] | length) > 0 then
+    ([.profiles.items[]? | select((.profileType // "location") != "infrastructure") |
       "<tr>
         <td><strong>" + .name + "</strong>" +
           # Veeam Backup & Replication repository name (Kasten 9.0 can send both
@@ -1234,10 +1290,22 @@ else "" end) + "
       </tr>"
     ] | join(""))
   else
-    "<tr><td colspan=\"4\" style=\"text-align:center;color:#57606a;\">No profiles found</td></tr>"
+    "<tr><td colspan=\"4\" style=\"text-align:center;color:#57606a;\">No location profiles found</td></tr>"
   end)
-+ "</tbody></table>
-
++ "</tbody></table>"
++ (if ((.profiles.infraCount // 0) > 0) then
+    "<h3>\uD83C\uDFD7\uFE0F Infrastructure Profiles</h3>
+    <p class=\"section-description\">Infrastructure profiles describe how Kasten reaches the storage layer (credentials for snapshot operations). They are not export destinations, which is why the Kasten UI keeps them off the Location page.</p>
+    <table><thead><tr><th>Name</th><th>Backend</th><th>Region</th></tr></thead><tbody>" +
+    ([.profiles.items[]? | select((.profileType // "") == "infrastructure") |
+      "<tr><td><strong>" + (.name | @html) + "</strong></td><td>" + ((.backend // "\u2014") | @html) + "</td><td>" + ((.region // "N/A") | @html) + "</td></tr>"
+    ] | join("")) +
+    "</tbody></table>"
+  else "" end)
++ (if ((.profiles.undeterminedCount // 0) > 0) then
+    "<div class=\"info-box\">\u2139 " + ((.profiles.undeterminedCount) | tostring) + " profile(s) could not be classified as location or infrastructure and are shown in the location table above.</div>"
+  else "" end)
++ "
 <h2>\uD83D\uDCDC Backup Policies</h2>
 <table>
 <thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Export destinations</th><th>Retention</th></tr></thead>
@@ -1756,7 +1824,13 @@ else "" end) + "
           "<div class=\"warning-box\">⚠ <strong>No default VolumeSnapshotClass</strong> — a common, easily-overlooked cause of snapshot/backup failures when a policy does not pin a class explicitly.</div>"
         else "" end) +
        (if ((.volumeSnapshotClasses.csiDriversWithoutVsc.count // 0) > 0) then
-          "<div class=\"warning-box\">⚠ <strong>" + (.volumeSnapshotClasses.csiDriversWithoutVsc.count | tostring) + " CSI driver(s) without a VolumeSnapshotClass</strong>: " + ([.volumeSnapshotClasses.csiDriversWithoutVsc.drivers[]? | "<code>" + (. | @html) + "</code>"] | join(", ")) + "</div>"
+          "<div class=\"warning-box\">⚠ <strong>" + (.volumeSnapshotClasses.csiDriversWithoutVsc.count | tostring) + " CSI driver(s) in use by a StorageClass have NO VolumeSnapshotClass</strong>: " + ([.volumeSnapshotClasses.csiDriversWithoutVsc.drivers[]? | "<code>" + (. | @html) + "</code>"] | join(", ")) + ". Kasten cannot take CSI snapshots of volumes on these drivers and will fall back to generic volume backup — slower, and it requires the workload to tolerate it. Create a VolumeSnapshotClass for each driver listed.</div>"
+        else "" end) +
+       (if ((.volumeSnapshotClasses.provisionerClassification.inTree.count // 0) > 0) then
+          "<div class=\"info-box\">ℹ " + (.volumeSnapshotClasses.provisionerClassification.inTree.count | tostring) + " legacy in-tree provisioner(s) in use: " + ([.volumeSnapshotClasses.provisionerClassification.inTree.provisioners[]? | "<code>" + (. | @html) + "</code>"] | join(", ")) + ". CSI snapshots do not apply to these — a VolumeSnapshotClass would not help; Kasten uses generic volume backup. Migrating these StorageClasses to their CSI equivalent is what unlocks snapshot-based backup.</div>"
+        else "" end) +
+       (if ((.volumeSnapshotClasses.provisionerClassification.unrecognised.count // 0) > 0) then
+          "<div class=\"info-box\">ℹ " + (.volumeSnapshotClasses.provisionerClassification.unrecognised.count | tostring) + " provisioner(s) could not be classified as CSI or in-tree: " + ([.volumeSnapshotClasses.provisionerClassification.unrecognised.provisioners[]? | "<code>" + (. | @html) + "</code>"] | join(", ")) + ". Verify their snapshot capability manually." + (if (.volumeSnapshotClasses.provisionerClassification.classificationSource == "name-heuristic") then " The CSIDriver API was not readable, so classification fell back to driver naming." else "" end) + "</div>"
         else "" end) +
        "<table><thead><tr><th>Name</th><th>Driver</th><th>Deletion Policy</th><th>Default</th></tr></thead><tbody>" +
        ([.volumeSnapshotClasses.items[]? |
