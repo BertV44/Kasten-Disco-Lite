@@ -307,6 +307,42 @@ AND fix invalidated — that an empty policy must carry a dangling reference —
 was replaced by checks that a catch-all never reads as empty and that an empty
 policy never claims an existing namespace.
 
+### Fixed — false all-clear found on a live Kasten 9.0.1 cluster
+
+A real 9.0.1 run (kasten-se-lab, 114 namespaces, 37 policies, 20 VMs) reported
+**"Namespace Protection: COMPLETE"** while its own evidence view listed 100
+namespaces never successfully backed up, and claimed **115 namespaces
+"explicitly targeted" on a cluster that has 114**. Both came from the same
+omission: the protection view was built from every application policy,
+regardless of whether that policy can protect a namespace at all.
+
+- **An import/restore-only policy marked every namespace protected.** A policy
+  with no selector and actions `import, restore` — the shape multi-cluster import
+  policies take — went through the catch-all branch and covered all application
+  namespaces. `CATCHALL_POLICIES` had required a `backup` action since v2.0, but
+  the `PROTECTED_NAMESPACES` call site never did. Protection now requires a
+  policy that actually backs up.
+- **A label-based VM policy claimed cluster-wide namespace protection.** A 9.0
+  policy selecting `virtualMachineNamespace: *` plus VM labels legitimately
+  resolves to every namespace on the cluster, and those candidates were unioned
+  into namespace-level protection — which is how the targeted count came to
+  exceed the number of namespaces in existence, on a cluster the same report
+  scored at 11 of 20 VMs protected. Only namespace-scoped policies feed the
+  namespace view now. VM coverage keeps its own section, and a namespace whose
+  VMs genuinely are backed up is recovered by the backup-evidence reconciliation
+  instead of by inference from a selector.
+
+On a fixture reproducing that cluster's policy shapes, the protected set drops
+from 7 namespaces (every namespace, `kube-system` included) to the 1 namespace
+its only targeted backup policy actually covers, and the verdict from a false
+`COMPLETE` to `GAPS_DETECTED`.
+
+`kdl-v9-validate.sh` also resolves `KDL.sh` and `kdl-json-to-html.sh` relative to
+itself rather than to the working directory. Run from anywhere else it collected
+the report and then died with "./kdl-json-to-html.sh: No such file or directory",
+which reads as a collection failure rather than a path problem; both companions
+are now checked up front with an actionable message.
+
 ### Notes on two jq traps met while fixing the above
 
 Both belong to the family already recorded in `CLAUDE.md` and are worth

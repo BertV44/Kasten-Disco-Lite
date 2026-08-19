@@ -2119,9 +2119,30 @@ debug "Has complex selector: $HAS_COMPLEX_SELECTOR"
 # Resolution is per policy, then unioned, so a NotIn exception on one policy
 # cannot cancel another policy that genuinely does protect that namespace.
 printf '%s' "${ALL_NAMESPACES_LABELED:-[]}" > "$TEMP_DIR/pn_allns.json"
+# Two filters, both learned from a real 9.0.1 cluster where their absence
+# produced a false all-clear (#protect-scope):
+#
+#   1. A policy must BACK UP to protect. An import/restore-only policy with an
+#      empty selector (multi-cluster import policies look exactly like this)
+#      went through the catch-all branch and marked every application namespace
+#      protected. The cluster reported "All application namespaces are
+#      protected" while its own evidence view showed 100 namespaces never
+#      backed up. CATCHALL_POLICIES already required a backup action; this call
+#      site did not.
+#   2. Only NAMESPACE-scoped policies count here. A VM policy protects virtual
+#      machines, not the namespace around them, and a 9.0 label-based VM policy
+#      with `virtualMachineNamespace: *` legitimately resolves to every
+#      namespace on the cluster — which read as cluster-wide namespace
+#      protection and pushed the count above the number of namespaces that
+#      exist. VM coverage has its own section, and a namespace whose VMs really
+#      are backed up is rescued by the backup-evidence reconciliation rather
+#      than by inference from a selector.
 PROTECTED_NAMESPACES=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP_DIR/pn_allns.json" "$JQ_SELECTOR_LIB"'
   ( $allNs[0] // [] ) as $allNs |
-  [ .items[]? | policy_target_ns($allNs).namespaces[]? ]
+  [ .items[]?
+    | select([.spec.actions[]?.action] | index("backup"))
+    | select(policy_scope == "namespace")
+    | policy_target_ns($allNs).namespaces[]? ]
   | map(select(type == "string" and . != "")) | unique
 ' 2>/dev/null || echo '[]')
 
@@ -2137,7 +2158,11 @@ fi
 # understand (#selector-labels).
 PROTECTION_UNRESOLVED_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP_DIR/pn_allns.json" "$JQ_SELECTOR_LIB"'
   ( $allNs[0] // [] ) as $allNs |
-  [ .items[]? | select((policy_target_ns($allNs)).resolvable | not) | .metadata.name ]
+  [ .items[]?
+    | select([.spec.actions[]?.action] | index("backup"))
+    | select(policy_scope == "namespace")
+    | select((policy_target_ns($allNs)).resolvable | not)
+    | .metadata.name ]
 ' 2>/dev/null || echo '[]')
 if ! _ep "$PROTECTION_UNRESOLVED_POLICIES" | jq -e '.' >/dev/null 2>&1; then
   PROTECTION_UNRESOLVED_POLICIES='[]'
@@ -2151,6 +2176,7 @@ PROTECTION_UNRESOLVED_COUNT=$(safe_int "$(_ep "$PROTECTION_UNRESOLVED_POLICIES" 
 PROTECTION_NONSTANDARD_PATTERNS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP_DIR/pn_allns.json" "$JQ_SELECTOR_LIB"'
   ( $allNs[0] // [] ) as $allNs |
   [ .items[]?
+    | select([.spec.actions[]?.action] | index("backup"))
     | . as $p
     | (policy_target_ns($allNs)).nonStandardPatterns as $np
     | select(($np | length) > 0)

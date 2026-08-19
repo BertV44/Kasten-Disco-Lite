@@ -29,8 +29,23 @@
 set -u
 
 NS="${1:-kasten-io}"
-KDL="${2:-./KDL.sh}"
-HTML="./kdl-json-to-html.sh"
+# Resolve companions relative to THIS script, not to the working directory:
+# running it from anywhere else used to fail with
+# "./kdl-json-to-html.sh: No such file or directory" after KDL had already
+# collected the report, which reads as a KDL failure rather than a path problem.
+_SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+KDL="${2:-$_SELF_DIR/KDL.sh}"
+HTML="$_SELF_DIR/kdl-json-to-html.sh"
+if [ ! -x "$KDL" ]; then
+  echo "KDL.sh not found or not executable at: $KDL" >&2
+  echo "Pass its path explicitly: sh kdl-v9-validate.sh <namespace> /path/to/KDL.sh" >&2
+  exit 2
+fi
+if [ ! -x "$HTML" ]; then
+  echo "kdl-json-to-html.sh not found or not executable at: $HTML" >&2
+  echo "Run the gate from a full checkout — it needs KDL.sh AND kdl-json-to-html.sh." >&2
+  exit 2
+fi
 OUT="${TMPDIR:-/tmp}/kdl-v9"
 mkdir -p "$OUT"
 J="$OUT/disco.json"
