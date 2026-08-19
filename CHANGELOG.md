@@ -14,12 +14,16 @@ reads is byte-identical to 2.1.1.
 
 Verified against synthetic 9.0 fixtures covering both VM selector shapes,
 catch-all-with-exceptions namespace selectors, dual export, Veeam Vault
-(Azure/AWS) and VBR (hardened and plain) profiles, plus re-analysis of a real
-`kasten-se-lab` report (Kasten 8.5.13 / OpenShift Virtualization 4.18.36) which
-independently confirmed the VM-coverage and export-counting defects on
-production data. `kdl-json-to-html.sh` was re-checked against that same report
-to confirm pre-2.2.0 JSON still renders. Not yet run against a live 9.0 cluster
--- see `RELEASING.md` for the validation gate.
+(Azure/AWS) and VBR (hardened and plain) profiles, and run against a live
+**Kasten 9.0.1 / OpenShift 4.18** cluster (`kasten-se-lab`, 114 namespaces, 37
+policies, 20 VMs) which exercised the 9.0-specific paths end to end: additional
+export detected on four policies, the label-based VM policy resolved through
+`virtualMachineNamespace` + VM labels, and VBR snapshot data attributed to its
+repository. That run also surfaced two coverage defects on real data, fixed
+below. Re-analysis of an 8.5.13 report from the same lab independently confirmed
+the VM-coverage and export-counting defects, and `kdl-json-to-html.sh` was
+re-checked against it to confirm pre-2.2.0 JSON still renders.
+See `RELEASING.md` for the release gate.
 
 ### Added
 - **Label-based VM policies (`k10.kasten.io/virtualMachineNamespace`).** Kasten
