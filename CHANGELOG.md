@@ -347,6 +347,51 @@ the report and then died with "./kdl-json-to-html.sh: No such file or directory"
 which reads as a collection failure rather than a path problem; both companions
 are now checked up front with an actionable message.
 
+### Validated on a live Kasten 9.0.3 cluster — and one root cause finally pinned
+
+Release gate run on OpenShift 4.20.30 / Kubernetes 1.33.13 with Kasten **9.0.3**:
+`PASS=48 FAIL=0` in gate mode, no `_jq_fail` on stderr, HTML renders complete.
+Newer than any version this release was built against, and
+`kastenCompatibility` correctly resolves 9.0.3 to major.minor 9.0 without
+raising the "newer than validated" warning.
+
+Paths exercised on real 9.0 data for the first time:
+
+- **Additional export.** A policy carrying two `export` actions was parsed into
+  two destinations with their own profiles and retentions
+  (`daily=14, weekly=4` and `daily=7`), `sameProfileTwice` correctly empty.
+- **`In` + `NotIn` on the same key, with a glob in the exclusion.** A selector
+  combining `appNamespace In [openshift-etcd, kasten-io-cluster]` with
+  `appNamespace NotIn [default*]` resolved to the right namespaces, and the
+  reference to a namespace that does not exist surfaced as a dangling reference
+  rather than as coverage.
+- **Import-only policy with an empty selector.** The exact shape that produced
+  the false all-clear fixed in the previous commit: `hasCatchallPolicy` is
+  `false`, and the policy is reported as empty instead of covering everything.
+- **Provisioner classification from the CSIDriver API**, including the field
+  that now lists real StorageClass names.
+
+**Root cause of the orphaned-RestorePoint failure, definitively.** On 9.0.3
+`.spec.source` is null on **every** RestorePoint — the `actionName` field the
+detection was built on does not exist. The same failure was observed on 8.5.
+This was never an edge case about odd RestorePoints: it broke the section on
+every cluster, which is why two independent production reports showed
+"Section 'orphaned restore points' could not be computed" followed by a green
+"no orphans". Kasten does populate `k10.kasten.io/policyName` on the
+RestorePoint (verified alongside `appName`, `appNamespace`, `appType`,
+`policyNamespace`, `runActionName`), and that label is now the attribution path;
+the action-name route survives only for older catalogs that may still carry it.
+
+Added in consequence: when **nothing** on the catalog can be attributed —
+neither a policy label nor an action name on any RestorePoint — orphan detection
+is impossible and the section reports `NOT_ASSESSED` rather than a count of
+zero, applying to a missing field the same rule already applied to a failed
+computation.
+
+The cluster carries no application workload (all 77 namespaces are system ones),
+so the coverage, gap-reconciliation and missing-VSC paths ran self-consistently
+but on trivial data. Those remain fixture-validated.
+
 ### Notes on two jq traps met while fixing the above
 
 Both belong to the family already recorded in `CLAUDE.md` and are worth

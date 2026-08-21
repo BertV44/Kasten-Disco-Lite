@@ -43,6 +43,16 @@ bonnes pratiques, etc.) à partir d'un cluster Kubernetes/OpenShift.
   `resolved_ns`) — à réutiliser plutôt que de redupliquer la logique.
 - Depuis 9.0 une policy peut porter **deux actions `export`** (additional
   export) : ne jamais utiliser `first` sur la liste des actions export.
+- **Schéma RestorePoint en 9.0** : `spec.source` est **absent** (null) sur
+  *tous* les RestorePoints — vérifié sur un cluster 9.0.3 réel, et le même échec
+  s'observait en 8.5. Donc `.spec.source.actionName` n'existe pas : c'est ce qui
+  faisait planter la détection d'orphelins sur *tout* cluster 9.0 (`null |
+  split("-")`), pas un cas limite. L'attribution passe par le label
+  `k10.kasten.io/policyName`, que Kasten renseigne (aux côtés de `appName`,
+  `appNamespace`, `appType`, `policyNamespace`, `runActionName`). Le chemin par
+  nom d'action ne subsiste que pour d'anciens catalogues. Si ni le label ni le
+  nom d'action ne sont présents, l'attribution est impossible et la section doit
+  passer en `NOT_ASSESSED` plutôt que d'annoncer zéro orphelin.
 - **Sémantique des wildcards de sélecteur** (doc Kasten, `usage/protect`
   #application-selection) : deux formes seulement sont documentées — `*` seul
   (toutes les applications) et un wildcard **en fin** qui matche les noms

@@ -2556,10 +2556,15 @@ fi
 # Three defects fixed in v2.2.0 (#orphan-rp), all observed on a 31k-RestorePoint
 # production cluster where this section silently reported a clean zero:
 #
-#   1. CRASH. `.spec.source.actionName` is not guaranteed to be present (manual
-#      RestorePoints, imported/migrated catalogs). `null | split("-")` aborts the
-#      whole jq program with "split input and separator must be strings", so a
-#      single such RestorePoint reduced the entire section to [].
+#   1. CRASH. `.spec.source.actionName` was assumed present. It is not: on a live
+#      Kasten 9.0.3 cluster `.spec.source` is null on EVERY RestorePoint, and the
+#      same failure was observed on 8.5. `null | split("-")` aborts the whole jq
+#      program with "split input and separator must be strings", so the section
+#      collapsed to [] on every such cluster — not an edge case, the normal case.
+#      Attribution therefore reads the `k10.kasten.io/policyName` LABEL, which
+#      Kasten does populate (verified on 9.0.3 alongside appName, appNamespace,
+#      appType, policyNamespace, runActionName). The action-name path below is
+#      kept only for older catalogs that may still carry it.
 #   2. WRONG MATCHING. The policy name was derived by dropping the last 3
 #      dash-separated segments of the action name. The suffix count Kasten
 #      appends is not contractual, and policy names legitimately contain dashes
@@ -2629,6 +2634,17 @@ RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq '
             and ((((.metadata.labels // {})["k10.kasten.io/policyName"] // "") | tostring) == ""))]
   | length // 0
 ' 2>/dev/null || echo 0)")
+
+# When NOTHING can be attributed — neither the policy label nor an action name
+# on any RestorePoint — orphan detection is not possible and a count of 0 is
+# meaningless. Report it as unassessed rather than as a clean zero, which is the
+# same rule applied to a jq failure above.
+if [ "${RESTORE_POINTS_COUNT:-0}" -gt 0 ] 2>/dev/null \
+   && [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -ge "${RESTORE_POINTS_COUNT:-0}" ] 2>/dev/null; then
+  ORPHANED_RP_STATUS="NOT_ASSESSED"
+  warn "None of the $RESTORE_POINTS_COUNT RestorePoint(s) carry a policy label or a source action name."
+  warn "Orphan detection is not possible on this catalog; the count is reported as not assessed."
+fi
 
 debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT (status: $ORPHANED_RP_STATUS, unattributable: $RP_UNATTRIBUTABLE_COUNT)"
 
