@@ -657,8 +657,7 @@ Key portability measures:
   - **Location and Infrastructure profiles counted separately**, matching the
     two pages the Kasten UI presents.
   - Validated on a live **Kasten 9.0.3** cluster (OpenShift 4.20.30 /
-    Kubernetes 1.33.13): release gate `PASS=48 FAIL=0`.
-    See the CHANGELOG for the complete list.
+    Kubernetes 1.33.13). See the CHANGELOG for the complete list.
 
 - **v2.1.1** — Windows/Git-Bash `Argument list too long` hardening, RBAC-limited
   run transparency, deliberate-exclusion breakdown for coverage gaps.

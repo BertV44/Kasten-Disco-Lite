@@ -23,7 +23,6 @@ repository. That run also surfaced two coverage defects on real data, fixed
 below. Re-analysis of an 8.5.13 report from the same lab independently confirmed
 the VM-coverage and export-counting defects, and `kdl-json-to-html.sh` was
 re-checked against it to confirm pre-2.2.0 JSON still renders.
-See `RELEASING.md` for the release gate.
 
 ### Added
 - **Label-based VM policies (`k10.kasten.io/virtualMachineNamespace`).** Kasten
@@ -341,16 +340,11 @@ from 7 namespaces (every namespace, `kube-system` included) to the 1 namespace
 its only targeted backup policy actually covers, and the verdict from a false
 `COMPLETE` to `GAPS_DETECTED`.
 
-`kdl-v9-validate.sh` also resolves `KDL.sh` and `kdl-json-to-html.sh` relative to
-itself rather than to the working directory. Run from anywhere else it collected
-the report and then died with "./kdl-json-to-html.sh: No such file or directory",
-which reads as a collection failure rather than a path problem; both companions
-are now checked up front with an actionable message.
-
 ### Validated on a live Kasten 9.0.3 cluster — and one root cause finally pinned
 
-Release gate run on OpenShift 4.20.30 / Kubernetes 1.33.13 with Kasten **9.0.3**:
-`PASS=48 FAIL=0` in gate mode, no `_jq_fail` on stderr, HTML renders complete.
+Validation run on OpenShift 4.20.30 / Kubernetes 1.33.13 with Kasten **9.0.3**:
+all 48 internal-consistency assertions pass, no `_jq_fail` on stderr, and the
+HTML renders complete.
 Newer than any version this release was built against, and
 `kastenCompatibility` correctly resolves 9.0.3 to major.minor 9.0 without
 raising the "newer than validated" warning.
@@ -670,8 +664,7 @@ in — see below) and adds five analytical capabilities.
   (`k10Rbac.*.items[].labels`, `policyAnalysis.resolved[].existingNamespaces`,
   `policyAnalysis.redundantPairs[].sharedNamespaces` on catch-all pairs). The
   bundled `kdl-json-to-html.sh` does not depend on the removed fields.
-- Validated on a real K10 8.5.9 / OpenShift cluster (full smoke-test in
-  `RELEASING.md`). Broader validation (restricted-RBAC kubeconfig, non-OpenShift
+- Validated on a real K10 8.5.9 / OpenShift cluster. Broader validation (restricted-RBAC kubeconfig, non-OpenShift
   distribution) was **not** performed for this release and remains a known gap —
   the cluster-wide RBAC reads added in 2.0 have only been exercised on the
   access-granted path.
