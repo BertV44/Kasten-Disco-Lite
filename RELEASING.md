@@ -92,7 +92,7 @@ reference. Record the two numbers.
    `.virtualization.protection.unprotectedVmList` must genuinely have **no**
    policy covering it. A mismatch here blocks the release.
 
-   > **Why this is step 1.** Re-analysing a real `kasten-se-lab` report
+   > **Why this is step 1.** Re-analysing a real lab report
    > (KDL v2.0.2, Kasten 8.5.13, OpenShift Virtualization 4.18.36) showed the
    > pre-2.2.0 estimator claiming **16/16 VMs protected, 0 unprotected**, with
    > the note "wildcard patterns detected - verify coverage". Recomputing from

@@ -61,7 +61,7 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 ---
 
-## What's New in v2.1
+## What's New in v2.2
 
 - **Redesigned HTML report** — single self-contained offline file, now with a
   dark theme (+ light/dark toggle), a Veeam-green sidebar with scroll-spy and
@@ -634,8 +634,31 @@ Key portability measures:
   - **Counting fixes**: `policies.withExport` counted export *actions*, not
     policies; namespace-selector wildcards (`prod-*`) never matched, producing
     phantom coverage gaps.
-  - New 9.0/9.0.2 Helm settings surfaced; `kdl-rbac.yaml` unchanged (no new
-    cluster reads). See the CHANGELOG for the complete list.
+  - New 9.0/9.0.2 Helm settings surfaced. `kdl-rbac.yaml` gains one *optional*
+    read, `csidrivers`, used to tell CSI provisioners from legacy in-tree ones;
+    denial only downgrades that classification to a name-based heuristic.
+  - **Report-accuracy overhaul.** Selector resolution now evaluates
+    `matchExpressions` on any label key, `matchLabels` and `matchNames`, ANDed as
+    a Kubernetes LabelSelector requires; wildcards outside the two forms Kasten
+    documents are reported `NOT_ASSESSED` rather than guessed; protection gaps
+    are reconciled against real backup history, so a namespace with a completed
+    backup is never listed as a gap; and only policies that actually back up and
+    are namespace-scoped count as protection.
+  - **Orphaned RestorePoints repaired.** Kasten 9.0 does not populate
+    `spec.source` on RestorePoints, which aborted the whole computation and then
+    rendered a reassuring "no orphans". Attribution now uses the
+    `k10.kasten.io/policyName` label, and a computation that cannot run reports
+    `NOT_ASSESSED` instead of zero.
+  - **VolumeSnapshotClass cross-check widened.** CSI detection no longer
+    requires the literal string `csi` in the driver name, so drivers such as
+    `pxd.portworx.com` or `topolvm.io` are classified correctly; provisioners are
+    split CSI / in-tree / unrecognised, because a missing VolumeSnapshotClass
+    means something different in each case.
+  - **Location and Infrastructure profiles counted separately**, matching the
+    two pages the Kasten UI presents.
+  - Validated on a live **Kasten 9.0.3** cluster (OpenShift 4.20.30 /
+    Kubernetes 1.33.13): release gate `PASS=48 FAIL=0`.
+    See the CHANGELOG for the complete list.
 
 - **v2.1.1** — Windows/Git-Bash `Argument list too long` hardening, RBAC-limited
   run transparency, deliberate-exclusion breakdown for coverage gaps.

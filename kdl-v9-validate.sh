@@ -262,7 +262,7 @@ echo "  (also confirm the run printed NO '[WARN] Section ... could not be comput
 
 echo
 echo "== 8. Selector-based coverage must agree with backup history =="
-# The ocp-infra-prd-2 defect: every app policy was expression-based on a custom
+# The production defect this guards: every app policy was expression-based on a custom
 # label, the value-only resolver saw none of them, and the report published 786
 # "actionable gaps" that were in fact the 786 namespaces backed up daily. These
 # assertions catch that class of contradiction on any cluster.

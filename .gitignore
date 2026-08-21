@@ -12,3 +12,7 @@ discovery-*.json
 discovery-*.html
 report-*.txt
 *.report.html
+
+# Internal working notes: references customer/lab clusters and
+# house conventions. Deliberately not published.
+CLAUDE.md

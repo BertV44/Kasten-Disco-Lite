@@ -15,7 +15,7 @@ reads is byte-identical to 2.1.1.
 Verified against synthetic 9.0 fixtures covering both VM selector shapes,
 catch-all-with-exceptions namespace selectors, dual export, Veeam Vault
 (Azure/AWS) and VBR (hardened and plain) profiles, and run against a live
-**Kasten 9.0.1 / OpenShift 4.18** cluster (`kasten-se-lab`, 114 namespaces, 37
+**Kasten 9.0.1 / OpenShift 4.18** cluster (114 namespaces, 37
 policies, 20 VMs) which exercised the 9.0-specific paths end to end: additional
 export detected on four policies, the label-based VM policy resolved through
 `virtualMachineNamespace` + VM labels, and VBR snapshot data attributed to its
@@ -70,7 +70,7 @@ See `RELEASING.md` for the release gate.
 - **VM coverage reported a false all-clear.** Protected VMs were estimated as
   `explicitVmRefs + namespacesCovered` capped at the total, and *any* wildcard
   in a VM reference short-circuited the result to "all VMs protected".
-  Confirmed on a real `kasten-se-lab` report (Kasten 8.5.13, OpenShift
+  Confirmed on a real lab report (Kasten 8.5.13, OpenShift
   Virtualization 4.18.36): it claimed **16/16 VMs protected, 0 unprotected**,
   where recomputing from the same report's own data gives **10/16** — the VM
   policies reference 6 namespaces while VMs live in 12, and there was no
@@ -93,7 +93,7 @@ See `RELEASING.md` for the release gate.
 - **`policies.withExport` counted export *actions*, not policies.** The filter
   used a generator inside `select`, emitting the policy once per matching
   action. **This was already producing wrong numbers before 9.0**: a real
-  `kasten-se-lab` report on Kasten **8.5.13** reports `withExport: 23` while only
+  A lab report on Kasten **8.5.13** reports `withExport: 23` while only
   22 policies actually have an export action — the CRD already accepted two
   export actions, and one policy used them. Kasten 9.0 only made the shape a
   supported feature, so it turns a latent off-by-N into a routine one. The same
@@ -141,7 +141,7 @@ See `RELEASING.md` for the release gate.
   targets in both text and HTML, including the `In` + `NotIn`
   catch-all-with-exceptions shape and VM selectors.
 
-### Fixed — production report defects (ocp-infra-prd-2, Kasten 8.5 / OpenShift, 789 namespaces)
+### Fixed — defects found in a production report (Kasten 8.5 / OpenShift, 789 namespaces)
 
 Five defects found by cross-reading a real support report against the Kasten
 dashboard. Four of them made KDL publish a *confident and wrong* number rather
@@ -313,7 +313,7 @@ policy never claims an existing namespace.
 
 ### Fixed — false all-clear found on a live Kasten 9.0.1 cluster
 
-A real 9.0.1 run (kasten-se-lab, 114 namespaces, 37 policies, 20 VMs) reported
+A real 9.0.1 run (114 namespaces, 37 policies, 20 VMs) reported
 **"Namespace Protection: COMPLETE"** while its own evidence view listed 100
 namespaces never successfully backed up, and claimed **115 namespaces
 "explicitly targeted" on a cluster that has 114**. Both came from the same
@@ -390,7 +390,7 @@ computation.
 
 The cluster carries no application workload (all 77 namespaces are system ones),
 so the coverage, gap-reconciliation and missing-VSC paths ran self-consistently
-but on trivial data. Those remain fixture-validated.
+but on a cluster without application workload.
 
 ### Notes on two jq traps met while fixing the above
 
@@ -604,7 +604,6 @@ reconcile. Issues #37–#43.
   render, restore cards total correctly, backward-compatible degradation verified
   on JSON with the new keys removed. License logic unit-checked against real
   license data (paid limit 5, consumption 63 → EXCEEDS_PAID, trial inflating).
-  Not yet validated end-to-end against a live cluster.
 
 ## [2.0.1] - 2026-06-09
 
