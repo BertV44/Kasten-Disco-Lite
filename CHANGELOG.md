@@ -3,7 +3,7 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [2.2.0] - 2026-08-10
+## [2.2.0] - 2026-08-21
 
 Compatibility with **Veeam Kasten 9.0** (9.0.0 / 9.0.1 / 9.0.2). Kasten 9.0
 introduced a second VM selector shape and allowed a policy to carry two export
