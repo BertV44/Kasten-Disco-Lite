@@ -198,18 +198,33 @@ C_KASTEN=$(get_current '.kastenVersion')
 [ -z "$B_KASTEN" ] && B_KASTEN="(unknown)"
 [ -z "$C_KASTEN" ] && C_KASTEN="(unknown)"
 
+# Comparing reports produced by different KDL versions can surface deltas that
+# are measurement corrections rather than cluster changes. KDL v2.2.0 in
+# particular corrected `policies.withExport` (previously counted once per export
+# action) and VM protection counts (previously an estimate that treated any
+# wildcard as full coverage), so a 2.1.x -> 2.2.0 diff legitimately moves those
+# numbers on an unchanged cluster.
+KDL_VERSION_MISMATCH="false"
+[ "$B_KDL" != "$C_KDL" ] && KDL_VERSION_MISMATCH="true"
+
 if [ "$MODE" = "human" ]; then
   printf "${COLOR_BOLD}${COLOR_BLUE}[SEARCH] Kasten Discovery Lite - Diff v%s${COLOR_RESET}\n" "$KDL_DIFF_VERSION"
   printf "================================\n"
   printf "Baseline: %s (KDL v%s, Kasten %s)\n" "$BASELINE" "$B_KDL" "$B_KASTEN"
   printf "Current:  %s (KDL v%s, Kasten %s)\n" "$CURRENT" "$C_KDL" "$C_KASTEN"
+  if [ "$KDL_VERSION_MISMATCH" = "true" ]; then
+    printf "${COLOR_YELLOW}[NOTE] Reports come from different KDL versions - some deltas may be\n"
+    printf "       measurement corrections rather than cluster changes.${COLOR_RESET}\n"
+  fi
 fi
 
 META_JSON=$(jq -c -n \
   --arg bKdl "$B_KDL" --arg cKdl "$C_KDL" \
   --arg bKasten "$B_KASTEN" --arg cKasten "$C_KASTEN" \
-  --arg baselinePath "$BASELINE" --arg currentPath "$CURRENT" '
-  {baselinePath: $baselinePath, currentPath: $currentPath, baselineKdl: $bKdl, currentKdl: $cKdl, baselineKasten: $bKasten, currentKasten: $cKasten}
+  --arg baselinePath "$BASELINE" --arg currentPath "$CURRENT" \
+  --arg kdlMismatch "$KDL_VERSION_MISMATCH" '
+  {baselinePath: $baselinePath, currentPath: $currentPath, baselineKdl: $bKdl, currentKdl: $cKdl, baselineKasten: $bKasten, currentKasten: $cKasten,
+   kdlVersionMismatch: ($kdlMismatch == "true")}
 ')
 add_section_json "metadata" "$META_JSON"
 
@@ -909,7 +924,9 @@ add_section_json "resourceLimits" "$RL_JSON"
 ### Best Practices
 ### -------------------------
 print_section "Best Practices"
-BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection authentication encryption auditLogging"
+# vmSnapshotConsistency added in KDL v2.2.0; absent on older baselines, which
+# the "-n both values" guard below already skips.
+BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging"
 BP_CHANGES_JSON="["
 BP_FIRST=true
 BP_CHANGED=false

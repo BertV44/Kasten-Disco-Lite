@@ -105,6 +105,11 @@ rules:
   - apiGroups: ["storage.k8s.io"]
     resources:
       - storageclasses
+      # csidrivers is the authoritative answer to "is this provisioner CSI?".
+      # Optional: without it KDL falls back to classifying provisioners by name,
+      # which cannot recognise CSI drivers whose names omit "csi"
+      # (pxd.portworx.com, topolvm.io, driver.longhorn.io).
+      - csidrivers
     verbs: ["get", "list"]
   - apiGroups: ["snapshot.storage.k8s.io"]
     resources:

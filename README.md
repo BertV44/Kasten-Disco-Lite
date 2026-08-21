@@ -1,6 +1,10 @@
-# Kasten Discovery Lite v2.1.0
+# Kasten Discovery Lite v2.2.0
 
-A lightweight, read-only discovery script for Kasten K10 backup infrastructure analysis.
+A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
+
+**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2). On a newer
+cluster the report prints a warning and sets `kastenCompatibility.newerThanValidated`,
+rather than silently analysing an unknown CRD schema.
 
 ## Overview
 
@@ -20,7 +24,13 @@ These join the existing v1.9 features:
 - **FIPS mode**, **Network Policies**, **Audit Logging** detection
 - **Dashboard access**, **Concurrency limiters**, **Timeouts**, **Datastore parallelism**
 - **KubeVirt / OpenShift Virtualization** VM detection (Kasten 8.5+)
-- **VM-based policy detection** with protected/unprotected VM analysis
+- **VM-based policy detection** — both selector shapes: by reference (8.5+) and
+  by label (`virtualMachineNamespace` + VM labels, Kasten 9.0+), with per-VM
+  protected/unprotected resolution and VM snapshot-consistency reporting
+- **Additional export** (Kasten 9.0) — policies with two export destinations,
+  including same-profile-twice detection
+- **Veeam Vault and VBR profiles** named explicitly, with hardened-repository
+  immutability detection
 - **License information** with **Consumption tracking**
 - **Health status** (pod health, backup success rates based on finished actions)
 - **Multi-Cluster detection** (primary/secondary/standalone)
@@ -51,7 +61,7 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 ---
 
-## What's New in v2.1
+## What's New in v2.2
 
 - **Redesigned HTML report** — single self-contained offline file, now with a
   dark theme (+ light/dark toggle), a Veeam-green sidebar with scroll-spy and
@@ -335,7 +345,7 @@ echo "Regressions: $?"   # exit code = number of regressions
 
 Top-level keys (v2.0):
 
-`kdlVersion`, `platform`, `kastenVersion`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
+`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
 
 New in v2.0:
 
@@ -389,6 +399,9 @@ in one file, because in practice they are applied by two different people:
 - **Part A — cluster-scoped** (`ClusterRole` + `ClusterRoleBinding`, both
   named `kasten-discovery-reader`): the cluster-scoped **read** access KDL
   needs (namespaces, PVCs across all namespaces, nodes, storageclasses,
+  csidrivers (optional: used to tell CSI provisioners from legacy in-tree ones
+  when cross-checking VolumeSnapshotClasses; denial only downgrades that
+  classification to a name-based heuristic),
   volumesnapshotclasses, CRDs, **no Secrets**). It does **not** grant read
   access to cluster RBAC objects (ClusterRoles/ClusterRoleBindings) — that
   is an optional add-on (see "Cluster-scoped — optional, for full RBAC
@@ -500,7 +513,7 @@ rules:
   resources: ["volumesnapshots", "volumesnapshotclasses"]
   verbs: ["get", "list"]
 - apiGroups: ["storage.k8s.io"]
-  resources: ["storageclasses"]
+  resources: ["storageclasses", "csidrivers"]
   verbs: ["get", "list"]
 - apiGroups: ["cr.kanister.io"]
   resources: ["blueprints"]
@@ -603,7 +616,54 @@ Key portability measures:
 
 ## Version History
 
-- **v2.0.2** (Current)
+- **v2.2.0** (Current) — **Veeam Kasten 9.0 compatibility**
+  - **Label-based VM policies** (`k10.kasten.io/virtualMachineNamespace` + VM
+    `matchLabels`): previously invisible to KDL, and wrongly reported as empty
+    /orphaned policies.
+  - **Additional export (dual export)**: policies with two export destinations
+    are now fully reported (`policies.additionalExport`, per-policy `exports[]`);
+    previously only the first destination was ever shown.
+  - **VM coverage is resolved per VM** instead of estimated. The old estimate
+    treated any wildcard reference as "all VMs protected" — a false all-clear.
+  - **VM snapshot consistency** (`ApplicationConsistent` vs `CrashConsistent`)
+    surfaced as a new best practice: Kasten falls back to crash-consistent
+    silently when the guest freeze fails.
+  - **Veeam Vault / VBR profiles** named explicitly; hardened VBR repositories
+    now count as an immutability signal, and their `skipSSLVerify` is finally
+    checked by the ransomware TLS pillar.
+  - **Counting fixes**: `policies.withExport` counted export *actions*, not
+    policies; namespace-selector wildcards (`prod-*`) never matched, producing
+    phantom coverage gaps.
+  - New 9.0/9.0.2 Helm settings surfaced. `kdl-rbac.yaml` gains one *optional*
+    read, `csidrivers`, used to tell CSI provisioners from legacy in-tree ones;
+    denial only downgrades that classification to a name-based heuristic.
+  - **Report-accuracy overhaul.** Selector resolution now evaluates
+    `matchExpressions` on any label key, `matchLabels` and `matchNames`, ANDed as
+    a Kubernetes LabelSelector requires; wildcards outside the two forms Kasten
+    documents are reported `NOT_ASSESSED` rather than guessed; protection gaps
+    are reconciled against real backup history, so a namespace with a completed
+    backup is never listed as a gap; and only policies that actually back up and
+    are namespace-scoped count as protection.
+  - **Orphaned RestorePoints repaired.** Kasten 9.0 does not populate
+    `spec.source` on RestorePoints, which aborted the whole computation and then
+    rendered a reassuring "no orphans". Attribution now uses the
+    `k10.kasten.io/policyName` label, and a computation that cannot run reports
+    `NOT_ASSESSED` instead of zero.
+  - **VolumeSnapshotClass cross-check widened.** CSI detection no longer
+    requires the literal string `csi` in the driver name, so drivers such as
+    `pxd.portworx.com` or `topolvm.io` are classified correctly; provisioners are
+    split CSI / in-tree / unrecognised, because a missing VolumeSnapshotClass
+    means something different in each case.
+  - **Location and Infrastructure profiles counted separately**, matching the
+    two pages the Kasten UI presents.
+  - Validated on a live **Kasten 9.0.3** cluster (OpenShift 4.20.30 /
+    Kubernetes 1.33.13): release gate `PASS=48 FAIL=0`.
+    See the CHANGELOG for the complete list.
+
+- **v2.1.1** — Windows/Git-Bash `Argument list too long` hardening, RBAC-limited
+  run transparency, deliberate-exclusion breakdown for coverage gaps.
+- **v2.1.0** — HTML report redesign; DR verdict fixes.
+- **v2.0.2**
   - **HTML report — license paid-entitlement view**: a long-lived TRIAL license no
     longer inflates the headline node limit into a misleading "OK"; consumption is
     also checked against the paid (non-trial) entitlement (`nodeConsumption.paidLimit`,
