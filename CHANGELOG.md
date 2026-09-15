@@ -3,6 +3,51 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+### Added
+- **K10 infrastructure volume shape (`k10InfraVolumes`, best practice
+  `k10InfraVolumeAccessMode`).** The PVCs the Kasten Helm chart creates for the
+  K10 services (`catalog-pv-claim`, `jobs-pv-claim`, `logging-pv-claim`,
+  `metering-pv-claim`, `prometheus-server`) are each mounted by a single pod.
+  KDL now reports their access modes, StorageClass, provisioner and whether the
+  backend is a shared filesystem, and warns when any of them is `ReadWriteMany`
+  or sits on a shared-filesystem class.
+
+  RWX on these volumes is accepted by Kubernetes and appears to work, so it is a
+  common accident when a shared-filesystem class is the cluster default. It adds
+  POSIX permission and file-locking semantics that none of these services needs,
+  and the catalog — a file-backed database — has been observed on CephFS to keep
+  a stale advisory lock across a K10 upgrade, leaving the new catalog pod unable
+  to open the database and requiring backend-side intervention to clear.
+  Recommended shape: `ReadWriteOnce` on a StorageClass that provisions a block
+  device (ceph-rbd over ceph-fs, managed disk over Azure Files, EBS over EFS).
+
+  **Scoped, because some PVCs in the K10 namespace must be RWX.** A FileStore
+  location profile is a shared export target mounted by every worker pod at
+  once; flagging it would be a false positive on a correct configuration. Only
+  PVCs created by the Kasten Helm chart are assessed — identified by Helm
+  ownership of the K10 release, with the release name learned from the chart
+  labels rather than hardcoded, and the canonical K10 PVC names as a fallback
+  for operator/OLM installs whose labels were stripped (`scope` reports which
+  path was used). Any PVC referenced by a profile CR is excluded outright on top
+  of that. Everything skipped is still listed under `excluded` with its reason.
+
+  Backend shape is inferred from the provisioner name plus Portworx `sharedv4`;
+  an unrecognised provisioner is reported as `unknown`, never as compliant, and
+  a PVC whose StorageClass cannot be read is counted in
+  `storageClassUnresolvedCount` rather than passed. No new RBAC: reuses the
+  cluster-wide PVC list already fetched, falling back to the namespace-scoped
+  read the catalog-PVC lookup already performs. Surfaced in text mode, in the
+  HTML report (new "K10 Infrastructure Volumes" section plus a Best Practices
+  row), and tracked by `kdl-diff.sh`.
+
+### Fixed
+- `kdl-json-to-html.sh`: a `WARN` best-practice status rendered as a neutral
+  info badge instead of a warning badge (visible on `vmSnapshotConsistency`).
+
+---
+
 ## [2.2.0] - 2026-08-21
 
 Compatibility with **Veeam Kasten 9.0** (9.0.0 / 9.0.1 / 9.0.2). Kasten 9.0

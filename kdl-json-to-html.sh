@@ -13,6 +13,11 @@ set -eu
 # silently degrade with an info-box message; the rest of the report renders
 # unchanged.
 #
+# New (unreleased):
+#   - K10 Infrastructure Volumes section + "K10 Infrastructure Volumes" Best
+#     Practices row (`k10InfraVolumes`, `bestPractices.k10InfraVolumeAccessMode`).
+#     Absent on older JSON: the section is skipped, the BP row omitted.
+#
 # New in v2.0 (5 new sections, additive only):
 #   - Ransomware Readiness Score (grade A-F, 8 pillars, biggest gap)
 #   - Effective RPO per Policy (median interval, drift vs theoretical)
@@ -132,7 +137,7 @@ def badge(v):
     "<span class=\"badge ok\">\u2713 " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" or v == "CONFIGURED_NOT_HEALTHY" then
     "<span class=\"badge error\">\u2717 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "CONFIGURED_INCOMPLETE" then
+  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "CONFIGURED_INCOMPLETE" or v == "WARN" then
     "<span class=\"badge warn\">\u26a0 " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == false then
     "<span class=\"badge warn\">\u2717 false</span>"
@@ -266,7 +271,7 @@ def tunedBadge(val; dflt):
 
 # v2.1 redesign: severity map + findings tally for the verdict hero.
 def bpSevMap:
-  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
+  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","k10InfraVolumeAccessMode":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
 def bpIsOk(v):
   (["CONFIGURED","IN_USE","ENABLED","COMPLETE","OK","VALID","COMPLIANT"] | index(v|tostring)) != null or (v == true);
 def bpFindings:
@@ -709,6 +714,19 @@ else "" end) + "
           else "" end) + "</td>
       </tr>"
       else "" end) +
+      (if .bestPractices.k10InfraVolumeAccessMode then
+      "
+      <tr>
+        <td><strong>K10 Infrastructure Volumes</strong></td>
+        <td class=\"sev-warning\">Warning</td>
+        <td>" + severityBadge("warning"; .bestPractices.k10InfraVolumeAccessMode) + "</td>
+        <td>" + badge(.bestPractices.k10InfraVolumeAccessMode) +
+          (if ((.k10InfraVolumes.readWriteManyCount // 0) + (.k10InfraVolumes.sharedFilesystemCount // 0)) > 0 then
+            " (" + ((.k10InfraVolumes.readWriteManyCount // 0) | tostring) + " RWX, "
+                 + ((.k10InfraVolumes.sharedFilesystemCount // 0) | tostring) + " on shared filesystem)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
       "
     </tbody></table>"
   else
@@ -1099,6 +1117,50 @@ else "" end) + "
   else
     "<div class=\"info-box\">Catalog data not available.</div>"
   end)
++ (if .k10InfraVolumes then
+    "<h2>\uD83D\uDCBE K10 Infrastructure Volumes</h2>
+     <p class=\"section-description\">The PVCs the Kasten Helm chart creates for the K10 services \u2014 catalog, jobs, logging, metering, Prometheus. Each is mounted by a single pod, so <strong>ReadWriteOnce on a block-backed StorageClass</strong> is the recommended shape (ceph-rbd rather than ceph-fs, managed disk rather than Azure Files, EBS rather than EFS). PVCs referenced by a profile \u2014 a FileStore export target is shared on purpose and <em>needs</em> RWX \u2014 and any other PVC in the namespace are listed as out of scope and never flagged.</p>" +
+    (if (.k10InfraVolumes.total // 0) == 0 then
+      "<div class=\"info-box\">No Helm-created K10 PVC visible in namespace <code>" + ((.k10InfraVolumes.namespace // "kasten-io") | @html) + "</code> \u2014 RBAC-limited, or the K10 services use storage KDL cannot attribute.</div>"
+     else
+      (if (.k10InfraVolumes.readWriteManyCount // 0) > 0 then
+        "<div class=\"warning-box\">\u26a0 <strong>" + ((.k10InfraVolumes.readWriteManyCount) | tostring) + " volume(s) provisioned ReadWriteMany.</strong> These volumes are never shared between pods, so RWX adds file-locking and permission overhead with no benefit. Re-provision as ReadWriteOnce.</div>"
+       else "" end) +
+      (if (.k10InfraVolumes.sharedFilesystemCount // 0) > 0 then
+        "<div class=\"warning-box\">\u26a0 <strong>" + ((.k10InfraVolumes.sharedFilesystemCount) | tostring) + " volume(s) on a shared-filesystem backend.</strong> The catalog is a file-backed database: on a shared filesystem it can retain a stale advisory lock across a K10 upgrade, leaving the new catalog pod unable to open the database and needing backend-side intervention to clear. Prefer a StorageClass that provisions a block device.</div>"
+       else "" end) +
+      (if (.k10InfraVolumes.storageClassUnresolvedCount // 0) > 0 then
+        "<div class=\"info-box\">\u2139 " + ((.k10InfraVolumes.storageClassUnresolvedCount) | tostring) + " volume(s) whose StorageClass could not be read \u2014 their backend shape was not assessed.</div>"
+       else "" end) +
+      "<table><thead><tr><th>PVC</th><th>Access Modes</th><th>StorageClass</th><th>Provisioner</th><th>Backend</th><th>Capacity</th></tr></thead><tbody>" +
+      ([.k10InfraVolumes.items[]? |
+        "<tr><td><strong>" + (.name | @html) + "</strong></td><td>" +
+        (if .rwx then "<span class=\"badge warn\">" + ((.accessModes | join(", ")) | @html) + "</span>"
+         else "<span class=\"badge ok\">" + (((.accessModes | join(", ")) // "unknown") | @html) + "</span>" end) +
+        "</td><td><code>" + ((.storageClass // "\u2014") | @html) + "</code>" +
+        (if .storageClassFromDefault then " <span class=\"badge info\">cluster default</span>" else "" end) +
+        "</td><td>" + (if (.provisioner // null) == null then "<em>not readable</em>" else "<code>" + (.provisioner | @html) + "</code>" end) +
+        "</td><td>" +
+        (if .sharedFilesystemBackend == true then "<span class=\"badge warn\">shared filesystem</span>"
+         elif .sharedFilesystemBackend == false then "<span class=\"badge ok\">dedicated</span>"
+         else "<span class=\"badge info\">unknown</span>" end) +
+        "</td><td>" + ((.capacity // "N/A") | @html) + "</td></tr>"
+      ] | join("")) +
+      "</tbody></table>" +
+      (if (.k10InfraVolumes.scope // "") == "known-name" then
+        "<div class=\"info-box\">\u2139 Helm labels were absent on these PVCs (operator install, or labels stripped), so scoping fell back to the canonical K10 PVC name list. Verify the list matches this deployment before acting on a finding.</div>"
+       else "" end)
+     end) +
+    (if ((.k10InfraVolumes.excludedCount // 0) > 0) then
+      "<h3>Out of scope (" + ((.k10InfraVolumes.excludedCount) | tostring) + " other PVC(s) in the namespace)</h3>
+       <table><thead><tr><th>PVC</th><th>Access Modes</th><th>StorageClass</th><th>Why it is not assessed</th></tr></thead><tbody>" +
+      ([.k10InfraVolumes.excluded[]? |
+        "<tr><td><strong>" + (.name | @html) + "</strong></td><td>" + (((.accessModes | join(", ")) // "unknown") | @html) +
+        "</td><td><code>" + ((.storageClass // "\u2014") | @html) + "</code></td><td>" + ((.reason // "") | @html) + "</td></tr>"
+      ] | join("")) +
+      "</tbody></table>"
+     else "" end)
+  else "" end)
 + "
 
 <!-- Orphaned RestorePoints -->

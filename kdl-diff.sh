@@ -924,9 +924,10 @@ add_section_json "resourceLimits" "$RL_JSON"
 ### Best Practices
 ### -------------------------
 print_section "Best Practices"
-# vmSnapshotConsistency added in KDL v2.2.0; absent on older baselines, which
-# the "-n both values" guard below already skips.
-BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging"
+# vmSnapshotConsistency added in KDL v2.2.0, k10InfraVolumeAccessMode after it;
+# both are absent on older baselines, which the "-n both values" guard below
+# already skips.
+BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging k10InfraVolumeAccessMode"
 BP_CHANGES_JSON="["
 BP_FIRST=true
 BP_CHANGED=false

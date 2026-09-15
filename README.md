@@ -48,6 +48,7 @@ These join the existing v1.9 features:
 - **Import policies tracking** (multi-cluster import workflow)
 - **K10 Resource Limits** (CPU/RAM per container) with **Deployment Replicas**
 - **Catalog Size** with **Free Space** alerts
+- **K10 infrastructure volumes** — access mode and backend shape of the PVCs the Helm chart creates for K10 itself (catalog, jobs, logging, metering, Prometheus), scoped to exclude FileStore profile targets
 - **Orphaned RestorePoints** detection
 - **Average Policy Run Duration**
 - **Location Profiles** with immutability detection (supports `Xh` and `Xd` formats)
@@ -55,7 +56,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status
-- **Best Practices compliance** summary (15 checks with severity levels)
+- **Best Practices compliance** summary (16 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
@@ -327,25 +328,26 @@ echo "Regressions: $?"   # exit code = number of regressions
 19. **Namespace Protection** — Catch-all detection, unprotected namespaces
 20. **K10 Resource Limits** — Pod/container counts, limits, deployment replicas
 21. **Catalog** — PVC name, size, free space percentage with alerts
-22. **Orphaned RestorePoints** — Count and details
-23. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
-24. **Transform Sets** — Count and transform details
-25. **Monitoring** — Prometheus status
-26. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
-27. **K10 Configuration** — Security, dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
-28. **K10 RBAC Inventory** *(NEW v2.0)* — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, unique subjects (Users, Groups, ServiceAccounts), wildcard role flags
-29. **Policy Coverage Summary** — App policies targeting all namespaces
-30. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
-31. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
-32. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
-33. **Best Practices Compliance** — 15 checks with severity-coded indicators
-34. **Execution Time** — Elapsed time display
+22. **K10 Infrastructure Volumes** — Access mode, StorageClass, provisioner and backend shape of the Helm-created K10 PVCs, plus the namespace PVCs deliberately left out of scope (FileStore profile targets)
+23. **Orphaned RestorePoints** — Count and details
+24. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
+25. **Transform Sets** — Count and transform details
+26. **Monitoring** — Prometheus status
+27. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
+28. **K10 Configuration** — Security, dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
+29. **K10 RBAC Inventory** *(NEW v2.0)* — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, unique subjects (Users, Groups, ServiceAccounts), wildcard role flags
+30. **Policy Coverage Summary** — App policies targeting all namespaces
+31. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
+32. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
+33. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
+34. **Best Practices Compliance** — 16 checks with severity-coded indicators
+35. **Execution Time** — Elapsed time display
 
 ### JSON Output
 
 Top-level keys (v2.0):
 
-`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
+`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `k10InfraVolumes`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
 
 New in v2.0:
 
@@ -357,7 +359,7 @@ New in v2.0:
 
 ---
 
-## Best Practices Compliance (15 checks)
+## Best Practices Compliance (16 checks)
 
 | Check                  | Severity | Good                                              | Bad                                                |
 |------------------------|----------|---------------------------------------------------|----------------------------------------------------|
@@ -370,6 +372,7 @@ New in v2.0:
 | Fast local recovery    | Warning  | All backup policies retain >= 1 snapshot          | Snapshot retention = 0 (no fast restore)           |
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
+| K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
 | Audit Logging          | Info     | SIEM logging enabled                              | Optional                                           |
@@ -377,6 +380,51 @@ New in v2.0:
 | Namespace Protection   | Info     | All app namespaces covered                        | Gaps detected                                      |
 | Kanister Blueprints    | Info     | Blueprints configured                             | Optional                                           |
 | Cluster-scoped         | Info     | At least one policy with `includeClusterResources`| Optional                                           |
+
+### K10 infrastructure volumes — why RWO on block storage
+
+The PVCs the Kasten Helm chart creates for K10's own services
+(`catalog-pv-claim`, `jobs-pv-claim`, `logging-pv-claim`, `metering-pv-claim`,
+`prometheus-server`) are each mounted by exactly one pod. Kubernetes will
+happily bind them `ReadWriteMany`, and it does work — which is why RWX is a
+common accident when a shared-filesystem class is the cluster default. It buys
+nothing and costs something:
+
+- none of these services is designed to share a volume, so the POSIX permission
+  and file-locking semantics of a shared filesystem are pure overhead;
+- the catalog is a file-backed database. On CephFS it has been observed to keep
+  a **stale advisory lock across a K10 upgrade**: the new catalog pod cannot
+  open the database, and clearing the lock requires backend-side intervention
+  that is not discoverable from Kubernetes.
+
+Recommended shape: `ReadWriteOnce`, on a StorageClass that provisions a **block
+device** — `ceph-rbd` rather than `ceph-fs`, a managed disk rather than Azure
+Files, EBS rather than EFS.
+
+**Scope — what is deliberately *not* checked.** Other PVCs live in the K10
+namespace and some of them *require* RWX: a **FileStore location profile** is a
+shared export target mounted by every worker pod at once, so RWX on it is
+correct. Flagging it would be a false positive on a working configuration. Two
+guards keep the check off them:
+
+1. only PVCs **created by the Kasten Helm chart** are assessed, identified by
+   Helm ownership of the K10 release (the release name is learned from the
+   chart labels, not hardcoded), with the canonical K10 PVC names as a fallback
+   for installs whose labels were stripped — operator/OLM. `k10InfraVolumes.scope`
+   reports which path was used; `known-name` is the weaker one and says so in
+   the report;
+2. any PVC **referenced by a profile CR** is excluded outright, even if it
+   somehow matched guard 1.
+
+Everything skipped is still listed, with the reason, under
+`k10InfraVolumes.excluded` — scoping down silently would hide the very PVCs a
+reader would ask about.
+
+KDL reports this as `k10InfraVolumes` (per-PVC access modes, StorageClass,
+provisioner, origin, and whether the backend is a shared filesystem) and as the
+`k10InfraVolumeAccessMode` best practice. The backend shape is inferred from the
+StorageClass provisioner name plus Portworx `sharedv4`; a provisioner KDL does
+not recognise is reported as `unknown`, never as compliant.
 
 ---
 
@@ -790,6 +838,40 @@ kubectl -n kasten-io get runactions
 ### Effective RPO shows null for all policies
 
 The 14-day window contains fewer than 2 successful (`Complete`) runs per policy. Median requires at least 2 intervals = 3 successful runs.
+
+### K10 infra volumes did not flag my RWX PVC / flagged one it should not
+
+The check only assesses PVCs created by the Kasten Helm chart. A PVC referenced
+by a location profile (a FileStore export target, which is shared on purpose)
+and any other PVC in the namespace are listed under `excluded` with a reason and
+are never counted. If a PVC you expected to see is in `excluded`, check
+`k10InfraVolumes.scope`:
+
+- `helm-release` — scoping came from Helm ownership of the K10 release, the
+  reliable path;
+- `known-name` — the Helm labels were absent (operator/OLM install, or labels
+  stripped), so scoping fell back to the canonical name list
+  (`catalog-pv-claim`, `jobs-pv-claim`, `logging-pv-claim`, `metering-pv-claim`,
+  `prometheus-server`). A Helm-created PVC outside that list is not assessed on
+  such a cluster.
+
+### K10 infra volumes flags a backend I believe is block-backed
+
+The backend column is inferred from the StorageClass provisioner name (plus the
+Portworx `sharedv4` parameter), not from the storage array. Check the
+provisioner KDL reported:
+
+```sh
+kubectl get pvc -n kasten-io -o custom-columns=\
+NAME:.metadata.name,MODES:.spec.accessModes,SC:.spec.storageClassName
+kubectl get storageclass <sc-name> -o jsonpath='{.provisioner}{"\n"}'
+```
+
+A provisioner that is not in KDL's shared-filesystem list is reported as
+`dedicated` / `unknown`, never as a failure — the check only warns on
+provisioners it positively recognises as shared-filesystem (CephFS, NFS, Azure
+Files, EFS, GlusterFS, Quobyte, Filestore, SMB, JuiceFS, Manila) or on
+`sharedv4: "true"`.
 
 ### Catalog free space shows N/A
 

@@ -4506,6 +4506,201 @@ fi
 
 debug "Best Practices v1.9 - SnapHigh: $BP_SNAP_RETENTION_HIGH_STATUS ($HIGH_SNAP_COUNT), SnapZero: $BP_SNAP_RETENTION_ZERO_STATUS ($ZERO_SNAP_COUNT), ExportNoRet: $BP_EXPORT_RETENTION_STATUS ($EXPORT_NO_RETENTION_COUNT), ClusterScoped: $BP_CLUSTER_SCOPED_STATUS, NoExport: $BP_NO_EXPORT_STATUS ($POLICIES_NO_EXPORT_COUNT)"
 
+# BP-K10-PVC-RWO (NEW): access mode + backend shape of the PVCs the Kasten Helm
+# chart creates for K10's own services (catalog, jobs, logging, metering,
+# prometheus).
+#
+# Every one of those volumes is mounted by exactly one pod. Kubernetes happily
+# binds them ReadWriteMany, and it "works", so RWX is a common accident when a
+# shared-filesystem class is the cluster default. It buys nothing and costs
+# something:
+#   - none of these services is designed to share a volume, so the extra POSIX
+#     permission and file-locking semantics of a shared filesystem are pure
+#     overhead;
+#   - the catalog is a file-backed database. On CephFS it has been observed to
+#     keep a stale advisory lock across a K10 upgrade: the new catalog pod
+#     cannot open the database, and clearing the lock needs backend-side
+#     intervention that is not discoverable from Kubernetes.
+# Recommendation: ReadWriteOnce, on a StorageClass that provisions a block
+# device (ceph-rbd rather than ceph-fs, managed disk rather than Azure Files,
+# EBS rather than EFS).
+#
+# SCOPE - this is the whole difficulty of the check. Other PVCs live in the K10
+# namespace and some of them REQUIRE RWX: a FileStore location profile is a
+# shared export target, mounted by every worker pod at once. Flagging those
+# would be a false positive on a correct configuration. Two guards:
+#   1. only PVCs created by the Kasten Helm chart are assessed - identified by
+#      Helm ownership of the K10 release (the release name is learned from the
+#      chart labels, not hardcoded), with the canonical K10 PVC names as a
+#      fallback for installs whose labels were stripped (operator/OLM);
+#   2. any PVC referenced by a profile CR is excluded outright, even if it
+#      somehow matched guard 1.
+# Everything skipped is still reported, with the reason, under `excluded` -
+# scoping down silently would hide the very PVCs a reader would ask about.
+#
+# No new RBAC: reuses the cluster-wide PVC list already fetched, and falls back
+# to the namespace-scoped read the catalog-PVC lookup already performs.
+K10_PVC_SOURCE="cluster-wide"
+K10_PVCS_RAW=$(jq -c --arg ns "$NAMESPACE" \
+  '{items: [((.items // [])[]? | select(.metadata.namespace == $ns))]}' \
+  "$TEMP_DIR/pvcs_raw.json" 2>/dev/null || echo '{"items":[]}')
+if ! _ep "$K10_PVCS_RAW" | jq -e '.items' >/dev/null 2>&1; then
+  K10_PVCS_RAW='{"items":[]}'
+fi
+if [ "$(_ep "$K10_PVCS_RAW" | jq '.items | length')" -eq 0 ]; then
+  K10_PVCS_RAW=$(safe_json "$($CLI -n "$NAMESPACE" get pvc -o json 2>/dev/null)")
+  K10_PVC_SOURCE="namespace-scoped"
+fi
+
+# PVCs a profile points at. A FileStore location profile names its claim here;
+# it is a shared export target and RWX on it is correct, not a finding. Deep
+# scan rather than a fixed path: the nesting of the FileStore block differs
+# between versions, and any claim a profile references is a data target
+# whatever the field is called.
+K10_PROFILE_PVC_NAMES=$(_ep "$PROFILES_JSON" | jq -c '
+  [ .items[]?
+    | (.spec // {})
+    | .. | objects
+    | (.claimName? // .persistentVolumeClaimName? // .pvcName? // empty)
+    | select(type == "string" and . != "")
+  ] | unique
+' 2>/dev/null) || { _jq_fail "profile-referenced PVC names"; K10_PROFILE_PVC_NAMES='[]'; }
+if ! _ep "$K10_PROFILE_PVC_NAMES" | jq -e '.' >/dev/null 2>&1; then
+  K10_PROFILE_PVC_NAMES='[]'
+fi
+
+# Shared-filesystem provisioners: a PVC on one of these is file-backed whatever
+# its access mode, which is the second half of the recommendation. Deliberately
+# a short, well-known list - an unrecognised provisioner is reported as
+# "unknown", never silently counted as compliant.
+K10_PVC_SHARED_RE='cephfs|ceph-fs|nfs|azurefile|file\.csi\.azure|efs\.csi|elasticfilesystem|glusterfs|quobyte|filestore|smb\.csi|juicefs|manila'
+
+K10_PVC_CLASSIFIED=$(_ep "$K10_PVCS_RAW" | jq -c \
+  --slurpfile sc "$TEMP_DIR/sc_raw.json" \
+  --arg sharedRe "$K10_PVC_SHARED_RE" \
+  --argjson profilePvcs "$K10_PROFILE_PVC_NAMES" '
+  ( ($sc[0].items) // [] ) as $scs |
+  ( [ $scs[]
+      | select((.metadata.annotations["storageclass.kubernetes.io/is-default-class"] // "false") == "true")
+    ] | first ) as $defaultSc |
+  ( [ "catalog-pv-claim", "jobs-pv-claim", "logging-pv-claim",
+      "metering-pv-claim", "prometheus-server" ] ) as $canonical |
+  ( [ (.items // [])[]? ] ) as $pvcs |
+  # Helm release that owns the K10 chart, learned from whichever PVC still
+  # carries the chart identity. Not hardcoded to "k10": the release name is a
+  # user choice at install time.
+  ( [ $pvcs[]
+      | select(
+          (((.metadata.labels // {})["helm.sh/chart"] // "") | test("^k10-"))
+          or (((.metadata.labels // {}).app // "") == "k10")
+          or (((.metadata.labels // {})["app.kubernetes.io/name"] // "") == "k10")
+        )
+      | ( (.metadata.labels // {}).release
+          // (.metadata.labels // {})["app.kubernetes.io/instance"]
+          // (.metadata.annotations // {})["meta.helm.sh/release-name"] )
+      | select(type == "string" and . != "")
+    ] | first ) as $release |
+  [ $pvcs[]
+    | . as $pvc
+    | ( $pvc.metadata.labels // {} ) as $l
+    | ( $pvc.metadata.annotations // {} ) as $a
+    | ( $l.release // $l["app.kubernetes.io/instance"] // $a["meta.helm.sh/release-name"] // null ) as $pvcRelease
+    | ( ($l.heritage // "") == "Helm"
+        or ($l["app.kubernetes.io/managed-by"] // "") == "Helm"
+        or ($a["meta.helm.sh/release-name"] // "") != "" ) as $isHelm
+    | ( $pvc.spec.storageClassName
+        // $a["volume.beta.kubernetes.io/storage-class"] ) as $scName
+    | ( if $scName == null then $defaultSc
+        else ( [ $scs[] | select(.metadata.name == $scName) ] | first )
+        end ) as $scObj
+    | ( $scObj.provisioner // null ) as $prov
+    | {
+        name: $pvc.metadata.name,
+        accessModes: ($pvc.spec.accessModes // []),
+        volumeMode: ($pvc.spec.volumeMode // "Filesystem"),
+        capacity: ($pvc.status.capacity.storage // $pvc.spec.resources.requests.storage // "N/A"),
+        phase: ($pvc.status.phase // "Unknown"),
+        storageClass: ($scName // ($defaultSc.metadata.name // null)),
+        storageClassFromDefault: ($scName == null),
+        provisioner: $prov,
+        rwx: ((($pvc.spec.accessModes // []) | index("ReadWriteMany")) != null),
+        # null (not false) when the StorageClass could not be read: unknown is
+        # not the same as fine.
+        sharedFilesystemBackend: (
+          if $prov == null then null
+          else ( ($prov | ascii_downcase | test($sharedRe))
+                 or (($scObj.parameters.sharedv4 // "") == "true") )
+          end
+        ),
+        origin: (
+          if ($release != null and $isHelm and $pvcRelease == $release) then "helm"
+          elif ($canonical | index($pvc.metadata.name)) then "known-name"
+          else "other" end
+        ),
+        profileReferenced: (($profilePvcs | index($pvc.metadata.name)) != null)
+      }
+    | .assessed = ((.origin != "other") and (.profileReferenced | not))
+    | .excludedReason = (
+        if .assessed then null
+        elif .profileReferenced then "referenced by a location profile (FileStore export targets are shared on purpose - RWX is expected)"
+        else "not created by the Kasten Helm chart - out of scope for this check"
+        end
+      )
+  ] | sort_by(.name)
+' 2>/dev/null) || { _jq_fail "K10 infrastructure volumes"; K10_PVC_CLASSIFIED='[]'; }
+if ! _ep "$K10_PVC_CLASSIFIED" | jq -e '.' >/dev/null 2>&1; then
+  K10_PVC_CLASSIFIED='[]'
+fi
+
+K10_INFRA_VOLUMES=$(_ep "$K10_PVC_CLASSIFIED" | jq -c '
+  [ .[] | select(.assessed)
+    | del(.assessed, .excludedReason, .profileReferenced) ]' 2>/dev/null || echo '[]')
+K10_PVC_EXCLUDED=$(_ep "$K10_PVC_CLASSIFIED" | jq -c '
+  [ .[] | select(.assessed | not)
+    | {name, accessModes, storageClass, origin, reason: .excludedReason} ]' 2>/dev/null || echo '[]')
+
+K10_PVC_TOTAL=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq 'length // 0')")
+K10_PVC_EXCLUDED_COUNT=$(safe_int "$(_ep "$K10_PVC_EXCLUDED" | jq 'length // 0')")
+K10_PVC_RWX_COUNT=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq '[.[] | select(.rwx)] | length // 0')")
+K10_PVC_SHARED_FS_COUNT=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq '[.[] | select(.sharedFilesystemBackend == true)] | length // 0')")
+K10_PVC_UNKNOWN_SC_COUNT=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq '[.[] | select(.provisioner == null)] | length // 0')")
+# How the assessed set was identified - "known-name" means the Helm labels were
+# absent and the canonical name list carried the scoping, which is weaker.
+K10_PVC_SCOPE=$(_ep "$K10_INFRA_VOLUMES" | jq -r '
+  if length == 0 then "none"
+  elif ([.[].origin] | index("helm")) then
+    (if ([.[].origin] | index("known-name")) then "helm-release+known-name" else "helm-release" end)
+  else "known-name" end' 2>/dev/null || echo "none")
+
+K10_PVC_FINDINGS=$(_ep "$K10_INFRA_VOLUMES" | jq -c '
+  [ .[]
+    | select(.rwx or (.sharedFilesystemBackend == true))
+    | {
+        name, accessModes, storageClass, provisioner, rwx, sharedFilesystemBackend,
+        reasons: (
+          [ (if .rwx then "ReadWriteMany on a single-writer volume - ReadWriteOnce is sufficient" else empty end),
+            (if .sharedFilesystemBackend == true then "shared-filesystem backend - prefer a StorageClass backed by a block device" else empty end)
+          ]
+        )
+      }
+  ]
+' 2>/dev/null) || { _jq_fail "K10 infrastructure volume findings"; K10_PVC_FINDINGS='[]'; }
+if ! _ep "$K10_PVC_FINDINGS" | jq -e '.' >/dev/null 2>&1; then
+  K10_PVC_FINDINGS='[]'
+fi
+
+if [ "$K10_PVC_TOTAL" -eq 0 ]; then
+  # No Helm-created PVC visible in the K10 namespace: RBAC denied both reads,
+  # or the K10 services use storage KDL cannot attribute. Not a pass.
+  BP_K10_PVC_ACCESS_STATUS="NOT_ASSESSED"
+elif [ "$K10_PVC_RWX_COUNT" -gt 0 ] || [ "$K10_PVC_SHARED_FS_COUNT" -gt 0 ]; then
+  BP_K10_PVC_ACCESS_STATUS="WARN"
+else
+  BP_K10_PVC_ACCESS_STATUS="OK"
+fi
+
+debug "K10 infra volumes ($K10_PVC_SOURCE, scope: $K10_PVC_SCOPE): $K10_PVC_TOTAL assessed, $K10_PVC_EXCLUDED_COUNT excluded, RWX: $K10_PVC_RWX_COUNT, shared-fs: $K10_PVC_SHARED_FS_COUNT, unknown SC: $K10_PVC_UNKNOWN_SC_COUNT -> $BP_K10_PVC_ACCESS_STATUS"
+
 ### -------------------------
 ### Ransomware Readiness Score (NEW v2.0 - patch 5/7) - F1
 ### -------------------------
@@ -4738,6 +4933,9 @@ printf '%s' "$ZERO_SNAP_POLICIES" > "$TEMP_DIR/zeroSnapPolicies.json"
 printf '%s' "$EXPORT_NO_RETENTION_POLICIES" > "$TEMP_DIR/exportNoRetentionPolicies.json"
 printf '%s' "$MULTI_EXPORT_POLICIES" > "$TEMP_DIR/multiExportPolicies.json"
 printf '%s' "$MULTI_EXPORT_SAME_PROFILE" > "$TEMP_DIR/multiExportSameProfile.json"
+printf '%s' "$K10_INFRA_VOLUMES" > "$TEMP_DIR/k10InfraVolumes.json"
+printf '%s' "$K10_PVC_FINDINGS" > "$TEMP_DIR/k10InfraVolumeFindings.json"
+printf '%s' "$K10_PVC_EXCLUDED" > "$TEMP_DIR/k10InfraVolumesExcluded.json"
 _ep "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})' > "$TEMP_DIR/presets.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/presets.json"
 jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: ((.actions // .spec.actions // {}) | keys)})' "$BLUEPRINTS_FILE" > "$TEMP_DIR/blueprints.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/blueprints.json"
 jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: (.spec.blueprintRef.name // "N/A")})' "$BINDINGS_FILE" > "$TEMP_DIR/bindings.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/bindings.json"
@@ -5041,6 +5239,18 @@ if [ "$MODE" = "json" ]; then
     --arg bpExportRetention "$BP_EXPORT_RETENTION_STATUS" \
     --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
     --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
+    --arg bpK10PvcAccess "$BP_K10_PVC_ACCESS_STATUS" \
+    --slurpfile k10InfraVolumes "$TEMP_DIR/k10InfraVolumes.json" \
+    --slurpfile k10InfraVolumeFindings "$TEMP_DIR/k10InfraVolumeFindings.json" \
+    --slurpfile k10InfraVolumesExcluded "$TEMP_DIR/k10InfraVolumesExcluded.json" \
+    --arg k10PvcSource "$K10_PVC_SOURCE" \
+    --arg k10Namespace "$NAMESPACE" \
+    --argjson k10PvcTotal "$K10_PVC_TOTAL" \
+    --argjson k10PvcRwxCount "$K10_PVC_RWX_COUNT" \
+    --argjson k10PvcSharedFsCount "$K10_PVC_SHARED_FS_COUNT" \
+    --argjson k10PvcUnknownScCount "$K10_PVC_UNKNOWN_SC_COUNT" \
+    --argjson k10PvcExcludedCount "$K10_PVC_EXCLUDED_COUNT" \
+    --arg k10PvcScope "$K10_PVC_SCOPE" \
     --argjson profileLocationCount "$PROFILE_LOCATION_COUNT" \
     --argjson profileInfraCount "$PROFILE_INFRA_COUNT" \
     --argjson profileUndeterminedCount "$PROFILE_UNDETERMINED_COUNT" \
@@ -5090,6 +5300,9 @@ if [ "$MODE" = "json" ]; then
     ( $highSnapPolicies[0] ) as $highSnapPolicies |
     ( $zeroSnapPolicies[0] ) as $zeroSnapPolicies |
     ( $exportNoRetentionPolicies[0] ) as $exportNoRetentionPolicies |
+    ( $k10InfraVolumes[0] // [] ) as $k10InfraVolumes |
+    ( $k10InfraVolumeFindings[0] // [] ) as $k10InfraVolumeFindings |
+    ( $k10InfraVolumesExcluded[0] // [] ) as $k10InfraVolumesExcluded |
     ( $presets[0] ) as $presets |
     ( $blueprints[0] ) as $blueprints |
     ( $bindings[0] ) as $bindings |
@@ -5515,6 +5728,7 @@ if [ "$MODE" = "json" ]; then
         exportRetentionExplicit: $bpExportRetention,
         clusterScopedResources: $bpClusterScoped,
         policiesWithoutExport: $bpNoExport,
+        k10InfraVolumeAccessMode: $bpK10PvcAccess,
         clusterScopedResourcesProtected: ($hasClusterScopedPolicy == "true")
       },
 
@@ -5607,6 +5821,22 @@ if [ "$MODE" = "json" ]; then
       policiesWithoutExport: {
         count: $policiesNoExportCount,
         items: $policiesNoExportList
+      },
+
+      k10InfraVolumes: {
+        namespace: $k10Namespace,
+        source: $k10PvcSource,
+        scope: $k10PvcScope,
+        total: $k10PvcTotal,
+        readWriteManyCount: $k10PvcRwxCount,
+        sharedFilesystemCount: $k10PvcSharedFsCount,
+        storageClassUnresolvedCount: $k10PvcUnknownScCount,
+        items: $k10InfraVolumes,
+        findings: $k10InfraVolumeFindings,
+        excludedCount: $k10PvcExcludedCount,
+        excluded: $k10InfraVolumesExcluded,
+        note: "Scoped to the PVCs the Kasten Helm chart creates for the K10 services (catalog, jobs, logging, metering, prometheus). Each is mounted by a single pod, so ReadWriteOnce on a block-backed StorageClass is recommended; ReadWriteMany and shared-filesystem backends add locking/permission overhead with no benefit, and have caused stale advisory locks on the catalog database across upgrades. PVCs referenced by a profile (FileStore export targets, which are shared on purpose) and any other PVC in the namespace are listed under excluded and are never flagged.",
+        scopeNote: "scope=helm-release: identified by Helm ownership of the K10 release. scope=known-name: Helm labels were absent (operator install or stripped labels) and the canonical K10 PVC name list carried the scoping, which is weaker - verify the list against this deployment."
       },
 
       retentionAnalysis: {
@@ -6488,6 +6718,49 @@ else
   printf "  Free Space: ${COLOR_YELLOW}N/A${COLOR_RESET} (could not determine)\n"
 fi
 
+### K10 Infrastructure Volumes (NEW): access mode + backend shape
+printf "\n${COLOR_BOLD}[DISK] K10 Infrastructure Volumes${COLOR_RESET}\n"
+printf "  ${COLOR_CYAN}Scope: PVCs created by the Kasten Helm chart. FileStore profile targets and\n"
+printf "         other PVCs in the namespace are listed separately and never flagged.${COLOR_RESET}\n"
+if [ "$K10_PVC_TOTAL" -eq 0 ] 2>/dev/null; then
+  printf "  ${COLOR_CYAN}No Helm-created K10 PVC visible in namespace $NAMESPACE${COLOR_RESET} (RBAC-limited, or K10 services use storage KDL cannot attribute)\n"
+else
+  printf "  Namespace:  $NAMESPACE ($K10_PVC_TOTAL assessed PVC(s), read: $K10_PVC_SOURCE, scope: $K10_PVC_SCOPE)\n"
+  _ep "$K10_INFRA_VOLUMES" | jq -r '
+    .[] |
+    "  - " + .name
+      + "  [" + ((.accessModes | join(",")) // "unknown") + "]"
+      + "  sc=" + (.storageClass // "N/A")
+      + (if .storageClassFromDefault then " (cluster default)" else "" end)
+      + "  " + (.capacity // "N/A")
+      + (if .provisioner then "  via " + .provisioner else "  (StorageClass not readable)" end)
+  ' 2>/dev/null
+  if [ "$K10_PVC_RWX_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN]  $K10_PVC_RWX_COUNT volume(s) in ReadWriteMany${COLOR_RESET} - these are single-writer volumes, ReadWriteOnce is sufficient\n"
+  fi
+  if [ "$K10_PVC_SHARED_FS_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN]  $K10_PVC_SHARED_FS_COUNT volume(s) on a shared-filesystem backend${COLOR_RESET} - prefer a block-backed StorageClass (ceph-rbd over ceph-fs, managed disk over Azure Files, EBS over EFS)\n"
+  fi
+  if [ "$K10_PVC_RWX_COUNT" -gt 0 ] || [ "$K10_PVC_SHARED_FS_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}        The catalog is a file-backed database: on a shared filesystem it can keep${COLOR_RESET}\n"
+    printf "  ${COLOR_YELLOW}        a stale advisory lock across a K10 upgrade, blocking the new catalog pod.${COLOR_RESET}\n"
+  fi
+  if [ "$K10_PVC_UNKNOWN_SC_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]  $K10_PVC_UNKNOWN_SC_COUNT volume(s) whose StorageClass could not be resolved${COLOR_RESET} - backend shape not assessed\n"
+  fi
+  if [ "$BP_K10_PVC_ACCESS_STATUS" = "OK" ]; then
+    printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} All K10 infrastructure volumes are ReadWriteOnce on block-backed storage\n"
+  fi
+  if [ "$K10_PVC_SCOPE" = "known-name" ]; then
+    printf "  ${COLOR_CYAN}[INFO]  Helm labels absent - scoping fell back to the canonical K10 PVC name list;\n"
+    printf "          verify it matches this deployment before acting on the finding${COLOR_RESET}\n"
+  fi
+fi
+if [ "$K10_PVC_EXCLUDED_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  Not assessed ($K10_PVC_EXCLUDED_COUNT PVC(s) in $NAMESPACE, out of scope):\n"
+  _ep "$K10_PVC_EXCLUDED" | jq -r '.[:10][] | "    - " + .name + "  [" + ((.accessModes | join(",")) // "unknown") + "]  " + .reason' 2>/dev/null
+fi
+
 ### Orphaned RestorePoints (NEW v1.5)
 printf "\n${COLOR_BOLD}[TRASH] Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 if [ "$ORPHANED_RP_STATUS" = "NOT_ASSESSED" ]; then
@@ -7079,6 +7352,16 @@ if [ "$BP_CLUSTER_SCOPED_STATUS" = "CONFIGURED" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Cluster-scoped:       ${COLOR_GREEN}CONFIGURED${COLOR_RESET} (CRDs/ClusterRoles backed up)\n"
 else
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Cluster-scoped:       Not configured (no policy with includeClusterResources or appType=cluster)\n"
+fi
+
+# K10 infrastructure volume access mode (NEW)
+if [ "$BP_K10_PVC_ACCESS_STATUS" = "OK" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} K10 infra volumes:    ${COLOR_GREEN}RWO / BLOCK-BACKED${COLOR_RESET} ($K10_PVC_TOTAL Helm-created PVC(s))\n"
+elif [ "$BP_K10_PVC_ACCESS_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  K10 infra volumes:    NOT ASSESSED (no Helm-created K10 PVC visible in $NAMESPACE)\n"
+else
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  K10 infra volumes:    ${COLOR_YELLOW}REVIEW${COLOR_RESET} ($K10_PVC_RWX_COUNT RWX, $K10_PVC_SHARED_FS_COUNT on shared filesystem - RWO on block storage recommended)\n"
+  _ep "$K10_PVC_FINDINGS" | jq -r '.[:5][] | "      - " + .name + ": " + (.reasons | join("; "))' 2>/dev/null
 fi
 
 # Policies without export (NEW v1.9)
