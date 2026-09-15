@@ -4569,15 +4569,21 @@ if ! _ep "$K10_PROFILE_PVC_NAMES" | jq -e '.' >/dev/null 2>&1; then
   K10_PROFILE_PVC_NAMES='[]'
 fi
 
-# Shared-filesystem provisioners: a PVC on one of these is file-backed whatever
-# its access mode, which is the second half of the recommendation. Deliberately
-# a short, well-known list - an unrecognised provisioner is reported as
-# "unknown", never silently counted as compliant.
-K10_PVC_SHARED_RE='cephfs|ceph-fs|nfs|azurefile|file\.csi\.azure|efs\.csi|elasticfilesystem|glusterfs|quobyte|filestore|smb\.csi|juicefs|manila'
+# Backend shape is a THREE-state answer, because name-based classification can
+# only ever recognise what it has been told about (the same caveat kdl-rbac.yaml
+# already records for csidrivers). A provisioner in neither list is reported as
+# unknown - never as "dedicated", which would assert a block device KDL never
+# verified and hand a green pass to WekaFS, FSx, Dell Isilon or NetApp ontap-nas.
+K10_PVC_SHARED_RE='cephfs|ceph-fs|nfs|azurefile|file\.csi\.azure|efs\.csi|elasticfilesystem|glusterfs|quobyte|filestore|smb\.csi|juicefs|manila|weka|beegfs|lustre|gpfs|spectrumscale|vast|isilon|powerscale|oci-fss|ontap-nas'
+# Provisioners positively known to hand out a block device. Deliberately narrow:
+# anything absent is "unknown", not "fine". csi.trident.netapp.io is absent on
+# purpose - the same driver serves NAS and SAN, so the name cannot decide.
+K10_PVC_BLOCK_RE='ebs\.csi\.aws|disk\.csi\.azure|pd\.csi\.storage\.gke|rbd|cinder|vsphere|longhorn|linstor|topolvm|openebs|local-path|no-provisioner|pxd\.portworx|powerstore|powermax|vxflexos|pure-csi|hpe|zfs'
 
 K10_PVC_CLASSIFIED=$(_ep "$K10_PVCS_RAW" | jq -c \
   --slurpfile sc "$TEMP_DIR/sc_raw.json" \
   --arg sharedRe "$K10_PVC_SHARED_RE" \
+  --arg blockRe "$K10_PVC_BLOCK_RE" \
   --argjson profilePvcs "$K10_PROFILE_PVC_NAMES" '
   ( ($sc[0].items) // [] ) as $scs |
   ( [ $scs[]
@@ -4624,17 +4630,25 @@ K10_PVC_CLASSIFIED=$(_ep "$K10_PVCS_RAW" | jq -c \
         storageClassFromDefault: ($scName == null),
         provisioner: $prov,
         rwx: ((($pvc.spec.accessModes // []) | index("ReadWriteMany")) != null),
-        # null (not false) when the StorageClass could not be read: unknown is
-        # not the same as fine.
+        # true / false / null, where null means "not determined" - either the
+        # StorageClass could not be read, or its provisioner is in neither list.
+        # Asserting false on an unrecognised name would overstate compliance.
         sharedFilesystemBackend: (
           if $prov == null then null
-          else ( ($prov | ascii_downcase | test($sharedRe))
-                 or (($scObj.parameters.sharedv4 // "") == "true") )
+          else ( ($prov | ascii_downcase) as $p
+                 | if ($p | test($sharedRe))
+                      or (($scObj.parameters.sharedv4 // "") == "true") then true
+                   elif ($p | test($blockRe)) then false
+                   else null end )
           end
         ),
         origin: (
           if ($release != null and $isHelm and $pvcRelease == $release) then "helm"
-          elif ($canonical | index($pvc.metadata.name)) then "known-name"
+          # Fallback ONLY when Helm ownership could not be established at all.
+          # Reached while $release resolves, the name list would pull in a PVC
+          # Kasten does not own - a standalone Prometheus release in this
+          # namespace owns a "prometheus-server" PVC too.
+          elif ($release == null and ($canonical | index($pvc.metadata.name))) then "known-name"
           else "other" end
         ),
         profileReferenced: (($profilePvcs | index($pvc.metadata.name)) != null)
@@ -4664,6 +4678,10 @@ K10_PVC_EXCLUDED_COUNT=$(safe_int "$(_ep "$K10_PVC_EXCLUDED" | jq 'length // 0')
 K10_PVC_RWX_COUNT=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq '[.[] | select(.rwx)] | length // 0')")
 K10_PVC_SHARED_FS_COUNT=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq '[.[] | select(.sharedFilesystemBackend == true)] | length // 0')")
 K10_PVC_UNKNOWN_SC_COUNT=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq '[.[] | select(.provisioner == null)] | length // 0')")
+# Provisioner readable but in neither list. Disjoint from the count above; the
+# two together are every volume whose backend shape KDL did not determine.
+K10_PVC_UNKNOWN_BACKEND_COUNT=$(safe_int "$(_ep "$K10_INFRA_VOLUMES" | jq '[.[] | select(.provisioner != null and .sharedFilesystemBackend == null)] | length // 0')")
+K10_PVC_BACKEND_UNASSESSED=$((K10_PVC_UNKNOWN_SC_COUNT + K10_PVC_UNKNOWN_BACKEND_COUNT))
 # How the assessed set was identified - "known-name" means the Helm labels were
 # absent and the canonical name list carried the scoping, which is weaker.
 K10_PVC_SCOPE=$(_ep "$K10_INFRA_VOLUMES" | jq -r '
@@ -4695,11 +4713,16 @@ if [ "$K10_PVC_TOTAL" -eq 0 ]; then
   BP_K10_PVC_ACCESS_STATUS="NOT_ASSESSED"
 elif [ "$K10_PVC_RWX_COUNT" -gt 0 ] || [ "$K10_PVC_SHARED_FS_COUNT" -gt 0 ]; then
   BP_K10_PVC_ACCESS_STATUS="WARN"
+elif [ "$K10_PVC_BACKEND_UNASSESSED" -gt 0 ]; then
+  # Access mode is clean, but the backend shape - the signal that matters most
+  # in practice - was not determined for every volume. Reporting OK here would
+  # assert block-backed storage KDL never saw. NOT_ASSESSED, per the convention.
+  BP_K10_PVC_ACCESS_STATUS="NOT_ASSESSED"
 else
   BP_K10_PVC_ACCESS_STATUS="OK"
 fi
 
-debug "K10 infra volumes ($K10_PVC_SOURCE, scope: $K10_PVC_SCOPE): $K10_PVC_TOTAL assessed, $K10_PVC_EXCLUDED_COUNT excluded, RWX: $K10_PVC_RWX_COUNT, shared-fs: $K10_PVC_SHARED_FS_COUNT, unknown SC: $K10_PVC_UNKNOWN_SC_COUNT -> $BP_K10_PVC_ACCESS_STATUS"
+debug "K10 infra volumes ($K10_PVC_SOURCE, scope: $K10_PVC_SCOPE): $K10_PVC_TOTAL assessed, $K10_PVC_EXCLUDED_COUNT excluded, RWX: $K10_PVC_RWX_COUNT, shared-fs: $K10_PVC_SHARED_FS_COUNT, unknown SC: $K10_PVC_UNKNOWN_SC_COUNT, unknown backend: $K10_PVC_UNKNOWN_BACKEND_COUNT -> $BP_K10_PVC_ACCESS_STATUS"
 
 ### -------------------------
 ### Ransomware Readiness Score (NEW v2.0 - patch 5/7) - F1
@@ -5249,6 +5272,7 @@ if [ "$MODE" = "json" ]; then
     --argjson k10PvcRwxCount "$K10_PVC_RWX_COUNT" \
     --argjson k10PvcSharedFsCount "$K10_PVC_SHARED_FS_COUNT" \
     --argjson k10PvcUnknownScCount "$K10_PVC_UNKNOWN_SC_COUNT" \
+    --argjson k10PvcUnknownBackendCount "$K10_PVC_UNKNOWN_BACKEND_COUNT" \
     --argjson k10PvcExcludedCount "$K10_PVC_EXCLUDED_COUNT" \
     --arg k10PvcScope "$K10_PVC_SCOPE" \
     --argjson profileLocationCount "$PROFILE_LOCATION_COUNT" \
@@ -5831,6 +5855,7 @@ if [ "$MODE" = "json" ]; then
         readWriteManyCount: $k10PvcRwxCount,
         sharedFilesystemCount: $k10PvcSharedFsCount,
         storageClassUnresolvedCount: $k10PvcUnknownScCount,
+        backendUnrecognisedCount: $k10PvcUnknownBackendCount,
         items: $k10InfraVolumes,
         findings: $k10InfraVolumeFindings,
         excludedCount: $k10PvcExcludedCount,
@@ -6729,7 +6754,7 @@ else
   _ep "$K10_INFRA_VOLUMES" | jq -r '
     .[] |
     "  - " + .name
-      + "  [" + ((.accessModes | join(",")) // "unknown") + "]"
+      + "  [" + (if ((.accessModes // []) | length) == 0 then "unknown" else (.accessModes | join(",")) end) + "]"
       + "  sc=" + (.storageClass // "N/A")
       + (if .storageClassFromDefault then " (cluster default)" else "" end)
       + "  " + (.capacity // "N/A")
@@ -6748,17 +6773,22 @@ else
   if [ "$K10_PVC_UNKNOWN_SC_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_CYAN}[INFO]  $K10_PVC_UNKNOWN_SC_COUNT volume(s) whose StorageClass could not be resolved${COLOR_RESET} - backend shape not assessed\n"
   fi
+  if [ "$K10_PVC_UNKNOWN_BACKEND_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]  $K10_PVC_UNKNOWN_BACKEND_COUNT volume(s) on a provisioner KDL does not recognise${COLOR_RESET} - backend shape not assessed, check whether it is block or shared\n"
+  fi
   if [ "$BP_K10_PVC_ACCESS_STATUS" = "OK" ]; then
     printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} All K10 infrastructure volumes are ReadWriteOnce on block-backed storage\n"
+  elif [ "$K10_PVC_RWX_COUNT" -eq 0 ] && [ "$K10_PVC_SHARED_FS_COUNT" -eq 0 ] && [ "$K10_PVC_BACKEND_UNASSESSED" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  All access modes are ReadWriteOnce, but the backend shape of $K10_PVC_BACKEND_UNASSESSED volume(s) was not determined - no verdict\n"
   fi
-  if [ "$K10_PVC_SCOPE" = "known-name" ]; then
+  case "$K10_PVC_SCOPE" in *known-name*)
     printf "  ${COLOR_CYAN}[INFO]  Helm labels absent - scoping fell back to the canonical K10 PVC name list;\n"
     printf "          verify it matches this deployment before acting on the finding${COLOR_RESET}\n"
-  fi
+  ;; esac
 fi
 if [ "$K10_PVC_EXCLUDED_COUNT" -gt 0 ] 2>/dev/null; then
   printf "  Not assessed ($K10_PVC_EXCLUDED_COUNT PVC(s) in $NAMESPACE, out of scope):\n"
-  _ep "$K10_PVC_EXCLUDED" | jq -r '.[:10][] | "    - " + .name + "  [" + ((.accessModes | join(",")) // "unknown") + "]  " + .reason' 2>/dev/null
+  _ep "$K10_PVC_EXCLUDED" | jq -r '.[:10][] | "    - " + .name + "  [" + (if ((.accessModes // []) | length) == 0 then "unknown" else (.accessModes | join(",")) end) + "]  " + .reason' 2>/dev/null
 fi
 
 ### Orphaned RestorePoints (NEW v1.5)
@@ -7357,8 +7387,10 @@ fi
 # K10 infrastructure volume access mode (NEW)
 if [ "$BP_K10_PVC_ACCESS_STATUS" = "OK" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} K10 infra volumes:    ${COLOR_GREEN}RWO / BLOCK-BACKED${COLOR_RESET} ($K10_PVC_TOTAL Helm-created PVC(s))\n"
-elif [ "$BP_K10_PVC_ACCESS_STATUS" = "NOT_ASSESSED" ]; then
+elif [ "$BP_K10_PVC_ACCESS_STATUS" = "NOT_ASSESSED" ] && [ "$K10_PVC_TOTAL" -eq 0 ]; then
   printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  K10 infra volumes:    NOT ASSESSED (no Helm-created K10 PVC visible in $NAMESPACE)\n"
+elif [ "$BP_K10_PVC_ACCESS_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  K10 infra volumes:    NOT ASSESSED (all RWO, but backend shape undetermined on $K10_PVC_BACKEND_UNASSESSED of $K10_PVC_TOTAL volume(s))\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  K10 infra volumes:    ${COLOR_YELLOW}REVIEW${COLOR_RESET} ($K10_PVC_RWX_COUNT RWX, $K10_PVC_SHARED_FS_COUNT on shared filesystem - RWO on block storage recommended)\n"
   _ep "$K10_PVC_FINDINGS" | jq -r '.[:5][] | "      - " + .name + ": " + (.reasons | join("; "))' 2>/dev/null

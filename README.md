@@ -56,7 +56,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status
-- **Best Practices compliance** summary (16 checks with severity levels)
+- **Best Practices compliance** summary (17 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
@@ -340,14 +340,17 @@ echo "Regressions: $?"   # exit code = number of regressions
 31. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
 32. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
 33. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
-34. **Best Practices Compliance** — 16 checks with severity-coded indicators
+34. **Best Practices Compliance** — 17 checks with severity-coded indicators
 35. **Execution Time** — Elapsed time display
 
 ### JSON Output
 
 Top-level keys (v2.0):
 
-`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `k8sVersion`, `k8sDistribution`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `restoreActions`, `failedActionsTop5`, `stuckActions`, `nsProtectionStatus`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `k10InfraVolumes`, `ransomwareReadiness`, `bestPractices`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
+`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `cluster`, `rbacLimited`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `failedActionsTop5`, `stuckActions`, `namespaceProtectionStatus`, `restorePointsByNamespace`, `profileValidation`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `k10InfraVolumes`, `ransomwareReadiness`, `bestPractices`, `policiesWithoutExport`, `retentionAnalysis`, `collectionFlags`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
+
+Kubernetes version and distribution live under `cluster.kubernetesVersion` /
+`cluster.distribution`; restore-action counters under `health.backups.restoreActions`.
 
 New in v2.0:
 
@@ -359,7 +362,7 @@ New in v2.0:
 
 ---
 
-## Best Practices Compliance (16 checks)
+## Best Practices Compliance (17 checks)
 
 | Check                  | Severity | Good                                              | Bad                                                |
 |------------------------|----------|---------------------------------------------------|----------------------------------------------------|
@@ -423,8 +426,13 @@ reader would ask about.
 KDL reports this as `k10InfraVolumes` (per-PVC access modes, StorageClass,
 provisioner, origin, and whether the backend is a shared filesystem) and as the
 `k10InfraVolumeAccessMode` best practice. The backend shape is inferred from the
-StorageClass provisioner name plus Portworx `sharedv4`; a provisioner KDL does
-not recognise is reported as `unknown`, never as compliant.
+StorageClass provisioner name plus Portworx `sharedv4`, and is a **three-state**
+answer: shared-filesystem, block-backed, or `unknown`. A provisioner in neither
+list is reported as `unknown` and counted in `backendUnrecognisedCount` — never
+as compliant, because asserting `dedicated` would claim a block device KDL never
+verified. When every access mode is `ReadWriteOnce` but the backend shape of one
+or more volumes is undetermined (unreadable StorageClass, or an unrecognised
+provisioner), the best practice reports `NOT_ASSESSED` rather than `OK`.
 
 ---
 
@@ -849,8 +857,8 @@ are never counted. If a PVC you expected to see is in `excluded`, check
 
 - `helm-release` — scoping came from Helm ownership of the K10 release, the
   reliable path;
-- `known-name` — the Helm labels were absent (operator/OLM install, or labels
-  stripped), so scoping fell back to the canonical name list
+- `known-name` — no Helm ownership could be established at all (operator/OLM
+  install, or labels stripped), so scoping fell back to the canonical name list
   (`catalog-pv-claim`, `jobs-pv-claim`, `logging-pv-claim`, `metering-pv-claim`,
   `prometheus-server`). A Helm-created PVC outside that list is not assessed on
   such a cluster.
@@ -867,11 +875,17 @@ NAME:.metadata.name,MODES:.spec.accessModes,SC:.spec.storageClassName
 kubectl get storageclass <sc-name> -o jsonpath='{.provisioner}{"\n"}'
 ```
 
-A provisioner that is not in KDL's shared-filesystem list is reported as
-`dedicated` / `unknown`, never as a failure — the check only warns on
-provisioners it positively recognises as shared-filesystem (CephFS, NFS, Azure
-Files, EFS, GlusterFS, Quobyte, Filestore, SMB, JuiceFS, Manila) or on
-`sharedv4: "true"`.
+KDL only warns on provisioners it positively recognises as shared-filesystem
+(CephFS, NFS, Azure Files, EFS, GlusterFS, Quobyte, Filestore, SMB, JuiceFS,
+Manila, WekaFS, BeeGFS, Lustre, GPFS/Spectrum Scale, VAST, Dell Isilon/PowerScale,
+OCI FSS, NetApp `ontap-nas`) or on `sharedv4: "true"`, and only reports
+`dedicated` for provisioners it positively recognises as block
+(EBS, Azure managed disk, GCE PD, Ceph RBD, Cinder, vSphere, Longhorn, LINSTOR,
+TopoLVM, OpenEBS, local-path, Portworx, Dell PowerStore/PowerMax/VxFlex, Pure,
+HPE, ZFS). Anything else is `unknown`, and an `unknown` backend blocks an `OK`
+verdict instead of passing silently. `csi.trident.netapp.io` is deliberately in
+neither list: the same driver serves NAS and SAN, so the name cannot decide —
+check the StorageClass parameters.
 
 ### Catalog free space shows N/A
 

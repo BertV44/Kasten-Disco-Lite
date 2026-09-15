@@ -33,10 +33,16 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   path was used). Any PVC referenced by a profile CR is excluded outright on top
   of that. Everything skipped is still listed under `excluded` with its reason.
 
-  Backend shape is inferred from the provisioner name plus Portworx `sharedv4`;
-  an unrecognised provisioner is reported as `unknown`, never as compliant, and
-  a PVC whose StorageClass cannot be read is counted in
-  `storageClassUnresolvedCount` rather than passed. No new RBAC: reuses the
+  Backend shape is inferred from the provisioner name plus Portworx `sharedv4`
+  and is a three-state answer: shared-filesystem, block-backed, or unknown. A
+  provisioner in neither list is reported as `unknown` and counted in
+  `backendUnrecognisedCount`, never as compliant — asserting `dedicated` on an
+  unrecognised name would claim a block device KDL never verified. A PVC whose
+  StorageClass cannot be read is counted in `storageClassUnresolvedCount`. When
+  every access mode is `ReadWriteOnce` but one or more backends were not
+  determined, the best practice reports `NOT_ASSESSED` rather than `OK`: the
+  backend signal is the one that matters most in practice, and a check that did
+  not run must not render as a pass. No new RBAC: reuses the
   cluster-wide PVC list already fetched, falling back to the namespace-scoped
   read the catalog-PVC lookup already performs. Surfaced in text mode, in the
   HTML report (new "K10 Infrastructure Volumes" section plus a Best Practices
@@ -45,6 +51,8 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
 ### Fixed
 - `kdl-json-to-html.sh`: a `WARN` best-practice status rendered as a neutral
   info badge instead of a warning badge (visible on `vmSnapshotConsistency`).
+- `README.md`: the best-practices count said 16; the table and `bpSevMap` both
+  carry 17. Pre-existing off-by-one (`main` listed 16 rows as "15 checks").
 
 ---
 

@@ -1132,11 +1132,14 @@ else "" end) + "
       (if (.k10InfraVolumes.storageClassUnresolvedCount // 0) > 0 then
         "<div class=\"info-box\">\u2139 " + ((.k10InfraVolumes.storageClassUnresolvedCount) | tostring) + " volume(s) whose StorageClass could not be read \u2014 their backend shape was not assessed.</div>"
        else "" end) +
+      (if (.k10InfraVolumes.backendUnrecognisedCount // 0) > 0 then
+        "<div class=\"info-box\">\u2139 <strong>" + ((.k10InfraVolumes.backendUnrecognisedCount) | tostring) + " volume(s) on a provisioner KDL does not recognise.</strong> Their backend shape was not assessed \u2014 KDL will not claim a block device it has not verified. Check whether the provisioner hands out a block device or a shared filesystem before treating these as compliant.</div>"
+       else "" end) +
       "<table><thead><tr><th>PVC</th><th>Access Modes</th><th>StorageClass</th><th>Provisioner</th><th>Backend</th><th>Capacity</th></tr></thead><tbody>" +
       ([.k10InfraVolumes.items[]? |
         "<tr><td><strong>" + (.name | @html) + "</strong></td><td>" +
         (if .rwx then "<span class=\"badge warn\">" + ((.accessModes | join(", ")) | @html) + "</span>"
-         else "<span class=\"badge ok\">" + (((.accessModes | join(", ")) // "unknown") | @html) + "</span>" end) +
+         else "<span class=\"badge ok\">" + ((if ((.accessModes // []) | length) == 0 then "unknown" else (.accessModes | join(", ")) end) | @html) + "</span>" end) +
         "</td><td><code>" + ((.storageClass // "\u2014") | @html) + "</code>" +
         (if .storageClassFromDefault then " <span class=\"badge info\">cluster default</span>" else "" end) +
         "</td><td>" + (if (.provisioner // null) == null then "<em>not readable</em>" else "<code>" + (.provisioner | @html) + "</code>" end) +
@@ -1147,7 +1150,7 @@ else "" end) + "
         "</td><td>" + ((.capacity // "N/A") | @html) + "</td></tr>"
       ] | join("")) +
       "</tbody></table>" +
-      (if (.k10InfraVolumes.scope // "") == "known-name" then
+      (if ((.k10InfraVolumes.scope // "") | test("known-name")) then
         "<div class=\"info-box\">\u2139 Helm labels were absent on these PVCs (operator install, or labels stripped), so scoping fell back to the canonical K10 PVC name list. Verify the list matches this deployment before acting on a finding.</div>"
        else "" end)
      end) +
@@ -1155,7 +1158,7 @@ else "" end) + "
       "<h3>Out of scope (" + ((.k10InfraVolumes.excludedCount) | tostring) + " other PVC(s) in the namespace)</h3>
        <table><thead><tr><th>PVC</th><th>Access Modes</th><th>StorageClass</th><th>Why it is not assessed</th></tr></thead><tbody>" +
       ([.k10InfraVolumes.excluded[]? |
-        "<tr><td><strong>" + (.name | @html) + "</strong></td><td>" + (((.accessModes | join(", ")) // "unknown") | @html) +
+        "<tr><td><strong>" + (.name | @html) + "</strong></td><td>" + ((if ((.accessModes // []) | length) == 0 then "unknown" else (.accessModes | join(", ")) end) | @html) +
         "</td><td><code>" + ((.storageClass // "\u2014") | @html) + "</code></td><td>" + ((.reason // "") | @html) + "</td></tr>"
       ] | join("")) +
       "</tbody></table>"
