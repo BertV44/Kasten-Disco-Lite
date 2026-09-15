@@ -3,7 +3,12 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.3.0] - 2026-09-15
+
+Adds one best practice: the shape of the storage K10 runs its *own* services on.
+Validated on a live OpenShift 4.20 / Kasten 9.0.5 cluster (Phase A gate: 48
+assertions, 0 failures). Still read-only, still no new permissions --
+`kdl-rbac.yaml` is unchanged.
 
 ### Added
 - **K10 infrastructure volume shape (`k10InfraVolumes`, best practice

@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.2.0
+# Kasten Discovery Lite v2.3.0
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -61,6 +61,18 @@ These join the existing v1.9 features:
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New in v2.3
+
+- **K10 infrastructure volumes** — a new section and best practice covering the
+  PVCs the Kasten Helm chart creates for K10's own services (catalog, jobs,
+  logging, metering, Prometheus). Each is mounted by a single pod, so
+  `ReadWriteOnce` on a **block-backed** StorageClass is the recommended shape.
+  Two independent signals: the access mode, and the backend shape inferred from
+  the provisioner. The backend answer is three-state -- shared-filesystem,
+  block-backed, or `unknown` -- and an undetermined backend reports
+  `NOT_ASSESSED` rather than a green pass. FileStore profile targets, which are
+  shared on purpose, are excluded and listed with a reason.
 
 ## What's New in v2.2
 
@@ -672,7 +684,17 @@ Key portability measures:
 
 ## Version History
 
-- **v2.2.0** (Current) — **Veeam Kasten 9.0 compatibility**
+- **v2.3.0** (Current) — **K10 infrastructure volume shape**
+  - New `k10InfraVolumes` section and `k10InfraVolumeAccessMode` best practice:
+    flags K10's own service PVCs that are `ReadWriteMany` or sit on a
+    shared-filesystem backend. The catalog is a file-backed database and has
+    been observed on CephFS to keep a stale advisory lock across an upgrade.
+  - Backend shape is three-state; an unrecognised provisioner is reported as
+    `unknown` and blocks an `OK` verdict instead of passing as `dedicated`.
+  - Scoped to Helm-created PVCs, with FileStore profile targets excluded.
+  - Validated on a live OpenShift 4.20 / Kasten 9.0.5 cluster.
+
+- **v2.2.0** — **Veeam Kasten 9.0 compatibility**
   - **Label-based VM policies** (`k10.kasten.io/virtualMachineNamespace` + VM
     `matchLabels`): previously invisible to KDL, and wrongly reported as empty
     /orphaned policies.
