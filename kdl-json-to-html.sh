@@ -271,7 +271,7 @@ def tunedBadge(val; dflt):
 
 # v2.1 redesign: severity map + findings tally for the verdict hero.
 def bpSevMap:
-  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","k10InfraVolumeAccessMode":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
+  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","k10InfraVolumeAccessMode":"warn","storageRepositoryMaintenance":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
 def bpIsOk(v):
   (["CONFIGURED","IN_USE","ENABLED","COMPLETE","OK","VALID","COMPLIANT"] | index(v|tostring)) != null or (v == true);
 def bpFindings:
@@ -731,9 +731,14 @@ else "" end) + "
       "
       <tr>
         <td><strong>Storage Repository Maintenance</strong></td>
-        <td class=\"sev-warning\">Warning</td>
-        <td>" + severityBadge("warning"; .bestPractices.storageRepositoryMaintenance) + "</td>
-        <td>" + badge(.bestPractices.storageRepositoryMaintenance) +
+        <td class=\"" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "sev-optional" else "sev-warning" end) + "\">" +
+          (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "Optional" else "Warning" end) + "</td>
+        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
+                 then severityBadge("optional"; "NOT_USED")
+                 else severityBadge("warning"; .bestPractices.storageRepositoryMaintenance) end) + "</td>
+        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
+                 then "<span class=\"badge info\">\u2014 not using exports</span>"
+                 else badge(.bestPractices.storageRepositoryMaintenance) end) +
           (if ((.storageRepositories.amberCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
             " (" +
             ([

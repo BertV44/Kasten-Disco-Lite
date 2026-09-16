@@ -149,6 +149,14 @@ rules:
     resources:
       - restorepoints
     verbs: ["get", "list"]
+  - apiGroups: ["repositories.kio.kasten.io"]
+    resources:
+      - storagerepositories
+      # The maintenance metrics live on the /details subresource, not on the
+      # object itself. Without this rule KDL can list repositories but reads
+      # nothing about them, and reports the maintenance check as NOT_ASSESSED.
+      - storagerepositories/details
+    verbs: ["get", "list"]
   - apiGroups: ["reporting.kio.kasten.io"]
     resources:
       - reports

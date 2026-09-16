@@ -390,27 +390,6 @@ progress() {
   fi
 }
 
-# Format duration in seconds to human-readable format (e.g., "1m 47s")
-format_duration() {
-  local seconds=$1
-  if [ -z "$seconds" ] || [ "$seconds" -lt 0 ]; then
-    echo ""
-    return
-  fi
-
-  local hours=$((seconds / 3600))
-  local minutes=$(((seconds % 3600) / 60))
-  local secs=$((seconds % 60))
-
-  if [ "$hours" -gt 0 ]; then
-    printf "%dh %dm %ds" "$hours" "$minutes" "$secs"
-  elif [ "$minutes" -gt 0 ]; then
-    printf "%dm %ds" "$minutes" "$secs"
-  else
-    printf "%ds" "$secs"
-  fi
-}
-
 # Sanitize raw kubectl JSON: strip control chars, validate, fallback
 EMPTY_ITEMS='{"items":[]}'
 
@@ -3717,28 +3696,46 @@ helm_bool() {
 K10_CM_JSON=$($CLI -n "$NAMESPACE" get configmaps k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
 
 # --- Prometheus Remote Write Configuration (NEW v2.4) ---
-# Check actual Prometheus ConfigMap for remote_write (works with/without helm values)
-PROM_CM_NAME=$($CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/instance=$K10_RELEASE,app.kubernetes.io/name=k10" --no-headers 2>/dev/null | grep -i "prometheus" | awk '{print $1}' | head -1)
+# Three states, not two: enabled / not-configured / unknown. "We could not read
+# the config" and "the config has no remote_write" are different answers, and
+# collapsing them asserts a finding KDL never established.
+#
+# Lookup order mirrors the pod probe above rather than inventing a new one. The
+# chart names this ConfigMap "<release>-prometheus-server", so try that first;
+# the label fallbacks cover renamed installs. The previous selector required
+# app.kubernetes.io/name=k10, which is the label K10 puts on its OWN components
+# - the Prometheus subchart's objects carry name=prometheus, so a ConfigMap
+# could not satisfy both that label and a name containing "prometheus".
+PROM_CM_NAME=""
+for _prom_cm_try in \
+  "$($CLI -n "$NAMESPACE" get configmap "${K10_RELEASE}-prometheus-server" -o name 2>/dev/null | sed 's|.*/||')" \
+  "$($CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=$K10_RELEASE" -o name 2>/dev/null | sed 's|.*/||' | head -1)" \
+  "$($CLI -n "$NAMESPACE" get configmaps -l "app=prometheus" -o name 2>/dev/null | sed 's|.*/||' | head -1)" \
+  "$($CLI -n "$NAMESPACE" get configmaps -o name 2>/dev/null | sed 's|.*/||' | grep -i 'prometheus.*server' | head -1)"; do
+  # Accept only a plausible resource name: a CLI that errors or returns an
+  # unexpected payload must not end up quoted as the config source.
+  case "$_prom_cm_try" in
+    ""|*[!a-zA-Z0-9.-]*) continue ;;
+    *) PROM_CM_NAME="$_prom_cm_try"; break ;;
+  esac
+done
 
+PROM_YAML=""
 if [ -n "$PROM_CM_NAME" ]; then
-  # Extract prometheus.yml config from ConfigMap
   PROM_YAML=$($CLI -n "$NAMESPACE" get configmap "$PROM_CM_NAME" -o jsonpath='{.data.prometheus\.yml}' 2>/dev/null)
+fi
 
-  # Check for remote_write with actual entries (not empty array/map/null)
-  # Must have remote_write: followed by url: in next few lines
-  if echo "$PROM_YAML" | grep -q "remote_write:" && \
-     echo "$PROM_YAML" | grep -A 5 "remote_write:" | grep -q "url:"; then
-    PROM_REMOTE_WRITE_ENABLED="true"
-    debug "Prometheus remote write: ENABLED (from ConfigMap: $PROM_CM_NAME)"
-  else
-    PROM_REMOTE_WRITE_ENABLED="false"
-    debug "Prometheus remote write: DISABLED (from ConfigMap: $PROM_CM_NAME)"
-  fi
+if [ -z "$PROM_CM_NAME" ] || [ -z "$PROM_YAML" ]; then
+  PROM_REMOTE_WRITE_ENABLED="unknown"
+  debug "Prometheus remote write: UNKNOWN (config not readable; cm='$PROM_CM_NAME')"
+elif _ep "$PROM_YAML" | grep -v '^[[:space:]]*#' | grep -q '^[[:space:]]*remote_write:' &&
+     _ep "$PROM_YAML" | grep -v '^[[:space:]]*#' | sed -n '/^[[:space:]]*remote_write:/,/^[[:alpha:]]/p' | grep -q '[[:space:]]url:'; then
+  PROM_REMOTE_WRITE_ENABLED="true"
+  debug "Prometheus remote write: ENABLED (from ConfigMap: $PROM_CM_NAME)"
 else
   PROM_REMOTE_WRITE_ENABLED="false"
-  debug "Prometheus remote write: DISABLED (ConfigMap not found)"
+  debug "Prometheus remote write: NOT CONFIGURED (from ConfigMap: $PROM_CM_NAME)"
 fi
-PROM_REMOTE_WRITE_URL=""
 
 # --- Authentication ---
 AUTH_METHOD="none"
@@ -4368,13 +4365,14 @@ else
   BP_PRESETS_STATUS="NOT_USED"
 fi
 
-# Monitoring Assessment (includes Prometheus + Remote Write)
+# Monitoring Assessment
+# Remote write is reported alongside this (monitoring.prometheusRemoteWrite) but
+# deliberately does NOT change the verdict: it is an optional centralised-
+# monitoring integration, not a requirement for K10 monitoring to be working.
+# Folding it in downgraded every existing install from ENABLED to PARTIAL with
+# nothing changed on the cluster, which kdl-diff.sh scores as a regression.
 if [ "$PROMETHEUS_ENABLED" = "true" ]; then
-  if [ "$PROM_REMOTE_WRITE_ENABLED" = "true" ]; then
-    BP_MONITORING_STATUS="ENABLED"
-  else
-    BP_MONITORING_STATUS="PARTIAL"
-  fi
+  BP_MONITORING_STATUS="ENABLED"
 else
   BP_MONITORING_STATUS="NOT_ENABLED"
 fi
@@ -4793,7 +4791,9 @@ STORAGE_REPO_MAINTENANCE_RAW=$(cat "$TEMP_DIR/storagerepositories_raw.json" 2>/d
 
 # Extract repository names from raw list
 REPO_NAMES=$(_ep "$STORAGE_REPO_MAINTENANCE_RAW" | jq -r '.items[]?.metadata.name' 2>/dev/null)
-debug "Storage repository: Found $(echo "$REPO_NAMES" | grep -c . || echo 0) repositories"
+REPO_NAMES_COUNT=$(_ep "$REPO_NAMES" | grep -c . 2>/dev/null || true)
+[ -z "$REPO_NAMES_COUNT" ] && REPO_NAMES_COUNT=0
+debug "Storage repository: Found $REPO_NAMES_COUNT repositories"
 [ -n "$REPO_NAMES" ] && debug "First repo: $(echo "$REPO_NAMES" | head -1)"
 
 # Query details endpoint for each repository and build maintenance info
@@ -4802,6 +4802,13 @@ STORAGE_REPO_MAINTENANCE=$(
     echo "$REPO_NAMES" | while read -r REPO; do
       [ -z "$REPO" ] && continue
       $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/${NAMESPACE}/storagerepositories/${REPO}/details" 2>/dev/null | jq -c '
+        # RFC3339Nano tolerance: status.details.kopiaMeta is Kopia'"'"'s own struct
+        # passed through, not a metav1.Time, so Go emits fractional seconds
+        # whenever they are non-zero - per cluster, not per edge case. Without
+        # this, strptime errors inside the object constructor and jq emits
+        # NOTHING for the repo: it vanishes from the report with no warning.
+        def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
+        def ts_epoch: ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime;
         (.status.details.kopiaMeta.maintenanceRun.recentResults[0]) as $lastFullRun |
         {
           name: .metadata.name,
@@ -4809,10 +4816,11 @@ STORAGE_REPO_MAINTENANCE=$(
           profile: ((.metadata.labels // {})["k10.kasten.io/exportProfile"] // (.metadata.labels // {})["k10.kasten.io/policyName"] // "N/A"),
           contentType: (.status.contentType // "unknown"),
           disableMaintenance: (.spec.disableMaintenance // false),
-          lastFullMaintenanceTime: ($lastFullRun.completedTime // null),
+          lastFullMaintenanceTime: (($lastFullRun.completedTime // null) | ts_clean),
+          # scheduled -> completed, so it includes time queued, not just run time.
           lastFullMaintenanceDurationSeconds: (
             if (($lastFullRun.completedTime // null) != null) and (($lastFullRun.scheduledTime // null) != null) then
-              (($lastFullRun.completedTime | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) - ($lastFullRun.scheduledTime | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+              (try (($lastFullRun.completedTime | ts_epoch) - ($lastFullRun.scheduledTime | ts_epoch)) catch null)
             else
               null
             end
@@ -4828,10 +4836,16 @@ STORAGE_REPO_MAINTENANCE=$(
 STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   --arg threshold "$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS" \
   --arg now "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" '
+  # Same RFC3339Nano tolerance as the per-repo filter, and wrapped in try so a
+  # single unparseable timestamp degrades that one repo to "unknown age"
+  # instead of erroring out and emptying the entire array.
+  def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
   def days_ago($now_iso; $then_iso):
-    ($now_iso | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $now_ts |
-    ($then_iso | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $then_ts |
-    (($now_ts - $then_ts) / 86400 | floor);
+    (try (
+      ($now_iso | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $now_ts |
+      ($then_iso | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $then_ts |
+      (($now_ts - $then_ts) / 86400 | floor)
+    ) catch null);
 
   map(
     . + {
@@ -4841,6 +4855,10 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
         else
           -1
         end
+      ),
+      # true when a maintenance time exists but its age could not be computed.
+      maintenanceAgeUnknown: (
+        (.lastFullMaintenanceTime != null) and (days_ago($now; .lastFullMaintenanceTime) == null)
       ),
       lastFullMaintenanceDurationHuman: (
         if .lastFullMaintenanceDurationSeconds != null then
@@ -4865,7 +4883,11 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
           "DISABLED"
         elif .lastFullMaintenanceTime == null then
           "NEVER_RAN"
-        elif (if .lastFullMaintenanceTime != null then days_ago($now; .lastFullMaintenanceTime) else -1 end) > ($threshold | tonumber) then
+        elif (days_ago($now; .lastFullMaintenanceTime)) == null then
+          # Timestamp present but unparseable: we do not know the age, so we
+          # must not say OK. Unknown is not the same as fresh.
+          "UNKNOWN"
+        elif (days_ago($now; .lastFullMaintenanceTime)) > ($threshold | tonumber) then
           "AMBER"
         else
           "OK"
@@ -4880,24 +4902,41 @@ if ! _ep "$STORAGE_REPO_MAINTENANCE" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 STORAGE_REPO_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq 'length // 0')
+STORAGE_REPO_UNKNOWN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "UNKNOWN")] | length // 0')
 STORAGE_REPO_AMBER_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "AMBER")] | length // 0')
 STORAGE_REPO_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "NEVER_RAN")] | length // 0')
 STORAGE_REPO_DISABLED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "DISABLED")] | length // 0')
 
 [ -z "$STORAGE_REPO_COUNT" ] && STORAGE_REPO_COUNT=0
+[ -z "$STORAGE_REPO_UNKNOWN_COUNT" ] && STORAGE_REPO_UNKNOWN_COUNT=0
+# Repositories the cluster listed, before /details was queried. The gap between
+# this and STORAGE_REPO_COUNT is what distinguishes "no repositories exist" from
+# "we could not read their details" - RBAC denial, missing subresource, older
+# Kasten. Without it every failure renders as the confident, wrong statement
+# "not using exports or imports".
+STORAGE_REPO_LISTED=$(safe_int "$REPO_NAMES_COUNT")
 [ -z "$STORAGE_REPO_AMBER_COUNT" ] && STORAGE_REPO_AMBER_COUNT=0
 [ -z "$STORAGE_REPO_NEVER_RAN_COUNT" ] && STORAGE_REPO_NEVER_RAN_COUNT=0
 [ -z "$STORAGE_REPO_DISABLED_COUNT" ] && STORAGE_REPO_DISABLED_COUNT=0
 
-debug "Storage repositories: $STORAGE_REPO_COUNT total, $STORAGE_REPO_AMBER_COUNT amber (>$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days), $STORAGE_REPO_NEVER_RAN_COUNT never ran, $STORAGE_REPO_DISABLED_COUNT disabled"
+debug "Storage repositories: $STORAGE_REPO_LISTED listed, $STORAGE_REPO_COUNT with details, $STORAGE_REPO_UNKNOWN_COUNT unknown-age, $STORAGE_REPO_AMBER_COUNT amber (>$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days), $STORAGE_REPO_NEVER_RAN_COUNT never ran, $STORAGE_REPO_DISABLED_COUNT disabled"
 
 # Storage Repository Best Practice Assessment
-if [ "$STORAGE_REPO_COUNT" -eq 0 ]; then
+if [ "$STORAGE_REPO_COUNT" -eq 0 ] && [ "$STORAGE_REPO_LISTED" -gt 0 ]; then
+  # The cluster listed repositories but none of their details came back.
+  BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
+elif [ "$STORAGE_REPO_COUNT" -eq 0 ]; then
   BP_STORAGE_REPO_STATUS="NOT_CONFIGURED"
+elif [ "$STORAGE_REPO_COUNT" -lt "$STORAGE_REPO_LISTED" ]; then
+  # Some repositories were listed but never produced details - a partial read is
+  # not a clean result, and the missing ones are exactly the ones we cannot vouch for.
+  BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
 elif [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ] || [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
   BP_STORAGE_REPO_STATUS="PARTIAL"
 elif [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
   BP_STORAGE_REPO_STATUS="PARTIAL"
+elif [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
+  BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
 else
   BP_STORAGE_REPO_STATUS="OK"
 fi
@@ -5221,7 +5260,7 @@ if [ "$MODE" = "json" ]; then
     --slurpfile transformsets "$TEMP_DIR/transformsets.json" \
     --arg prometheusEnabled "$PROMETHEUS_ENABLED" \
     --arg promRemoteWriteEnabled "$PROM_REMOTE_WRITE_ENABLED" \
-    --arg promRemoteWriteUrl "$PROM_REMOTE_WRITE_URL" \
+    --arg promRemoteWriteSource "$PROM_CM_NAME" \
     --arg bpDr "$BP_DR_STATUS" \
     --arg bpImmutability "$BP_IMMUTABILITY_STATUS" \
     --arg bpPresets "$BP_PRESETS_STATUS" \
@@ -5465,6 +5504,8 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoAmberCount "$STORAGE_REPO_AMBER_COUNT" \
     --argjson storageRepoNeverRanCount "$STORAGE_REPO_NEVER_RAN_COUNT" \
     --argjson storageRepoDisabledCount "$STORAGE_REPO_DISABLED_COUNT" \
+    --argjson storageRepoUnknownCount "$STORAGE_REPO_UNKNOWN_COUNT" \
+    --argjson storageRepoListed "$STORAGE_REPO_LISTED" \
     "$JQ_SELECTOR_LIB$JQ_PROFILE_LIB"'
     ( $immutableProfiles[0] ) as $immutableProfiles |
     ( $restoreActionsRecent[0] ) as $restoreActionsRecent |
@@ -5614,8 +5655,11 @@ if [ "$MODE" = "json" ]; then
       monitoring: {
         prometheus: ($prometheusEnabled == "true"),
         prometheusRemoteWrite: {
-          enabled: ($promRemoteWriteEnabled == "true"),
-          url: $promRemoteWriteUrl
+          # null when the Prometheus config could not be read at all - that is
+          # not the same answer as "configured without remote_write".
+          enabled: (if $promRemoteWriteEnabled == "unknown" then null
+                    else ($promRemoteWriteEnabled == "true") end),
+          configSource: (if $promRemoteWriteSource == "" then null else $promRemoteWriteSource end)
         }
       },
 
@@ -6058,13 +6102,17 @@ if [ "$MODE" = "json" ]; then
       },
 
       storageRepositories: {
+        listed: $storageRepoListed,
         total: $storageRepoCount,
         amberCount: $storageRepoAmberCount,
         neverRanCount: $storageRepoNeverRanCount,
         disabledCount: $storageRepoDisabledCount,
+        ageUnknownCount: $storageRepoUnknownCount,
         maintenanceThresholdDays: 7,
         items: $storageRepoMaintenance,
-        note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. Amber status indicates last full maintenance run is older than 7 days."
+        note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. AMBER means the most recent maintenance run completed more than 7 days ago; UNKNOWN means a run was recorded but its timestamp could not be parsed, so its age is not known.",
+        readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten), and the best practice reports NOT_ASSESSED rather than a clean result.",
+        maintenanceTypeNote: "recentResults[0] is taken as the most recent maintenance run. Kasten does not expose a full/quick discriminator on this subresource, so a quick run cannot be told apart from a full one - treat the timestamp as last maintenance of any kind."
       },
 
       retentionAnalysis: {
@@ -6996,17 +7044,25 @@ fi
 
 ### Storage Repository Maintenance Status (NEW v2.4)
 printf "\n${COLOR_BOLD}[STORAGE] Repository Maintenance${COLOR_RESET} ${COLOR_CYAN}(NEW v2.4)${COLOR_RESET}\n"
-if [ "$STORAGE_REPO_COUNT" -eq 0 ]; then
+if [ "$STORAGE_REPO_COUNT" -eq 0 ] && [ "$STORAGE_REPO_LISTED" -gt 0 ]; then
+  printf "  ${COLOR_CYAN}[INFO]  $STORAGE_REPO_LISTED repository/repositories exist but none returned details${COLOR_RESET}\n"
+  printf "          Maintenance status NOT ASSESSED - the /details subresource was not readable\n"
+  printf "          (RBAC: repositories.kio.kasten.io storagerepositories/details, or an older Kasten)\n"
+elif [ "$STORAGE_REPO_COUNT" -eq 0 ]; then
   printf "  ${COLOR_CYAN}No Storage Repositories found${COLOR_RESET} (not using exports or imports)\n"
 else
   printf "  Total: $STORAGE_REPO_COUNT repository/repositories\n"
+  if [ "$STORAGE_REPO_COUNT" -lt "$STORAGE_REPO_LISTED" ]; then
+    printf "  ${COLOR_YELLOW}[WARN]  Only $STORAGE_REPO_COUNT of $STORAGE_REPO_LISTED listed repository/repositories returned details${COLOR_RESET} - the rest are not assessed\n"
+  fi
   _ep "$STORAGE_REPO_MAINTENANCE" | jq -r '
     .[] |
     "  - " + .name
       + " [\(.contentType)]"
       + " profile=" + .profile
       + (if .lastFullMaintenanceDurationHuman then " duration=" + .lastFullMaintenanceDurationHuman else "" end)
-      + (if .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
+      + (if .status == "UNKNOWN" then " [UNKNOWN_STATUS]"
+         elif .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
          elif .status == "DISABLED" then " [DISABLED_STATUS]"
          elif .status == "AMBER" then " [AMBER_STATUS - " + (.daysSinceLastMaintenance | tostring) + " days]"
          elif .status == "OK" then " [OK_STATUS - " + (.daysSinceLastMaintenance | tostring) + " days ago]"
@@ -7014,6 +7070,7 @@ else
          end)
   ' 2>/dev/null | while IFS= read -r line; do
     printf "%s\n" "$line" | sed \
+      -e "s/\[UNKNOWN_STATUS\]/${COLOR_CYAN}[AGE UNKNOWN]${COLOR_RESET}/" \
       -e "s/\[NEVER_RAN_STATUS\]/${COLOR_RED}[NEVER RAN]${COLOR_RESET}/" \
       -e "s/\[DISABLED_STATUS\]/${COLOR_YELLOW}[DISABLED]${COLOR_RESET}/" \
       -e "s/\[AMBER_STATUS/${COLOR_YELLOW}[AMBER${COLOR_RESET}/" \
@@ -7082,9 +7139,11 @@ printf "\n${COLOR_BOLD}[CHART] Monitoring${COLOR_RESET}\n"
 if [ "$PROMETHEUS_ENABLED" = "true" ]; then
   printf "  Prometheus: ${COLOR_GREEN}ENABLED${COLOR_RESET} ($PROMETHEUS_RUNNING pods running)\n"
   if [ "$PROM_REMOTE_WRITE_ENABLED" = "true" ]; then
-    printf "  Remote Write: ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+    printf "  Remote Write: ${COLOR_GREEN}ENABLED${COLOR_RESET} (from $PROM_CM_NAME)\n"
+  elif [ "$PROM_REMOTE_WRITE_ENABLED" = "false" ]; then
+    printf "  Remote Write: ${COLOR_CYAN}NOT CONFIGURED${COLOR_RESET} (optional - for shipping metrics off-cluster)\n"
   else
-    printf "  Remote Write: ${COLOR_YELLOW}DISABLED${COLOR_RESET}\n"
+    printf "  Remote Write: ${COLOR_CYAN}NOT ASSESSED${COLOR_RESET} (Prometheus config not readable)\n"
   fi
 else
   printf "  Prometheus: ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
@@ -7532,9 +7591,11 @@ fi
 
 # Monitoring
 if [ "$BP_MONITORING_STATUS" = "ENABLED" ]; then
-  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET} (Prometheus + Remote Write)\n"
-elif [ "$BP_MONITORING_STATUS" = "PARTIAL" ]; then
-  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Monitoring:           ${COLOR_YELLOW}PARTIAL${COLOR_RESET} (Prometheus without Remote Write)\n"
+  if [ "$PROM_REMOTE_WRITE_ENABLED" = "true" ]; then
+    printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET} (Prometheus + remote write)\n"
+  else
+    printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET} (Prometheus)\n"
+  fi
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Monitoring:           ${COLOR_YELLOW}NOT ENABLED${COLOR_RESET}\n"
 fi
@@ -7652,22 +7713,25 @@ fi
 
 # Storage repository maintenance (NEW v2.4)
 if [ "$BP_STORAGE_REPO_STATUS" = "OK" ]; then
-  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}HEALTHY${COLOR_RESET} ($STORAGE_REPO_COUNT repo(s) with regular full maintenance)\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}HEALTHY${COLOR_RESET} ($STORAGE_REPO_COUNT repo(s) maintained within $STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days)\n"
 elif [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ]; then
-  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET}"
-  if [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ]; then
-    printf " ($STORAGE_REPO_AMBER_COUNT stale, "
-  fi
+  _repo_bits=""
+  [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ] && _repo_bits="$STORAGE_REPO_AMBER_COUNT stale"
   if [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
-    printf "$STORAGE_REPO_NEVER_RAN_COUNT never ran"
-    if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
-      printf ", "
-    fi
+    [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
+    _repo_bits="$_repo_bits$STORAGE_REPO_NEVER_RAN_COUNT never ran"
   fi
   if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
-    printf "$STORAGE_REPO_DISABLED_COUNT disabled"
+    [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
+    _repo_bits="$_repo_bits$STORAGE_REPO_DISABLED_COUNT disabled"
   fi
-  printf ")\n"
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET} ($_repo_bits)\n"
+elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_ASSESSED" ]; then
+  if [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_UNKNOWN_COUNT repo(s) with an unreadable maintenance timestamp)\n"
+  else
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_COUNT of $STORAGE_REPO_LISTED listed repo(s) returned details - check RBAC for storagerepositories/details)\n"
+  fi
 elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_CONFIGURED" ]; then
   printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: Not using exports/imports\n"
 fi
