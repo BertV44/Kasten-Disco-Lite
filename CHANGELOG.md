@@ -3,6 +3,46 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+### Added
+- **Prometheus Remote Write Configuration.** KDL now reports whether Prometheus
+  ships metrics off-cluster, in JSON under `monitoring.prometheusRemoteWrite` as
+  `enabled` (`true` / `false` / `null`) and `configSource`. `null` means the
+  Prometheus config could not be read -- a different answer from "configured
+  without remote write", and not one the report is entitled to guess at. The
+  ConfigMap is located by the chart's `<release>-prometheus-server` name first,
+  then by the same label fallbacks the Prometheus pod probe already uses.
+  Endpoint URLs are not collected. Remote write is an optional integration, so
+  it is shown alongside the Monitoring best practice without changing its
+  verdict: making it a precondition would downgrade every existing install from
+  `ENABLED` to `PARTIAL` with nothing changed on the cluster, which
+  `kdl-diff.sh` scores as a regression.
+
+- **Storage Repository Maintenance Status.** KDL now queries the Kopia
+  StorageRepository objects in the K10 namespace to report maintenance status.
+  Each repository shows the last maintenance run and is marked `AMBER` when that
+  run completed more than 7 days ago, `NEVER_RAN` when there is none, `DISABLED`
+  when maintenance is turned off, and `UNKNOWN` when a run exists but its
+  timestamp could not be parsed. Reported in human output, in the HTML dashboard,
+  and in JSON under `storageRepositories` (`listed`, `total`, `amberCount`,
+  `neverRanCount`, `disabledCount`, `ageUnknownCount`, per-repository `items`).
+
+  `listed` and `total` are separate on purpose: the maintenance metrics live on
+  the `/details` subresource, and a repository that the cluster lists but whose
+  details cannot be read is *not* evidence that no repositories exist. When the
+  two differ, or when any age is unknown, the best practice reports
+  `NOT_ASSESSED` instead of a clean result. `kdl-rbac.yaml` gains a
+  `repositories.kio.kasten.io` rule covering `storagerepositories` and
+  `storagerepositories/details`; without it the check degrades to
+  `NOT_ASSESSED` rather than claiming the cluster does not use exports.
+
+  Timestamps are parsed with sub-second tolerance. `status.details.kopiaMeta` is
+  Kopia's own struct rather than a `metav1.Time`, so Go emits RFC3339Nano
+  whenever the fractional part is non-zero; a strict `%S` parse errors inside the
+  object constructor and jq then emits nothing for that repository, dropping it
+  from the report with no warning at all.
+
 ## [2.3.0] - 2026-09-15
 
 Adds one best practice: the shape of the storage K10 runs its *own* services on.

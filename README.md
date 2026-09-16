@@ -55,12 +55,37 @@ These join the existing v1.9 features:
 - **PolicyPresets** inventory
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
-- **Prometheus** monitoring status
-- **Best Practices compliance** summary (17 checks with severity levels)
+- **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
+- **Storage Repository Maintenance Status** with last-run tracking and 7-day staleness detection *(NEW v2.4)*
+- **Best Practices compliance** summary (18 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New in v2.4 (unreleased, on `main`)
+
+- **Prometheus Remote Write Detection** — KDL now reports whether Prometheus is
+  configured to ship metrics off-cluster. Reported under
+  `monitoring.prometheusRemoteWrite` as `enabled` (`true` / `false` / `null`)
+  and `configSource` (the ConfigMap the answer came from). `null` means the
+  Prometheus config could not be read, which is deliberately distinct from
+  "configured without remote write". Remote write is an optional integration,
+  so it is reported alongside the Monitoring best practice but does **not**
+  change its verdict. Endpoint URLs are not collected.
+
+- **Storage Repository Maintenance Status** — KDL now queries Kopia
+  StorageRepository objects in the K10 namespace to report on maintenance
+  status for export and import repositories. Repositories are marked as "Amber"
+  (review needed) if maintenance has not run in the last 7 days, which can
+  indicate performance degradation or capacity planning issues. Reports the last
+  maintenance run date, its scheduled-to-completion time, and disabled
+  maintenance configurations. Repositories the cluster listed but whose
+  `/details` subresource could not be read are counted separately and force
+  `NOT_ASSESSED` rather than being reported as absent. Useful for identifying
+  stale repositories that may need
+  manual intervention. Reported in human output, JSON under `storageRepositories`,
+  and in the HTML dashboard with color-coded status indicators.
 
 ## What's New in v2.3
 
@@ -352,7 +377,7 @@ echo "Regressions: $?"   # exit code = number of regressions
 31. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
 32. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
 33. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
-34. **Best Practices Compliance** — 17 checks with severity-coded indicators
+34. **Best Practices Compliance** — 18 checks with severity-coded indicators
 35. **Execution Time** — Elapsed time display
 
 ### JSON Output
@@ -374,20 +399,21 @@ New in v2.0:
 
 ---
 
-## Best Practices Compliance (17 checks)
+## Best Practices Compliance (18 checks)
 
 | Check                  | Severity | Good                                              | Bad                                                |
 |------------------------|----------|---------------------------------------------------|----------------------------------------------------|
 | Disaster Recovery      | Critical | KDR policy enabled with export                    | Not configured                                     |
 | Authentication         | Critical | OIDC, LDAP, OpenShift OAuth, etc.                 | Dashboard unauthenticated                          |
 | Immutability           | Warning  | At least 1 profile with protection period         | No immutable profiles                              |
-| Monitoring             | Warning  | Prometheus detected                               | No monitoring                                      |
+| Monitoring             | Warning  | Prometheus detected (remote write reported apart) | No monitoring                                      |
 | VM Protection          | Warning  | All VMs covered by policies                       | Unprotected VMs                                    |
 | Snapshot retention high| Warning  | No policy with snapshot retention > 7             | Source SC I/O impact risk                          |
 | Fast local recovery    | Warning  | All backup policies retain >= 1 snapshot          | Snapshot retention = 0 (no fast restore)           |
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
 | K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
+| Repository maintenance | Warning  | Export repos maintained within 7 days             | Stale (>7d), never run, or maintenance disabled     |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
 | Audit Logging          | Info     | SIEM logging enabled                              | Optional                                           |

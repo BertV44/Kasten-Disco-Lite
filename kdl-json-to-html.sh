@@ -296,7 +296,7 @@ def tunedBadge(val; dflt):
 
 # v2.1 redesign: severity map + findings tally for the verdict hero.
 def bpSevMap:
-  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","k10InfraVolumeAccessMode":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
+  {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","k10InfraVolumeAccessMode":"warn","storageRepositoryMaintenance":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
 def bpIsOk(v):
   (["CONFIGURED","IN_USE","ENABLED","COMPLETE","OK","VALID","COMPLIANT"] | index(v|tostring)) != null or (v == true);
 def bpFindings:
@@ -674,7 +674,7 @@ else "" end) + "
         <td><strong>Monitoring</strong></td>
         <td class=\"sev-optional\">Optional</td>
         <td>" + severityBadge("optional"; (.bestPractices.monitoring // "N/A")) + "</td>
-        <td>" + badge(.bestPractices.monitoring // "N/A") + "</td>
+        <td>" + badge(.bestPractices.monitoring // "N/A") + (if (.bestPractices.monitoring // "N/A") == "PARTIAL" then " (Remote Write not configured)" elif (.bestPractices.monitoring // "N/A") == "ENABLED" then " (Remote Write enabled)" else "" end) + "</td>
       </tr>
       <tr>
         <td><strong>Audit Logging</strong></td>
@@ -749,6 +749,28 @@ else "" end) + "
           (if ((.k10InfraVolumes.readWriteManyCount // 0) + (.k10InfraVolumes.sharedFilesystemCount // 0)) > 0 then
             " (" + ((.k10InfraVolumes.readWriteManyCount // 0) | tostring) + " RWX, "
                  + ((.k10InfraVolumes.sharedFilesystemCount // 0) | tostring) + " on shared filesystem)"
+          else "" end) + "</td>
+      </tr>"
+      else "" end) +
+      (if .bestPractices.storageRepositoryMaintenance then
+      "
+      <tr>
+        <td><strong>Storage Repository Maintenance</strong></td>
+        <td class=\"" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "sev-optional" else "sev-warning" end) + "\">" +
+          (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "Optional" else "Warning" end) + "</td>
+        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
+                 then severityBadge("optional"; "NOT_USED")
+                 else severityBadge("warning"; .bestPractices.storageRepositoryMaintenance) end) + "</td>
+        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
+                 then "<span class=\"badge info\">\u2014 not using exports</span>"
+                 else badge(.bestPractices.storageRepositoryMaintenance) end) +
+          (if ((.storageRepositories.amberCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
+            " (" +
+            ([
+              (if (.storageRepositories.amberCount // 0) > 0 then (.storageRepositories.amberCount | tostring) + " stale" else empty end),
+              (if (.storageRepositories.neverRanCount // 0) > 0 then (.storageRepositories.neverRanCount | tostring) + " never-ran" else empty end),
+              (if (.storageRepositories.disabledCount // 0) > 0 then (.storageRepositories.disabledCount | tostring) + " disabled" else empty end)
+            ] | join(", ")) + ")"
           else "" end) + "</td>
       </tr>"
       else "" end) +
@@ -1191,6 +1213,54 @@ else "" end) + "
   else "" end)
 + "
 
+<!-- Storage Repository Maintenance -->
+<h2>\uD83D\uDCBE Repository Maintenance</h2>
+     <p class=\"section-description\">Storage repositories require periodic full maintenance to optimize performance and detect corruption. Full maintenance runs include data verification, catalog cleanup, and garbage collection. Repositories should be maintained at least once every 7 days. <strong>Stale</strong> repositories (not maintained >7 days) and <strong>Disabled</strong> repositories require attention to maintain backup integrity and reliability.</p>"
++ (if .storageRepositories then
+    (if (.storageRepositories.total // 0) == 0 then
+      "<div class=\"info-box\">No Storage Repositories found (not using exports or imports)</div>"
+    else
+      "<div class=\"card\">
+        <div class=\"stat-row\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">" + ((.storageRepositories.total // 0) | tostring) + "</span></div>"
+        + (if (.storageRepositories.amberCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Stale (> 7 days)</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.amberCount // 0) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.neverRanCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Never Ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount // 0) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.disabledCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Disabled</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.disabledCount // 0) | tostring) + "</span></span></div>"
+          else "" end)
+      + "</div>
+      <table>
+        <thead><tr><th>Repository Name</th><th>Type</th><th>Profile</th><th>Status</th><th>Last Full Maintenance</th><th>Duration</th></tr></thead>
+        <tbody>" +
+      ([.storageRepositories.items[]? |
+        "<tr><td><code>" + (.name | @html) + "</code></td>" +
+        "<td>" + (.contentType | @html) + "</td>" +
+        "<td>" + (if .profile != "N/A" then (.profile | @html) else "\u2014" end) + "</td>" +
+        "<td>" + (
+          if .status == "DISABLED" then
+            "<span class=\"badge error\">Disabled</span>"
+          elif .status == "NEVER_RAN" then
+            "<span class=\"badge error\">Never Ran</span>"
+          elif .status == "AMBER" then
+            "<span class=\"badge warn\">Stale (" + (.daysSinceLastMaintenance | tostring) + "d)</span>"
+          else
+            "<span class=\"badge ok\">OK (" + (.daysSinceLastMaintenance | tostring) + "d)</span>"
+          end
+        ) + "</td>" +
+        "<td>" + (if .lastFullMaintenanceTime then (.lastFullMaintenanceTime | tostring | split("T")[0] + " " + split("T")[1] | split("Z")[0]) else "\u2014" end) + "</td>" +
+        "<td>" + (if .lastFullMaintenanceDurationHuman then .lastFullMaintenanceDurationHuman else "\u2014" end) + "</td></tr>"
+      ] | join("")) +
+      "</tbody>
+      </table>"
+    end)
+  else
+    "<div class=\"info-box\">Storage Repository data not available.</div>"
+  end)
++ "
+
 <!-- Orphaned RestorePoints -->
 <h2>\uD83D\uDDD1\uFE0F Orphaned RestorePoints</h2>"
 + (if .orphanedRestorePoints then
@@ -1322,6 +1392,7 @@ else "" end) + "
 <h2>\uD83D\uDCC8 Monitoring</h2>
 <div class=\"grid-2\">
   <div class=\"card\"><div class=\"stat-row\"><span class=\"stat-label\">Prometheus</span><span class=\"stat-value\">" + boolBadge(.monitoring.prometheus) + "</span></div></div>
+  <div class=\"card\"><div class=\"stat-row\"><span class=\"stat-label\">Remote Write</span><span class=\"stat-value\">" + boolBadge(.monitoring.prometheusRemoteWrite.enabled // false) + "</span></div></div>
 </div>
 
 <!-- Data Usage -->
