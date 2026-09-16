@@ -131,7 +131,32 @@ if ! jq -e . "$INPUT_JSON" >/dev/null 2>&1; then
   exit 1
 fi
 
-jq -r '
+# The render program below is ~145 KB. Passing it as a command-line argument
+# breaks on Linux: MAX_ARG_STRLEN caps a SINGLE argument at 128 KiB regardless
+# of how large ARG_MAX is, so jq never runs and execve reports "Argument list
+# too long". macOS has no equivalent per-argument cap, which is why this only
+# ever reproduced for Linux users. Writing the program to a file and using
+# `jq -f` removes the size ceiling entirely, so the report can keep growing.
+_jq_tmpdir=""
+for _cand in "${TMPDIR:-}" /tmp "$HOME" "$PWD"; do
+  [ -n "$_cand" ] || continue
+  [ -d "$_cand" ] || continue
+  if _jq_tmpdir=$(mktemp -d "$_cand/kdlhtml_XXXXXX" 2>/dev/null); then
+    break
+  fi
+  _jq_tmpdir=""
+done
+if [ -z "$_jq_tmpdir" ]; then
+  echo "ERROR: could not create a temporary directory for the render program." >&2
+  echo "  Tried: \$TMPDIR, /tmp, \$HOME, \$PWD - none was writable." >&2
+  exit 1
+fi
+trap 'rm -rf "$_jq_tmpdir"' EXIT
+trap 'rm -rf "$_jq_tmpdir"; exit 130' INT
+trap 'rm -rf "$_jq_tmpdir"; exit 143' TERM
+JQ_PROGRAM="$_jq_tmpdir/render.jq"
+
+cat > "$JQ_PROGRAM" <<'KDL_RENDER_JQ'
 def badge(v):
   if v == true or v == "VALID" or v == "ENABLED" or v == "IN_USE" or v == "COMPLIANT" or v == "CONFIGURED" or v == "COMPLETE" or v == "OK" then 
     "<span class=\"badge ok\">\u2713 " + (v | tostring | gsub("_"; " ")) + "</span>"
@@ -2254,7 +2279,9 @@ else "" end) + "
 
 </body>
 </html>"
-' "$INPUT_JSON" > "$OUTPUT_HTML"
+KDL_RENDER_JQ
+
+jq -rf "$JQ_PROGRAM" "$INPUT_JSON" > "$OUTPUT_HTML"
 
 echo "[OK] HTML report generated: $OUTPUT_HTML"
 echo "     Open with: open $OUTPUT_HTML (macOS) or xdg-open $OUTPUT_HTML (Linux)"
