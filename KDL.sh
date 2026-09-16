@@ -1037,10 +1037,15 @@ $CLI get clusterrolebindings -o json > "$TEMP_DIR/clusterrolebindings_raw.json" 
 $CLI -n "$NAMESPACE" get roles -o json > "$TEMP_DIR/roles_raw.json" 2>/dev/null &
 $CLI -n "$NAMESPACE" get rolebindings -o json > "$TEMP_DIR/rolebindings_raw.json" 2>/dev/null &
 # v2.4 additions: StorageRepository maintenance status (Kasten exports/imports)
-$CLI get storagerepositories.repositories.kio.kasten.io -n kasten-io -o json > "$TEMP_DIR/storagerepositories_raw.json" 2>/dev/null &
+$CLI get storagerepositories.repositories.kio.kasten.io -n "$NAMESPACE" -o json > "$TEMP_DIR/storagerepositories_raw.json" 2>/dev/null &
 wait
 
 debug "Parallel fetch complete"
+
+# Extract K10 Helm release name from k10-config ConfigMap labels (defaults to "k10" if not found)
+K10_RELEASE=$($CLI -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.metadata.labels["app.kubernetes.io/instance"] // "k10"' 2>/dev/null)
+[ -z "$K10_RELEASE" ] && K10_RELEASE="k10"
+debug "K10 Helm release name: $K10_RELEASE"
 
 ### -------------------------
 ### License info — multi-secret, type, duration, node reconciliation (#14)
@@ -2759,7 +2764,7 @@ debug "TransformSets: $TRANSFORMSET_COUNT"
 PROMETHEUS_RUNNING=$($CLI -n "$NAMESPACE" get pods -l "app=prometheus" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
 [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 if [ "$PROMETHEUS_RUNNING" -eq 0 ]; then
-  PROMETHEUS_RUNNING=$($CLI -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=k10" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
+  PROMETHEUS_RUNNING=$($CLI -n "$NAMESPACE" get pods -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=$K10_RELEASE" --field-selector=status.phase=Running --no-headers 2>/dev/null | wc -l | tr -d '[:space:]')
   [ -z "$PROMETHEUS_RUNNING" ] && PROMETHEUS_RUNNING=0
 fi
 
@@ -3713,7 +3718,7 @@ K10_CM_JSON=$($CLI -n "$NAMESPACE" get configmaps k10-config -o json 2>/dev/null
 
 # --- Prometheus Remote Write Configuration (NEW v2.4) ---
 # Check actual Prometheus ConfigMap for remote_write (works with/without helm values)
-PROM_CM_NAME=$($CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/instance=k10,app.kubernetes.io/name=k10" --no-headers 2>/dev/null | grep -i "prometheus" | awk '{print $1}' | head -1)
+PROM_CM_NAME=$($CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/instance=$K10_RELEASE,app.kubernetes.io/name=k10" --no-headers 2>/dev/null | grep -i "prometheus" | awk '{print $1}' | head -1)
 
 if [ -n "$PROM_CM_NAME" ]; then
   # Extract prometheus.yml config from ConfigMap
@@ -4784,17 +4789,19 @@ debug "K10 infra volumes ($K10_PVC_SOURCE, scope: $K10_PVC_SCOPE): $K10_PVC_TOTA
 STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS=7
 
 # Read raw StorageRepository list
-STORAGE_REPO_MAINTENANCE_RAW=$(safe_json "$(cat "$TEMP_DIR/storagerepositories_raw.json" 2>/dev/null)")
+STORAGE_REPO_MAINTENANCE_RAW=$(cat "$TEMP_DIR/storagerepositories_raw.json" 2>/dev/null)
 
 # Extract repository names from raw list
 REPO_NAMES=$(_ep "$STORAGE_REPO_MAINTENANCE_RAW" | jq -r '.items[]?.metadata.name' 2>/dev/null)
+debug "Storage repository: Found $(echo "$REPO_NAMES" | grep -c . || echo 0) repositories"
+[ -n "$REPO_NAMES" ] && debug "First repo: $(echo "$REPO_NAMES" | head -1)"
 
 # Query details endpoint for each repository and build maintenance info
 STORAGE_REPO_MAINTENANCE=$(
   (
     echo "$REPO_NAMES" | while read -r REPO; do
       [ -z "$REPO" ] && continue
-      $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/kasten-io/storagerepositories/${REPO}/details" 2>/dev/null | jq -c '
+      $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/${NAMESPACE}/storagerepositories/${REPO}/details" 2>/dev/null | jq -c '
         (.status.details.kopiaMeta.maintenanceRun.recentResults[0]) as $lastFullRun |
         {
           name: .metadata.name,
