@@ -4795,7 +4795,7 @@ STORAGE_REPO_MAINTENANCE=$(
     echo "$REPO_NAMES" | while read -r REPO; do
       [ -z "$REPO" ] && continue
       $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/kasten-io/storagerepositories/${REPO}/details" 2>/dev/null | jq -c '
-        (.status.details.kopiaMeta.maintenanceRun.recentResults[] | select(.type == "full")) as $lastFullRun |
+        (.status.details.kopiaMeta.maintenanceRun.recentResults[0]) as $lastFullRun |
         {
           name: .metadata.name,
           namespace: .metadata.namespace,
@@ -7663,30 +7663,6 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ]; then
   printf ")\n"
 elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_CONFIGURED" ]; then
   printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: Not using exports/imports\n"
-fi
-
-### Remediation Worklist (NEW v2.4)
-TOTAL_REMEDIATION_ITEMS=$(_ep "$STORAGE_REPO_REMEDIATION" | jq 'length // 0')
-TOTAL_REMEDIATION_ITEMS=$((TOTAL_REMEDIATION_ITEMS + $(_ep "$MONITORING_REMEDIATION" | jq 'length // 0')))
-
-if [ "$TOTAL_REMEDIATION_ITEMS" -gt 0 ]; then
-  printf "\n${COLOR_BOLD}[CHECKLIST] Remediation Worklist${COLOR_RESET}\n"
-
-  ITEM_NUM=1
-  # Storage repository remediation items
-  if [ "$(_ep "$STORAGE_REPO_REMEDIATION" | jq 'length // 0')" -gt 0 ]; then
-    _ep "$STORAGE_REPO_REMEDIATION" | jq -r '.[] | "\(.item_num). [\(.repo)] \(.issue)"' 2>/dev/null | while IFS= read -r line; do
-      printf "  ${COLOR_YELLOW}☐${COLOR_RESET} $line\n"
-    done
-    ITEM_NUM=$((_ITEM_NUM + $(_ep "$STORAGE_REPO_REMEDIATION" | jq 'length')))
-  fi
-
-  # Monitoring remediation items
-  if [ "$(_ep "$MONITORING_REMEDIATION" | jq 'length // 0')" -gt 0 ]; then
-    _ep "$MONITORING_REMEDIATION" | jq -r '.[] | "\(.issue)"' 2>/dev/null | while IFS= read -r line; do
-      printf "  ${COLOR_YELLOW}☐${COLOR_RESET} $line\n"
-    done
-  fi
 fi
 
 ELAPSED=$(($(date +%s) - START_TIME))
