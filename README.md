@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.3.0
+# Kasten Discovery Lite v2.4.0 (in progress)
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -55,12 +55,31 @@ These join the existing v1.9 features:
 - **PolicyPresets** inventory
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
-- **Prometheus** monitoring status
+- **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
+- **Storage Repository Maintenance Status** with last-run tracking and 7-day staleness detection *(NEW v2.4)*
 - **Best Practices compliance** summary (17 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New in v2.4
+
+- **Prometheus Remote Write Detection** — KDL now detects and reports Prometheus
+  remote write configuration status. When enabled, the endpoint URL is displayed
+  in both human-readable and JSON output (with basic auth credentials redacted
+  for security). Reported under `monitoring.prometheusRemoteWrite` in JSON with
+  `enabled` (boolean) and `url` (string) fields.
+
+- **Storage Repository Maintenance Status** — KDL now queries Kopia
+  StorageRepository objects in the kasten-io namespace to report on maintenance
+  status for export and import repositories. Repositories are marked as "Amber"
+  (review needed) if maintenance has not run in the last 7 days, which can
+  indicate performance degradation or capacity planning issues. Reports last
+  maintenance run date, successful vs failed status, and disabled maintenance
+  configurations. Useful for identifying stale repositories that may need
+  manual intervention. Reported in human output, JSON under `storageRepositories`,
+  and in the HTML dashboard with color-coded status indicators.
 
 ## What's New in v2.3
 

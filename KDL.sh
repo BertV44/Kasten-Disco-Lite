@@ -390,6 +390,27 @@ progress() {
   fi
 }
 
+# Format duration in seconds to human-readable format (e.g., "1m 47s")
+format_duration() {
+  local seconds=$1
+  if [ -z "$seconds" ] || [ "$seconds" -lt 0 ]; then
+    echo ""
+    return
+  fi
+
+  local hours=$((seconds / 3600))
+  local minutes=$(((seconds % 3600) / 60))
+  local secs=$((seconds % 60))
+
+  if [ "$hours" -gt 0 ]; then
+    printf "%dh %dm %ds" "$hours" "$minutes" "$secs"
+  elif [ "$minutes" -gt 0 ]; then
+    printf "%dm %ds" "$minutes" "$secs"
+  else
+    printf "%ds" "$secs"
+  fi
+}
+
 # Sanitize raw kubectl JSON: strip control chars, validate, fallback
 EMPTY_ITEMS='{"items":[]}'
 
@@ -1015,6 +1036,8 @@ $CLI get clusterroles -o json > "$TEMP_DIR/clusterroles_raw.json" 2>/dev/null &
 $CLI get clusterrolebindings -o json > "$TEMP_DIR/clusterrolebindings_raw.json" 2>/dev/null &
 $CLI -n "$NAMESPACE" get roles -o json > "$TEMP_DIR/roles_raw.json" 2>/dev/null &
 $CLI -n "$NAMESPACE" get rolebindings -o json > "$TEMP_DIR/rolebindings_raw.json" 2>/dev/null &
+# v2.4 additions: StorageRepository maintenance status (Kasten exports/imports)
+$CLI get storagerepositories.repositories.kio.kasten.io -n kasten-io -o json > "$TEMP_DIR/storagerepositories_raw.json" 2>/dev/null &
 wait
 
 debug "Parallel fetch complete"
@@ -3688,6 +3711,30 @@ helm_bool() {
 # k10-config ConfigMap (shared fallback source)
 K10_CM_JSON=$($CLI -n "$NAMESPACE" get configmaps k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
 
+# --- Prometheus Remote Write Configuration (NEW v2.4) ---
+# Check actual Prometheus ConfigMap for remote_write (works with/without helm values)
+PROM_CM_NAME=$($CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/instance=k10,app.kubernetes.io/name=k10" --no-headers 2>/dev/null | grep -i "prometheus" | awk '{print $1}' | head -1)
+
+if [ -n "$PROM_CM_NAME" ]; then
+  # Extract prometheus.yml config from ConfigMap
+  PROM_YAML=$($CLI -n "$NAMESPACE" get configmap "$PROM_CM_NAME" -o jsonpath='{.data.prometheus\.yml}' 2>/dev/null)
+
+  # Check for remote_write with actual entries (not empty array/map/null)
+  # Must have remote_write: followed by url: in next few lines
+  if echo "$PROM_YAML" | grep -q "remote_write:" && \
+     echo "$PROM_YAML" | grep -A 5 "remote_write:" | grep -q "url:"; then
+    PROM_REMOTE_WRITE_ENABLED="true"
+    debug "Prometheus remote write: ENABLED (from ConfigMap: $PROM_CM_NAME)"
+  else
+    PROM_REMOTE_WRITE_ENABLED="false"
+    debug "Prometheus remote write: DISABLED (from ConfigMap: $PROM_CM_NAME)"
+  fi
+else
+  PROM_REMOTE_WRITE_ENABLED="false"
+  debug "Prometheus remote write: DISABLED (ConfigMap not found)"
+fi
+PROM_REMOTE_WRITE_URL=""
+
 # --- Authentication ---
 AUTH_METHOD="none"
 AUTH_DETAILS=""
@@ -4316,9 +4363,13 @@ else
   BP_PRESETS_STATUS="NOT_USED"
 fi
 
-# Monitoring Assessment
+# Monitoring Assessment (includes Prometheus + Remote Write)
 if [ "$PROMETHEUS_ENABLED" = "true" ]; then
-  BP_MONITORING_STATUS="ENABLED"
+  if [ "$PROM_REMOTE_WRITE_ENABLED" = "true" ]; then
+    BP_MONITORING_STATUS="ENABLED"
+  else
+    BP_MONITORING_STATUS="PARTIAL"
+  fi
 else
   BP_MONITORING_STATUS="NOT_ENABLED"
 fi
@@ -4725,6 +4776,126 @@ fi
 debug "K10 infra volumes ($K10_PVC_SOURCE, scope: $K10_PVC_SCOPE): $K10_PVC_TOTAL assessed, $K10_PVC_EXCLUDED_COUNT excluded, RWX: $K10_PVC_RWX_COUNT, shared-fs: $K10_PVC_SHARED_FS_COUNT, unknown SC: $K10_PVC_UNKNOWN_SC_COUNT, unknown backend: $K10_PVC_UNKNOWN_BACKEND_COUNT -> $BP_K10_PVC_ACCESS_STATUS"
 
 ### -------------------------
+### Storage Repository Maintenance Status (NEW v2.4)
+### -------------------------
+# Query StorageRepository /details endpoint to get full maintenance info (not quick).
+# Reports last full maintenance completion time, duration, and interval.
+# Marks as Amber (review) if last full maintenance is older than 7 days.
+STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS=7
+
+# Read raw StorageRepository list
+STORAGE_REPO_MAINTENANCE_RAW=$(safe_json "$(cat "$TEMP_DIR/storagerepositories_raw.json" 2>/dev/null)")
+
+# Extract repository names from raw list
+REPO_NAMES=$(_ep "$STORAGE_REPO_MAINTENANCE_RAW" | jq -r '.items[]?.metadata.name' 2>/dev/null)
+
+# Query details endpoint for each repository and build maintenance info
+STORAGE_REPO_MAINTENANCE=$(
+  (
+    echo "$REPO_NAMES" | while read -r REPO; do
+      [ -z "$REPO" ] && continue
+      $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/kasten-io/storagerepositories/${REPO}/details" 2>/dev/null | jq -c '
+        (.status.details.kopiaMeta.maintenanceRun.recentResults[] | select(.type == "full")) as $lastFullRun |
+        {
+          name: .metadata.name,
+          namespace: .metadata.namespace,
+          profile: ((.metadata.labels // {})["k10.kasten.io/exportProfile"] // (.metadata.labels // {})["k10.kasten.io/policyName"] // "N/A"),
+          contentType: (.status.contentType // "unknown"),
+          disableMaintenance: (.spec.disableMaintenance // false),
+          lastFullMaintenanceTime: ($lastFullRun.completedTime // null),
+          lastFullMaintenanceDurationSeconds: (
+            if (($lastFullRun.completedTime // null) != null) and (($lastFullRun.scheduledTime // null) != null) then
+              (($lastFullRun.completedTime | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) - ($lastFullRun.scheduledTime | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+            else
+              null
+            end
+          ),
+          nextFullMaintenanceTime: (.status.details.kopiaMeta.maintenanceInfo.nextFullMaintenanceTime // null)
+        }
+      ' 2>/dev/null
+    done
+  ) | jq -s '.' 2>/dev/null
+) || STORAGE_REPO_MAINTENANCE='[]'
+
+# Now add status field based on days since last maintenance
+STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
+  --arg threshold "$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS" \
+  --arg now "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" '
+  def days_ago($now_iso; $then_iso):
+    ($now_iso | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $now_ts |
+    ($then_iso | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $then_ts |
+    (($now_ts - $then_ts) / 86400 | floor);
+
+  map(
+    . + {
+      daysSinceLastMaintenance: (
+        if .lastFullMaintenanceTime != null then
+          days_ago($now; .lastFullMaintenanceTime)
+        else
+          -1
+        end
+      ),
+      lastFullMaintenanceDurationHuman: (
+        if .lastFullMaintenanceDurationSeconds != null then
+          (
+            (.lastFullMaintenanceDurationSeconds / 3600 | floor) as $h |
+            ((.lastFullMaintenanceDurationSeconds % 3600) / 60 | floor) as $m |
+            (.lastFullMaintenanceDurationSeconds % 60) as $s |
+            if $h > 0 then
+              "\($h)h \($m)m \($s)s"
+            elif $m > 0 then
+              "\($m)m \($s)s"
+            else
+              "\($s)s"
+            end
+          )
+        else
+          null
+        end
+      ),
+      status: (
+        if (.disableMaintenance == true) then
+          "DISABLED"
+        elif .lastFullMaintenanceTime == null then
+          "NEVER_RAN"
+        elif (if .lastFullMaintenanceTime != null then days_ago($now; .lastFullMaintenanceTime) else -1 end) > ($threshold | tonumber) then
+          "AMBER"
+        else
+          "OK"
+        end
+      )
+    }
+  )
+' 2>/dev/null) || { _jq_fail "storage repository maintenance"; STORAGE_REPO_MAINTENANCE='[]'; }
+
+if ! _ep "$STORAGE_REPO_MAINTENANCE" | jq -e '.' >/dev/null 2>&1; then
+  STORAGE_REPO_MAINTENANCE='[]'
+fi
+
+STORAGE_REPO_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq 'length // 0')
+STORAGE_REPO_AMBER_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "AMBER")] | length // 0')
+STORAGE_REPO_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "NEVER_RAN")] | length // 0')
+STORAGE_REPO_DISABLED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "DISABLED")] | length // 0')
+
+[ -z "$STORAGE_REPO_COUNT" ] && STORAGE_REPO_COUNT=0
+[ -z "$STORAGE_REPO_AMBER_COUNT" ] && STORAGE_REPO_AMBER_COUNT=0
+[ -z "$STORAGE_REPO_NEVER_RAN_COUNT" ] && STORAGE_REPO_NEVER_RAN_COUNT=0
+[ -z "$STORAGE_REPO_DISABLED_COUNT" ] && STORAGE_REPO_DISABLED_COUNT=0
+
+debug "Storage repositories: $STORAGE_REPO_COUNT total, $STORAGE_REPO_AMBER_COUNT amber (>$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days), $STORAGE_REPO_NEVER_RAN_COUNT never ran, $STORAGE_REPO_DISABLED_COUNT disabled"
+
+# Storage Repository Best Practice Assessment
+if [ "$STORAGE_REPO_COUNT" -eq 0 ]; then
+  BP_STORAGE_REPO_STATUS="NOT_CONFIGURED"
+elif [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ] || [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
+  BP_STORAGE_REPO_STATUS="PARTIAL"
+elif [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
+  BP_STORAGE_REPO_STATUS="PARTIAL"
+else
+  BP_STORAGE_REPO_STATUS="OK"
+fi
+
+### -------------------------
 ### Ransomware Readiness Score (NEW v2.0 - patch 5/7) - F1
 ### -------------------------
 # Synthesises 8 security pillars into a 0-100 score and a letter grade.
@@ -4959,6 +5130,7 @@ printf '%s' "$MULTI_EXPORT_SAME_PROFILE" > "$TEMP_DIR/multiExportSameProfile.jso
 printf '%s' "$K10_INFRA_VOLUMES" > "$TEMP_DIR/k10InfraVolumes.json"
 printf '%s' "$K10_PVC_FINDINGS" > "$TEMP_DIR/k10InfraVolumeFindings.json"
 printf '%s' "$K10_PVC_EXCLUDED" > "$TEMP_DIR/k10InfraVolumesExcluded.json"
+printf '%s' "$STORAGE_REPO_MAINTENANCE" > "$TEMP_DIR/storageRepoMaintenance.json"
 _ep "$PRESETS_JSON" | jq -c '.items | map({name: .metadata.name, frequency: .spec.frequency, retention: .spec.retention})' > "$TEMP_DIR/presets.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/presets.json"
 jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, actions: ((.actions // .spec.actions // {}) | keys)})' "$BLUEPRINTS_FILE" > "$TEMP_DIR/blueprints.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/blueprints.json"
 jq -c '.items | map({name: .metadata.name, namespace: .metadata.namespace, blueprint: (.spec.blueprintRef.name // "N/A")})' "$BINDINGS_FILE" > "$TEMP_DIR/bindings.json" 2>/dev/null || echo '[]' > "$TEMP_DIR/bindings.json"
@@ -5041,6 +5213,8 @@ if [ "$MODE" = "json" ]; then
     --argjson transformsetCount "$TRANSFORMSET_COUNT" \
     --slurpfile transformsets "$TEMP_DIR/transformsets.json" \
     --arg prometheusEnabled "$PROMETHEUS_ENABLED" \
+    --arg promRemoteWriteEnabled "$PROM_REMOTE_WRITE_ENABLED" \
+    --arg promRemoteWriteUrl "$PROM_REMOTE_WRITE_URL" \
     --arg bpDr "$BP_DR_STATUS" \
     --arg bpImmutability "$BP_IMMUTABILITY_STATUS" \
     --arg bpPresets "$BP_PRESETS_STATUS" \
@@ -5263,6 +5437,7 @@ if [ "$MODE" = "json" ]; then
     --arg bpClusterScoped "$BP_CLUSTER_SCOPED_STATUS" \
     --arg bpNoExport "$BP_NO_EXPORT_STATUS" \
     --arg bpK10PvcAccess "$BP_K10_PVC_ACCESS_STATUS" \
+    --arg bpStorageRepo "$BP_STORAGE_REPO_STATUS" \
     --slurpfile k10InfraVolumes "$TEMP_DIR/k10InfraVolumes.json" \
     --slurpfile k10InfraVolumeFindings "$TEMP_DIR/k10InfraVolumeFindings.json" \
     --slurpfile k10InfraVolumesExcluded "$TEMP_DIR/k10InfraVolumesExcluded.json" \
@@ -5278,6 +5453,11 @@ if [ "$MODE" = "json" ]; then
     --argjson profileLocationCount "$PROFILE_LOCATION_COUNT" \
     --argjson profileInfraCount "$PROFILE_INFRA_COUNT" \
     --argjson profileUndeterminedCount "$PROFILE_UNDETERMINED_COUNT" \
+    --slurpfile storageRepoMaintenance "$TEMP_DIR/storageRepoMaintenance.json" \
+    --argjson storageRepoCount "$STORAGE_REPO_COUNT" \
+    --argjson storageRepoAmberCount "$STORAGE_REPO_AMBER_COUNT" \
+    --argjson storageRepoNeverRanCount "$STORAGE_REPO_NEVER_RAN_COUNT" \
+    --argjson storageRepoDisabledCount "$STORAGE_REPO_DISABLED_COUNT" \
     "$JQ_SELECTOR_LIB$JQ_PROFILE_LIB"'
     ( $immutableProfiles[0] ) as $immutableProfiles |
     ( $restoreActionsRecent[0] ) as $restoreActionsRecent |
@@ -5327,6 +5507,7 @@ if [ "$MODE" = "json" ]; then
     ( $k10InfraVolumes[0] // [] ) as $k10InfraVolumes |
     ( $k10InfraVolumeFindings[0] // [] ) as $k10InfraVolumeFindings |
     ( $k10InfraVolumesExcluded[0] // [] ) as $k10InfraVolumesExcluded |
+    ( $storageRepoMaintenance[0] // [] ) as $storageRepoMaintenance |
     ( $presets[0] ) as $presets |
     ( $blueprints[0] ) as $blueprints |
     ( $bindings[0] ) as $bindings |
@@ -5424,7 +5605,11 @@ if [ "$MODE" = "json" ]; then
       },
 
       monitoring: {
-        prometheus: ($prometheusEnabled == "true")
+        prometheus: ($prometheusEnabled == "true"),
+        prometheusRemoteWrite: {
+          enabled: ($promRemoteWriteEnabled == "true"),
+          url: $promRemoteWriteUrl
+        }
       },
 
       virtualization: {
@@ -5753,6 +5938,7 @@ if [ "$MODE" = "json" ]; then
         clusterScopedResources: $bpClusterScoped,
         policiesWithoutExport: $bpNoExport,
         k10InfraVolumeAccessMode: $bpK10PvcAccess,
+        storageRepositoryMaintenance: $bpStorageRepo,
         clusterScopedResourcesProtected: ($hasClusterScopedPolicy == "true")
       },
 
@@ -5862,6 +6048,16 @@ if [ "$MODE" = "json" ]; then
         excluded: $k10InfraVolumesExcluded,
         note: "Scoped to the PVCs the Kasten Helm chart creates for the K10 services (catalog, jobs, logging, metering, prometheus). Each is mounted by a single pod, so ReadWriteOnce on a block-backed StorageClass is recommended; ReadWriteMany and shared-filesystem backends add locking/permission overhead with no benefit, and have caused stale advisory locks on the catalog database across upgrades. PVCs referenced by a profile (FileStore export targets, which are shared on purpose) and any other PVC in the namespace are listed under excluded and are never flagged.",
         scopeNote: "scope=helm-release: identified by Helm ownership of the K10 release. scope=known-name: Helm labels were absent (operator install or stripped labels) and the canonical K10 PVC name list carried the scoping, which is weaker - verify the list against this deployment."
+      },
+
+      storageRepositories: {
+        total: $storageRepoCount,
+        amberCount: $storageRepoAmberCount,
+        neverRanCount: $storageRepoNeverRanCount,
+        disabledCount: $storageRepoDisabledCount,
+        maintenanceThresholdDays: 7,
+        items: $storageRepoMaintenance,
+        note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. Amber status indicates last full maintenance run is older than 7 days."
       },
 
       retentionAnalysis: {
@@ -6791,6 +6987,42 @@ if [ "$K10_PVC_EXCLUDED_COUNT" -gt 0 ] 2>/dev/null; then
   _ep "$K10_PVC_EXCLUDED" | jq -r '.[:10][] | "    - " + .name + "  [" + (if ((.accessModes // []) | length) == 0 then "unknown" else (.accessModes | join(",")) end) + "]  " + .reason' 2>/dev/null
 fi
 
+### Storage Repository Maintenance Status (NEW v2.4)
+printf "\n${COLOR_BOLD}[STORAGE] Repository Maintenance${COLOR_RESET} ${COLOR_CYAN}(NEW v2.4)${COLOR_RESET}\n"
+if [ "$STORAGE_REPO_COUNT" -eq 0 ]; then
+  printf "  ${COLOR_CYAN}No Storage Repositories found${COLOR_RESET} (not using exports or imports)\n"
+else
+  printf "  Total: $STORAGE_REPO_COUNT repository/repositories\n"
+  _ep "$STORAGE_REPO_MAINTENANCE" | jq -r '
+    .[] |
+    "  - " + .name
+      + " [\(.contentType)]"
+      + " profile=" + .profile
+      + (if .lastFullMaintenanceDurationHuman then " duration=" + .lastFullMaintenanceDurationHuman else "" end)
+      + (if .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
+         elif .status == "DISABLED" then " [DISABLED_STATUS]"
+         elif .status == "AMBER" then " [AMBER_STATUS - " + (.daysSinceLastMaintenance | tostring) + " days]"
+         elif .status == "OK" then " [OK_STATUS - " + (.daysSinceLastMaintenance | tostring) + " days ago]"
+         else " [" + .status + "]"
+         end)
+  ' 2>/dev/null | while IFS= read -r line; do
+    printf "%s\n" "$line" | sed \
+      -e "s/\[NEVER_RAN_STATUS\]/${COLOR_RED}[NEVER RAN]${COLOR_RESET}/" \
+      -e "s/\[DISABLED_STATUS\]/${COLOR_YELLOW}[DISABLED]${COLOR_RESET}/" \
+      -e "s/\[AMBER_STATUS/${COLOR_YELLOW}[AMBER${COLOR_RESET}/" \
+      -e "s/\[OK_STATUS/${COLOR_GREEN}[OK${COLOR_RESET}/"
+  done
+  if [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN]  $STORAGE_REPO_AMBER_COUNT repository/repositories with full maintenance last run >$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days ago${COLOR_RESET}\n"
+  fi
+  if [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_RED}[FAIL]  $STORAGE_REPO_NEVER_RAN_COUNT repository/repositories never had full maintenance run${COLOR_RESET}\n"
+  fi
+  if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[INFO]  $STORAGE_REPO_DISABLED_COUNT repository/repositories with full maintenance disabled${COLOR_RESET}\n"
+  fi
+fi
+
 ### Orphaned RestorePoints (NEW v1.5)
 printf "\n${COLOR_BOLD}[TRASH] Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 if [ "$ORPHANED_RP_STATUS" = "NOT_ASSESSED" ]; then
@@ -6842,6 +7074,11 @@ fi
 printf "\n${COLOR_BOLD}[CHART] Monitoring${COLOR_RESET}\n"
 if [ "$PROMETHEUS_ENABLED" = "true" ]; then
   printf "  Prometheus: ${COLOR_GREEN}ENABLED${COLOR_RESET} ($PROMETHEUS_RUNNING pods running)\n"
+  if [ "$PROM_REMOTE_WRITE_ENABLED" = "true" ]; then
+    printf "  Remote Write: ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+  else
+    printf "  Remote Write: ${COLOR_YELLOW}DISABLED${COLOR_RESET}\n"
+  fi
 else
   printf "  Prometheus: ${COLOR_YELLOW}NOT DETECTED${COLOR_RESET}\n"
 fi
@@ -7288,7 +7525,9 @@ fi
 
 # Monitoring
 if [ "$BP_MONITORING_STATUS" = "ENABLED" ]; then
-  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET}\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Monitoring:           ${COLOR_GREEN}ENABLED${COLOR_RESET} (Prometheus + Remote Write)\n"
+elif [ "$BP_MONITORING_STATUS" = "PARTIAL" ]; then
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Monitoring:           ${COLOR_YELLOW}PARTIAL${COLOR_RESET} (Prometheus without Remote Write)\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Monitoring:           ${COLOR_YELLOW}NOT ENABLED${COLOR_RESET}\n"
 fi
@@ -7402,6 +7641,52 @@ if [ "$BP_NO_EXPORT_STATUS" = "OK" ]; then
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Export coverage:      ${COLOR_YELLOW}$POLICIES_NO_EXPORT_COUNT policy/policies snapshot-only (no export)${COLOR_RESET}\n"
   _ep "$POLICIES_NO_EXPORT_LIST" | jq -r '.[:5][] | "      - " + .' 2>/dev/null
+fi
+
+# Storage repository maintenance (NEW v2.4)
+if [ "$BP_STORAGE_REPO_STATUS" = "OK" ]; then
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}HEALTHY${COLOR_RESET} ($STORAGE_REPO_COUNT repo(s) with regular full maintenance)\n"
+elif [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ]; then
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET}"
+  if [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ]; then
+    printf " ($STORAGE_REPO_AMBER_COUNT stale, "
+  fi
+  if [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
+    printf "$STORAGE_REPO_NEVER_RAN_COUNT never ran"
+    if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
+      printf ", "
+    fi
+  fi
+  if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
+    printf "$STORAGE_REPO_DISABLED_COUNT disabled"
+  fi
+  printf ")\n"
+elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_CONFIGURED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: Not using exports/imports\n"
+fi
+
+### Remediation Worklist (NEW v2.4)
+TOTAL_REMEDIATION_ITEMS=$(_ep "$STORAGE_REPO_REMEDIATION" | jq 'length // 0')
+TOTAL_REMEDIATION_ITEMS=$((TOTAL_REMEDIATION_ITEMS + $(_ep "$MONITORING_REMEDIATION" | jq 'length // 0')))
+
+if [ "$TOTAL_REMEDIATION_ITEMS" -gt 0 ]; then
+  printf "\n${COLOR_BOLD}[CHECKLIST] Remediation Worklist${COLOR_RESET}\n"
+
+  ITEM_NUM=1
+  # Storage repository remediation items
+  if [ "$(_ep "$STORAGE_REPO_REMEDIATION" | jq 'length // 0')" -gt 0 ]; then
+    _ep "$STORAGE_REPO_REMEDIATION" | jq -r '.[] | "\(.item_num). [\(.repo)] \(.issue)"' 2>/dev/null | while IFS= read -r line; do
+      printf "  ${COLOR_YELLOW}☐${COLOR_RESET} $line\n"
+    done
+    ITEM_NUM=$((_ITEM_NUM + $(_ep "$STORAGE_REPO_REMEDIATION" | jq 'length')))
+  fi
+
+  # Monitoring remediation items
+  if [ "$(_ep "$MONITORING_REMEDIATION" | jq 'length // 0')" -gt 0 ]; then
+    _ep "$MONITORING_REMEDIATION" | jq -r '.[] | "\(.issue)"' 2>/dev/null | while IFS= read -r line; do
+      printf "  ${COLOR_YELLOW}☐${COLOR_RESET} $line\n"
+    done
+  fi
 fi
 
 ELAPSED=$(($(date +%s) - START_TIME))

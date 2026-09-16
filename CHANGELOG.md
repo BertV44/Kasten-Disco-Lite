@@ -3,6 +3,25 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+### Added
+- **Prometheus Remote Write Configuration (NEW v2.4).** KDL now detects and reports
+  Prometheus remote write configuration status. When remote write is enabled, the
+  endpoint URL is displayed (with basic auth redacted for security). Reported in
+  JSON under `monitoring.prometheusRemoteWrite` with `enabled` and `url` fields.
+  Human output and HTML dashboard updated to show remote write status alongside
+  Prometheus availability.
+
+- **Storage Repository Maintenance Status (NEW v2.4).** KDL now queries Kopia
+  StorageRepository objects in the kasten-io namespace to report maintenance
+  status. Each repository shows the last maintenance run date and is marked as
+  "Amber" if maintenance has not run in the last 7 days, which can indicate
+  performance degradation risk. Repository status is reported in human output,
+  JSON under `storageRepositories` with total count, amber/failed/disabled counts,
+  and detailed maintenance history per repository, and in the HTML dashboard.
+  Repositories with `disableMaintenance: true` are noted separately.
+
 ## [2.3.0] - 2026-09-15
 
 Adds one best practice: the shape of the storage K10 runs its *own* services on.
