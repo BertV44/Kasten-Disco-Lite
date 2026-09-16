@@ -1184,7 +1184,8 @@ else "" end) + "
 + "
 
 <!-- Storage Repository Maintenance -->
-<h2>\uD83D\uDCBE Repository Maintenance</h2>"
+<h2>\uD83D\uDCBE Repository Maintenance</h2>
+     <p class=\"section-description\">Storage repositories require periodic full maintenance to optimize performance and detect corruption. Full maintenance runs include data verification, catalog cleanup, and garbage collection. Repositories should be maintained at least once every 7 days. <strong>Stale</strong> repositories (not maintained >7 days) and <strong>Disabled</strong> repositories require attention to maintain backup integrity and reliability.</p>"
 + (if .storageRepositories then
     (if (.storageRepositories.total // 0) == 0 then
       "<div class=\"info-box\">No Storage Repositories found (not using exports or imports)</div>"
