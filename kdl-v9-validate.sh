@@ -110,6 +110,26 @@ a "repo maintenance: zero repositories is not asserted when some were listed" \
    else ((.storageRepositories.total // 0) > 0)
         or ((.storageRepositories.listed // 0) == 0)
         or (.bestPractices.storageRepositoryMaintenance == "NOT_ASSESSED") end'
+# The assertions above compare verdicts against counters. v2.4.0 shipped a
+# defect they could not see: the rendered Monitoring row said "Remote Write
+# enabled" while the JSON beside it said enabled:false, because the row inferred
+# the state from a verdict that had stopped depending on it. Rendered text has to
+# be checked against the data too.
+# Bind before testing: `.enabled // "absent"` fires on false as well as null,
+# which is the same trap this assertion exists to catch.
+_rw=$(jq -r '(.monitoring.prometheusRemoteWrite.enabled) as $v
+             | if $v == true then "true" elif $v == false then "false" else "unset" end' "$J" 2>/dev/null)
+# The phrase appears only in the Monitoring best-practice row, so no windowing
+# is needed - and windowed greps hit BSD grep's 255-repetition cap anyway.
+_row=$(grep -o 'Remote Write \(enabled\|not configured\|not assessed\)' "$OUT/disco.html" | head -1)
+case "$_rw|$_row" in
+  "true|Remote Write enabled"*)            ok "HTML remote-write text matches the data ($_rw)" ;;
+  "false|Remote Write not configured"*)    ok "HTML remote-write text matches the data ($_rw)" ;;
+  "unset|Remote Write not assessed"*)      ok "HTML remote-write text matches the data ($_rw)" ;;
+  *"|")                                    skip "no Monitoring remote-write text rendered" ;;
+  *) bad "HTML says '$_row' but JSON says enabled=$_rw" ;;
+esac
+
 a "every bestPractices key is scored by the HTML severity map" \
   --slurpfile sev "$OUT/bpsev.json" \
   '[(.bestPractices | del(.clusterScopedResourcesProtected) | keys[])]
