@@ -261,7 +261,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="2.4.0"
+KDL_VERSION="2.4.1"
 
 # Highest Kasten release this build was validated against (#kasten-v9).
 # Surfaced in the report so a newer cluster is flagged as "not yet validated"

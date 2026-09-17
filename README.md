@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.4.0
+# Kasten Discovery Lite v2.4.1
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -710,7 +710,10 @@ Key portability measures:
 
 ## Version History
 
-- **v2.4.0** (Current) — **Monitoring reach and repository maintenance**
+- **v2.4.1** (Current) — fixes the Best Practices Monitoring row, which read
+  "Remote Write enabled" regardless of the actual state.
+
+- **v2.4.0** — **Monitoring reach and repository maintenance**
   - `storageRepositories` section and `storageRepositoryMaintenance` best
     practice: flags Kopia export/import repositories that have not been
     maintained in 7 days, never ran, or have maintenance disabled.

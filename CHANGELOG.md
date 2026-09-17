@@ -3,6 +3,18 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.4.1] - 2026-09-17
+
+### Fixed
+- The Best Practices **Monitoring** row read `(Remote Write enabled)` whatever
+  the actual state, because it inferred remote write from the `monitoring`
+  verdict after that verdict stopped depending on it. It now reads
+  `monitoring.prometheusRemoteWrite.enabled` directly, and distinguishes all
+  three states -- enabled, not configured, and not assessed when the Prometheus
+  config could not be read or the report predates the field. Reported by
+  Jaiganesh J K with the fix in #46; the null state needed one correction on top
+  (`// false` swallows null as well as false, so "not assessed" was unreachable).
+
 ## [2.4.0] - 2026-09-17
 
 Two new signals, both contributed by Jaiganesh J K (#46): whether Prometheus
