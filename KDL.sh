@@ -3700,34 +3700,34 @@ K10_CM_JSON=$($CLI -n "$NAMESPACE" get configmaps k10-config -o json 2>/dev/null
 # the config" and "the config has no remote_write" are different answers, and
 # collapsing them asserts a finding KDL never established.
 #
-# Lookup order mirrors the pod probe above rather than inventing a new one. The
-# chart names this ConfigMap "<release>-prometheus-server", so try that first;
-# the label fallbacks cover renamed installs. The previous selector required
-# app.kubernetes.io/name=k10, which is the label K10 puts on its OWN components
-# - the Prometheus subchart's objects carry name=prometheus, so a ConfigMap
-# could not satisfy both that label and a name containing "prometheus".
+# Finding the ConfigMap by name or by label is guesswork - K10 9.0.5 templates
+# the Prometheus config from the k10 chart itself (k10-k10-prometheus-config,
+# labelled app.kubernetes.io/name=k10), while the prometheus subchart labels its
+# own objects name=prometheus. Rather than bet on either, collect candidates
+# from both label shapes plus the name, and keep the first that actually carries
+# a prometheus.yml key. The data key is the real test.
 PROM_CM_NAME=""
-for _prom_cm_try in \
-  "$($CLI -n "$NAMESPACE" get configmap "${K10_RELEASE}-prometheus-server" -o name 2>/dev/null | sed 's|.*/||')" \
-  "$($CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=$K10_RELEASE" -o name 2>/dev/null | sed 's|.*/||' | head -1)" \
-  "$($CLI -n "$NAMESPACE" get configmaps -l "app=prometheus" -o name 2>/dev/null | sed 's|.*/||' | head -1)" \
-  "$($CLI -n "$NAMESPACE" get configmaps -o name 2>/dev/null | sed 's|.*/||' | grep -i 'prometheus.*server' | head -1)"; do
-  # Accept only a plausible resource name: a CLI that errors or returns an
-  # unexpected payload must not end up quoted as the config source.
-  case "$_prom_cm_try" in
-    ""|*[!a-zA-Z0-9.-]*) continue ;;
-    *) PROM_CM_NAME="$_prom_cm_try"; break ;;
-  esac
+PROM_YAML=""
+for _cm in $(
+  {
+    $CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/instance=$K10_RELEASE,app.kubernetes.io/name=k10" -o name 2>/dev/null
+    $CLI -n "$NAMESPACE" get configmaps -l "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=$K10_RELEASE" -o name 2>/dev/null
+    $CLI -n "$NAMESPACE" get configmaps -l "app=prometheus" -o name 2>/dev/null
+    $CLI -n "$NAMESPACE" get configmaps -o name 2>/dev/null
+  } | sed 's|.*/||' | grep -i prometheus | awk '!seen[$0]++'
+); do
+  case "$_cm" in ""|*[!a-zA-Z0-9.-]*) continue ;; esac
+  _yaml=$($CLI -n "$NAMESPACE" get configmap "$_cm" -o jsonpath='{.data.prometheus\.yml}' 2>/dev/null)
+  if [ -n "$_yaml" ]; then
+    PROM_CM_NAME="$_cm"
+    PROM_YAML="$_yaml"
+    break
+  fi
 done
 
-PROM_YAML=""
-if [ -n "$PROM_CM_NAME" ]; then
-  PROM_YAML=$($CLI -n "$NAMESPACE" get configmap "$PROM_CM_NAME" -o jsonpath='{.data.prometheus\.yml}' 2>/dev/null)
-fi
-
-if [ -z "$PROM_CM_NAME" ] || [ -z "$PROM_YAML" ]; then
+if [ -z "$PROM_CM_NAME" ]; then
   PROM_REMOTE_WRITE_ENABLED="unknown"
-  debug "Prometheus remote write: UNKNOWN (config not readable; cm='$PROM_CM_NAME')"
+  debug "Prometheus remote write: UNKNOWN (no ConfigMap carrying prometheus.yml)"
 elif _ep "$PROM_YAML" | grep -v '^[[:space:]]*#' | grep -q '^[[:space:]]*remote_write:' &&
      _ep "$PROM_YAML" | grep -v '^[[:space:]]*#' | sed -n '/^[[:space:]]*remote_write:/,/^[[:alpha:]]/p' | grep -q '[[:space:]]url:'; then
   PROM_REMOTE_WRITE_ENABLED="true"
@@ -3736,7 +3736,6 @@ else
   PROM_REMOTE_WRITE_ENABLED="false"
   debug "Prometheus remote write: NOT CONFIGURED (from ConfigMap: $PROM_CM_NAME)"
 fi
-
 # --- Authentication ---
 AUTH_METHOD="none"
 AUTH_DETAILS=""
