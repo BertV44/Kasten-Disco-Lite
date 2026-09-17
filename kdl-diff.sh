@@ -928,7 +928,7 @@ print_section "Best Practices"
 # storageRepositoryMaintenance after that;
 # both are absent on older baselines, which the "-n both values" guard below
 # already skips.
-BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging k10InfraVolumeAccessMode storageRepositoryMaintenance"
+BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging k10InfraVolumeAccessMode storageRepositoryMaintenance residualSnapshots"
 BP_CHANGES_JSON="["
 BP_FIRST=true
 BP_CHANGED=false

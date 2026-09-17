@@ -3,6 +3,23 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+### Added
+- **Residual Snapshots** section and a 19th best-practice check
+  (`residualSnapshots`): local Kasten snapshots left in the cluster past a
+  7-day threshold. Reads `RestorePointContent` (cluster-scoped, aggregated
+  APIService), tells local snapshots from exports by the **presence** of the
+  `k10.kasten.io/exportProfile` label, and splits what it finds into the subset
+  no live policy retains -- taken on demand, policy since deleted, application
+  gone -- and the subset a GFS policy legitimately keeps. Age past the threshold
+  alone is reported as context and never as a finding. Unknown ages, an
+  unreadable policy list and a failed `restorepointcontents` list all resolve to
+  `NOT_ASSESSED` rather than to a clean zero. Requires `list` on
+  `restorepointcontents.apps.kio.kasten.io` (added to `kdl-rbac.yaml`).
+  Field model, export discriminator and timestamp handling taken from
+  k10-snapshot-janitor, lab-validated on Kasten 9.0.3.
+
 ## [2.4.1] - 2026-09-17
 
 ### Fixed

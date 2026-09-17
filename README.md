@@ -57,7 +57,7 @@ These join the existing v1.9 features:
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
 - **Storage Repository Maintenance Status** with last-run tracking and 7-day staleness detection *(NEW v2.4)*
-- **Best Practices compliance** summary (18 checks with severity levels)
+- **Best Practices compliance** summary (19 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
@@ -367,18 +367,19 @@ echo "Regressions: $?"   # exit code = number of regressions
 21. **Catalog** — PVC name, size, free space percentage with alerts
 22. **K10 Infrastructure Volumes** — Access mode, StorageClass, provisioner and backend shape of the Helm-created K10 PVCs, plus the namespace PVCs deliberately left out of scope (FileStore profile targets)
 23. **Orphaned RestorePoints** — Count and details
-24. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
-25. **Transform Sets** — Count and transform details
-26. **Monitoring** — Prometheus status
-27. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
-28. **K10 Configuration** — Security, dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
-29. **K10 RBAC Inventory** *(NEW v2.0)* — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, unique subjects (Users, Groups, ServiceAccounts), wildcard role flags
-30. **Policy Coverage Summary** — App policies targeting all namespaces
-31. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
-32. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
-33. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
-34. **Best Practices Compliance** — 18 checks with severity-coded indicators
-35. **Execution Time** — Elapsed time display
+24. **Residual Snapshots** *(NEW v2.5)* — Local Kasten snapshots (RestorePointContents) past a 7-day threshold, split into the subset no live policy retains (on demand, policy deleted, application gone) and the subset a GFS policy legitimately keeps
+25. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
+26. **Transform Sets** — Count and transform details
+27. **Monitoring** — Prometheus status
+28. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
+29. **K10 Configuration** — Security, dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
+30. **K10 RBAC Inventory** *(NEW v2.0)* — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, unique subjects (Users, Groups, ServiceAccounts), wildcard role flags
+31. **Policy Coverage Summary** — App policies targeting all namespaces
+32. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
+33. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
+34. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
+35. **Best Practices Compliance** — 19 checks with severity-coded indicators
+36. **Execution Time** — Elapsed time display
 
 ### JSON Output
 
@@ -399,7 +400,7 @@ New in v2.0:
 
 ---
 
-## Best Practices Compliance (18 checks)
+## Best Practices Compliance (19 checks)
 
 | Check                  | Severity | Good                                              | Bad                                                |
 |------------------------|----------|---------------------------------------------------|----------------------------------------------------|
@@ -414,6 +415,7 @@ New in v2.0:
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
 | K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
 | Repository maintenance | Warning  | Export repos maintained within 7 days             | Stale (>7d), never run, or maintenance disabled     |
+| Residual snapshots     | Warning  | No local snapshot past 7 days that no policy retains | On-demand, policy-deleted or unbound snapshots left behind |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
 | Audit Logging          | Info     | SIEM logging enabled                              | Optional                                           |
@@ -421,6 +423,48 @@ New in v2.0:
 | Namespace Protection   | Info     | All app namespaces covered                        | Gaps detected                                      |
 | Kanister Blueprints    | Info     | Blueprints configured                             | Optional                                           |
 | Cluster-scoped         | Info     | At least one policy with `includeClusterResources`| Optional                                           |
+
+### Residual snapshots — why age alone is not the finding
+
+The check reads `RestorePointContent` objects, not `RestorePoint` ones. The RPC
+carries the actual snapshot artifacts; a RestorePoint is the catalog entry that
+points at one, and removing it releases nothing. The resource is cluster-scoped
+and served by the **aggregated APIService** (`v1alpha1.apps.kio.kasten.io`),
+not by a CRD — so `get crd restorepointcontents.apps.kio.kasten.io` fails on a
+perfectly healthy install and is never used as a presence probe.
+
+Local snapshots are told apart from exports by the **presence** of the
+`k10.kasten.io/exportProfile` label, never by its value: Kubernetes allows an
+empty label value, and an export is still an export. Exported restore points are
+out of scope here — they sit in an export repository under its own retention,
+which is what *Repository maintenance* covers.
+
+A snapshot older than 7 days is **not** a finding by itself: a GFS policy
+legitimately retains monthly and yearly points. The verdict therefore keys on
+the subset that no live policy retains —
+
+| Bucket | Meaning |
+|---|---|
+| `on-demand` | No `policyName` label: taken by hand, so no retention will ever reclaim it |
+| `policy-deleted` | Names a policy absent from a **non-empty** policy list |
+| `unbound` | `status.state = Unbound`: the application is gone |
+| `policy-retained` | Past the threshold but a live policy retains it — reported as context, never as a finding |
+| `policy-unverifiable` | Names a policy that could not be checked because the policy list was empty or unreadable — never reported as deleted |
+
+Reported sizes come from `status.physicalSizeBytes`, which is absent on plenty
+of clusters. Absent, non-numeric and negative all count as **unknown**, never as
+a zero, and the total is never presented as reclaimable space: what the storage
+layer reports back varies by CSI driver. A snapshot whose reference timestamp
+(`status.actionTime` → `status.scheduledTime` → `metadata.creationTimestamp`)
+carries a numeric UTC offset is left with an unknown age rather than converted
+by hand — a wrong conversion would age it past the threshold and manufacture a
+finding. Unknown ages and unverifiable policies both gate the verdict to
+`NOT_ASSESSED`; they are not merely printed beside an `OK`.
+
+KDL only counts these objects. Retiring them is what
+[k10-snapshot-janitor](https://github.com/BertV44/k10-snapshot-janitor) does,
+and the field model, the export discriminator and the timestamp handling here
+are taken from it.
 
 ### K10 infrastructure volumes — why RWO on block storage
 
@@ -608,6 +652,11 @@ rules:
   verbs: ["get", "list"]
 - apiGroups: ["storage.k8s.io"]
   resources: ["storageclasses", "csidrivers"]
+  verbs: ["get", "list"]
+- apiGroups: ["apps.kio.kasten.io"]
+  # Cluster-scoped, served by the aggregated APIService rather than a CRD.
+  # Without it the Residual Snapshots section reports NOT_ASSESSED, not zero.
+  resources: ["restorepointcontents"]
   verbs: ["get", "list"]
 - apiGroups: ["cr.kanister.io"]
   resources: ["blueprints"]

@@ -148,6 +148,13 @@ rules:
   - apiGroups: ["apps.kio.kasten.io"]
     resources:
       - restorepoints
+      # restorepointcontents carry the actual snapshot artifacts and are what
+      # the residual-snapshot section counts. CLUSTER-SCOPED, and served by the
+      # aggregated APIService (v1alpha1.apps.kio.kasten.io ->
+      # kasten-io/aggregatedapis-svc) rather than by a CRD, so it is granted
+      # here in Part A and cannot be covered by the namespaced Role. Without
+      # it KDL reports residual snapshots as NOT_ASSESSED, never as zero.
+      - restorepointcontents
     verbs: ["get", "list"]
   - apiGroups: ["repositories.kio.kasten.io"]
     resources:
