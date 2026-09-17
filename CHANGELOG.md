@@ -37,6 +37,12 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   `storagerepositories/details`; without it the check degrades to
   `NOT_ASSESSED` rather than claiming the cluster does not use exports.
 
+  `recentResults[0]` is the most recent run -- verified descending across all
+  nine repositories of a live Kasten 9.0.5 cluster, which the staleness verdict
+  depends on and nothing in the payload states. The entries carry no full/quick
+  discriminator, but they arrive one per day against a configured full interval
+  of 24h and a quick interval of 1h, so they are full runs.
+
   Timestamps are parsed with sub-second tolerance. `status.details.kopiaMeta` is
   Kopia's own struct rather than a `metav1.Time`, so Go emits RFC3339Nano
   whenever the fractional part is non-zero; a strict `%S` parse errors inside the

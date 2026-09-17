@@ -6111,7 +6111,7 @@ if [ "$MODE" = "json" ]; then
         items: $storageRepoMaintenance,
         note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. AMBER means the most recent maintenance run completed more than 7 days ago; UNKNOWN means a run was recorded but its timestamp could not be parsed, so its age is not known.",
         readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten), and the best practice reports NOT_ASSESSED rather than a clean result.",
-        maintenanceTypeNote: "recentResults[0] is taken as the most recent maintenance run. Kasten does not expose a full/quick discriminator on this subresource, so a quick run cannot be told apart from a full one - treat the timestamp as last maintenance of any kind."
+        maintenanceTypeNote: "recentResults[0] is the most recent run: verified descending on all 9 repositories of a live Kasten 9.0.5 cluster. The entries carry no full/quick discriminator, but they are spaced one per day against a configured full interval of 24h and a quick interval of 1h (maintenanceInfo.full.interval / .quick.interval), and quick runs would produce roughly 24x more entries than observed - so recentResults holds full runs. runsTotal exceeds the number of entries kept, so the list is truncated to the most recent."
       },
 
       retentionAnalysis: {
