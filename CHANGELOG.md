@@ -12,8 +12,15 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   APIService), tells local snapshots from exports by the **presence** of the
   `k10.kasten.io/exportProfile` label, and splits what it finds into the subset
   no live policy retains -- taken on demand, policy since deleted, application
-  gone -- and the subset a GFS policy legitimately keeps. Age past the threshold
-  alone is reported as context and never as a finding. Unknown ages, an
+  gone, or ranked past everything the owning policy retention can hold -- and the
+  subset a GFS policy legitimately keeps. Age past the threshold alone is
+  reported as context and never as a finding, and neither is a live policy taken
+  as proof of retention: each snapshot is ranked among those of the same
+  application and policy, newest first, against the sum of the declared
+  retention values (`.spec.retention`, else the largest
+  `.spec.actions[].snapshotRetention`). Found on the lab cluster, where three
+  22-day-old snapshots of a live `retention: {daily: 2}` policy were being filed
+  as legitimately retained. Unknown ages, an
   unreadable policy list and a failed `restorepointcontents` list all resolve to
   `NOT_ASSESSED` rather than to a clean zero. Requires `list` on
   `restorepointcontents.apps.kio.kasten.io` (added to `kdl-rbac.yaml`).

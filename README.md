@@ -440,16 +440,33 @@ out of scope here — they sit in an export repository under its own retention,
 which is what *Repository maintenance* covers.
 
 A snapshot older than 7 days is **not** a finding by itself: a GFS policy
-legitimately retains monthly and yearly points. The verdict therefore keys on
-the subset that no live policy retains —
+legitimately retains monthly and yearly points. And a *live* policy is not proof
+of retention either — that is the trap a mere existence check falls into. On the
+validation cluster, three 22-day-old local snapshots belonged to a live policy
+declaring `retention: {daily: 2}` while two newer points existed, so nothing in
+that window could be keeping them.
+
+Each snapshot is therefore **ranked** among the local snapshots of the same
+application *and* policy, newest first, and counted as residual only when its
+rank is at or past everything the declared retention could hold. The retention
+total is the **sum** of the numeric retention values, which overstates what is
+kept (one restore point can serve as both the daily and the weekly), so the test
+under-flags rather than over-flags. Snapshot retention is read from
+`.spec.retention`, falling back to the **largest** `.spec.actions[].snapshotRetention`
+— the largest, not the first, since a policy can carry several actions and the
+widest window retains the most.
+
+The verdict keys on the subset that nothing retains —
 
 | Bucket | Meaning |
 |---|---|
 | `on-demand` | No `policyName` label: taken by hand, so no retention will ever reclaim it |
 | `policy-deleted` | Names a policy absent from a **non-empty** policy list |
 | `unbound` | `status.state = Unbound`: the application is gone |
-| `policy-retained` | Past the threshold but a live policy retains it — reported as context, never as a finding |
+| `policy-over-retention` | Policy alive, but the snapshot is ranked at or past everything its declared retention could hold — newer points have taken every slot |
+| `policy-retained` | Past the threshold and still within what the policy retains — reported as context, never as a finding |
 | `policy-unverifiable` | Names a policy that could not be checked because the policy list was empty or unreadable — never reported as deleted |
+| `policy-retention-unknown` | Live policy declaring no snapshot retention at all — the window is unknown, so neither retained nor residual |
 
 Reported sizes come from `status.physicalSizeBytes`, which is absent on plenty
 of clusters. Absent, non-numeric and negative all count as **unknown**, never as
@@ -459,7 +476,10 @@ layer reports back varies by CSI driver. A snapshot whose reference timestamp
 carries a numeric UTC offset is left with an unknown age rather than converted
 by hand — a wrong conversion would age it past the threshold and manufacture a
 finding. Unknown ages and unverifiable policies both gate the verdict to
-`NOT_ASSESSED`; they are not merely printed beside an `OK`.
+`NOT_ASSESSED`; they are not merely printed beside an `OK`. A policy that
+declares no snapshot retention at all does the same: whether Kasten then keeps
+nothing or keeps everything is not something a read-only script can establish,
+so it is reported rather than guessed.
 
 KDL only counts these objects. Retiring them is what
 [k10-snapshot-janitor](https://github.com/BertV44/k10-snapshot-janitor) does,

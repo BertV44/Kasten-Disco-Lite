@@ -2687,9 +2687,26 @@ debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT (status: $ORPHANED_RP_STATUS, 
 # AGE PAST THE THRESHOLD IS NOT, BY ITSELF, A FINDING. A GFS policy legitimately
 # retains monthly and yearly points, so "older than 7 days" describes plenty of
 # correctly-managed snapshots. Only snapshots that no live policy retains are
-# residue. The verdict therefore keys on that unretained subset -- no policy at
-# all, policy since deleted, application gone -- and never on the raw age count,
-# which is reported alongside it as context.
+# residue, and the verdict keys on that subset rather than on the raw age count.
+#
+# "The policy still exists" is NOT the same as "the policy retains this
+# snapshot", which is the trap a mere existence check falls into: on the
+# validation cluster, three 22-day-old local snapshots belonged to a live policy
+# declaring retention {daily: 2} while two newer points existed, so nothing in
+# that window could be keeping them -- and an existence check filed them under
+# "expected with GFS retention". Each snapshot is therefore RANKED among the
+# local snapshots of the same application AND policy, newest first, and counted
+# as residue only when its rank is at or beyond everything the declared
+# retention could possibly hold. The retention total is the SUM of the numeric
+# retention values, which OVERSTATES what is kept (one restore point can serve
+# as both the daily and the weekly), so the test under-flags rather than over-
+# flags. Snapshot retention is read from .spec.retention, falling back to the
+# largest .spec.actions[].snapshotRetention -- the largest, not the first, since
+# a policy can carry several actions and the widest window retains the most.
+# A policy that declares NO snapshot retention at all yields an unknown window,
+# never a finding and never a clean pass: whether Kasten then keeps nothing or
+# keeps everything is not something this script can establish, so it reports
+# NOT_ASSESSED.
 #
 # Field model, timestamp handling and the export discriminator are taken from
 # k10-snapshot-janitor (github.com/BertV44/k10-snapshot-janitor), lab-validated
@@ -2705,8 +2722,10 @@ RESIDUAL_SNAP_UNRETAINED_COUNT=0
 RESIDUAL_SNAP_ONDEMAND_COUNT=0
 RESIDUAL_SNAP_POLICY_DELETED_COUNT=0
 RESIDUAL_SNAP_UNBOUND_COUNT=0
+RESIDUAL_SNAP_OVER_RETENTION_COUNT=0
 RESIDUAL_SNAP_RETAINED_COUNT=0
 RESIDUAL_SNAP_UNVERIFIABLE_COUNT=0
+RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT=0
 RESIDUAL_SNAP_UNKNOWN_AGE_COUNT=0
 RESIDUAL_SNAP_OLDEST_DAYS=-1
 RESIDUAL_SNAP_BYTES=0
@@ -2720,10 +2739,35 @@ if [ ! -f "$TEMP_DIR/rpc_read.ok" ]; then
   warn "RestorePointContents could not be listed (RBAC on 'restorepointcontents' or aggregated API unavailable)."
   warn "Residual snapshots are reported as not assessed, not as zero. See kdl-rbac.yaml."
 else
+  # policyName -> how many local snapshots its declared retention could hold.
+  # `declared` is carried separately from `total`, because a total of 0 from an
+  # explicit {daily: 0} means "keeps none" while a total of 0 from an absent
+  # retention block means "we do not know" - opposite conclusions.
+  _ep "$POLICIES_JSON" | jq -c '
+    [ (.items // [])[]?
+      | . as $p
+      | ( ($p.spec.retention // {}) | to_entries | map(.value) | map(select(type == "number")) ) as $top
+      | ( [ ($p.spec.actions // [])[]?
+            | (.snapshotRetention // {}) | to_entries | map(.value) | map(select(type == "number"))
+            | select(length > 0) | add ] ) as $actionSums
+      | {
+          key: (($p.metadata.name // "") | tostring),
+          value: (
+            if ($top | length) > 0 then { declared: true, total: ($top | add) }
+            elif ($actionSums | length) > 0 then { declared: true, total: ($actionSums | max) }
+            else { declared: false, total: 0 }
+            end
+          )
+        }
+    ] | from_entries
+  ' > "$TEMP_DIR/residual_retention.json" 2>/dev/null || printf '%s' '{}' > "$TEMP_DIR/residual_retention.json"
+  [ -s "$TEMP_DIR/residual_retention.json" ] || printf '%s' '{}' > "$TEMP_DIR/residual_retention.json"
+
   # One pass over the inventory: it can hold tens of thousands of objects, so
   # every counter comes out of a single jq run and `items` is capped below.
   RESIDUAL_SNAP_SUMMARY=$(cat "$TEMP_DIR/rpc_raw.json" 2>/dev/null | jq -c \
     --slurpfile policies "$TEMP_DIR/orp_policies.json" \
+    --slurpfile retention "$TEMP_DIR/residual_retention.json" \
     --argjson threshold "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" '
     def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else null end;
     # Strips fractional seconds before a Z and nothing else, so a numeric offset
@@ -2734,6 +2778,7 @@ else
     def ts_epoch: (try (ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch null);
 
     ( $policies[0] // [] ) as $policyNames |
+    ( $retention[0] // {} ) as $retentionMap |
     ( now ) as $now |
     ( .items // [] ) as $all |
     [ $all[]?
@@ -2751,6 +2796,8 @@ else
           appType: (($l["k10.kasten.io/appType"] // "namespace") | tostring),
           policyName: $policyName,
           refTime: ($refTime | ts_clean),
+          # Kept for the per-application ranking below, stripped from `items`.
+          refEpoch: $refEpoch,
           ageDays: (if $refEpoch == null then null else (($now - $refEpoch) / 86400 | floor) end),
           # Absent, null, non-numeric and negative are all UNKNOWN, never a real
           # zero: physicalSizeBytes was absent from every object of the janitor
@@ -2766,8 +2813,35 @@ else
             elif ($policyNames | index($policyName)) != null then "active"
             else "deleted"
             end
+          ),
+          # Bound explicitly rather than with `//`: `declared` is a BOOLEAN, and
+          # `a // b` fires on false exactly as it does on null, so `// false`
+          # would make "declared: false" and "policy absent" indistinguishable.
+          retentionDeclared: (
+            ( if $policyName == "" then null else $retentionMap[$policyName] end ) as $ret |
+            if $ret == null then false else $ret.declared end
+          ),
+          retentionTotal: (
+            ( if $policyName == "" then null else $retentionMap[$policyName] end ) as $ret |
+            if $ret == null then 0 else $ret.total end
           )
         }
+    ] as $snaps0 |
+    # Rank each snapshot among the local snapshots of the SAME application and
+    # policy, newest first. Per application AND policy, not per application
+    # alone: one namespace can be covered by two policies, each with its own
+    # retention window. Only snapshots with a known age are ranked; an unknown
+    # age already forces NOT_ASSESSED, so it cannot silently shift a rank into
+    # a finding.
+    ( [ $snaps0[] | select(.refEpoch != null) ]
+      | group_by([.appNamespace, .appName, .policyName])
+      | map( sort_by(.refEpoch) | reverse | to_entries | map(.value + {rank: .key}) )
+      | flatten
+      | map({key: .name, value: .rank})
+      | from_entries ) as $rankMap |
+    [ $snaps0[]
+      | . as $s
+      | . + { rank: (if ($rankMap[$s.name]) == null then -1 else $rankMap[$s.name] end) }
       | .beyond = (.ageDays != null and .ageDays > $threshold)
       | .reason = (
           if .ageDays == null then "unknown-age"
@@ -2776,13 +2850,20 @@ else
           elif .policyState == "deleted" then "policy-deleted"
           elif .state == "Unbound" then "unbound"
           elif .policyState == "unknown" then "policy-unverifiable"
+          # No declared snapshot retention: the window is unknown, so this is
+          # neither a finding nor a pass.
+          elif (.retentionDeclared | not) then "policy-retention-unknown"
+          # Ranked at or past everything the declared retention could hold:
+          # newer points have taken every slot, so nothing retains this one.
+          elif (.rank >= 0 and .rank >= .retentionTotal) then "policy-over-retention"
           else "policy-retained"
           end
         )
     ] as $snaps |
     ( [ $snaps[] | select(.beyond) ] ) as $residual |
     # The actionable subset: nothing alive retains these.
-    ( [ $residual[] | select(.reason as $r | ["on-demand","policy-deleted","unbound"] | index($r) != null) ] ) as $unretained |
+    ( ["on-demand","policy-deleted","unbound","policy-over-retention"] ) as $unretainedReasons |
+    ( [ $residual[] | select(.reason as $r | $unretainedReasons | index($r) != null) ] ) as $unretained |
     {
       listed: ($all | length),
       localSnapshots: ($snaps | length),
@@ -2791,8 +2872,12 @@ else
       onDemand: ([ $residual[] | select(.reason == "on-demand") ] | length),
       policyDeleted: ([ $residual[] | select(.reason == "policy-deleted") ] | length),
       unbound: ([ $residual[] | select(.reason == "unbound") ] | length),
+      # Ranked past everything the declared retention could hold: residue.
+      policyOverRetention: ([ $residual[] | select(.reason == "policy-over-retention") ] | length),
       policyRetained: ([ $residual[] | select(.reason == "policy-retained") ] | length),
       policyUnverifiable: ([ $residual[] | select(.reason == "policy-unverifiable") ] | length),
+      # Policy alive but declaring no snapshot retention: window unknown.
+      policyRetentionUnknown: ([ $residual[] | select(.reason == "policy-retention-unknown") ] | length),
       unknownAge: ([ $snaps[] | select(.reason == "unknown-age") ] | length),
       oldestDays: (if ($residual | length) == 0 then -1 else ([ $residual[].ageDays ] | max) end),
       # Sum of the sizes that ARE known, with the unknowns counted beside it. A
@@ -2805,10 +2890,12 @@ else
       # counters above stay exact. Unretained first, then oldest first.
       items: (
                ( $unretained | sort_by(.ageDays) | reverse )
-               + ( [ $residual[] | select(.reason as $r | ["on-demand","policy-deleted","unbound"] | index($r) == null) ]
+               + ( [ $residual[] | select(.reason as $r | $unretainedReasons | index($r) == null) ]
                    | sort_by(.ageDays) | reverse )
              )
-             | map(del(.beyond, .policyState))
+             # rank and retentionTotal are kept: together they are the evidence
+             # for a policy-over-retention verdict, so the report can show it.
+             | map(del(.beyond, .policyState, .refEpoch, .retentionDeclared))
              | .[0:25]
     }
   ' 2>/dev/null) || RESIDUAL_SNAP_SUMMARY=""
@@ -2821,8 +2908,10 @@ else
     RESIDUAL_SNAP_ONDEMAND_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.onDemand // 0')")
     RESIDUAL_SNAP_POLICY_DELETED_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.policyDeleted // 0')")
     RESIDUAL_SNAP_UNBOUND_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.unbound // 0')")
+    RESIDUAL_SNAP_OVER_RETENTION_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.policyOverRetention // 0')")
     RESIDUAL_SNAP_RETAINED_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.policyRetained // 0')")
     RESIDUAL_SNAP_UNVERIFIABLE_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.policyUnverifiable // 0')")
+    RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.policyRetentionUnknown // 0')")
     RESIDUAL_SNAP_UNKNOWN_AGE_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.unknownAge // 0')")
     RESIDUAL_SNAP_SIZE_UNKNOWN_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.sizeUnknown // 0')")
     RESIDUAL_SNAP_BYTES=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.bytes // 0')")
@@ -2836,7 +2925,7 @@ else
   fi
 fi
 
-debug "Residual snapshots: $RESIDUAL_SNAP_LISTED RPC listed, $RESIDUAL_SNAP_LOCAL_COUNT local, $RESIDUAL_SNAP_COUNT beyond ${RESIDUAL_SNAPSHOT_THRESHOLD_DAYS}d ($RESIDUAL_SNAP_UNRETAINED_COUNT unretained: $RESIDUAL_SNAP_ONDEMAND_COUNT on-demand, $RESIDUAL_SNAP_POLICY_DELETED_COUNT policy-deleted, $RESIDUAL_SNAP_UNBOUND_COUNT unbound), $RESIDUAL_SNAP_RETAINED_COUNT policy-retained, $RESIDUAL_SNAP_UNVERIFIABLE_COUNT unverifiable, $RESIDUAL_SNAP_UNKNOWN_AGE_COUNT unknown-age, status: $RESIDUAL_SNAP_STATUS"
+debug "Residual snapshots: $RESIDUAL_SNAP_LISTED RPC listed, $RESIDUAL_SNAP_LOCAL_COUNT local, $RESIDUAL_SNAP_COUNT beyond ${RESIDUAL_SNAPSHOT_THRESHOLD_DAYS}d ($RESIDUAL_SNAP_UNRETAINED_COUNT unretained: $RESIDUAL_SNAP_ONDEMAND_COUNT on-demand, $RESIDUAL_SNAP_POLICY_DELETED_COUNT policy-deleted, $RESIDUAL_SNAP_UNBOUND_COUNT unbound, $RESIDUAL_SNAP_OVER_RETENTION_COUNT over-retention), $RESIDUAL_SNAP_RETAINED_COUNT policy-retained, $RESIDUAL_SNAP_UNVERIFIABLE_COUNT unverifiable, $RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT retention-unknown, $RESIDUAL_SNAP_UNKNOWN_AGE_COUNT unknown-age, status: $RESIDUAL_SNAP_STATUS"
 
 # Residual Snapshots Best Practice Assessment.
 # Order matters: a real finding outranks an incomplete read, and an incomplete
@@ -2846,10 +2935,11 @@ if [ "$RESIDUAL_SNAP_STATUS" = "NOT_ASSESSED" ]; then
   BP_RESIDUAL_SNAPSHOTS_STATUS="NOT_ASSESSED"
 elif [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ]; then
   BP_RESIDUAL_SNAPSHOTS_STATUS="PARTIAL"
-elif [ "$RESIDUAL_SNAP_UNKNOWN_AGE_COUNT" -gt 0 ] || [ "$RESIDUAL_SNAP_UNVERIFIABLE_COUNT" -gt 0 ]; then
-  # At least one snapshot whose age or whose owning policy we could not
-  # establish. Unknown is not the same as clean, so the counter gates the
-  # verdict instead of only being printed next to it.
+elif [ "$RESIDUAL_SNAP_UNKNOWN_AGE_COUNT" -gt 0 ] || [ "$RESIDUAL_SNAP_UNVERIFIABLE_COUNT" -gt 0 ] \
+     || [ "$RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT" -gt 0 ]; then
+  # At least one snapshot whose age, whose owning policy, or whose retention
+  # window we could not establish. Unknown is not the same as clean, so each
+  # counter gates the verdict instead of only being printed next to it.
   BP_RESIDUAL_SNAPSHOTS_STATUS="NOT_ASSESSED"
 else
   BP_RESIDUAL_SNAPSHOTS_STATUS="OK"
@@ -5549,8 +5639,10 @@ if [ "$MODE" = "json" ]; then
     --argjson residualSnapOnDemand "$RESIDUAL_SNAP_ONDEMAND_COUNT" \
     --argjson residualSnapPolicyDeleted "$RESIDUAL_SNAP_POLICY_DELETED_COUNT" \
     --argjson residualSnapUnbound "$RESIDUAL_SNAP_UNBOUND_COUNT" \
+    --argjson residualSnapOverRetention "$RESIDUAL_SNAP_OVER_RETENTION_COUNT" \
     --argjson residualSnapRetained "$RESIDUAL_SNAP_RETAINED_COUNT" \
     --argjson residualSnapUnverifiable "$RESIDUAL_SNAP_UNVERIFIABLE_COUNT" \
+    --argjson residualSnapRetentionUnknown "$RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT" \
     --argjson residualSnapUnknownAge "$RESIDUAL_SNAP_UNKNOWN_AGE_COUNT" \
     --argjson residualSnapOldestDays "$RESIDUAL_SNAP_OLDEST_DAYS" \
     --argjson residualSnapBytes "$RESIDUAL_SNAP_BYTES" \
@@ -6046,10 +6138,17 @@ if [ "$MODE" = "json" ]; then
           onDemand: $residualSnapOnDemand,
           policyDeleted: $residualSnapPolicyDeleted,
           unbound: $residualSnapUnbound,
+          # Ranked at or past everything the declared snapshot
+          # retention could hold, while newer points exist for the same
+          # application: nothing retains these.
+          policyOverRetention: $residualSnapOverRetention,
           policyRetained: $residualSnapRetained,
           # Carry a policy name that could NOT be checked, because the policy
           # list came back empty or unreadable. Never reported as deleted.
-          policyUnverifiable: $residualSnapUnverifiable
+          policyUnverifiable: $residualSnapUnverifiable,
+          # Live policy that declares no snapshot retention at all: the window
+          # is unknown, so these are neither a finding nor a pass.
+          policyRetentionUnknown: $residualSnapRetentionUnknown
         },
         # Local snapshots whose reference timestamp is absent or unparsable (a
         # numeric UTC offset is deliberately left unparsed rather than
@@ -7375,7 +7474,7 @@ else
   printf "  RestorePointContents listed: $RESIDUAL_SNAP_LISTED ($RESIDUAL_SNAP_LOCAL_COUNT local snapshot(s))\n"
   if [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}[WARN]  $RESIDUAL_SNAP_UNRETAINED_COUNT residual snapshot(s) no live policy retains${COLOR_RESET}\n"
-    printf "  ${COLOR_CYAN}    on demand: $RESIDUAL_SNAP_ONDEMAND_COUNT | policy deleted: $RESIDUAL_SNAP_POLICY_DELETED_COUNT | application gone: $RESIDUAL_SNAP_UNBOUND_COUNT${COLOR_RESET}\n"
+    printf "  ${COLOR_CYAN}    on demand: $RESIDUAL_SNAP_ONDEMAND_COUNT | policy deleted: $RESIDUAL_SNAP_POLICY_DELETED_COUNT | application gone: $RESIDUAL_SNAP_UNBOUND_COUNT | past declared retention: $RESIDUAL_SNAP_OVER_RETENTION_COUNT${COLOR_RESET}\n"
     _ep "$RESIDUAL_SNAPSHOTS" | jq -r '.[:5][] | "    - \(.name) [\(if .appNamespace == "" then "unknown" else .appNamespace end)] \(.ageDays)d (\(.reason))"' 2>/dev/null
   elif [ "$RESIDUAL_SNAP_LOCAL_COUNT" -eq 0 ]; then
     printf "  ${COLOR_GREEN}[OK] No local snapshots in the catalog${COLOR_RESET}\n"
@@ -7389,6 +7488,9 @@ else
   fi
   if [ "$RESIDUAL_SNAP_UNVERIFIABLE_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_UNVERIFIABLE_COUNT carry a policy name that could not be checked (policy list empty or unreadable)${COLOR_RESET}\n"
+  fi
+  if [ "$RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT belong to a policy declaring no snapshot retention (window unknown)${COLOR_RESET}\n"
   fi
   if [ "$RESIDUAL_SNAP_UNKNOWN_AGE_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_UNKNOWN_AGE_COUNT with an absent or unparsable timestamp (age unknown, not counted either way)${COLOR_RESET}\n"

@@ -787,8 +787,8 @@ else "" end) + "
           (if (.residualSnapshots.unretained // 0) > 0 then
             " (" + ((.residualSnapshots.unretained) | tostring) + " unretained past "
                  + ((.residualSnapshots.thresholdDays // 7) | tostring) + "d)"
-          elif ((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0)) > 0 then
-            " (" + (((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0)) | tostring)
+          elif ((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) > 0 then
+            " (" + (((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) | tostring)
                  + " snapshot(s) could not be assessed)"
           else "" end) + "</td>
       </tr>"
@@ -1317,7 +1317,7 @@ else "" end) + "
 + (if .residualSnapshots then
     "<p class=\"section-description\">Local Kasten snapshots &mdash; <code>RestorePointContent</code> objects with no <code>k10.kasten.io/exportProfile</code> label &mdash; still present past "
       + ((.residualSnapshots.thresholdDays // 7) | tostring)
-      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual.</p>"
+      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold.</p>"
     + (if .residualSnapshots.status == "NOT_ASSESSED" then
         "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The <code>RestorePointContent</code> list could not be read (RBAC on <code>restorepointcontents</code>, or the aggregated API is unavailable) or the computation failed. This is <em>not</em> the same as \"no residual snapshots\". Grant <code>list</code> on <code>restorepointcontents.apps.kio.kasten.io</code> (see <code>kdl-rbac.yaml</code>) and re-run with <code>--debug</code>.</div>"
       elif ((.residualSnapshots.localSnapshots // 0) == 0) then
@@ -1334,11 +1334,12 @@ else "" end) + "
           + ([
               (if (.residualSnapshots.breakdown.onDemand // 0) > 0 then (.residualSnapshots.breakdown.onDemand | tostring) + " taken on demand (no policy)" else empty end),
               (if (.residualSnapshots.breakdown.policyDeleted // 0) > 0 then (.residualSnapshots.breakdown.policyDeleted | tostring) + " whose policy was deleted" else empty end),
-              (if (.residualSnapshots.breakdown.unbound // 0) > 0 then (.residualSnapshots.breakdown.unbound | tostring) + " whose application is gone (Unbound)" else empty end)
+              (if (.residualSnapshots.breakdown.unbound // 0) > 0 then (.residualSnapshots.breakdown.unbound | tostring) + " whose application is gone (Unbound)" else empty end),
+              (if (.residualSnapshots.breakdown.policyOverRetention // 0) > 0 then (.residualSnapshots.breakdown.policyOverRetention | tostring) + " ranked past everything their policy retention can hold" else empty end)
             ] | join(" &middot; "))
           + "</div>
       <table>
-      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th>Physical size</th></tr></thead>
+      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th>Rank / retained</th><th>Physical size</th></tr></thead>
       <tbody>" +
         ([.residualSnapshots.items[:10][]? |
           "<tr>
@@ -1347,6 +1348,9 @@ else "" end) + "
             <td>" + (if (.appName // "") == "" then "\u2014" else .appName end) + "</td>
             <td>" + (if .ageDays == null then "unknown" else ((.ageDays | tostring) + "d") end) + "</td>
             <td>" + (.reason // "unknown") + "</td>
+            <td>" + (if .reason == "policy-over-retention" and .rank != null
+                     then ((.rank + 1) | tostring) + " of " + ((.retentionTotal // 0) | tostring) + " retained"
+                     else "\u2014" end) + "</td>
             <td>" + (if .physicalSizeBytes == null then "<span class=\"badge info\">unknown</span>"
                      else ((.physicalSizeBytes / 1073741824 * 100 | floor) / 100 | tostring) + " GiB" end) + "</td>
           </tr>"
@@ -1364,6 +1368,10 @@ else "" end) + "
     + (if ((.residualSnapshots.breakdown.policyUnverifiable // 0) > 0) then
         "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.policyUnverifiable) | tostring)
           + " snapshot(s) name a policy that could not be checked, because the policy list came back empty or unreadable. They are reported as unverifiable, never as orphaned.</div>"
+      else "" end)
+    + (if ((.residualSnapshots.breakdown.policyRetentionUnknown // 0) > 0) then
+        "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.policyRetentionUnknown) | tostring)
+          + " snapshot(s) belong to a live policy that declares no snapshot retention, neither at policy level nor on any action. The retention window is therefore unknown, so they are reported as neither retained nor residual.</div>"
       else "" end)
     + (if ((.residualSnapshots.unknownAge // 0) > 0) then
         "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.unknownAge) | tostring)
