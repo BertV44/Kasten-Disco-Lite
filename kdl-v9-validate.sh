@@ -55,21 +55,65 @@ ok()   { PASS=$((PASS+1)); printf '  [ OK ] %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  [FAIL] %s\n' "$1"; }
 skip() { SKIP=$((SKIP+1)); printf '  [SKIP] %s\n' "$1"; }
 # assert <label> <jq filter>
-a() { if jq -e "$2" "$J" >/dev/null 2>&1; then ok "$1"; else bad "$1"; fi; }
+# a <label> [jq args...] <filter>
+a() { _lbl="$1"; shift; if jq -e "$@" "$J" >/dev/null 2>&1; then ok "$_lbl"; else bad "$_lbl"; fi; }
 show() { printf '        -> %s\n' "$(jq -r "$1" "$J" 2>/dev/null)"; }
 
 echo "== Collecting =="
 "$KDL" "$NS" --json --output "$J" || { echo "KDL.sh failed"; exit 2; }
 jq -e 'type=="object"' "$J" >/dev/null || { echo "invalid JSON"; exit 2; }
 "$HTML" "$J" "$OUT/disco.html" >/dev/null || { echo "HTML generation failed"; exit 2; }
+sed -n '/^def bpSevMap:/,+1p' "$HTML" | tail -1 | grep -o '"[A-Za-z0-9]*":' | tr -d '":' \
+  | jq -R . | jq -s . > "$OUT/bpsev.json"
+# The render program must stay out of argv: Linux caps a single argument at
+# MAX_ARG_STRLEN (131072), regardless of ARG_MAX, and the program is past that.
+if grep -q "^jq -r '$" "$HTML"; then
+  bad "render program is passed as a command-line argument (will hit MAX_ARG_STRLEN on Linux)"
+else
+  ok "render program is read from a file, not argv"
+fi
 tail -c 20 "$OUT/disco.html" | grep -q '</html>' && echo "  HTML ends with </html>"
 
 echo
 echo "== 0. Baseline (unchanged from v2.1.1 smoke test) =="
-a "kdlVersion is 2.2.x"                  '.kdlVersion | startswith("2.2")'
+# Derived from KDL.sh rather than pinned: the old `startswith("2.2")` silently
+# became a guaranteed FAIL the moment v2.3.0 shipped, which trains people to
+# ignore the gate's output.
+KDL_DECLARED=$(sed -n 's/^KDL_VERSION="\(.*\)"/\1/p' "$KDL" | head -1)
+a "kdlVersion matches KDL.sh ($KDL_DECLARED)" --arg v "$KDL_DECLARED" '.kdlVersion == $v'
 a "policies.count == items length"       '.policies.count == (.policies.items|length)'
 a "restore buckets reconcile"            '.health.backups.restoreActions | (.completed+.failed+.running+.other)==.total'
 a "totalCapacityGi is numeric"           '.dataUsage.totalCapacityGi|type=="number"'
+
+echo
+echo "== 0b. Verdict integrity =="
+# The recurring defect in this repo is a computed "I could not determine this"
+# counter that never reaches the verdict, so the report contradicts itself:
+# "backend not assessed" beside "all block-backed", or "not using exports" on a
+# cluster with nine repositories. Three reviews in a row turned this up, so it
+# is asserted here rather than left to the next reviewer.
+#
+# Adding a best practice? Add its pair below: the check must not read clean
+# while its own unknown counter is non-zero.
+a "infra volumes: not OK while a backend is undetermined" \
+  'if (.k10InfraVolumes // null) == null then true
+   else (.bestPractices.k10InfraVolumeAccessMode != "OK")
+        or (((.k10InfraVolumes.storageClassUnresolvedCount // 0)
+             + (.k10InfraVolumes.backendUnrecognisedCount // 0)) == 0) end'
+a "repo maintenance: not OK while details are missing or an age is unknown" \
+  'if (.storageRepositories // null) == null then true
+   else (.bestPractices.storageRepositoryMaintenance != "OK")
+        or (((.storageRepositories.listed // 0) == (.storageRepositories.total // 0))
+            and ((.storageRepositories.ageUnknownCount // 0) == 0)) end'
+a "repo maintenance: zero repositories is not asserted when some were listed" \
+  'if (.storageRepositories // null) == null then true
+   else ((.storageRepositories.total // 0) > 0)
+        or ((.storageRepositories.listed // 0) == 0)
+        or (.bestPractices.storageRepositoryMaintenance == "NOT_ASSESSED") end'
+a "every bestPractices key is scored by the HTML severity map" \
+  --slurpfile sev "$OUT/bpsev.json" \
+  '[(.bestPractices | del(.clusterScopedResourcesProtected) | keys[])]
+   - ($sev[0]) | length == 0'
 
 echo
 echo "== 1. Mode selection (Kasten version) =="
