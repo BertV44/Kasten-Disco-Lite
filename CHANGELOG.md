@@ -3,7 +3,13 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.4.0] - 2026-09-17
+
+Two new signals, both contributed by Jaiganesh J K (#46): whether Prometheus
+ships metrics off-cluster, and whether the Kopia repositories behind exports and
+imports are still being maintained. Validated on a live OpenShift 4.20 / Kasten
+9.0.5 cluster carrying nine real StorageRepositories. `kdl-rbac.yaml` gains one
+rule; see below.
 
 ### Added
 - **Prometheus Remote Write Configuration.** KDL now reports whether Prometheus

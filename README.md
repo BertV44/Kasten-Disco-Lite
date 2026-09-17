@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.3.0
+# Kasten Discovery Lite v2.4.0
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -63,7 +63,7 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 ---
 
-## What's New in v2.4 (unreleased, on `main`)
+## What's New in v2.4
 
 - **Prometheus Remote Write Detection** — KDL now reports whether Prometheus is
   configured to ship metrics off-cluster. Reported under
@@ -710,7 +710,17 @@ Key portability measures:
 
 ## Version History
 
-- **v2.3.0** (Current) — **K10 infrastructure volume shape**
+- **v2.4.0** (Current) — **Monitoring reach and repository maintenance**
+  - `storageRepositories` section and `storageRepositoryMaintenance` best
+    practice: flags Kopia export/import repositories that have not been
+    maintained in 7 days, never ran, or have maintenance disabled.
+  - Prometheus remote-write detection, reported alongside the Monitoring check
+    without changing its verdict.
+  - `listed` vs `total` keeps an unreadable `/details` subresource from being
+    reported as "no repositories exist".
+  - Contributed by Jaiganesh J K (#46).
+
+- **v2.3.0** — **K10 infrastructure volume shape**
   - New `k10InfraVolumes` section and `k10InfraVolumeAccessMode` best practice:
     flags K10's own service PVCs that are `ReadWriteMany` or sit on a
     shared-filesystem backend. The catalog is a file-backed database and has
