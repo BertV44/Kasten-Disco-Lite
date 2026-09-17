@@ -1,8 +1,8 @@
-# Kasten Discovery Lite v2.4.1
+# Kasten Discovery Lite v2.5.0
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
-**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2). On a newer
+**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2 / 9.0.5). On a newer
 cluster the report prints a warning and sets `kastenCompatibility.newerThanValidated`,
 rather than silently analysing an unknown CRD schema.
 
@@ -57,11 +57,49 @@ These join the existing v1.9 features:
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
 - **Storage Repository Maintenance Status** with last-run tracking and 7-day staleness detection *(NEW v2.4)*
+- **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New in v2.5
+
+- **Residual Snapshots** — a new section and a 19th best practice
+  (`residualSnapshots`) covering local Kasten snapshots the cluster is still
+  holding past a 7-day threshold. Reads `RestorePointContent`, which carries the
+  actual artifacts, rather than `RestorePoint`, which is only the catalog entry
+  pointing at one. The resource is cluster-scoped and served by the aggregated
+  APIService, so `get crd` is never used as a presence probe and a denied list
+  reports `NOT_ASSESSED` instead of zero.
+
+  **Age past the threshold is not the finding.** A GFS policy legitimately
+  retains monthly and yearly points, and a *live* policy is not proof of
+  retention either: each snapshot is ranked among those of the same application
+  and policy, newest first, and counted as residual only when its rank is at or
+  past everything the declared retention could hold. The verdict keys on that
+  subset — taken on demand, policy since deleted, application gone, or ranked
+  past the retention window — while legitimately retained points are reported
+  as context. Unknown ages, an unreadable policy list and a policy declaring no
+  retention at all each block a clean pass rather than sitting beside one.
+
+  Local snapshots are told from exports by the **presence** of the
+  `k10.kasten.io/exportProfile` label, never its value. Sizes come from
+  `status.physicalSizeBytes`, where absent, non-numeric and negative all count
+  as unknown rather than as zero, and the total is never presented as
+  reclaimable space. Requires `list` on `restorepointcontents.apps.kio.kasten.io`
+  (added to `kdl-rbac.yaml`). The field model, export discriminator and
+  timestamp handling are taken from
+  [k10-snapshot-janitor](https://github.com/BertV44/k10-snapshot-janitor);
+  that tool retires these objects, KDL only counts them.
+
+- **Fixed: no report at all when exactly one cluster read was denied.** The RBAC
+  pre-flight warning ended with a false test as the last statement of a `while`
+  body closing a pipeline, which makes the pipeline fail and `set -eu` exit. The
+  bug was pre-existing and dormant — two or more denials happened to survive —
+  but the new `restorepointcontents` probe made one denial the normal state for
+  anyone who updates KDL without reapplying the ClusterRole.
 
 ## What's New in v2.4
 
@@ -805,7 +843,23 @@ Key portability measures:
 
 ## Version History
 
-- **v2.4.1** (Current) — fixes the Best Practices Monitoring row, which read
+- **v2.5.0** (Current) — **Residual snapshots**
+  - New `residualSnapshots` section and 19th best practice: local Kasten
+    snapshots (`RestorePointContent`) past a 7-day threshold that no live policy
+    retains, split into taken-on-demand, policy-deleted, application-gone and
+    ranked-past-the-retention-window.
+  - A live policy is not taken as proof of retention: each snapshot is ranked
+    among those of the same application and policy against the sum of the
+    declared retention values.
+  - Age alone is never a finding, and unknown ages, an unreadable policy list
+    or an undeclared retention window each force `NOT_ASSESSED`.
+  - Fixes a pre-existing `set -eu` exit in the RBAC pre-flight warning that
+    produced no report at all when exactly one cluster read was denied.
+  - Validated on a live OpenShift 4.20.30 / Kasten 9.0.5 cluster (57
+    RestorePointContents, 3 genuine findings) and by an offline suite of 38
+    assertions.
+
+- **v2.4.1** — fixes the Best Practices Monitoring row, which read
   "Remote Write enabled" regardless of the actual state.
 
 - **v2.4.0** — **Monitoring reach and repository maintenance**

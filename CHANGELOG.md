@@ -3,7 +3,7 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.5.0] - 2026-09-17
 
 ### Added
 - **Residual Snapshots** section and a 19th best-practice check
