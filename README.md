@@ -505,10 +505,12 @@ are taken from it. The two do not report the same population: the janitor's
 `--min-keep` guard always spares the most recent point per application, so
 `unretained` here is **not** "what the janitor would delete".
 
-The section has an offline regression suite, `kdl-residual-test.sh`: 38
-assertions, no cluster, fixtures and a stub CLI generated on the fly. It is
-maintainer tooling and is expected to leave `main` at release, as
-`kdl-v9-validate.sh` did.
+The section has an offline regression suite of 38 assertions
+(`kdl-residual-test.sh`): no cluster, fixtures and a stub CLI generated on the
+fly, each assertion naming the trap it guards. It is maintainer tooling and so
+lives on the development branch `dev-2.5.0-residual-snapshots`, not in the
+published tree -- the same treatment `kdl-v9-validate.sh` and `RELEASING.md`
+received in `0c9905a`.
 
 ### K10 infrastructure volumes — why RWO on block storage
 
