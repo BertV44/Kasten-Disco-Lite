@@ -839,8 +839,25 @@ RBAC_LIMITED_JSON=$(printf '%s' "$RBAC_MISSING" | jq -R -c 'split(";") | map(sel
 
 if [ -n "$RBAC_MISSING" ]; then
   warn "Insufficient cluster-scoped RBAC: the following reads are denied, so related sections will be EMPTY (not necessarily zero):"
-  printf '%s' "$RBAC_MISSING" | tr ';' '\n' | while IFS= read -r _rbac_item; do
-    [ -n "$_rbac_item" ] && printf '%s    - %s%s\n' "$COLOR_YELLOW" "$_rbac_item" "$COLOR_RESET" >&2
+  # Three things had to be right here, and two of them were wrong.
+  #
+  # `if`, not `cmd && cmd`: as the LAST statement of a while body that is the
+  # last stage of a pipeline, a false test makes the pipeline fail and `set -e`
+  # kills the script. With EXACTLY ONE denied read that is what happened, before
+  # a single line of report was written -- and one denied read is the normal
+  # state for anyone who updates KDL.sh without reapplying the ClusterRole. Two
+  # or more denials happened to survive, which is why it lay dormant.
+  #
+  # `printf '%s\n'`, not `printf '%s'`: without a trailing newline the final
+  # `read` hits EOF, returns non-zero and the body never runs for the last
+  # field, so the entry silently vanished from the warning.
+  #
+  # `${RBAC_MISSING#;}` drops the leading empty field, so no iteration is
+  # wasted on it. Each guard stands alone; none depends on the others.
+  printf '%s\n' "${RBAC_MISSING#;}" | tr ';' '\n' | while IFS= read -r _rbac_item; do
+    if [ -n "$_rbac_item" ]; then
+      printf '%s    - %s%s\n' "$COLOR_YELLOW" "$_rbac_item" "$COLOR_RESET" >&2
+    fi
   done
   warn "Fix: the cluster-scoped part of kdl-rbac.yaml (ClusterRole/ClusterRoleBinding) must be applied ONCE by a cluster-admin; a k10-admin can only apply the namespaced part. See README, section 'RBAC Requirements'."
   warn "KDL will still complete; affected sections are marked as not assessed in the report rather than showing misleading zeros."
@@ -2727,7 +2744,7 @@ RESIDUAL_SNAP_RETAINED_COUNT=0
 RESIDUAL_SNAP_UNVERIFIABLE_COUNT=0
 RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT=0
 RESIDUAL_SNAP_UNKNOWN_AGE_COUNT=0
-RESIDUAL_SNAP_OLDEST_DAYS=-1
+RESIDUAL_SNAP_OLDEST_UNRET_DAYS=-1
 RESIDUAL_SNAP_BYTES=0
 RESIDUAL_SNAP_SIZE_UNKNOWN_COUNT=0
 
@@ -2798,7 +2815,12 @@ else
           refTime: ($refTime | ts_clean),
           # Kept for the per-application ranking below, stripped from `items`.
           refEpoch: $refEpoch,
-          ageDays: (if $refEpoch == null then null else (($now - $refEpoch) / 86400 | floor) end),
+          # Two decimals, like the janitor: flooring to whole days made the
+          # effective threshold EIGHT days, so everything in ]7d, 8d[ went
+          # unreported while four texts promised "past 7 days". That error
+          # under-declares residue, which is the direction that hides the gap
+          # the section exists to find.
+          ageDays: (if $refEpoch == null then null else ((($now - $refEpoch) / 86400 * 100) | floor) / 100 end),
           # Absent, null, non-numeric and negative are all UNKNOWN, never a real
           # zero: physicalSizeBytes was absent from every object of the janitor
           # validation cluster. A string in the sum would also make jq add
@@ -2879,20 +2901,24 @@ else
       # Policy alive but declaring no snapshot retention: window unknown.
       policyRetentionUnknown: ([ $residual[] | select(.reason == "policy-retention-unknown") ] | length),
       unknownAge: ([ $snaps[] | select(.reason == "unknown-age") ] | length),
-      oldestDays: (if ($residual | length) == 0 then -1 else ([ $residual[].ageDays ] | max) end),
+      # The oldest FINDING, not the oldest snapshot past the threshold: the
+      # latter read as a finding under a warning headline while being a
+      # legitimately retained GFS point. Floored to whole days, since it is a
+      # summary figure; items[].ageDays keeps the two decimals.
+      oldestUnretainedDays: (if ($unretained | length) == 0 then -1 else ([ $unretained[].ageDays ] | max | floor) end),
       # Sum of the sizes that ARE known, with the unknowns counted beside it. A
       # sum with unknowns folded in would not be a size, and even a complete one
       # is not a promise of reclaimable space: what the storage layer reports
       # back varies by CSI driver.
       bytes: ([ $residual[] | .physicalSizeBytes | select(. != null) ] | add // 0),
       sizeUnknown: ([ $residual[] | select(.physicalSizeBytes == null) ] | length),
-      # Capped: the full list is a liability on a 30k-object catalog, and the
-      # counters above stay exact. Unretained first, then oldest first.
-      items: (
-               ( $unretained | sort_by(.ageDays) | reverse )
-               + ( [ $residual[] | select(.reason as $r | $unretainedReasons | index($r) == null) ]
-                   | sort_by(.ageDays) | reverse )
-             )
+      # ONLY the actionable subset, oldest first. A mixed array made both
+      # renderers slice context rows into the findings table: under a headline
+      # of "2 residual snapshots" the table listed eight rows the section had
+      # just described as legitimately retained. The context is fully carried
+      # by the counters above. Capped, since the full list is a liability on a
+      # 30k-object catalog while the counters stay exact.
+      items: ( $unretained | sort_by(.ageDays) | reverse )
              # rank and retentionTotal are kept: together they are the evidence
              # for a policy-over-retention verdict, so the report can show it.
              | map(del(.beyond, .policyState, .refEpoch, .retentionDeclared))
@@ -2915,8 +2941,8 @@ else
     RESIDUAL_SNAP_UNKNOWN_AGE_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.unknownAge // 0')")
     RESIDUAL_SNAP_SIZE_UNKNOWN_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.sizeUnknown // 0')")
     RESIDUAL_SNAP_BYTES=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.bytes // 0')")
-    RESIDUAL_SNAP_OLDEST_DAYS=$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.oldestDays // -1')
-    [ -z "$RESIDUAL_SNAP_OLDEST_DAYS" ] && RESIDUAL_SNAP_OLDEST_DAYS=-1
+    RESIDUAL_SNAP_OLDEST_UNRET_DAYS=$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.oldestUnretainedDays // -1')
+    [ -z "$RESIDUAL_SNAP_OLDEST_UNRET_DAYS" ] && RESIDUAL_SNAP_OLDEST_UNRET_DAYS=-1
     RESIDUAL_SNAPSHOTS=$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq -c '.items // []')
     [ -z "$RESIDUAL_SNAPSHOTS" ] && RESIDUAL_SNAPSHOTS='[]'
   else
@@ -5644,7 +5670,7 @@ if [ "$MODE" = "json" ]; then
     --argjson residualSnapUnverifiable "$RESIDUAL_SNAP_UNVERIFIABLE_COUNT" \
     --argjson residualSnapRetentionUnknown "$RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT" \
     --argjson residualSnapUnknownAge "$RESIDUAL_SNAP_UNKNOWN_AGE_COUNT" \
-    --argjson residualSnapOldestDays "$RESIDUAL_SNAP_OLDEST_DAYS" \
+    --argjson residualSnapOldestUnret "$RESIDUAL_SNAP_OLDEST_UNRET_DAYS" \
     --argjson residualSnapBytes "$RESIDUAL_SNAP_BYTES" \
     --argjson residualSnapSizeUnknown "$RESIDUAL_SNAP_SIZE_UNKNOWN_COUNT" \
     --arg mcRole "$MC_ROLE" \
@@ -6155,7 +6181,10 @@ if [ "$MODE" = "json" ]; then
         # converted by hand): age unknown, so they are counted neither inside
         # nor outside the threshold.
         unknownAge: $residualSnapUnknownAge,
-        oldestDays: (if $residualSnapOldestDays < 0 then null else $residualSnapOldestDays end),
+        # The oldest snapshot among the findings, in whole days, or null when
+        # there are none. Not the oldest past the threshold: that one can be a
+        # legitimately retained GFS point and read as a finding.
+        oldestUnretainedDays: (if $residualSnapOldestUnret < 0 then null else $residualSnapOldestUnret end),
         # Sum of the status.physicalSizeBytes that ARE numeric, with the rest
         # counted in sizeUnknownCount rather than folded in as zero. Never a
         # promise of reclaimable space: what the storage layer reports back
@@ -7475,11 +7504,19 @@ else
   if [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}[WARN]  $RESIDUAL_SNAP_UNRETAINED_COUNT residual snapshot(s) no live policy retains${COLOR_RESET}\n"
     printf "  ${COLOR_CYAN}    on demand: $RESIDUAL_SNAP_ONDEMAND_COUNT | policy deleted: $RESIDUAL_SNAP_POLICY_DELETED_COUNT | application gone: $RESIDUAL_SNAP_UNBOUND_COUNT | past declared retention: $RESIDUAL_SNAP_OVER_RETENTION_COUNT${COLOR_RESET}\n"
-    _ep "$RESIDUAL_SNAPSHOTS" | jq -r '.[:5][] | "    - \(.name) [\(if .appNamespace == "" then "unknown" else .appNamespace end)] \(.ageDays)d (\(.reason))"' 2>/dev/null
+    _ep "$RESIDUAL_SNAPSHOTS" | jq -r '.[:5][] | "    - \(.name) [\(if .appNamespace == "" then "unknown" else .appNamespace end)] \(((.ageDays * 10 | floor) / 10) as $a | if ($a | floor) == $a then ($a | floor) else $a end)d (\(.reason))"' 2>/dev/null
   elif [ "$RESIDUAL_SNAP_LOCAL_COUNT" -eq 0 ]; then
     printf "  ${COLOR_GREEN}[OK] No local snapshots in the catalog${COLOR_RESET}\n"
+  elif [ $((RESIDUAL_SNAP_UNKNOWN_AGE_COUNT + RESIDUAL_SNAP_UNVERIFIABLE_COUNT + RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT)) -gt 0 ]; then
+    # No finding identified, but not a clean pass either: something could not
+    # be established. Claiming "all retained by a live policy" here was a
+    # positive statement the data did not support, printed one line above the
+    # warning that contradicted it.
+    printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} No residual snapshot identified, but $((RESIDUAL_SNAP_UNKNOWN_AGE_COUNT + RESIDUAL_SNAP_UNVERIFIABLE_COUNT + RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT)) snapshot(s) could not be assessed - see below\n"
+  elif [ "$RESIDUAL_SNAP_COUNT" -eq 0 ]; then
+    printf "  ${COLOR_GREEN}[OK] No local snapshot past the threshold${COLOR_RESET}\n"
   else
-    printf "  ${COLOR_GREEN}[OK] No residual snapshot: every snapshot past the threshold is retained by a live policy${COLOR_RESET}\n"
+    printf "  ${COLOR_GREEN}[OK] No residual snapshot: all $RESIDUAL_SNAP_COUNT past the threshold are within what their policy retains${COLOR_RESET}\n"
   fi
   # Past the threshold but retained by a live policy: GFS monthlies and
   # yearlies land here, so this is context, never a finding.
@@ -7495,8 +7532,8 @@ else
   if [ "$RESIDUAL_SNAP_UNKNOWN_AGE_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_UNKNOWN_AGE_COUNT with an absent or unparsable timestamp (age unknown, not counted either way)${COLOR_RESET}\n"
   fi
-  if [ "$RESIDUAL_SNAP_OLDEST_DAYS" -gt 0 ] 2>/dev/null; then
-    printf "  ${COLOR_CYAN}    oldest past the threshold: $RESIDUAL_SNAP_OLDEST_DAYS days${COLOR_RESET}\n"
+  if [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ] && [ "$RESIDUAL_SNAP_OLDEST_UNRET_DAYS" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}    oldest residual snapshot: $RESIDUAL_SNAP_OLDEST_UNRET_DAYS days${COLOR_RESET}\n"
   fi
   # Printed only when at least one size is known, and never called reclaimable
   # space: what the storage layer reports back varies by CSI driver.

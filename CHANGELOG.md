@@ -25,7 +25,23 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   `NOT_ASSESSED` rather than to a clean zero. Requires `list` on
   `restorepointcontents.apps.kio.kasten.io` (added to `kdl-rbac.yaml`).
   Field model, export discriminator and timestamp handling taken from
-  k10-snapshot-janitor, lab-validated on Kasten 9.0.3.
+  k10-snapshot-janitor, lab-validated on Kasten 9.0.3. Validated here against a
+  real cluster (OpenShift 4.20.30 / Kasten 9.0.5, 57 RestorePointContents) and
+  by an offline suite of 38 assertions, `kdl-residual-test.sh`.
+  `ClusterRestorePoint` objects, orphaned CSI `VolumeSnapshot` objects at the
+  storage layer and the janitor's `k10-janitor/exempt` label are out of scope,
+  now stated in the README.
+
+### Fixed
+- The RBAC pre-flight warning killed KDL under `set -eu` when **exactly one**
+  cluster read was denied, producing no report at all in any output mode. A
+  false test as the last statement of a `while` body ending a pipeline makes
+  the pipeline fail; `RBAC_MISSING` leads with an empty field and `printf '%s'`
+  emits no trailing newline, so that empty field was the last iteration. The
+  bug was pre-existing and dormant -- two or more denials happened to survive
+  -- but the new `restorepointcontents` probe made one denial the normal state
+  for anyone updating `KDL.sh` without reapplying the ClusterRole. The detail
+  lines were also being dropped for the last entry.
 
 ## [2.4.1] - 2026-09-17
 

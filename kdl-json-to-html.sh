@@ -1323,9 +1323,28 @@ else "" end) + "
       elif ((.residualSnapshots.localSnapshots // 0) == 0) then
         "<div class=\"success-box\">\u2713 <strong>No local snapshots in the catalog</strong> ("
           + ((.residualSnapshots.listed // 0) | tostring) + " RestorePointContent(s) listed, all exports)</div>"
+      elif ((.residualSnapshots.unretained // 0) == 0)
+           and (((.residualSnapshots.unknownAge // 0)
+                 + (.residualSnapshots.breakdown.policyUnverifiable // 0)
+                 + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) > 0) then
+        # No finding identified, but not a clean pass either. The green box used
+        # to claim "every one past the threshold is retained by a live policy"
+        # here - a positive statement the data did not support, rendered one
+        # line above the warning that contradicted it.
+        "<div class=\"info-box\">\u2139 <strong>No residual snapshot identified, but this is not a clean pass.</strong> "
+          + (((.residualSnapshots.unknownAge // 0)
+              + (.residualSnapshots.breakdown.policyUnverifiable // 0)
+              + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) | tostring)
+          + " of the " + ((.residualSnapshots.localSnapshots // 0) | tostring)
+          + " local snapshot(s) could not be assessed &mdash; see the details below. The best-practice check reports <em>not assessed</em> for this reason.</div>"
+      elif ((.residualSnapshots.unretained // 0) == 0) and ((.residualSnapshots.beyondThreshold // 0) == 0) then
+        "<div class=\"success-box\">\u2713 <strong>No local snapshot past the threshold</strong> &mdash; "
+          + ((.residualSnapshots.localSnapshots // 0) | tostring) + " local snapshot(s), none older than "
+          + ((.residualSnapshots.thresholdDays // 7) | tostring) + " days</div>"
       elif ((.residualSnapshots.unretained // 0) == 0) then
-        "<div class=\"success-box\">\u2713 <strong>No residual snapshots</strong> &mdash; "
-          + ((.residualSnapshots.localSnapshots // 0) | tostring) + " local snapshot(s), and every one past the threshold is retained by a live policy</div>"
+        "<div class=\"success-box\">\u2713 <strong>No residual snapshots</strong> &mdash; all "
+          + ((.residualSnapshots.beyondThreshold // 0) | tostring)
+          + " snapshot(s) past the threshold are within what their policy retains</div>"
       else
         "<div class=\"warning-box\">\u26a0 <strong>" + ((.residualSnapshots.unretained) | tostring)
           + " residual snapshot(s)</strong> that no live policy retains, out of "
@@ -1346,7 +1365,10 @@ else "" end) + "
             <td><code>" + (.name // "unknown") + "</code></td>
             <td>" + (if (.appNamespace // "") == "" then "\u2014" else .appNamespace end) + "</td>
             <td>" + (if (.appName // "") == "" then "\u2014" else .appName end) + "</td>
-            <td>" + (if .ageDays == null then "unknown" else ((.ageDays | tostring) + "d") end) + "</td>
+            <td>" + (if .ageDays == null then "unknown"
+                     else ((.ageDays * 10 | floor) / 10) as $a
+                          | (if ($a | floor) == $a then ($a | floor | tostring) else ($a | tostring) end) + "d"
+                     end) + "</td>
             <td>" + (.reason // "unknown") + "</td>
             <td>" + (if .reason == "policy-over-retention" and .rank != null
                      then ((.rank + 1) | tostring) + " of " + ((.retentionTotal // 0) | tostring) + " retained"

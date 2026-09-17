@@ -481,10 +481,34 @@ declares no snapshot retention at all does the same: whether Kasten then keeps
 nothing or keeps everything is not something a read-only script can establish,
 so it is reported rather than guessed.
 
+#### What this section does not cover
+
+- **Exported restore points.** Out of scope by design (see above): they sit in
+  an export repository under its own retention.
+- **`ClusterRestorePoint` objects.** Only namespaced `RestorePointContent` is
+  read, so cluster-scoped resource backups are not inventoried here.
+- **Orphaned CSI `VolumeSnapshot` objects at the storage layer.** A snapshot
+  that Kasten no longer references, but that the storage backend still holds,
+  is invisible to this section: it reads Kasten's own objects, not the CSI
+  layer. `VolumeSnapshot` counts appear under *Data Usage* instead.
+- **The `k10-janitor/exempt` label** is deliberately not honoured. It belongs to
+  the janitor, which deletes; KDL reports, and an operator who exempted an
+  object from deletion has not said the report should stop mentioning it.
+
+So "residual snapshots" here means *local Kasten snapshot objects past the
+threshold that nothing retains* — not every stale snapshot a cluster might hold.
+
 KDL only counts these objects. Retiring them is what
 [k10-snapshot-janitor](https://github.com/BertV44/k10-snapshot-janitor) does,
 and the field model, the export discriminator and the timestamp handling here
-are taken from it.
+are taken from it. The two do not report the same population: the janitor's
+`--min-keep` guard always spares the most recent point per application, so
+`unretained` here is **not** "what the janitor would delete".
+
+The section has an offline regression suite, `kdl-residual-test.sh`: 38
+assertions, no cluster, fixtures and a stub CLI generated on the fly. It is
+maintainer tooling and is expected to leave `main` at release, as
+`kdl-v9-validate.sh` did.
 
 ### K10 infrastructure volumes — why RWO on block storage
 
