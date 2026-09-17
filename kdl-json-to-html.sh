@@ -674,7 +674,7 @@ else "" end) + "
         <td><strong>Monitoring</strong></td>
         <td class=\"sev-optional\">Optional</td>
         <td>" + severityBadge("optional"; (.bestPractices.monitoring // "N/A")) + "</td>
-        <td>" + badge(.bestPractices.monitoring // "N/A") + (if (.monitoring.prometheusRemoteWrite.enabled // false) == true then " (Remote Write enabled)" elif (.monitoring.prometheusRemoteWrite.enabled // false) == false then " (Remote Write not configured)" else " (Remote Write unknown)" end) + "</td>
+        <td>" + badge(.bestPractices.monitoring // "N/A") + (.monitoring.prometheusRemoteWrite.enabled) as $rw | (if $rw == true then " (Remote Write enabled)" elif $rw == false then " (Remote Write not configured)" else " (Remote Write not assessed)" end) + "</td>
       </tr>
       <tr>
         <td><strong>Audit Logging</strong></td>
