@@ -5554,11 +5554,21 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   # single unparseable timestamp degrades that one repo to "unknown age"
   # instead of erroring out and emptying the entire array.
   def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
+  # TWO DECIMALS, not floored. Flooring before comparing against the threshold
+  # made the effective threshold 8 days while the README, the JSON note and the
+  # HTML section text all promise 7: an age of 7.9 floored to 7, and 7 > 7 is
+  # false, so everything in ]7d, 8d[ went unreported. The error under-declares
+  # staleness, which is the direction that hides the very thing this check
+  # exists to find.
+  #
+  # Identical defect to de65a80 item 3 in the residual-snapshots section, found
+  # there by an independent audit and never grepped for elsewhere. Behaviour at
+  # exactly 7 days is unchanged (not past it). Display rounds to one decimal.
   def days_ago($now_iso; $then_iso):
     (try (
       ($now_iso | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $now_ts |
       ($then_iso | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $then_ts |
-      (($now_ts - $then_ts) / 86400 | floor)
+      ((($now_ts - $then_ts) / 86400) * 100 | round) / 100
     ) catch null);
 
   map(
@@ -7960,6 +7970,10 @@ else
   fi
   _ep "$STORAGE_REPO_MAINTENANCE" | jq -r '
     .[] |
+    # Ages are carried at two decimals so the threshold comparison is exact;
+    # one decimal is enough to read. Bound up front - `as` cannot appear in the
+    # middle of a concatenation.
+    ((((.daysSinceLastMaintenance // 0) * 10 | round) / 10) | tostring) as $ageShown |
     "  - " + .name
       + " [\(.contentType)]"
       + " profile=" + .profile
@@ -7967,8 +7981,8 @@ else
       + (if .status == "UNKNOWN" then " [UNKNOWN_STATUS]"
          elif .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
          elif .status == "DISABLED" then " [DISABLED_STATUS]"
-         elif .status == "AMBER" then " [AMBER_STATUS - " + (.daysSinceLastMaintenance | tostring) + " days]"
-         elif .status == "OK" then " [OK_STATUS - " + (.daysSinceLastMaintenance | tostring) + " days ago]"
+         elif .status == "AMBER" then " [AMBER_STATUS - " + $ageShown + " days]"
+         elif .status == "OK" then " [OK_STATUS - " + $ageShown + " days ago]"
          else " [" + .status + "]"
          end)
   ' 2>/dev/null | while IFS= read -r line; do

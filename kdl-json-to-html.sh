@@ -1259,14 +1259,18 @@ else "" end) + "
         "<td>" + (.contentType | @html) + "</td>" +
         "<td>" + (if .profile != "N/A" then (.profile | @html) else "\u2014" end) + "</td>" +
         "<td>" + (
+          # Ages carry two decimals from v2.5.1 so the 7-day threshold compares
+          # exactly; one decimal is enough to read. Older reports hold whole
+          # numbers and round to themselves, so this renders both.
+          ((((.daysSinceLastMaintenance // 0) * 10 | round) / 10) | tostring) as $ageShown |
           if .status == "DISABLED" then
             "<span class=\"badge error\">Disabled</span>"
           elif .status == "NEVER_RAN" then
             "<span class=\"badge error\">Never Ran</span>"
           elif .status == "AMBER" then
-            "<span class=\"badge warn\">Stale (" + (.daysSinceLastMaintenance | tostring) + "d)</span>"
+            "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>"
           else
-            "<span class=\"badge ok\">OK (" + (.daysSinceLastMaintenance | tostring) + "d)</span>"
+            "<span class=\"badge ok\">OK (" + $ageShown + "d)</span>"
           end
         ) + "</td>" +
         "<td>" + (if .lastFullMaintenanceTime then (.lastFullMaintenanceTime | tostring | split("T")[0] + " " + split("T")[1] | split("Z")[0]) else "\u2014" end) + "</td>" +
