@@ -5124,13 +5124,232 @@ STORAGE_REPO_MAINTENANCE=$(
         # NOTHING for the repo: it vanishes from the report with no warning.
         def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
         def ts_epoch: ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime;
+        # Per-value, never per-object. A single bad timestamp must cost one
+        # entry, not the whole array and not the repository.
+        def ts_try: (try ts_epoch catch null);
+        # Go duration string -> seconds, for metav1.Duration fields. Returns
+        # null on anything it cannot parse rather than a partial number: a
+        # fabricated timeout is worse than an absent one.
+        #
+        # capture() on a non-matching string emits NOTHING, and `try` does not
+        # catch that - `try` catches errors, and a non-match is not an error. A
+        # key whose value emits nothing makes the entire object emit nothing
+        # (`jq -n "{a:1, b:empty}"` prints nothing at all), so an unexpected
+        # timeout format would have dropped the whole repository from the
+        # report. Collecting into an array turns "no match" into [] and keeps
+        # the object intact. Third occurrence of this shape in this section -
+        # the others were max-of-all-null reaching todate.
+        def go_duration:
+          if type != "string" then null
+          else
+            ([ capture("^(?<h>[0-9]+(\\.[0-9]+)?h)?(?<m>[0-9]+(\\.[0-9]+)?m)?(?<s>[0-9]+(\\.[0-9]+)?s)?$") ]) as $m
+            | if ($m | length) == 0 then null
+              else ($m[0]) as $c
+                | if ($c.h == null) and ($c.m == null) and ($c.s == null) then null
+                  else (try (
+                          ((($c.h // "0h") | rtrimstr("h") | tonumber) * 3600)
+                          + ((($c.m // "0m") | rtrimstr("m") | tonumber) * 60)
+                          + ((($c.s // "0s") | rtrimstr("s") | tonumber))
+                        ) catch null)
+                  end
+              end
+          end;
+        def redact_err:
+          if type == "string" then
+            (gsub("(?<a>[0-9]{1,3}(\\.[0-9]{1,3}){3})(:[0-9]+)?"; "IP")
+             | if (length > 300) then (.[0:300] + "...") else . end)
+          else . end;
+
         (.status.details.kopiaMeta.maintenanceRun.recentResults[0]) as $lastFullRun |
+        (.status.details.kopiaMeta.maintenanceInfo) as $mi |
+
+        # "runs absent" and "runs present but empty" are different answers. The
+        # first means we could not see the task history; the second means no
+        # task ever ran. Collapsing them would let an unreadable repository
+        # render as one that has never been maintained.
+        (($mi | type) == "object" and ($mi | has("runs"))) as $hasRuns |
+        (($mi.runs // {}) | to_entries) as $runEntries |
+
+        # ok is THREE-state: absent success must not read as failure, the same
+        # rule this section applies to taskHistoryAvailable and
+        # lastRunComplete.
+        #
+        # This is a DEFENSIVE guard, not a live feature. Watched against a real
+        # maintenance run on Kasten 9.0.5: the StorageRepository object is
+        # written atomically at completion. Throughout a six-minute run the
+        # object did not change at all - no procedure record, no task records,
+        # and never a task entry carrying a start without an end. So no partial
+        # record exists to observe today, and lastRunInProgress below cannot
+        # fire on this version. It stays because a future version writing
+        # progress incrementally must not be read as a failure.
+        #
+        # The authoritative in-progress signal is the owner pod
+        # (<storageRepoName>-owner, deleted on completion), not this field.
+        [ $runEntries[] as $t | $t.value[]? |
+          { task: $t.key, s: (.start | ts_try), e: ((.end // .start) | ts_try),
+            ok: (if (.success == true) then true
+                 elif (.success == false) then false
+                 else null end),
+            err: .error }
+        ] as $allExecs |
+        ([ $allExecs[] | select(.s == null) ] | length) as $tsUnparsed |
+        ([ $allExecs[] | select(.s != null) ] | sort_by(.s)) as $execs |
+
+        # Group task executions into maintenance runs by their own timestamps.
+        # Never against K10 timestamps: those come from a different writer, and
+        # on a cluster with node clock skew the two disagreed by ~7 minutes
+        # while the tasks within a run stayed consistent with each other.
+        #
+        # The gap is measured from the previous task ENDING to the next task
+        # STARTING, not start-to-start. Maintenance can run for days on a large
+        # repository, and a single task carries that duration: a start-to-start
+        # rule would exceed any threshold mid-run and shred one long run into
+        # several partial ones, each missing most of its tasks, each scoring
+        # incomplete - a false failure on exactly the repositories where
+        # maintenance is slowest. End-to-start is indifferent to task duration.
+        # Measured over 209 executions: end-to-start within a run has a median
+        # of 1s while the gap between runs is 88047s, so the two scales are
+        # four orders of magnitude apart and the threshold is not delicate.
+        #
+        # A repeated task name is the second boundary. When a run takes longer
+        # than the maintenance interval, runs follow each other with no idle
+        # time and no gap to find - but each task appears at most once per run
+        # (verified: zero duplicates across all 24 runs of the DR repository),
+        # so seeing a task again means a new run has started.
+        (reduce $execs[] as $r ([];
+           if (length == 0) then [[$r]]
+           else
+             (.[-1]) as $cur
+             | ([ $cur[] | (.e // .s) ] | max) as $curEnd
+             | (if (($r.s - $curEnd) > 900)
+                     or (([ $cur[].task ] | index($r.task)) != null)
+                then . + [[$r]]
+                else (.[0:-1] + [($cur + [$r])])
+                end)
+           end)) as $observedRuns |
+        ($observedRuns | length) as $nObserved |
+
+        # Derive the expected task shape from the repository own history rather
+        # than a hard-coded list: task sets vary with the Kopia index format,
+        # and full-delete-blobs / full-rewrite-contents alternate day by day, so
+        # any fixed list marks half the healthy runs incomplete. Tasks present
+        # in >=90% of observed runs are expected; the alternating pair sits near
+        # 50% and drops out on its own.
+        #
+        # BOTH ends are excluded from the calibration window.
+        #
+        # The OLDEST is a repository first full maintenance, which legitimately
+        # carries a smaller task set: full-drop-deleted-content does not run
+        # then, because nothing has been marked deleted yet. Verified on all 5
+        # repositories of the live cluster - each oldest run starts within
+        # minutes of metadata.creationTimestamp, has 8 tasks instead of 9, and
+        # is the only run in its repository missing that task. Including it
+        # would drag the task below the threshold on a 6-run repository
+        # (5/6 = 83%) and quietly weaken the floor from 8 tasks to 7.
+        #
+        # The NEWEST is the run under test: leaving it in lets a failing run
+        # lower the bar for itself. Measured on the abort fixture, the floor
+        # collapsed from 8 tasks to 2 and a 3-task aborted run scored
+        # "complete" - and a repository failing every night would erode the bar
+        # to nothing, which is exactly the case this check exists to catch.
+        (if $nObserved >= 3 then $observedRuns[1:-1] else [] end) as $calib |
+        (if ($calib | length) >= 2 then
+           ($calib | length) as $n |
+           ([ $calib[] | ([ .[].task ] | unique) ] | flatten | group_by(.)
+            | map(select((length / $n) >= 0.9) | .[0])) as $set |
+           # An empty floor is not a floor: complete() would find nothing
+           # missing and pass every run, including a one-task abort. Two
+           # calibration runs sharing no task names put every task at 50% and
+           # produce exactly that. No floor means no claim, same as too little
+           # history.
+           (if ($set | length) > 0 then $set else null end)
+         else null end) as $expected |
+
+        (if $nObserved > 0 then $observedRuns[-1] else null end) as $newest |
+        # null, not false: with too little history to calibrate we do not know
+        # whether a run was complete, and guessing false would invent a failure.
+        def complete($cl):
+          if ($expected == null) or ($cl == null) then null
+          else (([ $cl[].task ] | unique) as $have
+                | ([ $expected[] | select(. as $t | $have | index($t) | not) ] | length) == 0)
+          end;
+        # Latest instant in a run. Prefers task end times but falls back to
+        # start times, because .e is allowed to be null - an `end` that fails
+        # to parse while `start` parses fine - whereas .s is guaranteed
+        # non-null, unparseable starts having been filtered out before
+        # grouping. Without the fallback, a run whose end timestamps are all
+        # unparseable makes max return null, todate then raises, and since the
+        # per-repo call is `jq -c ... 2>/dev/null` the repository is dropped
+        # from the report with no warning at all. That is f15f962 exactly,
+        # through a different timestamp.
+        def run_end($cl):
+          ([ $cl[].e | select(. != null) ]) as $ends |
+          if ($ends | length) > 0 then ($ends | max) else ([ $cl[].s ] | max) end;
+
+        (if $newest == null then [] else ([ $newest[] | select(.ok == false) | .task ] | unique) end) as $failedTasks |
+        (if $newest == null then 0 else ([ $newest[] | select(.ok == null) ] | length) end) as $unfinished |
+
+        # A run counts as a success only if nothing in it failed, nothing is
+        # still running, and it was not demonstrably short. completedTime alone
+        # never implies success: a run can abort partway and still have one
+        # written.
+        ([ $observedRuns[] | select((([ .[] | select(.ok != true) ] | length) == 0)
+                                and (complete(.) != false)) ]) as $goodRuns |
+        (if ($goodRuns | length) > 0 then run_end($goodRuns[-1]) else null end) as $lastGoodEpoch |
+
+        # Consecutive bad runs, counted newest-first. Reported as a floor rather
+        # than a total: on this cluster maintenanceInfo.runs held each
+        # repository complete history (oldest run within minutes of
+        # creationTimestamp on all 5), but the deepest sample was only 24 runs,
+        # so a cap above that would not have shown. Do not promise exactness
+        # from evidence that cannot rule it out.
+        # Only an explicit failure or a demonstrably short run counts as bad. A
+        # run still in flight is not a failure and must not extend the streak.
+        ([ ($observedRuns | reverse)[] | ((([ .[] | select(.ok == false) ] | length) > 0)
+                                      or (complete(.) == false)) ]) as $badFlags |
+        (($badFlags | length) - ($badFlags | until((length == 0) or (.[0] != true); .[1:]) | length)) as $consecFail |
+
+        # Sort by startTime; do not trust position. recentResults was observed
+        # newest-first, but nothing in the payload states it and the list is
+        # shared with StorageScan.
+        ([ (.status.processResults.recentResults // [])[]
+           | select(.procedure == "MaintenanceRun")
+           | . + { _s: (.startTime | ts_try) } | select(._s != null) ] | sort_by(._s)) as $mruns |
+        (if ($mruns | length) > 0 then $mruns[-1] else null end) as $mrun |
+        # Select the inner command by desc, never by index: the command list
+        # varies between runs and MaintenanceInfo can appear twice.
+        (if $mrun == null then null
+         else ([ $mrun.commandResults[]? | select(.desc == "MaintenanceRun") ]
+               | if length > 0 then .[-1] else null end) end) as $mcmd |
+
+        # The observed run that the newest procedure record describes, which is
+        # NOT necessarily the newest run: on a busy repository the surviving
+        # MaintenanceRun record can be hours older than the latest task
+        # activity, so comparing the procedure verdict against the newest
+        # cluster would compare two different runs.
+        #
+        # The window carries deliberate slack. Procedure timestamps and task
+        # timestamps come from different writers, and on a cluster with node
+        # NTP drift the two sat several minutes apart for the same run. Runs
+        # are a day apart, so slack far exceeding the skew still cannot reach
+        # a neighbouring run.
+        (if ($mrun == null) or (($mrun.endTime | ts_try) == null) then null
+         else
+           ($mrun._s) as $ps
+           | ($mrun.endTime | ts_try) as $pe
+           | ([ $observedRuns[]
+                | select(((.[0].s) <= ($pe + 1800)) and ((run_end(.)) >= ($ps - 1800))) ]
+              | if length > 0 then .[-1] else null end)
+         end) as $procRun |
+
         {
           name: .metadata.name,
           namespace: .metadata.namespace,
           profile: ((.metadata.labels // {})["k10.kasten.io/exportProfile"] // (.metadata.labels // {})["k10.kasten.io/policyName"] // "N/A"),
           contentType: (.status.contentType // "unknown"),
           disableMaintenance: (.spec.disableMaintenance // false),
+          # Retained with its original meaning: the newest recorded aggregate
+          # result. It is NOT evidence of success and no longer drives staleness.
           lastFullMaintenanceTime: (($lastFullRun.completedTime // null) | ts_clean),
           # scheduled -> completed, so it includes time queued, not just run time.
           lastFullMaintenanceDurationSeconds: (
@@ -5140,7 +5359,135 @@ STORAGE_REPO_MAINTENANCE=$(
               null
             end
           ),
-          nextFullMaintenanceTime: (.status.details.kopiaMeta.maintenanceInfo.nextFullMaintenanceTime // null)
+          nextFullMaintenanceTime: ($mi.nextFullMaintenanceTime // null),
+
+          # Span of the newest run, from its first task starting to its last
+          # task ending. Task-derived, so it is available whenever there is any
+          # task history - unlike lastRunDurationSeconds, which comes from the
+          # procedure record and is absent roughly 80% of the time on a busy
+          # repository. A run that outlasts its own configured interval means
+          # maintenance cannot keep up with its schedule, which is a backlog
+          # symptom rather than mere slowness. Collected here; the verdict is
+          # not this commit.
+          lastRunSpanSeconds: (if $newest == null then null
+                               else (run_end($newest) - $newest[0].s) end),
+          # Nanoseconds in the payload (86400000000000 = 24h).
+          fullIntervalSeconds: (if ($mi.full.interval | type) == "number"
+                                then ($mi.full.interval / 1000000000) else null end),
+          quickIntervalSeconds: (if ($mi.quick.interval | type) == "number"
+                                 then ($mi.quick.interval / 1000000000) else null end),
+          # A SECOND switch, independent of spec.disableMaintenance: Kopia can
+          # have full maintenance disabled at the repository level while the
+          # Kasten spec field reads false. The v2.4 DISABLED status consults
+          # only spec.disableMaintenance, so this state is currently invisible.
+          # Three-state, and deliberately not via `//`.
+          fullMaintenanceEnabled: (if ($mi.full.enabled == true) then true
+                                   elif ($mi.full.enabled == false) then false
+                                   else null end),
+          quickMaintenanceEnabled: (if ($mi.quick.enabled == true) then true
+                                    elif ($mi.quick.enabled == false) then false
+                                    else null end),
+          # spec.backgroundProcessTimeout is a metav1.Duration per the served
+          # schema, so it is a Go duration STRING ("10h0m0s"), not a number.
+          # Watch the trap: full.interval and quick.interval above are in
+          # NANOSECONDS. Two duration fields in one payload, two encodings.
+          #   kubectl get --raw /openapi/v3/apis/repositories.kio.kasten.io/v1alpha1
+          # It is in the schema required list, which is why the key is always
+          # present, and it was null on every repository observed - null means
+          # "use the default". `// 0` here would read as "no timeout".
+          backgroundProcessTimeout: (.spec.backgroundProcessTimeout),
+          backgroundProcessTimeoutSeconds: (.spec.backgroundProcessTimeout | go_duration),
+          # 10h default per Jaiganesh. NOT in the schema - it declares a default
+          # only for disableMaintenance - so this is domain knowledge, recorded
+          # as such and kept separate from the measured value above.
+          effectiveProcessTimeoutSeconds: (
+            (.spec.backgroundProcessTimeout | go_duration) as $t
+            | if $t != null then $t else 36000 end
+          ),
+          processTimeoutIsDefault: (.spec.backgroundProcessTimeout == null),
+
+          taskHistoryAvailable: $hasRuns,
+          observedRunCount: $nObserved,
+          timestampParseFailures: $tsUnparsed,
+          expectedTaskCount: (if $expected == null then null else ($expected | length) end),
+          lastRunTime: (if $newest == null then null else ($newest[0].s | todate) end),
+          lastRunEndTime: (if $newest == null then null else (run_end($newest) | todate) end),
+          lastRunTaskCount: (if $newest == null then null else ($newest | length) end),
+          lastRunComplete: complete($newest),
+          lastRunFailedTasks: $failedTasks,
+          lastRunUnfinishedTasks: $unfinished,
+          lastRunInProgress: (($newest != null) and ($unfinished > 0)),
+          lastRunError: (if $newest == null then null
+                         else ([ $newest[] | select(.ok == false) | .err | select(. != null) ] | first // null | redact_err) end),
+          # Three states. null when the run is still in flight: we do not yet
+          # know, and saying false would flag a healthy repository mid-run.
+          lastRunSucceeded: (
+            if $newest == null then null
+            elif ($failedTasks | length) > 0 then false
+            elif (complete($newest) == false) then false
+            elif $unfinished > 0 then null
+            else true end
+          ),
+          lastSuccessfulMaintenanceTime: (if $lastGoodEpoch == null then null else ($lastGoodEpoch | todate) end),
+          consecutiveFailures: (if $nObserved == 0 then null else $consecFail end),
+
+          procedureAvailable: (($mruns | length) > 0),
+          procedureSucceeded: (if $mrun == null then null else ($mrun.succeeded == true) end),
+          procedureError: (if $mrun == null then null else ($mrun.procedureError // null | redact_err) end),
+          # Start AND end. The age of the procedure end is what "is this run
+          # recent" should key on where a procedure record exists, and naming
+          # the start alone `procedureTime` invited reading it as either.
+          procedureStartTime: (if $mrun == null then null else ($mrun.startTime | ts_clean) end),
+          procedureEndTime: (if $mrun == null then null else ($mrun.endTime // null | ts_clean) end),
+          # The inner MaintenanceRun command window. Its endTime is the exact
+          # join key against kopiaMeta.maintenanceRun.recentResults[].completedTime.
+          maintenanceCommandStartTime: (if $mcmd == null then null else ($mcmd.startTime // null | ts_clean) end),
+          maintenanceCommandEndTime: (if $mcmd == null then null else ($mcmd.endTime // null | ts_clean) end),
+          # endTime - startTime of the inner MaintenanceRun command: one writer,
+          # one record, so it is immune to the clock skew that inflates
+          # completedTime - scheduledTime. Not yet the published duration.
+          lastRunDurationSeconds: (
+            if $mcmd == null then null
+            else (try (($mcmd.endTime | ts_epoch) - ($mcmd.startTime | ts_epoch)) catch null) end
+          ),
+          maintenanceCommandSucceeded: (if $mcmd == null then null else ($mcmd.succeeded == true) end),
+          # Does the aggregate result belong to the run the procedure describes?
+          # Equality, not proximity: the two are written by the same process in
+          # the same instant, so they match to the second or they are different
+          # runs. When they differ, the statistics in recentResults[0] describe
+          # a run this procedure record says nothing about, and attaching them
+          # to its verdict would be wrong.
+          resultCorrelated: (
+            (($lastFullRun.completedTime // null) | ts_clean) as $ct
+            | (if $mcmd == null then null
+               else (($mcmd.endTime // null) | ts_clean) end) as $ce
+            | (if ($ct == null) or ($ce == null) then null else ($ct == $ce) end)
+          ),
+          # The K10 verdict and the task records disagreeing about the SAME run:
+          # succeeded with a failed task inside it (degraded but green), or
+          # failed with a clean complete run (the failure was outside the
+          # maintenance itself). Computed rather than left for a reader to
+          # spot, and null when there is nothing to compare.
+          evidenceConflict: (
+            if ($mrun == null) or ($procRun == null) then null
+            else
+              ($mrun.succeeded == true) as $pOk
+              | (([ $procRun[] | select(.ok == false) ] | length) == 0) as $tClean
+              | (if ($pOk == true) and ($tClean == false) then true
+                 elif ($pOk == false) and ($tClean == true) and (complete($procRun) != false) then true
+                 else false end)
+            end
+          ),
+          # processResults is capped at 10 entries and shared with StorageScan,
+          # which on a busy repository evicts every MaintenanceRun within hours.
+          procedureHistoryTruncated: (((.status.processResults.processCount // 0)
+                                       > ((.status.processResults.recentResults // []) | length))),
+          successEvidence: (
+            if ($mrun != null) and ($newest != null) then "both"
+            elif $mrun != null then "procedure"
+            elif $newest != null then "tasks"
+            else "none" end
+          )
         }
       ' 2>/dev/null
     done
@@ -5174,6 +5521,45 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       # true when a maintenance time exists but its age could not be computed.
       maintenanceAgeUnknown: (
         (.lastFullMaintenanceTime != null) and (days_ago($now; .lastFullMaintenanceTime) == null)
+      ),
+      # Age of the last run we have evidence SUCCEEDED, as opposed to the last
+      # run that left a timestamp behind. null means not determinable - never a
+      # sentinel number: daysSinceLastMaintenance overloads -1 for "never ran",
+      # which a future timestamp under clock skew collides with (observed on a
+      # live cluster with node NTP drift, rendering "OK (-29d)"). Clamped at 0
+      # so a clock ahead of the operator reads as "just now" rather than
+      # negative.
+      daysSinceLastSuccess: (
+        if .lastSuccessfulMaintenanceTime == null then null
+        else (days_ago($now; .lastSuccessfulMaintenanceTime)
+              | if . == null then null elif . < 0 then 0 else . end)
+        end
+      ),
+      lastSuccessAgeUnknown: (
+        (.lastSuccessfulMaintenanceTime != null)
+        and (days_ago($now; .lastSuccessfulMaintenanceTime) == null)
+      ),
+      # Age of the K10 procedure record itself, where one survives. This is the
+      # authoritative clock for "was this run recent" - daysSinceLastSuccess is
+      # task-derived and available far more often, but it is the weaker source.
+      # Same null-not-sentinel and future-clamp rules as above.
+      daysSinceProcedure: (
+        if .procedureEndTime == null then null
+        else (days_ago($now; .procedureEndTime)
+              | if . == null then null elif . < 0 then 0 else . end)
+        end
+      ),
+      lastRunDurationHuman: (
+        if .lastRunDurationSeconds != null then
+          (
+            (.lastRunDurationSeconds / 3600 | floor) as $h |
+            ((.lastRunDurationSeconds % 3600) / 60 | floor) as $m |
+            (.lastRunDurationSeconds % 60) as $s |
+            if $h > 0 then "\($h)h \($m)m \($s)s"
+            elif $m > 0 then "\($m)m \($s)s"
+            else "\($s)s" end
+          )
+        else null end
       ),
       lastFullMaintenanceDurationHuman: (
         if .lastFullMaintenanceDurationSeconds != null then
