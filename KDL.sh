@@ -5494,8 +5494,60 @@ STORAGE_REPO_MAINTENANCE=$(
   ) | jq -s '.' 2>/dev/null
 ) || STORAGE_REPO_MAINTENANCE='[]'
 
+# Maintenance owner pods. Watching a real run showed the StorageRepository
+# object does not change at all while maintenance executes - it is written
+# atomically at completion - so the pod is the ONLY signal that a run is in
+# flight, and its age the only measure of how long it has been going. That
+# matters most where it matters most: maintenance can run for days on a large
+# repository, and a run overdue because it is still working is not a stall.
+#
+# Selected by the annotation and the -owner suffix, then the suffix is stripped
+# to recover the repository. Gathering what exists and deriving the owner beats
+# constructing "<repo>-owner" per repository and probing for it (891f7d4: a
+# guessed name that did not exist reported the state as unknown). The pod
+# carries no label naming its repository and its ownerReference points at
+# crypto-svc, so the name is the only linkage there is.
+#
+# restartPolicy is Never and there is no controller, so the pod cannot
+# CrashLoopBackOff and restartCount is always 0 - not collected. A failed
+# container terminates the pod and Kasten removes it quickly, so the phases
+# worth seeing are Pending (cannot start) and Running; the reason a pod is not
+# running can come from the PodScheduled condition, a container waiting state
+# or a container terminated state, so all three are consulted.
+STORAGE_REPO_MAINT_PODS=$(cat "$TEMP_DIR/pods.json" 2>/dev/null | jq -c '
+  [ .items[]?
+    | select((((.metadata.annotations // {})["k10.kasten.io/actionPodType"]) == "repository-operations")
+             or ((.metadata.labels // {}).createdBy == "kanister"))
+    | select((.metadata.name // "") | endswith("-owner"))
+    | {
+        repo: ((.metadata.name) | sub("-owner$"; "")),
+        phase: (.status.phase // null),
+        startTime: (.status.startTime // null),
+        blockedReason: (
+          ([ .status.conditions[]? | select(.type == "PodScheduled" and .status != "True")
+             | ((.reason // "NotScheduled") + (if .message then ": " + .message else "" end)) ]
+           + [ .status.containerStatuses[]? | select(.state.waiting)
+               | ("Waiting: " + (.state.waiting.reason // "unknown")) ]
+           + [ .status.containerStatuses[]? | select(.state.terminated)
+               | ("Terminated: " + (.state.terminated.reason // "unknown")
+                  + " (exit " + ((.state.terminated.exitCode // 0) | tostring) + ")") ]
+          ) | if length > 0 then .[0] else null end
+        )
+      } ]' 2>/dev/null) || STORAGE_REPO_MAINT_PODS='[]'
+_ep "$STORAGE_REPO_MAINT_PODS" | jq -e 'type == "array"' >/dev/null 2>&1 || STORAGE_REPO_MAINT_PODS='[]'
+
+# KDL writes {"items":[]} when the pod list cannot be read, so an empty list is
+# ambiguous on its own. A K10 namespace always runs pods, so seeing ANY pod
+# proves the read worked and the absence of an owner pod is real rather than
+# denied. Without this, a denied read would render as "not running".
+STORAGE_REPO_PODS_READABLE=$(cat "$TEMP_DIR/pods.json" 2>/dev/null | jq -r '((.items // []) | length) > 0' 2>/dev/null)
+[ "$STORAGE_REPO_PODS_READABLE" = "true" ] || STORAGE_REPO_PODS_READABLE=false
+debug "Maintenance owner pods: $(_ep "$STORAGE_REPO_MAINT_PODS" | jq -r 'length') (pod list readable: $STORAGE_REPO_PODS_READABLE)"
+
 # Now add status field based on days since last maintenance
 STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
+  --argjson maintPods "$STORAGE_REPO_MAINT_PODS" \
+  --argjson podsReadable "$STORAGE_REPO_PODS_READABLE" \
   --arg threshold "$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS" \
   --arg now "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" '
   # Same RFC3339Nano tolerance as the per-repo filter, and wrapped in try so a
@@ -5539,6 +5591,78 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
         (.lastSuccessfulMaintenanceTime != null)
         and (days_ago($now; .lastSuccessfulMaintenanceTime) == null)
       ),
+      # --- owner pod: the only live signal ---------------------------------
+      # Three-state throughout. null when the pod list could not be read,
+      # because "we cannot see" must not render as "not running".
+      #
+      # PRESENT and RUNNING are deliberately separate. A pod stuck Pending is
+      # not executing maintenance, it is failing to start - and it is precisely
+      # the stall worth reporting, so it must not satisfy the gate that
+      # suppresses an overdue finding. Collapsing the two would have hidden the
+      # case this fixture was written for.
+      maintenancePodPresent: (
+        . as $r
+        | if $podsReadable != true then null
+          else (([ $maintPods[] | select(.repo == $r.name) ] | length) > 0) end
+      ),
+      maintenanceRunning: (
+        . as $r
+        | if $podsReadable != true then null
+          else (([ $maintPods[] | select(.repo == $r.name) | select(.phase == "Running") ] | length) > 0) end
+      ),
+      # Phase recorded VERBATIM, not mapped onto states I predicted, so an
+      # unexpected phase is visible instead of silently bucketed.
+      maintenancePodPhase: (
+        . as $r | ([ $maintPods[] | select(.repo == $r.name) | .phase ] | first // null)
+      ),
+      maintenancePodBlockedReason: (
+        . as $r | ([ $maintPods[] | select(.repo == $r.name) | .blockedReason | select(. != null) ] | first // null)
+      ),
+      maintenanceRunningSince: (
+        . as $r | ([ $maintPods[] | select(.repo == $r.name) | .startTime | select(. != null) ] | first // null)
+      ),
+      maintenanceRunningSeconds: (
+        . as $r
+        | ([ $maintPods[] | select(.repo == $r.name) | .startTime | select(. != null) ] | first // null) as $st
+        | if $st == null then null
+          else (try (((($now | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+                      - ($st | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+                     | if . < 0 then 0 else . end) catch null)
+          end
+      ),
+
+      # --- schedule adherence ----------------------------------------------
+      # nextFullMaintenanceTime is anchored to the last COMPLETED run, verified
+      # on every repository of a live cluster, so it does not advance while a
+      # run executes. A repository mid-run therefore looks overdue by however
+      # long the run has taken - which is why any verdict built on this must be
+      # gated on maintenanceRunning. Collected as a signed number: negative
+      # simply means not due yet, and that is information, not an error.
+      overdueSeconds: (
+        if .nextFullMaintenanceTime == null then null
+        else (try ((($now | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+                   - (.nextFullMaintenanceTime | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+              catch null)
+        end
+      ),
+      # Overdue expressed in units of the repository OWN full interval, read
+      # from maintenanceInfo.full.interval rather than assumed. Full maintenance
+      # is scheduled daily -- it is quick maintenance and storage scans that
+      # cycle more often -- so 1.0 means one daily run was skipped. Kept
+      # relative rather than hard-coded to 24h so the threshold still holds if
+      # a repository is configured differently, without pretending that is
+      # common.
+      overdueIntervals: (
+        (if .nextFullMaintenanceTime == null then null
+         else (try ((($now | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+                    - (.nextFullMaintenanceTime | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
+               catch null)
+         end) as $od
+        | if ($od == null) or ((.fullIntervalSeconds // 0) <= 0) then null
+          else (($od / .fullIntervalSeconds) * 100 | round) / 100
+          end
+      ),
+
       # Age of the K10 procedure record itself, where one survives. This is the
       # authoritative clock for "was this run recent" - daysSinceLastSuccess is
       # task-derived and available far more often, but it is the weaker source.
