@@ -5342,6 +5342,15 @@ STORAGE_REPO_MAINTENANCE=$(
               | if length > 0 then .[-1] else null end)
          end) as $procRun |
 
+        # Consecutive failed MaintenanceRun procedures, newest first. The
+        # task-derived count cannot see these at all: a launch failure runs no
+        # task, so a repository that has failed ten times in a row reports zero
+        # failures from task evidence. A floor, not a total - the list is capped
+        # and shared with StorageScan.
+        ([ ($mruns | reverse)[] | (.succeeded != true) ]) as $procBadFlags |
+        (($procBadFlags | length)
+         - ($procBadFlags | until((length == 0) or (.[0] != true); .[1:]) | length)) as $procConsecFail |
+
         {
           name: .metadata.name,
           namespace: .metadata.namespace,
@@ -5432,6 +5441,7 @@ STORAGE_REPO_MAINTENANCE=$(
           consecutiveFailures: (if $nObserved == 0 then null else $consecFail end),
 
           procedureAvailable: (($mruns | length) > 0),
+          procedureConsecutiveFailures: (if ($mruns | length) == 0 then null else $procConsecFail end),
           procedureSucceeded: (if $mrun == null then null else ($mrun.succeeded == true) end),
           procedureError: (if $mrun == null then null else ($mrun.procedureError // null | redact_err) end),
           # Start AND end. The age of the procedure end is what "is this run
@@ -5564,6 +5574,18 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   # Identical defect to de65a80 item 3 in the residual-snapshots section, found
   # there by an independent audit and never grepped for elsewhere. Behaviour at
   # exactly 7 days is unchanged (not past it). Display rounds to one decimal.
+  # Seconds -> "1h 2m 3s". null for anything that is not a non-negative number,
+  # so a meaningless value is absent rather than mis-rendered.
+  def human_duration:
+    if (type != "number") or (. < 0) then null
+    else
+      (. / 3600 | floor) as $h
+      | ((. % 3600) / 60 | floor) as $m
+      | (. % 60) as $s
+      | if $h > 0 then "\($h)h \($m)m \($s)s"
+        elif $m > 0 then "\($m)m \($s)s"
+        else "\($s)s" end
+    end;
   def days_ago($now_iso; $then_iso):
     (try (
       ($now_iso | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) as $now_ts |
@@ -5573,11 +5595,15 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
 
   map(
     . + {
+      # null, not -1. The sentinel meant "never ran" and collided with a
+      # clock-skewed future timestamp, which a live cluster produced: a
+      # repository 29 days ahead of the operator floored to a negative age and
+      # rendered as "OK (-29d)". A number cannot carry "no answer".
       daysSinceLastMaintenance: (
         if .lastFullMaintenanceTime != null then
           days_ago($now; .lastFullMaintenanceTime)
         else
-          -1
+          null
         end
       ),
       # true when a maintenance time exists but its age could not be computed.
@@ -5683,50 +5709,87 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
               | if . == null then null elif . < 0 then 0 else . end)
         end
       ),
-      lastRunDurationHuman: (
-        if .lastRunDurationSeconds != null then
-          (
-            (.lastRunDurationSeconds / 3600 | floor) as $h |
-            ((.lastRunDurationSeconds % 3600) / 60 | floor) as $m |
-            (.lastRunDurationSeconds % 60) as $s |
-            if $h > 0 then "\($h)h \($m)m \($s)s"
-            elif $m > 0 then "\($m)m \($s)s"
-            else "\($s)s" end
-          )
-        else null end
-      ),
-      lastFullMaintenanceDurationHuman: (
-        if .lastFullMaintenanceDurationSeconds != null then
-          (
-            (.lastFullMaintenanceDurationSeconds / 3600 | floor) as $h |
-            ((.lastFullMaintenanceDurationSeconds % 3600) / 60 | floor) as $m |
-            (.lastFullMaintenanceDurationSeconds % 60) as $s |
-            if $h > 0 then
-              "\($h)h \($m)m \($s)s"
-            elif $m > 0 then
-              "\($m)m \($s)s"
-            else
-              "\($s)s"
-            end
-          )
-        else
-          null
-        end
-      ),
+      # A duration below zero is not a duration. It arises from
+      # completedTime - scheduledTime when a run was triggered by hand:
+      # scheduledTime then holds the slot the run did not wait for, and a live
+      # cluster produced -12283s that way.
+      #
+      # The old formatter made it worse. Its `if h > 0 ... elif m > 0 ... else`
+      # chain drops the hours and minutes entirely when they are negative, so
+      # -12283s (-3h24m43s) rendered as "-43s": a wrong display of a wrong
+      # number. Refuse it instead of decomposing it.
+      lastRunDurationHuman: (.lastRunDurationSeconds | human_duration),
+      lastFullMaintenanceDurationHuman: (.lastFullMaintenanceDurationSeconds | human_duration),
+    }
+  )
+  # SECOND stage. status must not live in the same object construction as the
+  # fields it reads: inside `. + {...}` the `.` is the INPUT, so sibling keys
+  # being added alongside are invisible. daysSinceLastSuccess,
+  # maintenanceRunning and overdueIntervals are all added above, so referring
+  # to them from a sibling status silently saw null and every repository came
+  # out UNKNOWN. Staging the pass is the fix that cannot regress, where
+  # hand-inlining each recomputation would drift.
+  | map(
+    . + {
       status: (
-        if (.disableMaintenance == true) then
-          "DISABLED"
-        elif .lastFullMaintenanceTime == null then
-          "NEVER_RAN"
-        elif (days_ago($now; .lastFullMaintenanceTime)) == null then
-          # Timestamp present but unparseable: we do not know the age, so we
-          # must not say OK. Unknown is not the same as fresh.
-          "UNKNOWN"
-        elif (days_ago($now; .lastFullMaintenanceTime)) > ($threshold | tonumber) then
-          "AMBER"
-        else
-          "OK"
-        end
+        ($threshold | tonumber) as $thr
+
+        # THREE-DEEP PRECEDENCE, most specific first.
+        #
+        # The inner MaintenanceRun command is the run itself. The procedure
+        # wraps four more commands - RepoStatus, MaintenanceInfo, SnapshotList,
+        # BlobStats - and reports failure if ANY of them fails, so keying on the
+        # procedure alone would call it a maintenance failure when only
+        # post-run bookkeeping broke. Task evidence comes last because it cannot
+        # see a launch failure at all: nothing ran, so nothing was recorded, and
+        # the newest task cluster is the previous good run.
+        #
+        # Not an OR across the three. Each is blind in a way the others are not,
+        # and ORing lets the blind one vote.
+        | (if .maintenanceCommandSucceeded != null then (.maintenanceCommandSucceeded == false)
+           elif .procedureSucceeded != null        then (.procedureSucceeded == false)
+           elif .lastRunSucceeded != null          then (.lastRunSucceeded == false)
+           else null end) as $failed
+
+        # Staleness is measured from the last run we have evidence SUCCEEDED,
+        # never from the newest recorded timestamp: a failed run can leave a
+        # fresh one behind, which is what made v2.4 call a failing repository OK.
+        | (if .daysSinceLastSuccess == null then null
+           else (.daysSinceLastSuccess > $thr) end) as $successStale
+
+        | if (.disableMaintenance == true) or (.fullMaintenanceEnabled == false) then
+            # Two independent switches. v2.4 consulted only the Kasten spec
+            # field, so a repository with full maintenance turned off inside
+            # Kopia read as enabled.
+            "DISABLED"
+          elif (.taskHistoryAvailable == true) and (.observedRunCount == 0)
+               and (.procedureAvailable != true) then
+            # History readable and genuinely empty. Distinct from UNKNOWN,
+            # which is history we could not read - reporting that as "never
+            # maintained" would be a critical finding about a repository we
+            # never saw.
+            "NEVER_RAN"
+          elif $failed == null then
+            "UNKNOWN"
+          elif ($failed == true) and (($successStale == null) or ($successStale == true)) then
+            "FAILING_STALE"
+          elif $failed == true then
+            "FAILING"
+          elif $successStale == true then
+            "STALE"
+          elif $successStale == null then
+            # It succeeded, but we cannot date it. Unknown is not fresh.
+            "UNKNOWN"
+          elif (.maintenanceRunning == false) and ((.overdueIntervals // 0) > 1) then
+            # A whole cycle skipped with nothing running and nothing recorded -
+            # no attempt, no failure, no task. Neither a failure check nor
+            # staleness can see this, and staleness would not for a week.
+            # Requires maintenanceRunning == false explicitly: null means the
+            # pod list was unreadable, and a run may well be in flight.
+            "OVERDUE"
+          else
+            "OK"
+          end
       )
     }
   )
@@ -5738,7 +5801,10 @@ fi
 
 STORAGE_REPO_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq 'length // 0')
 STORAGE_REPO_UNKNOWN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "UNKNOWN")] | length // 0')
-STORAGE_REPO_AMBER_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "AMBER")] | length // 0')
+STORAGE_REPO_STALE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "STALE")] | length // 0')
+STORAGE_REPO_FAILING_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "FAILING")] | length // 0')
+STORAGE_REPO_FAILING_STALE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "FAILING_STALE")] | length // 0')
+STORAGE_REPO_OVERDUE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "OVERDUE")] | length // 0')
 STORAGE_REPO_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "NEVER_RAN")] | length // 0')
 STORAGE_REPO_DISABLED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "DISABLED")] | length // 0')
 
@@ -5750,11 +5816,14 @@ STORAGE_REPO_DISABLED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | selec
 # Kasten. Without it every failure renders as the confident, wrong statement
 # "not using exports or imports".
 STORAGE_REPO_LISTED=$(safe_int "$REPO_NAMES_COUNT")
-[ -z "$STORAGE_REPO_AMBER_COUNT" ] && STORAGE_REPO_AMBER_COUNT=0
+[ -z "$STORAGE_REPO_STALE_COUNT" ] && STORAGE_REPO_STALE_COUNT=0
+[ -z "$STORAGE_REPO_FAILING_COUNT" ] && STORAGE_REPO_FAILING_COUNT=0
+[ -z "$STORAGE_REPO_FAILING_STALE_COUNT" ] && STORAGE_REPO_FAILING_STALE_COUNT=0
+[ -z "$STORAGE_REPO_OVERDUE_COUNT" ] && STORAGE_REPO_OVERDUE_COUNT=0
 [ -z "$STORAGE_REPO_NEVER_RAN_COUNT" ] && STORAGE_REPO_NEVER_RAN_COUNT=0
 [ -z "$STORAGE_REPO_DISABLED_COUNT" ] && STORAGE_REPO_DISABLED_COUNT=0
 
-debug "Storage repositories: $STORAGE_REPO_LISTED listed, $STORAGE_REPO_COUNT with details, $STORAGE_REPO_UNKNOWN_COUNT unknown-age, $STORAGE_REPO_AMBER_COUNT amber (>$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days), $STORAGE_REPO_NEVER_RAN_COUNT never ran, $STORAGE_REPO_DISABLED_COUNT disabled"
+debug "Storage repositories: $STORAGE_REPO_LISTED listed, $STORAGE_REPO_COUNT with details, $STORAGE_REPO_UNKNOWN_COUNT unknown, $STORAGE_REPO_FAILING_STALE_COUNT failing-stale, $STORAGE_REPO_FAILING_COUNT failing, $STORAGE_REPO_STALE_COUNT stale (>$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days), $STORAGE_REPO_OVERDUE_COUNT overdue, $STORAGE_REPO_NEVER_RAN_COUNT never ran, $STORAGE_REPO_DISABLED_COUNT disabled"
 
 # Storage Repository Best Practice Assessment
 if [ "$STORAGE_REPO_COUNT" -eq 0 ] && [ "$STORAGE_REPO_LISTED" -gt 0 ]; then
@@ -5766,15 +5835,20 @@ elif [ "$STORAGE_REPO_COUNT" -lt "$STORAGE_REPO_LISTED" ]; then
   # Some repositories were listed but never produced details - a partial read is
   # not a clean result, and the missing ones are exactly the ones we cannot vouch for.
   BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
-elif [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ] || [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
-  BP_STORAGE_REPO_STATUS="PARTIAL"
-elif [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
+elif [ "$STORAGE_REPO_FAILING_STALE_COUNT" -gt 0 ] || [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
+  # New worst verdict. A repository whose maintenance keeps failing and has not
+  # succeeded inside the threshold, or has never succeeded at all, is not a
+  # "partial" result - nothing about it is working.
+  BP_STORAGE_REPO_STATUS="FAILING"
+elif [ "$STORAGE_REPO_FAILING_COUNT" -gt 0 ] || [ "$STORAGE_REPO_STALE_COUNT" -gt 0 ] \
+     || [ "$STORAGE_REPO_OVERDUE_COUNT" -gt 0 ] || [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
   BP_STORAGE_REPO_STATUS="PARTIAL"
 elif [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
   BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
 else
   BP_STORAGE_REPO_STATUS="OK"
 fi
+debug "Storage repository best practice: $BP_STORAGE_REPO_STATUS"
 
 ### -------------------------
 ### Ransomware Readiness Score (NEW v2.0 - patch 5/7) - F1
@@ -6357,7 +6431,10 @@ if [ "$MODE" = "json" ]; then
     --argjson profileUndeterminedCount "$PROFILE_UNDETERMINED_COUNT" \
     --slurpfile storageRepoMaintenance "$TEMP_DIR/storageRepoMaintenance.json" \
     --argjson storageRepoCount "$STORAGE_REPO_COUNT" \
-    --argjson storageRepoAmberCount "$STORAGE_REPO_AMBER_COUNT" \
+    --argjson storageRepoStaleCount "$STORAGE_REPO_STALE_COUNT" \
+    --argjson storageRepoFailingCount "$STORAGE_REPO_FAILING_COUNT" \
+    --argjson storageRepoFailingStaleCount "$STORAGE_REPO_FAILING_STALE_COUNT" \
+    --argjson storageRepoOverdueCount "$STORAGE_REPO_OVERDUE_COUNT" \
     --argjson storageRepoNeverRanCount "$STORAGE_REPO_NEVER_RAN_COUNT" \
     --argjson storageRepoDisabledCount "$STORAGE_REPO_DISABLED_COUNT" \
     --argjson storageRepoUnknownCount "$STORAGE_REPO_UNKNOWN_COUNT" \
@@ -7017,13 +7094,16 @@ if [ "$MODE" = "json" ]; then
       storageRepositories: {
         listed: $storageRepoListed,
         total: $storageRepoCount,
-        amberCount: $storageRepoAmberCount,
+        staleCount: $storageRepoStaleCount,
+        failingCount: $storageRepoFailingCount,
+        failingStaleCount: $storageRepoFailingStaleCount,
+        overdueCount: $storageRepoOverdueCount,
         neverRanCount: $storageRepoNeverRanCount,
         disabledCount: $storageRepoDisabledCount,
         ageUnknownCount: $storageRepoUnknownCount,
         maintenanceThresholdDays: 7,
         items: $storageRepoMaintenance,
-        note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. AMBER means the most recent maintenance run completed more than 7 days ago; UNKNOWN means a run was recorded but its timestamp could not be parsed, so its age is not known.",
+        note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. Status is derived from evidence that a run SUCCEEDED, not from the newest recorded timestamp: a failed run can leave a fresh one behind. FAILING_STALE means the last run failed and none has succeeded within the threshold; FAILING means it failed but a success is still recent; STALE means the last success is older than the threshold; OVERDUE means a whole cycle passed with nothing running and nothing recorded; NEVER_RAN means readable history with no run in it; UNKNOWN means neither the procedure record nor the task history could answer, which is not the same as healthy.",
         readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten), and the best practice reports NOT_ASSESSED rather than a clean result.",
         maintenanceTypeNote: "recentResults[0] is the most recent run: verified descending on all 9 repositories of a live Kasten 9.0.5 cluster. The entries carry no full/quick discriminator, but they are spaced one per day against a configured full interval of 24h and a quick interval of 1h (maintenanceInfo.full.interval / .quick.interval), and quick runs would produce roughly 24x more entries than observed - so recentResults holds full runs. runsTotal exceeds the number of entries kept, so the list is truncated to the most recent."
       },
@@ -7973,15 +8053,27 @@ else
     # Ages are carried at two decimals so the threshold comparison is exact;
     # one decimal is enough to read. Bound up front - `as` cannot appear in the
     # middle of a concatenation.
-    ((((.daysSinceLastMaintenance // 0) * 10 | round) / 10) | tostring) as $ageShown |
+    # null is now a real value (the -1 sentinel is gone), and `// 0` would
+    # render it as "0 days" - a confident age for a repository whose age we do
+    # not know.
+    (if .daysSinceLastMaintenance == null then "unknown"
+     else (((.daysSinceLastMaintenance * 10) | round) / 10 | tostring) end) as $ageShown |
     "  - " + .name
       + " [\(.contentType)]"
       + " profile=" + .profile
-      + (if .lastFullMaintenanceDurationHuman then " duration=" + .lastFullMaintenanceDurationHuman else "" end)
+      # The inner MaintenanceRun command window, which is the run itself.
+      # completedTime - scheduledTime absorbs queue time, overstates several
+      # times over, and goes negative on a hand-triggered run.
+      + ((if has("lastRunDurationHuman") then .lastRunDurationHuman
+           else .lastFullMaintenanceDurationHuman end) as $dur
+         | if $dur then " duration=" + $dur else "" end)
       + (if .status == "UNKNOWN" then " [UNKNOWN_STATUS]"
          elif .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
          elif .status == "DISABLED" then " [DISABLED_STATUS]"
-         elif .status == "AMBER" then " [AMBER_STATUS - " + $ageShown + " days]"
+         elif .status == "FAILING_STALE" then " [FAILSTALE_STATUS - failing, no success in " + $ageShown + " days]"
+         elif .status == "FAILING" then " [FAILING_STATUS - last run failed, last success " + $ageShown + " days ago]"
+         elif .status == "OVERDUE" then " [OVERDUE_STATUS - " + (((.overdueIntervals // 0) * 10 | round) / 10 | tostring) + " cycles past due, nothing running]"
+         elif .status == "STALE" then " [STALE_STATUS - " + $ageShown + " days]"
          elif .status == "OK" then " [OK_STATUS - " + $ageShown + " days ago]"
          else " [" + .status + "]"
          end)
@@ -7990,11 +8082,23 @@ else
       -e "s/\[UNKNOWN_STATUS\]/${COLOR_CYAN}[AGE UNKNOWN]${COLOR_RESET}/" \
       -e "s/\[NEVER_RAN_STATUS\]/${COLOR_RED}[NEVER RAN]${COLOR_RESET}/" \
       -e "s/\[DISABLED_STATUS\]/${COLOR_YELLOW}[DISABLED]${COLOR_RESET}/" \
-      -e "s/\[AMBER_STATUS/${COLOR_YELLOW}[AMBER${COLOR_RESET}/" \
+      -e "s/\[FAILSTALE_STATUS/${COLOR_RED}[FAILING${COLOR_RESET}/" \
+      -e "s/\[FAILING_STATUS/${COLOR_YELLOW}[FAILING${COLOR_RESET}/" \
+      -e "s/\[OVERDUE_STATUS/${COLOR_YELLOW}[OVERDUE${COLOR_RESET}/" \
+      -e "s/\[STALE_STATUS/${COLOR_YELLOW}[STALE${COLOR_RESET}/" \
       -e "s/\[OK_STATUS/${COLOR_GREEN}[OK${COLOR_RESET}/"
   done
-  if [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ] 2>/dev/null; then
-    printf "  ${COLOR_YELLOW}[WARN]  $STORAGE_REPO_AMBER_COUNT repository/repositories with full maintenance last run >$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days ago${COLOR_RESET}\n"
+  if [ "$STORAGE_REPO_FAILING_STALE_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_RED}[FAIL]  $STORAGE_REPO_FAILING_STALE_COUNT repository/repositories failing with no success in >$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days${COLOR_RESET}\n"
+  fi
+  if [ "$STORAGE_REPO_FAILING_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN]  $STORAGE_REPO_FAILING_COUNT repository/repositories whose last maintenance run failed${COLOR_RESET}\n"
+  fi
+  if [ "$STORAGE_REPO_STALE_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN]  $STORAGE_REPO_STALE_COUNT repository/repositories with full maintenance last successful >$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days ago${COLOR_RESET}\n"
+  fi
+  if [ "$STORAGE_REPO_OVERDUE_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}[WARN]  $STORAGE_REPO_OVERDUE_COUNT repository/repositories past due by a full cycle with nothing running${COLOR_RESET}\n"
   fi
   if [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_RED}[FAIL]  $STORAGE_REPO_NEVER_RAN_COUNT repository/repositories never had full maintenance run${COLOR_RESET}\n"
@@ -8682,9 +8786,23 @@ fi
 # Storage repository maintenance (NEW v2.4)
 if [ "$BP_STORAGE_REPO_STATUS" = "OK" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}HEALTHY${COLOR_RESET} ($STORAGE_REPO_COUNT repo(s) maintained within $STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days)\n"
-elif [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ]; then
+elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ]; then
   _repo_bits=""
-  [ "$STORAGE_REPO_AMBER_COUNT" -gt 0 ] && _repo_bits="$STORAGE_REPO_AMBER_COUNT stale"
+  if [ "$STORAGE_REPO_FAILING_STALE_COUNT" -gt 0 ]; then
+    _repo_bits="$STORAGE_REPO_FAILING_STALE_COUNT failing and stale"
+  fi
+  if [ "$STORAGE_REPO_FAILING_COUNT" -gt 0 ]; then
+    [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
+    _repo_bits="$_repo_bits$STORAGE_REPO_FAILING_COUNT failing"
+  fi
+  if [ "$STORAGE_REPO_STALE_COUNT" -gt 0 ]; then
+    [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
+    _repo_bits="$_repo_bits$STORAGE_REPO_STALE_COUNT stale"
+  fi
+  if [ "$STORAGE_REPO_OVERDUE_COUNT" -gt 0 ]; then
+    [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
+    _repo_bits="$_repo_bits$STORAGE_REPO_OVERDUE_COUNT overdue"
+  fi
   if [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
     [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
     _repo_bits="$_repo_bits$STORAGE_REPO_NEVER_RAN_COUNT never ran"
@@ -8693,7 +8811,11 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ]; then
     [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
     _repo_bits="$_repo_bits$STORAGE_REPO_DISABLED_COUNT disabled"
   fi
-  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET} ($_repo_bits)\n"
+  if [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ]; then
+    printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Repository maintenance: ${COLOR_RED}FAILING${COLOR_RESET} ($_repo_bits)\n"
+  else
+    printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET} ($_repo_bits)\n"
+  fi
 elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_ASSESSED" ]; then
   if [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
     printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_UNKNOWN_COUNT repo(s) with an unreadable maintenance timestamp)\n"

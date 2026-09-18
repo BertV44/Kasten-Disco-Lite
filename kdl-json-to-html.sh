@@ -287,6 +287,15 @@ def formatRetention:
     "<span class=\"badge warn\">Not defined</span>"
   end;
 
+# staleCount replaced amberCount when AMBER was renamed STALE. has(), not //:
+# a legitimate 0 is truthy in jq so // would not fire, but an ABSENT key must
+# read as "not present" rather than zero for older reports.
+def staleCountOf(sr):
+  if (sr | type) != "object" then 0
+  elif (sr | has("staleCount")) then (sr.staleCount // 0)
+  elif (sr | has("amberCount")) then (sr.amberCount // 0)
+  else 0 end;
+
 def tunedBadge(val; dflt):
   if val != dflt then
     "<code>" + val + "</code> <span class=\"tuned-badge\">tuned</span>"
@@ -764,10 +773,13 @@ else "" end) + "
         <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
                  then "<span class=\"badge info\">\u2014 not using exports</span>"
                  else badge(.bestPractices.storageRepositoryMaintenance) end) +
-          (if ((.storageRepositories.amberCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
+          (if (staleCountOf(.storageRepositories) + (.storageRepositories.failingCount // 0) + (.storageRepositories.failingStaleCount // 0) + (.storageRepositories.overdueCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
             " (" +
             ([
-              (if (.storageRepositories.amberCount // 0) > 0 then (.storageRepositories.amberCount | tostring) + " stale" else empty end),
+              (if (.storageRepositories.failingStaleCount // 0) > 0 then ((.storageRepositories.failingStaleCount) | tostring) + " failing and stale" else empty end),
+              (if (.storageRepositories.failingCount // 0) > 0 then ((.storageRepositories.failingCount) | tostring) + " failing" else empty end),
+              (if staleCountOf(.storageRepositories) > 0 then (staleCountOf(.storageRepositories) | tostring) + " stale" else empty end),
+              (if (.storageRepositories.overdueCount // 0) > 0 then ((.storageRepositories.overdueCount) | tostring) + " overdue" else empty end),
               (if (.storageRepositories.neverRanCount // 0) > 0 then (.storageRepositories.neverRanCount | tostring) + " never-ran" else empty end),
               (if (.storageRepositories.disabledCount // 0) > 0 then (.storageRepositories.disabledCount | tostring) + " disabled" else empty end)
             ] | join(", ")) + ")"
@@ -1241,8 +1253,17 @@ else "" end) + "
     else
       "<div class=\"card\">
         <div class=\"stat-row\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">" + ((.storageRepositories.total // 0) | tostring) + "</span></div>"
-        + (if (.storageRepositories.amberCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Stale (> 7 days)</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.amberCount // 0) | tostring) + "</span></span></div>"
+        + (if (.storageRepositories.failingStaleCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Failing, no recent success</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.failingStaleCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.failingCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Last run failed</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.failingCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if staleCountOf(.storageRepositories) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Stale (> 7 days)</span><span class=\"stat-value\"><span class=\"badge warn\">" + (staleCountOf(.storageRepositories) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.overdueCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Past due, nothing running</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.overdueCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories.neverRanCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Never Ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount // 0) | tostring) + "</span></span></div>"
@@ -1262,19 +1283,33 @@ else "" end) + "
           # Ages carry two decimals from v2.5.1 so the 7-day threshold compares
           # exactly; one decimal is enough to read. Older reports hold whole
           # numbers and round to themselves, so this renders both.
-          ((((.daysSinceLastMaintenance // 0) * 10 | round) / 10) | tostring) as $ageShown |
+          (if .daysSinceLastMaintenance == null then "unknown"
+           else (((.daysSinceLastMaintenance * 10) | round) / 10 | tostring) end) as $ageShown |
           if .status == "DISABLED" then
             "<span class=\"badge error\">Disabled</span>"
           elif .status == "NEVER_RAN" then
             "<span class=\"badge error\">Never Ran</span>"
-          elif .status == "AMBER" then
+          elif .status == "FAILING_STALE" then
+            "<span class=\"badge error\">Failing (" + $ageShown + "d since success)</span>"
+          elif .status == "FAILING" then
+            "<span class=\"badge warn\">Last run failed</span>"
+          elif .status == "OVERDUE" then
+            "<span class=\"badge warn\">Past due</span>"
+          elif .status == "STALE" or .status == "AMBER" then
             "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>"
+          elif .status == "UNKNOWN" then
+            "<span class=\"badge info\">Not assessed</span>"
           else
             "<span class=\"badge ok\">OK (" + $ageShown + "d)</span>"
           end
         ) + "</td>" +
         "<td>" + (if .lastFullMaintenanceTime then (.lastFullMaintenanceTime | tostring | split("T")[0] + " " + split("T")[1] | split("Z")[0]) else "\u2014" end) + "</td>" +
-        "<td>" + (if .lastFullMaintenanceDurationHuman then .lastFullMaintenanceDurationHuman else "\u2014" end) + "</td></tr>"
+        # The inner MaintenanceRun command window. The v2.4 field it falls back
+        # to is completedTime - scheduledTime, which absorbs queue time and
+        # goes negative on a hand-triggered run; kept only for reports that
+        # predate the command window being collected.
+        "<td>" + (((if has("lastRunDurationHuman") then .lastRunDurationHuman
+                     else .lastFullMaintenanceDurationHuman end) // "\u2014")) + "</td></tr>"
       ] | join("")) +
       "</tbody>
       </table>"
