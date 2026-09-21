@@ -1246,24 +1246,53 @@ else "" end) + "
 
 <!-- Storage Repository Maintenance -->
 <h2>\uD83D\uDCBE Repository Maintenance</h2>
-     <p class=\"section-description\">Storage repositories require periodic full maintenance to optimize performance and detect corruption. Full maintenance runs include data verification, catalog cleanup, and garbage collection. Repositories should be maintained at least once every 7 days. <strong>Stale</strong> repositories (not maintained >7 days) and <strong>Disabled</strong> repositories require attention to maintain backup integrity and reliability.</p>"
+     <p class=\"section-description\">Full maintenance reclaims the space held by deleted snapshots and compacts the indexes. <strong>Nothing here means a backup has been lost</strong> &mdash; what suffers is storage cost and the speed of exports, imports and restores.</p>
+     <p class=\"section-description\">Missed runs compound: a bigger backlog makes a longer run, and a run outliving the process timeout (10h unless the repository overrides it) is killed partway, leaving more behind again. Status comes from evidence a run <strong>succeeded</strong>, not from the newest timestamp &mdash; a failed run leaves one of those too.</p>
+     <ul class=\"section-description\" style=\"margin-top:-0.6rem;padding-left:1.4rem;\">
+       <li><strong>OK</strong> &mdash; succeeded within " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days.</li>
+       <li><strong>Run failed &mdash; last success Nd ago</strong> <code>FAILING</code> &mdash; newest attempt failed, backlog still small. Read the reason under the status.</li>
+       <li><strong>Run failed &mdash; no success for Nd</strong> <code>FAILING_STALE</code> &mdash; urgent. Usually the maintenance pod cannot start or finish, or the repository is unreachable.</li>
+       <li><strong>Past due (N cycles)</strong> <code>OVERDUE</code> &mdash; a cycle passed with no attempt recorded, so there is no failure to find. Check K10 is scheduling, and whether the repository is still used.</li>
+       <li><strong>Stale (Nd)</strong> <code>STALE</code> &mdash; last success older than " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days, nothing failed. Start with whether its exports still run.</li>
+       <li><strong>Never Ran</strong> <code>NEVER_RAN</code> &mdash; readable history with no run in it. Normal under a day old.</li>
+       <li><strong>Disabled</strong> <code>DISABLED</code> &mdash; off in the Kasten spec or in Kopia. Space is never reclaimed while off.</li>
+       <li><strong>Not assessed</strong> <code>UNKNOWN</code> &mdash; neither source could answer. <strong>Not the same as healthy</strong>; usually the <code>storagerepositories/details</code> RBAC rule.</li>
+     </ul>
+     <p class=\"section-description\">Durations exclude time spent queued.</p>"
 + (if .storageRepositories then
     (if (.storageRepositories.total // 0) == 0 then
       "<div class=\"info-box\">No Storage Repositories found (not using exports or imports)</div>"
     else
       "<div class=\"card\">
-        <div class=\"stat-row\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">" + ((.storageRepositories.total // 0) | tostring) + "</span></div>"
+        <div class=\"stat-row\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">"
+        + ((.storageRepositories.total // 0) | tostring)
+        + (if ((.storageRepositories.listed // 0) > (.storageRepositories.total // 0))
+           then " <span class=\"badge info\">of " + ((.storageRepositories.listed) | tostring) + " listed \u2014 " + (((.storageRepositories.listed) - (.storageRepositories.total)) | tostring) + " unreadable</span>"
+           else "" end)
+        + "</span></div>"
         + (if (.storageRepositories.failingStaleCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Failing, no recent success</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.failingStaleCount) | tostring) + "</span></span></div>"
+            "<div class=\"stat-row\"><span class=\"stat-label\">Run failed, no recent success</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.failingStaleCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories.failingCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Last run failed</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.failingCount) | tostring) + "</span></span></div>"
+            "<div class=\"stat-row\"><span class=\"stat-label\">Run failed, success still recent</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.failingCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if staleCountOf(.storageRepositories) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Stale (> 7 days)</span><span class=\"stat-value\"><span class=\"badge warn\">" + (staleCountOf(.storageRepositories) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories.overdueCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Past due, nothing running</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.overdueCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.neverRanCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Never ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.disabledCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Disabled</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.disabledCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.ageUnknownCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Not assessed</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.ageUnknownCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("okCount")) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">OK</span><span class=\"stat-value\"><span class=\"badge ok\">" + ((.storageRepositories.okCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories.neverRanCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Never Ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount // 0) | tostring) + "</span></span></div>"
@@ -1285,16 +1314,20 @@ else "" end) + "
           # numbers and round to themselves, so this renders both.
           (if .daysSinceLastMaintenance == null then "unknown"
            else (((.daysSinceLastMaintenance * 10) | round) / 10 | tostring) end) as $ageShown |
+          (if .daysSinceLastSuccess == null then "never"
+           else (((.daysSinceLastSuccess * 10) | round) / 10 | tostring) + "d" end) as $succShown |
           if .status == "DISABLED" then
             "<span class=\"badge error\">Disabled</span>"
           elif .status == "NEVER_RAN" then
             "<span class=\"badge error\">Never Ran</span>"
           elif .status == "FAILING_STALE" then
-            "<span class=\"badge error\">Failing (" + $ageShown + "d since success)</span>"
+            "<span class=\"badge error\">Run failed \u2014 no success for " + $succShown + "</span>"
           elif .status == "FAILING" then
-            "<span class=\"badge warn\">Last run failed</span>"
+            "<span class=\"badge warn\">Run failed \u2014 last success " + $succShown + " ago</span>"
           elif .status == "OVERDUE" then
-            "<span class=\"badge warn\">Past due</span>"
+            "<span class=\"badge warn\">Past due ("
+            + ((((.overdueIntervals // 0) * 10 | round) / 10) | tostring)
+            + " cycle" + (if (((.overdueIntervals // 0) * 10 | round) / 10) == 1 then "" else "s" end) + ")</span>"
           elif .status == "STALE" or .status == "AMBER" then
             "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>"
           elif .status == "UNKNOWN" then
@@ -1302,6 +1335,15 @@ else "" end) + "
           else
             "<span class=\"badge ok\">OK (" + $ageShown + "d)</span>"
           end
+          # The reason, where there is one. For a launch failure this string is
+          # the most actionable line in the whole report, and until now it
+          # existed only in the JSON. procedureError first: it describes the
+          # run K10 itself judged, where lastRunError is one task inside a run.
+          # @html because it is cluster-supplied text.
+          + ((.procedureError // .lastRunError) as $err
+             | if ($err != null) and (.status | IN("FAILING","FAILING_STALE","NEVER_RAN")) then
+                 "<div class=\"muted\" style=\"font-size:11px;margin-top:4px\">" + ($err | @html) + "</div>"
+               else "" end)
         ) + "</td>" +
         "<td>" + (if .lastFullMaintenanceTime then (.lastFullMaintenanceTime | tostring | split("T")[0] + " " + split("T")[1] | split("Z")[0]) else "\u2014" end) + "</td>" +
         # The inner MaintenanceRun command window. The v2.4 field it falls back

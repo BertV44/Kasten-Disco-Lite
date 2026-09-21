@@ -5811,6 +5811,7 @@ STORAGE_REPO_STALE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.
 STORAGE_REPO_FAILING_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "FAILING")] | length // 0')
 STORAGE_REPO_FAILING_STALE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "FAILING_STALE")] | length // 0')
 STORAGE_REPO_OVERDUE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "OVERDUE")] | length // 0')
+STORAGE_REPO_OK_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "OK")] | length // 0')
 STORAGE_REPO_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "NEVER_RAN")] | length // 0')
 STORAGE_REPO_DISABLED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "DISABLED")] | length // 0')
 
@@ -5826,6 +5827,7 @@ STORAGE_REPO_LISTED=$(safe_int "$REPO_NAMES_COUNT")
 [ -z "$STORAGE_REPO_FAILING_COUNT" ] && STORAGE_REPO_FAILING_COUNT=0
 [ -z "$STORAGE_REPO_FAILING_STALE_COUNT" ] && STORAGE_REPO_FAILING_STALE_COUNT=0
 [ -z "$STORAGE_REPO_OVERDUE_COUNT" ] && STORAGE_REPO_OVERDUE_COUNT=0
+[ -z "$STORAGE_REPO_OK_COUNT" ] && STORAGE_REPO_OK_COUNT=0
 [ -z "$STORAGE_REPO_NEVER_RAN_COUNT" ] && STORAGE_REPO_NEVER_RAN_COUNT=0
 [ -z "$STORAGE_REPO_DISABLED_COUNT" ] && STORAGE_REPO_DISABLED_COUNT=0
 
@@ -5837,10 +5839,6 @@ if [ "$STORAGE_REPO_COUNT" -eq 0 ] && [ "$STORAGE_REPO_LISTED" -gt 0 ]; then
   BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
 elif [ "$STORAGE_REPO_COUNT" -eq 0 ]; then
   BP_STORAGE_REPO_STATUS="NOT_CONFIGURED"
-elif [ "$STORAGE_REPO_COUNT" -lt "$STORAGE_REPO_LISTED" ]; then
-  # Some repositories were listed but never produced details - a partial read is
-  # not a clean result, and the missing ones are exactly the ones we cannot vouch for.
-  BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
 elif [ "$STORAGE_REPO_FAILING_STALE_COUNT" -gt 0 ] || [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
   # New worst verdict. A repository whose maintenance keeps failing and has not
   # succeeded inside the threshold, or has never succeeded at all, is not a
@@ -5849,7 +5847,12 @@ elif [ "$STORAGE_REPO_FAILING_STALE_COUNT" -gt 0 ] || [ "$STORAGE_REPO_NEVER_RAN
 elif [ "$STORAGE_REPO_FAILING_COUNT" -gt 0 ] || [ "$STORAGE_REPO_STALE_COUNT" -gt 0 ] \
      || [ "$STORAGE_REPO_OVERDUE_COUNT" -gt 0 ] || [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
   BP_STORAGE_REPO_STATUS="PARTIAL"
-elif [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
+elif [ "$STORAGE_REPO_COUNT" -lt "$STORAGE_REPO_LISTED" ] || [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
+  # A partial read is not a clean result -- but it is checked AFTER the failure
+  # states, not before. On a 162-repository cluster ONE unreadable repository
+  # downgraded the section to NOT_ASSESSED and hid 49 that were definitively
+  # failing. f15f962 was right that "we could not see them" must never render
+  # as healthy; it must not suppress "the ones we did see are broken" either.
   BP_STORAGE_REPO_STATUS="NOT_ASSESSED"
 else
   BP_STORAGE_REPO_STATUS="OK"
@@ -6441,6 +6444,7 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoFailingCount "$STORAGE_REPO_FAILING_COUNT" \
     --argjson storageRepoFailingStaleCount "$STORAGE_REPO_FAILING_STALE_COUNT" \
     --argjson storageRepoOverdueCount "$STORAGE_REPO_OVERDUE_COUNT" \
+    --argjson storageRepoOkCount "$STORAGE_REPO_OK_COUNT" \
     --argjson storageRepoNeverRanCount "$STORAGE_REPO_NEVER_RAN_COUNT" \
     --argjson storageRepoDisabledCount "$STORAGE_REPO_DISABLED_COUNT" \
     --argjson storageRepoUnknownCount "$STORAGE_REPO_UNKNOWN_COUNT" \
@@ -7104,6 +7108,7 @@ if [ "$MODE" = "json" ]; then
         failingCount: $storageRepoFailingCount,
         failingStaleCount: $storageRepoFailingStaleCount,
         overdueCount: $storageRepoOverdueCount,
+        okCount: $storageRepoOkCount,
         neverRanCount: $storageRepoNeverRanCount,
         disabledCount: $storageRepoDisabledCount,
         ageUnknownCount: $storageRepoUnknownCount,
