@@ -56,7 +56,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** with last-run tracking and 7-day staleness detection *(NEW v2.4)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp *(NEW v2.4)*
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
@@ -112,18 +112,42 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   so it is reported alongside the Monitoring best practice but does **not**
   change its verdict. Endpoint URLs are not collected.
 
-- **Storage Repository Maintenance Status** — KDL now queries Kopia
-  StorageRepository objects in the K10 namespace to report on maintenance
-  status for export and import repositories. Repositories are marked as "Amber"
-  (review needed) if maintenance has not run in the last 7 days, which can
-  indicate performance degradation or capacity planning issues. Reports the last
-  maintenance run date, its scheduled-to-completion time, and disabled
-  maintenance configurations. Repositories the cluster listed but whose
-  `/details` subresource could not be read are counted separately and force
-  `NOT_ASSESSED` rather than being reported as absent. Useful for identifying
-  stale repositories that may need
-  manual intervention. Reported in human output, JSON under `storageRepositories`,
-  and in the HTML dashboard with color-coded status indicators.
+- **Storage Repository Maintenance Status** — KDL queries the Kopia
+  StorageRepository objects in the K10 namespace and reports whether
+  maintenance **succeeded**, not merely when it last recorded a timestamp. A
+  failed run leaves a fresh timestamp behind too, so a repository failing
+  every night used to report as healthy.
+
+  Each repository lands on one status: `OK`, `STALE` (succeeded, but longer
+  ago than the 7-day threshold), `FAILING` (last attempt failed, a success is
+  still recent), `FAILING_STALE` (attempts failing and nothing has succeeded
+  inside the threshold), `OVERDUE` (a whole cycle passed with nothing
+  attempted and nothing running), `NEVER_RAN`, `DISABLED`, `READ_ONLY`
+  (Kasten excludes read-only repositories from background processing, so
+  these are maintained by the cluster that owns them), or `UNKNOWN`.
+
+  Evidence comes from the per-task history in `maintenanceInfo.runs` and from
+  `processResults`, which cover each other's gaps: a launch failure records no
+  tasks at all, and a busy repository evicts its maintenance records within
+  hours. Durations are measured from the maintenance command itself rather
+  than from scheduling, which overstated them several-fold.
+
+  **Severity is earned.** The check goes critical only when a failing
+  repository is still being written to. Where every failing repository has
+  had no data written for 30+ days, or its profile or policy has since been
+  deleted, the finding stays but drops to a warning — nothing accumulates in
+  a repository nobody writes to, which is the normal state after a profile
+  migration. A repository whose last write cannot be dated counts as active,
+  so an unknown never quietens a finding.
+
+  Each row names the application, policy and target (an object-store bucket
+  or a FileStore PVC claim) so a failure can be traced to its owner. Bucket
+  and claim **names** only: endpoints and paths carry the cluster UUID and
+  are never collected. Repositories the cluster listed but whose `/details`
+  subresource could not be read are counted separately and force
+  `NOT_ASSESSED` rather than being reported as absent or clean. The
+  `/details` reads run concurrently (`KDL_PARALLEL`, default 10). Reported in
+  human output, JSON under `storageRepositories`, and in the HTML dashboard.
 
 ## What's New in v2.3
 
@@ -452,7 +476,7 @@ New in v2.0:
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
 | K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
-| Repository maintenance | Warning  | Export repos maintained within 7 days             | Stale (>7d), never run, or maintenance disabled     |
+| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when stale, overdue, never run or disabled; **critical** when a repository still being written to keeps failing |
 | Residual snapshots     | Warning  | No local snapshot past 7 days that no policy retains | On-demand, policy-deleted or unbound snapshots left behind |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |

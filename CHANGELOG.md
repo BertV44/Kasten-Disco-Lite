@@ -3,6 +3,73 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+### Fixed
+- **A repository whose maintenance fails every night no longer reports `OK`.**
+  The check read only `kopiaMeta.maintenanceRun.recentResults[0].completedTime`
+  and never whether the run succeeded — and a failed run leaves a fresh
+  timestamp behind too. Status now comes from evidence of success, drawn from
+  the per-task history in `maintenanceInfo.runs` and from `processResults`,
+  which cover each other's gaps: a launch failure records no tasks at all,
+  while a busy repository evicts its maintenance records within hours.
+- **One unreadable repository no longer hides failing ones.** The partial-read
+  check ran before the failure checks, so on a 162-repository cluster a single
+  unreadable repository reported the section `NOT_ASSESSED` while 49 others had
+  failed every recorded attempt.
+- The 7-day staleness threshold was effectively 8 days: the age was floored
+  before comparison, so everything in ]7d, 8d[ went unreported.
+- Negative maintenance ages from node clock skew (`OK (-29d)`). The clamp
+  existed on `daysSinceLastSuccess` and had been omitted on
+  `daysSinceLastMaintenance`.
+- Run duration was measured from scheduling to completion, so it absorbed
+  queue time and overstated by 4–5x; it could also go negative on a
+  hand-triggered run. Measured from the maintenance command itself now.
+- The summary card did not reconcile: statuses with no row left repositories
+  unexplained against the total.
+
+### Added
+- **Honest maintenance states.** `FAILING_STALE`, `FAILING`, `OVERDUE`,
+  `READ_ONLY` and `UNKNOWN` join `OK`, `STALE` (renamed from `AMBER`),
+  `NEVER_RAN` and `DISABLED`. `OVERDUE` catches a scheduler that stopped
+  without recording a failure — a stall that staleness would not report for
+  another week. `READ_ONLY` reflects that Kasten excludes read-only
+  repositories from background processing, so an absent history is correct
+  rather than unassessed; they had been reported `UNKNOWN`.
+- **Severity that is earned.** `storageRepositoryMaintenance` becomes
+  **critical** only when a repository that is still being written to keeps
+  failing. Where every failing repository has had no data written for
+  `inactiveThresholdDays` (30) or its profile or policy has since been
+  deleted, the rollup is `FAILING_INACTIVE` and stays a warning — nothing
+  accumulates in a repository nobody writes to, which is the normal state
+  after a profile migration. Inactivity only ever downgrades, never hides:
+  statuses and counts are unchanged, and a repository whose last write cannot
+  be dated counts as active.
+- `NOT_CONFIGURED` no longer counts as a finding. A cluster with no
+  repositories has nothing to maintain, and the row already read "Optional"
+  while the hero tally contradicted it.
+- **FileStore repositories.** A repository is not always an object store; an
+  NFS/SMB FileStore names a PVC claim. Reading only `objectStore.name`
+  published an empty target for every one of them.
+- Application, policy and target columns, with markers for a profile or
+  policy that no longer resolves and for import repositories. Bucket and
+  claim **names** only — endpoints and paths carry the cluster UUID and are
+  not collected.
+- Owner-pod detection: the StorageRepository object is written atomically at
+  completion, so the `<repo>-owner` pod is the only signal that a run is in
+  flight. Used to keep a long run from being reported overdue.
+- Concurrent `/details` reads, `KDL_PARALLEL` (default 10). On a
+  162-repository cluster the full run went from 4m31s to 1m55s.
+- Long tables are paginated (over 50 rows; 25/50/100/All). Filtering still
+  searches the whole table, and printing is never paginated.
+
+### Changed
+- **`kdl-diff.sh` exit code.** A cluster with a genuinely failing repository
+  moves from `OK` to `FAILING`, which `_is_good` classes as a regression. That
+  is a true finding surfacing rather than a new defect, but it changes the
+  exit code on the first run after upgrading. `FAILING_INACTIVE` is neither
+  good nor a regression and scores as a neutral change.
+
 ## [2.5.0] - 2026-09-17
 
 ### Added
