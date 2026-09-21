@@ -5111,12 +5111,21 @@ REPO_NAMES_COUNT=$(_ep "$REPO_NAMES" | grep -c . 2>/dev/null || true)
 debug "Storage repository: Found $REPO_NAMES_COUNT repositories"
 [ -n "$REPO_NAMES" ] && debug "First repo: $(echo "$REPO_NAMES" | head -1)"
 
-# Query details endpoint for each repository and build maintenance info
-STORAGE_REPO_MAINTENANCE=$(
-  (
-    echo "$REPO_NAMES" | while read -r REPO; do
-      [ -z "$REPO" ] && continue
-      $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/${NAMESPACE}/storagerepositories/${REPO}/details" 2>/dev/null | jq -c '
+# Query details endpoint for each repository and build maintenance info.
+#
+# One repository per call -- /details is a subresource, so there is no list
+# form to batch. At ~1.3s per call this was the single most expensive thing
+# KDL does: 210s of a 386s run on a 162-repository cluster, and it grows
+# linearly, so the biggest estates wait the longest. The calls are independent
+# and read-only, so they fan out.
+#
+# A shell FUNCTION rather than a worker script piped through `xargs -P`: the
+# jq program stays exactly where it was and is inherited by the background
+# subshells, so nothing had to be re-quoted or written to a temp file, and
+# `xargs -P` is not POSIX (it is a widely-implemented extension, but this
+# script is strict POSIX by house rule).
+_sr_fetch_details() {
+      $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/${NAMESPACE}/storagerepositories/${1}/details" 2>/dev/null | jq -c '
         # RFC3339Nano tolerance: status.details.kopiaMeta is Kopia'"'"'s own struct
         # passed through, not a metav1.Time, so Go emits fractional seconds
         # whenever they are non-zero - per cluster, not per edge case. Without
@@ -5527,9 +5536,49 @@ STORAGE_REPO_MAINTENANCE=$(
           )
         }
       ' 2>/dev/null
-    done
-  ) | jq -s '.' 2>/dev/null
-) || STORAGE_REPO_MAINTENANCE='[]'
+}
+
+# Fan-out width. Measured on a 162-repository cluster: 210s sequential, 21s at
+# 10 -- a 10x cut on the dominant cost. Ten concurrent reads of an aggregated
+# API is modest load, but the K10 repositories service is what ultimately
+# answers, so it is tunable for anyone who wants to be gentler (or who is
+# behind a rate-limited API gateway). Anything unparseable falls back to the
+# default rather than failing the run: this is a performance knob, and a
+# typo in it must not cost someone their report.
+STORAGE_REPO_PARALLEL="${KDL_PARALLEL:-10}"
+case "$STORAGE_REPO_PARALLEL" in
+  ''|*[!0-9]*) STORAGE_REPO_PARALLEL=10 ;;
+esac
+[ "$STORAGE_REPO_PARALLEL" -lt 1 ] && STORAGE_REPO_PARALLEL=1
+debug "Storage repository: fetching /details with parallelism $STORAGE_REPO_PARALLEL"
+
+# One output file per repository, named by its index, so the array keeps the
+# order the API returned. Concatenating whatever the jobs raced to write would
+# reorder the table between runs for no reason and make report diffs noisy.
+SR_DETAILS_DIR="$TEMP_DIR/sr-details"
+mkdir -p "$SR_DETAILS_DIR"
+# Read from a file rather than a pipe: a `while read` on the right of a pipe
+# runs in a subshell, and the final `wait` has to be in the same shell as the
+# jobs it is waiting for or the last batch is read while still being written.
+printf '%s\n' "$REPO_NAMES" > "$TEMP_DIR/sr-names.txt"
+_sr_i=0
+while read -r REPO; do
+  [ -z "$REPO" ] && continue
+  _sr_fetch_details "$REPO" > "$SR_DETAILS_DIR/$(printf '%05d' "$_sr_i").json" &
+  _sr_i=$((_sr_i + 1))
+  # Batch barrier rather than a rolling slot: `wait -n` is not POSIX. A slow
+  # repository holds up its batch, so this is a little short of a perfect
+  # 10x -- still the difference between 3.5 minutes and 20 seconds.
+  if [ $((_sr_i % STORAGE_REPO_PARALLEL)) -eq 0 ]; then wait; fi
+done < "$TEMP_DIR/sr-names.txt"
+wait
+
+# An empty or denied read leaves an EMPTY file, which contributes nothing to
+# the slurp -- exactly as the sequential version contributed nothing to the
+# pipe. So `total < listed` still detects it and the section still reports
+# NOT_ASSESSED rather than a clean result (f15f962).
+STORAGE_REPO_MAINTENANCE=$(cat "$SR_DETAILS_DIR"/*.json 2>/dev/null | jq -s '.' 2>/dev/null) \
+  || STORAGE_REPO_MAINTENANCE='[]'
 
 # Maintenance owner pods. Watching a real run showed the StorageRepository
 # object does not change at all while maintenance executes - it is written
