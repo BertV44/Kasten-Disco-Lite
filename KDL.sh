@@ -8364,6 +8364,15 @@ fi
 
 ### Storage Repository Maintenance Status (NEW v2.4)
 printf "\n${COLOR_BOLD}[STORAGE] Repository Maintenance${COLOR_RESET} ${COLOR_CYAN}(NEW v2.4)${COLOR_RESET}\n"
+# Real ESC characters for the sed substitutions below. %b interprets the
+# backslash escapes the COLOR_* variables carry; sed does not, and silently
+# ate the backslash. Empty stays empty, so --no-color and a non-tty are
+# unaffected.
+_SR_RED=$(printf '%b' "$COLOR_RED")
+_SR_YELLOW=$(printf '%b' "$COLOR_YELLOW")
+_SR_GREEN=$(printf '%b' "$COLOR_GREEN")
+_SR_CYAN=$(printf '%b' "$COLOR_CYAN")
+_SR_RESET=$(printf '%b' "$COLOR_RESET")
 if [ "$STORAGE_REPO_COUNT" -eq 0 ] && [ "$STORAGE_REPO_LISTED" -gt 0 ]; then
   printf "  ${COLOR_CYAN}[INFO]  $STORAGE_REPO_LISTED repository/repositories exist but none returned details${COLOR_RESET}\n"
   printf "          Maintenance status NOT ASSESSED - the /details subresource was not readable\n"
@@ -8387,7 +8396,10 @@ else
      else (((.daysSinceLastMaintenance * 10) | round) / 10 | tostring) end) as $ageShown |
     "  - " + .name
       + " [\(.contentType)]"
-      + " profile=" + .profile
+      + (if (.exportProfile // .importProfile) then " profile=" + (.exportProfile // .importProfile)
+         elif .policyName then " policy=" + .policyName
+         elif .profile != "N/A" then " profile=" + .profile
+         else "" end)
       # The inner MaintenanceRun command window, which is the run itself.
       # completedTime - scheduledTime absorbs queue time, overstates several
       # times over, and goes negative on a hand-triggered run.
@@ -8397,6 +8409,7 @@ else
       + (if .status == "UNKNOWN" then " [UNKNOWN_STATUS]"
          elif .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
          elif .status == "DISABLED" then " [DISABLED_STATUS]"
+         elif .status == "READ_ONLY" then " [READONLY_STATUS]"
          elif .status == "FAILING_STALE" then " [FAILSTALE_STATUS - failing, no success in " + $ageShown + " days]"
          elif .status == "FAILING" then " [FAILING_STATUS - last run failed, last success " + $ageShown + " days ago]"
          elif .status == "OVERDUE" then " [OVERDUE_STATUS - " + (((.overdueIntervals // 0) * 10 | round) / 10 | tostring) + " cycles past due, nothing running]"
@@ -8405,15 +8418,21 @@ else
          else " [" + .status + "]"
          end)
   ' 2>/dev/null | while IFS= read -r line; do
+    # The COLOR_* variables hold the literal characters \033, which printf
+    # turns into ESC only when they appear in a FORMAT string. sed does not
+    # interpret them and consumes the backslash, so every coloured status
+    # printed a literal "033[0;33m[FAILING033[0m" into the report. Expand
+    # them once with %b and substitute the real escape.
     printf "%s\n" "$line" | sed \
-      -e "s/\[UNKNOWN_STATUS\]/${COLOR_CYAN}[AGE UNKNOWN]${COLOR_RESET}/" \
-      -e "s/\[NEVER_RAN_STATUS\]/${COLOR_RED}[NEVER RAN]${COLOR_RESET}/" \
-      -e "s/\[DISABLED_STATUS\]/${COLOR_YELLOW}[DISABLED]${COLOR_RESET}/" \
-      -e "s/\[FAILSTALE_STATUS/${COLOR_RED}[FAILING${COLOR_RESET}/" \
-      -e "s/\[FAILING_STATUS/${COLOR_YELLOW}[FAILING${COLOR_RESET}/" \
-      -e "s/\[OVERDUE_STATUS/${COLOR_YELLOW}[OVERDUE${COLOR_RESET}/" \
-      -e "s/\[STALE_STATUS/${COLOR_YELLOW}[STALE${COLOR_RESET}/" \
-      -e "s/\[OK_STATUS/${COLOR_GREEN}[OK${COLOR_RESET}/"
+      -e "s/\[UNKNOWN_STATUS\]/${_SR_CYAN}[AGE UNKNOWN]${_SR_RESET}/" \
+      -e "s/\[READONLY_STATUS\]/${_SR_CYAN}[READ ONLY]${_SR_RESET}/" \
+      -e "s/\[NEVER_RAN_STATUS\]/${_SR_RED}[NEVER RAN]${_SR_RESET}/" \
+      -e "s/\[DISABLED_STATUS\]/${_SR_YELLOW}[DISABLED]${_SR_RESET}/" \
+      -e "s/\[FAILSTALE_STATUS/${_SR_RED}[FAILING${_SR_RESET}/" \
+      -e "s/\[FAILING_STATUS/${_SR_YELLOW}[FAILING${_SR_RESET}/" \
+      -e "s/\[OVERDUE_STATUS/${_SR_YELLOW}[OVERDUE${_SR_RESET}/" \
+      -e "s/\[STALE_STATUS/${_SR_YELLOW}[STALE${_SR_RESET}/" \
+      -e "s/\[OK_STATUS/${_SR_GREEN}[OK${_SR_RESET}/"
   done
   if [ "$STORAGE_REPO_FAILING_STALE_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_RED}[FAIL]  $STORAGE_REPO_FAILING_STALE_COUNT repository/repositories failing with no success in >$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days${COLOR_RESET}\n"
