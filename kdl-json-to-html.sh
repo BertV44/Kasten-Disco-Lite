@@ -306,6 +306,36 @@ def tunedBadge(val; dflt):
 # v2.1 redesign: severity map + findings tally for the verdict hero.
 def bpSevMap:
   {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","k10InfraVolumeAccessMode":"warn","storageRepositoryMaintenance":"warn","residualSnapshots":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
+# Severity per check AND value, not per check alone. bpSevMap gives the base;
+# this overrides it where the value carries the weight.
+#
+# storageRepositoryMaintenance earns crit only when the rollup says FAILING --
+# a repository failing with no recent success, or one that never succeeded.
+# "maintained 8 days ago" must not shout as loudly as an unauthenticated
+# dashboard, or the crit bucket stops meaning anything.
+#
+# NOT_CONFIGURED is not a finding for it at all: a cluster with no repositories
+# has nothing to maintain, which is why the row already reads "Optional". Today
+# bpIsOk omits NOT_CONFIGURED so it lands in the warn bucket, and the hero
+# tally has been contradicting that row since v2.4. Escalating without fixing
+# this would turn every snapshot-only cluster into a false CRITICAL. It cannot
+# be a blanket rule, because BP_AUTH_STATUS="NOT_CONFIGURED" means an
+# unauthenticated dashboard and must stay critical.
+#
+# FAILING_INACTIVE is the same failures on repositories nothing has written to
+# for a month -- typically a profile that was migrated away from. Maintenance
+# reclaims space from deleted snapshots and compacts indexes, so where nothing
+# is written nothing accumulates: cleanup, not an incident. It stays a finding
+# (it is not OK), it just does not earn red. KDL.sh decides this, not the
+# renderer, so the verdict and its severity cannot drift apart.
+def bpSeverityOf($key; $v):
+  if $key == "storageRepositoryMaintenance" then
+    (if $v == "FAILING" then "crit"
+     elif $v == "FAILING_INACTIVE" then "warn"
+     elif $v == "NOT_CONFIGURED" then null
+     else bpSevMap[$key] end)
+  else bpSevMap[$key] end;
+
 def bpIsOk(v):
   (["CONFIGURED","IN_USE","ENABLED","COMPLETE","OK","VALID","COMPLIANT"] | index(v|tostring)) != null or (v == true);
 def bpFindings:
@@ -315,9 +345,10 @@ def bpFindings:
     if $v == null then .
     elif $v == "NOT_ASSESSED" then .total += 1 | .notAssessed += 1
     else .total += 1
+      | (bpSeverityOf($e.key; $v)) as $sev
       | if bpIsOk($v) then .
-        elif $e.value == "crit" then .crit += 1
-        elif $e.value == "warn" then .warn += 1
+        elif $sev == "crit" then .crit += 1
+        elif $sev == "warn" then .warn += 1
         else . end
     end)
   | .pass = (.total - .crit - .warn - .notAssessed);
@@ -437,6 +468,13 @@ h3 { font-size:1rem; margin:1.5rem 0 0.5rem; color:var(--text-muted); }
 .stat-row:last-child { border-bottom:none; }
 .stat-label { color:var(--text-muted); font-size:0.9rem; }
 .stat-value { font-weight:600; color:var(--text); }
+/* A card that mixes a breakdown with cross-cutting counts reads as one flat
+   list, and a reader then tries to add 161 into a total of 162. stat-total
+   marks the denominator, stat-group captions each block and says whether it
+   sums. */
+.stat-total { border-bottom:2px solid var(--border); }
+.stat-total .stat-label { color:var(--text); font-weight:600; font-size:0.95rem; }
+.stat-group { margin:0.9rem 0 0.1rem; font-size:0.7rem; letter-spacing:0.07em; text-transform:uppercase; color:var(--text-muted); opacity:0.8; }
 .progress-bar { background:var(--border); border-radius:8px; height:8px; overflow:hidden; margin-top:0.5rem; }
 .progress-fill { background:linear-gradient(90deg,var(--brand),var(--brand-solid)); height:100%; }
 
@@ -762,17 +800,28 @@ else "" end) + "
       </tr>"
       else "" end) +
       (if .bestPractices.storageRepositoryMaintenance then
-      "
+      (.bestPractices.storageRepositoryMaintenance) as $srVal
+      | (bpSeverityOf("storageRepositoryMaintenance"; $srVal)) as $srSev
+      | "
       <tr>
         <td><strong>Storage Repository Maintenance</strong></td>
-        <td class=\"" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "sev-optional" else "sev-warning" end) + "\">" +
-          (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "Optional" else "Warning" end) + "</td>
-        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
-                 then severityBadge("optional"; "NOT_USED")
-                 else severityBadge("warning"; .bestPractices.storageRepositoryMaintenance) end) + "</td>
-        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
-                 then "<span class=\"badge info\">\u2014 not using exports</span>"
-                 else badge(.bestPractices.storageRepositoryMaintenance) end) +
+        <td class=\"" + (if $srSev == "crit" then "sev-critical" elif $srSev == "warn" then "sev-warning" else "sev-optional" end) + "\">" +
+          (if $srSev == "crit" then "Critical" elif $srSev == "warn" then "Warning" else "Not applicable" end) + "</td>
+        <td>" + (if $srSev == "crit" then severityBadge("critical"; $srVal)
+                 elif $srSev == "warn" then severityBadge("warning"; $srVal)
+                 else severityBadge("optional"; "NOT_USED") end) + "</td>
+        <td>" + (if $srVal == "NOT_CONFIGURED" then
+                   # Absence stated plainly, not as a configuration gap the
+                   # reader should close. The export-policy count is context,
+                   # never a verdict: export can be enabled on a policy today
+                   # and disabled tomorrow, and a failed export may or may not
+                   # have created a repository depending on where it failed, so
+                   # policies and repositories cannot be reconciled reliably.
+                   "<span class=\"badge info\">No storage repositories \u2014 exports and imports not in use</span>"
+                   + (((.policies.withExport // 0)) as $wx
+                      | if $wx > 0 then " (" + ($wx | tostring) + " policy/policies define an export action)"
+                        else " (no policy defines an export action)" end)
+                 else badge($srVal) end) +
           (if (staleCountOf(.storageRepositories) + (.storageRepositories.failingCount // 0) + (.storageRepositories.failingStaleCount // 0) + (.storageRepositories.overdueCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
             " (" +
             ([
@@ -783,7 +832,15 @@ else "" end) + "
               (if (.storageRepositories.neverRanCount // 0) > 0 then (.storageRepositories.neverRanCount | tostring) + " never-ran" else empty end),
               (if (.storageRepositories.disabledCount // 0) > 0 then (.storageRepositories.disabledCount | tostring) + " disabled" else empty end)
             ] | join(", ")) + ")"
-          else "" end) + "</td>
+          else "" end)
+          # Why it is a warning and not a critical, stated on the row itself.
+          # A reader who sees "49 failing and stale" beside "Warning" will
+          # otherwise assume the severity is wrong.
+          + (if $srVal == "FAILING_INACTIVE" then
+               " — all on repositories with no data written for "
+               + ((.storageRepositories.inactiveThresholdDays // 30) | tostring)
+               + "+ days, so nothing is accumulating. Cleanup, not an outage."
+             else "" end) + "</td>
       </tr>"
       else "" end) +
       (if .bestPractices.residualSnapshots then
@@ -1256,20 +1313,25 @@ else "" end) + "
        <li><strong>Stale (Nd)</strong> <code>STALE</code> &mdash; last success older than " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days, nothing failed. Start with whether its exports still run.</li>
        <li><strong>Never Ran</strong> <code>NEVER_RAN</code> &mdash; readable history with no run in it. Normal under a day old.</li>
        <li><strong>Disabled</strong> <code>DISABLED</code> &mdash; off in the Kasten spec or in Kopia. Space is never reclaimed while off.</li>
+       <li><strong>Read-only</strong> <code>READ_ONLY</code> &mdash; Kasten excludes read-only repositories from background processing, so maintenance never runs and no history is correct. These are imports: this cluster reads another cluster&rsquo;s exports from them, and the source cluster owns the maintenance. Nothing to do.</li>
        <li><strong>Not assessed</strong> <code>UNKNOWN</code> &mdash; neither source could answer. <strong>Not the same as healthy</strong>; usually the <code>storagerepositories/details</code> RBAC rule.</li>
      </ul>
+     <p class=\"section-description\"><strong>How loud is it?</strong> Failures earn a critical only on repositories still being written to. Where every failing repository has had no data written for " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days, or its profile or policy has since been deleted, the finding stays but drops to a warning &mdash; nothing accumulates in a repository nobody writes to, so that is cleanup, typically after a profile migration. A repository whose last write cannot be dated counts as active, so an unknown never quietens a finding.</p>
      <p class=\"section-description\">Durations exclude time spent queued.</p>"
 + (if .storageRepositories then
     (if (.storageRepositories.total // 0) == 0 then
       "<div class=\"info-box\">No Storage Repositories found (not using exports or imports)</div>"
     else
-      "<div class=\"card\">
-        <div class=\"stat-row\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">"
+      "<div class=\"grid-2\">
+       <div class=\"card\">
+        <div class=\"stat-group\" style=\"margin-top:0;\">Maintenance status</div>
+        <div class=\"stat-row stat-total\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">"
         + ((.storageRepositories.total // 0) | tostring)
         + (if ((.storageRepositories.listed // 0) > (.storageRepositories.total // 0))
            then " <span class=\"badge info\">of " + ((.storageRepositories.listed) | tostring) + " listed \u2014 " + (((.storageRepositories.listed) - (.storageRepositories.total)) | tostring) + " unreadable</span>"
            else "" end)
         + "</span></div>"
+        + "<div class=\"stat-group\">Every repository counted once \u2014 adds up to the total</div>"
         + (if (.storageRepositories.failingStaleCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Run failed, no recent success</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.failingStaleCount) | tostring) + "</span></span></div>"
           else "" end)
@@ -1300,14 +1362,76 @@ else "" end) + "
         + (if (.storageRepositories.disabledCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Disabled</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.disabledCount // 0) | tostring) + "</span></span></div>"
           else "" end)
+        + (if (.storageRepositories.readOnlyCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Read-only — maintained by the source cluster</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.readOnlyCount // 0) | tostring) + "</span></span></div>"
+          else "" end)
+        # The status card ends here. The cross-cutting counts get their OWN
+        # card, because in one list they read as part of the breakdown and a
+        # reader tries to add 161 into a total of 162. They are facts about
+        # some of the repositories already counted opposite, not more of them.
+        #
+        # The whole second card is conditional: an empty card titled
+        # "Repository context" is worse than no card. has() rather than a
+        # count, so a report predating these fields says nothing rather than
+        # claiming zero.
+        + "</div>"
+        + (if (((.storageRepositories.inactiveCount // 0) + (.storageRepositories.unusedCount // 0)
+                + (.storageRepositories.orphanedCount // 0)) > 0)
+           then "<div class=\"card\"><div class=\"stat-group\" style=\"margin-top:0;\">Repository context</div>"
+           else "" end)
+        + (if (.storageRepositories | has("inactiveCount")) and ((.storageRepositories.inactiveCount // 0) > 0) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">No data written in " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.inactiveCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("unusedCount")) and ((.storageRepositories.unusedCount // 0) > 0) then
+            # State, NOT advice. "Safe to delete" was the first wording and it
+            # was wrong: on a live cluster all four such repositories were
+            # import paths whose profile AND policy still existed, so they are
+            # configured imports that never received anything, not leftovers.
+            # Whether a repository can be removed depends on who still points
+            # at it, which the Profile and Policy columns show per row.
+            "<div class=\"stat-row\"><span class=\"stat-label\">Never held any data since creation</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.unusedCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("orphanedCount")) and ((.storageRepositories.orphanedCount // 0) > 0) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Profile or policy since deleted</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.orphanedCount) | tostring) + "</span></span></div>"
+          else "" end)
+        # Says outright what the two cards are to each other, for a reader
+        # who sees 161 beside a total of 162 and starts adding. Names the
+        # other card rather than pointing at it: grid-2 collapses to one
+        # column on narrow screens, where "opposite" would be wrong.
+        + (if (((.storageRepositories.inactiveCount // 0) + (.storageRepositories.unusedCount // 0)
+                + (.storageRepositories.orphanedCount // 0)) > 0)
+           then "<p class=\"section-description\" style=\"margin:0.8rem 0 0;font-size:0.78rem;\">Already counted under Maintenance status \u2014 not extra repositories.</p></div>"
+           else "" end)
+
       + "</div>
       <table>
-        <thead><tr><th>Repository Name</th><th>Type</th><th>Profile</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Duration</th></tr></thead>
+        <thead><tr><th>Repository Name</th><th>Application</th><th>Type</th><th>Profile</th><th>Policy</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Duration</th></tr></thead>
         <tbody>" +
       ([.storageRepositories.items[]? |
         "<tr><td><code>" + (.name | @html) + "</code></td>" +
+        # The repository name is a generated suffix and identifies nothing a
+        # reader can act on. The application and the policy do: "this failing
+        # repository belongs to mysql-backup-jai" is the sentence that leads
+        # somewhere. Both come from labels, both may legitimately be absent
+        # (an on-demand export has no policy), so em-dash rather than a guess.
+        "<td>" + (if .appName then (.appName | @html) else "\u2014" end) + "</td>" +
         "<td>" + (.contentType | @html) + "</td>" +
-        "<td>" + (if .profile != "N/A" then (.profile | @html) else "\u2014" end) + "</td>" +
+        # Profile, with the DIRECTION when it is an import: an import
+        # repository is this cluster reading the exports of another, so it is
+        # never maintained here and an empty history is correct, not a gap.
+        # Marked "deleted" when the name no longer resolves -- that is why
+        # maintenance fails with "failed to fetch K10 profile and the
+        # location", and it is the difference between fix it and delete it.
+        "<td>" + (if (.exportProfile // .importProfile) then
+                    ((.exportProfile // .importProfile) | @html)
+                    + (if .repositoryRole == "import" then " <span class=\"badge info\">import</span>" else "" end)
+                    + (if .profileMissing == true then " <span class=\"badge warn\">deleted</span>" else "" end)
+                  elif .profile != "N/A" then (.profile | @html)
+                  else "\u2014" end) + "</td>" +
+        "<td>" + (if .policyName then
+                    (.policyName | @html)
+                    + (if .policyMissing == true then " <span class=\"badge warn\">deleted</span>" else "" end)
+                  else "\u2014" end) + "</td>" +
         # @html mandatory: cluster-supplied.
         # "Bucket/Share", because a FileStore repository names a PVC backing an
         # NFS or SMB share, not a bucket, and the header has to be true for
@@ -1351,10 +1475,26 @@ else "" end) + "
             + " cycle" + (if (((.overdueIntervals // 0) * 10 | round) / 10) == 1 then "" else "s" end) + ")</span>"
           elif .status == "STALE" or .status == "AMBER" then
             "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>"
+          elif .status == "READ_ONLY" then
+            "<span class=\"badge info\">Read-only \u2014 source cluster maintains</span>"
           elif .status == "UNKNOWN" then
             "<span class=\"badge info\">Not assessed</span>"
+          elif .status == "OK" then
+            # Never "OK (unknownd)": the age is appended to a string that is
+            # the word "unknown" when it could not be computed. The gate
+            # asserts OK is unreachable without an age, so this is a belt on
+            # top of braces -- but a nonsense label in the one column a
+            # reader scans is worth the two lines.
+            (if $ageShown == "unknown" then "<span class=\"badge ok\">OK</span>"
+             else "<span class=\"badge ok\">OK (" + $ageShown + "d)</span>" end)
           else
-            "<span class=\"badge ok\">OK (" + $ageShown + "d)</span>"
+            # NOT a fallback to OK. This chain used to end in the OK badge, so
+            # READ_ONLY -- a status added to KDL.sh but not here -- rendered
+            # every import repository as "OK (unknownd)": a state the renderer
+            # had never heard of, shown as healthy. Any status this renderer
+            # does not know now shows itself instead, which is ugly on purpose
+            # and impossible to mistake for a pass.
+            "<span class=\"badge info\">" + (.status | tostring | @html) + "</span>"
           end
           # The reason, where there is one. For a launch failure this string is
           # the most actionable line in the whole report, and until now it
