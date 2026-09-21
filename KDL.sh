@@ -5599,9 +5599,15 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       # clock-skewed future timestamp, which a live cluster produced: a
       # repository 29 days ahead of the operator floored to a negative age and
       # rendered as "OK (-29d)". A number cannot carry "no answer".
+      # Clamped at 0 for the same reason as daysSinceLastSuccess below: a node
+      # clock ahead of the operator must read as "just now", never as a
+      # negative age. The clamp was originally written on the sibling field
+      # only, so this one went on rendering "OK (-29.9d)" on the ts-future
+      # fixture -- the same one-of-two-sites miss as b45ed9d.
       daysSinceLastMaintenance: (
         if .lastFullMaintenanceTime != null then
-          days_ago($now; .lastFullMaintenanceTime)
+          (days_ago($now; .lastFullMaintenanceTime)
+           | if . == null then null elif . < 0 then 0 else . end)
         else
           null
         end
