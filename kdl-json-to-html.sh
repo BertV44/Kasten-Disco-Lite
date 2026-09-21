@@ -539,6 +539,9 @@ details.wl-item > summary::-webkit-details-marker { display:none; }
   thead { display:table-header-group; }
   tr { page-break-inside:avoid; break-inside:avoid; }
   .badge { border:1px solid #888; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  /* A paginated print would silently drop rows from the deliverable. */
+  tbody tr.tbl-hide-p { display:table-row; }
+  .tbl-tools, .tbl-pager { display:none; }
 }
 @media (max-width:820px) {
   .layout { grid-template-columns:1fr; }
@@ -553,6 +556,16 @@ th[data-sortable] { cursor:pointer; user-select:none; }
 .tbl-filter { flex:1; max-width:280px; background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:0.35rem 0.6rem; font:inherit; font-size:0.8rem; }
 .tbl-filter:focus { outline:none; border-color:var(--brand); }
 .tbl-hint { font-size:0.68rem; color:var(--text-muted); }
+/* Three things hide rows: the filter box, the issues-only toggle, and
+   pagination. They have to COMPOSE -- the filter used to set style.display
+   directly, which pagination would then stomp (and vice versa), so both now
+   use classes and only-issues stays pure CSS. */
+tbody tr.tbl-hide-f, tbody tr.tbl-hide-p { display:none; }
+.tbl-pager { display:flex; align-items:center; gap:0.4rem; margin-left:auto; font-size:0.75rem; color:var(--text-muted); }
+.tbl-page-btn { background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:0.2rem 0.5rem; font:inherit; font-size:0.75rem; cursor:pointer; }
+.tbl-page-btn:hover:not(:disabled) { border-color:var(--brand); }
+.tbl-page-btn:disabled { opacity:0.4; cursor:default; }
+.tbl-page-size { background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:0.2rem 0.3rem; font:inherit; font-size:0.75rem; }
 .copy { cursor:pointer; border:1px solid var(--border); background:var(--surface); color:var(--text-muted); border-radius:6px; padding:0.02rem 0.35rem; font-size:0.7rem; font-family:var(--mono); margin-left:0.4rem; }
 .copy:hover { color:var(--brand); border-color:var(--brand); }
 details.wl-item > summary .chev { color:var(--text-muted); display:inline-block; transition:transform 0.15s; }
@@ -2562,7 +2575,14 @@ else "" end) + "
   var densBtn = document.getElementById(`densityToggle`);
   if(densBtn){ densBtn.addEventListener(`click`, function(){ press(densBtn, body.classList.toggle(`dense`)); }); }
   var issuesBtn = document.getElementById(`issuesToggle`);
-  if(issuesBtn){ issuesBtn.addEventListener(`click`, function(){ press(issuesBtn, body.classList.toggle(`only-issues`)); }); }
+  // Tables register a repaginate callback here. Issues-only hides rows in
+  // CSS, which changes how many rows a page actually shows, so every pager
+  // has to recount when it is toggled.
+  var repagers = [];
+  if(issuesBtn){ issuesBtn.addEventListener(`click`, function(){
+    press(issuesBtn, body.classList.toggle(`only-issues`));
+    repagers.forEach(function(f){ f(true); });
+  }); }
 
   // ---------- 4. mark rows that carry an issue ----------
   Array.prototype.slice.call(content.querySelectorAll(`table tbody tr`)).forEach(function(tr){
@@ -2572,6 +2592,9 @@ else "" end) + "
   // ---------- 5. sortable + filterable tables ----------
   Array.prototype.slice.call(content.querySelectorAll(`table`)).forEach(function(table){
     var tbody = table.querySelector(`tbody`); if(!tbody){ return; }
+    // Assigned below only for tables that get a pager; the sort handler calls
+    // it unconditionally, so it must always be callable.
+    var repage = function(){};
     var ths = Array.prototype.slice.call(table.querySelectorAll(`thead th`));
     ths.forEach(function(th, idx){
       th.setAttribute(`data-sortable`, `1`);
@@ -2589,20 +2612,80 @@ else "" end) + "
           return r * (dir === `asc` ? 1 : -1);
         });
         rows.forEach(function(r){ tbody.appendChild(r); });
+        repage(true);
       });
     });
-    if(tbody.querySelectorAll(`tr`).length >= 8){
+    var total = tbody.querySelectorAll(`tr`).length;
+    if(total >= 8){
       var tools = el(`div`, `tbl-tools`);
-      var inp = el(`input`, `tbl-filter`); inp.type = `text`; inp.placeholder = `Filter ` + tbody.querySelectorAll(`tr`).length + ` rows...`;
+      var inp = el(`input`, `tbl-filter`); inp.type = `text`; inp.placeholder = `Filter ` + total + ` rows...`;
       var hint = el(`span`, `tbl-hint`); hint.textContent = `click a header to sort`;
       tools.appendChild(inp); tools.appendChild(hint);
       table.parentNode.insertBefore(tools, table);
       inp.addEventListener(`input`, function(){
         var q = inp.value.toLowerCase();
         Array.prototype.slice.call(tbody.querySelectorAll(`tr`)).forEach(function(tr){
-          tr.style.display = tr.textContent.toLowerCase().indexOf(q) > -1 ? `` : `none`;
+          tr.classList.toggle(`tbl-hide-f`, tr.textContent.toLowerCase().indexOf(q) === -1);
         });
+        repage(true);
       });
+
+      // ---------- pagination ----------
+      // Only for tables long enough to be a nuisance. A repository list grows
+      // with the estate -- 162 rows on one real cluster -- and scrolling past
+      // it to reach the next section is the actual complaint.
+      //
+      // The filter deliberately searches the WHOLE table, not the current
+      // page, so pagination never hides a row from the box above it.
+      if(total > 50){
+        var size = 50, page = 1;
+        var pager = el(`div`, `tbl-pager`);
+        var prev = el(`button`, `tbl-page-btn`); prev.type = `button`; prev.textContent = `\u2039 Prev`;
+        var info = el(`span`, `tbl-page-info`);
+        var next = el(`button`, `tbl-page-btn`); next.type = `button`; next.textContent = `Next \u203a`;
+        var sizeSel = el(`select`, `tbl-page-size`);
+        [[25,`25`],[50,`50`],[100,`100`],[0,`All`]].forEach(function(o){
+          var op = document.createElement(`option`); op.value = o[0]; op.textContent = o[1];
+          if(o[0] === size){ op.selected = true; }
+          sizeSel.appendChild(op);
+        });
+        pager.appendChild(sizeSel); pager.appendChild(prev);
+        pager.appendChild(info); pager.appendChild(next);
+        tools.appendChild(pager);
+
+        // Eligible = everything the OTHER two mechanisms are already showing.
+        // Paginating the raw row list would leave short pages once a filter
+        // or issues-only is on.
+        var eligible = function(){
+          var oi = body.classList.contains(`only-issues`);
+          return Array.prototype.slice.call(tbody.querySelectorAll(`tr`)).filter(function(tr){
+            if(tr.classList.contains(`tbl-hide-f`)){ return false; }
+            if(oi && !tr.classList.contains(`has-issue`)){ return false; }
+            return true;
+          });
+        };
+        repage = function(reset){
+          var rows = eligible(), all = Array.prototype.slice.call(tbody.querySelectorAll(`tr`));
+          if(reset){ page = 1; }
+          if(size === 0){
+            all.forEach(function(tr){ tr.classList.remove(`tbl-hide-p`); });
+            info.textContent = rows.length + ` rows`;
+            prev.disabled = true; next.disabled = true;
+            return;
+          }
+          var pages = Math.max(1, Math.ceil(rows.length / size));
+          if(page > pages){ page = pages; }
+          all.forEach(function(tr){ tr.classList.add(`tbl-hide-p`); });
+          rows.slice((page - 1) * size, page * size).forEach(function(tr){ tr.classList.remove(`tbl-hide-p`); });
+          info.textContent = `Page ` + page + ` of ` + pages + ` \u00b7 ` + rows.length + ` rows`;
+          prev.disabled = page <= 1; next.disabled = page >= pages;
+        };
+        prev.addEventListener(`click`, function(){ if(page > 1){ page--; repage(false); } });
+        next.addEventListener(`click`, function(){ page++; repage(false); });
+        sizeSel.addEventListener(`change`, function(){ size = parseInt(sizeSel.value, 10); repage(true); });
+        repagers.push(repage);
+        repage(true);
+      }
     }
   });
 
