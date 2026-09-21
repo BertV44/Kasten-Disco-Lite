@@ -8452,6 +8452,21 @@ else
   if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_YELLOW}[INFO]  $STORAGE_REPO_DISABLED_COUNT repository/repositories with full maintenance disabled${COLOR_RESET}\n"
   fi
+  if [ "$STORAGE_REPO_READONLY_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  $STORAGE_REPO_READONLY_COUNT read-only (import) repository/repositories - maintained by the cluster that owns them\n"
+  fi
+  # Context, not findings. Cross-cutting: these repositories are already
+  # counted by status above, so they are worded to make that clear rather
+  # than reading as more repositories.
+  if [ "$STORAGE_REPO_INACTIVE_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_INACTIVE_COUNT have had no data written for $STORAGE_REPO_INACTIVE_THRESHOLD_DAYS+ days\n"
+  fi
+  if [ "$STORAGE_REPO_ORPHANED_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_ORPHANED_COUNT reference a profile or policy that no longer exists\n"
+  fi
+  if [ "$STORAGE_REPO_UNUSED_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation\n"
+  fi
 fi
 
 ### Orphaned RestorePoints (NEW v1.5)
@@ -9132,7 +9147,8 @@ fi
 # Storage repository maintenance (NEW v2.4)
 if [ "$BP_STORAGE_REPO_STATUS" = "OK" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}HEALTHY${COLOR_RESET} ($STORAGE_REPO_COUNT repo(s) maintained within $STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days)\n"
-elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ]; then
+elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ] \
+     || [ "$BP_STORAGE_REPO_STATUS" = "FAILING_INACTIVE" ]; then
   _repo_bits=""
   if [ "$STORAGE_REPO_FAILING_STALE_COUNT" -gt 0 ]; then
     _repo_bits="$STORAGE_REPO_FAILING_STALE_COUNT failing and stale"
@@ -9159,6 +9175,13 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = 
   fi
   if [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ]; then
     printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Repository maintenance: ${COLOR_RED}FAILING${COLOR_RESET} ($_repo_bits)\n"
+  elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING_INACTIVE" ]; then
+    # Same failures, every one of them on a repository nothing writes to, so
+    # nothing is accumulating. Without the reason this line reads as a wrong
+    # severity next to "49 failing and stale".
+    printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}CLEANUP${COLOR_RESET} ($_repo_bits)\n"
+    printf "          All of them idle ${STORAGE_REPO_INACTIVE_THRESHOLD_DAYS}+ days or with a deleted profile/policy - nothing is accumulating.\n"
+    printf "          Not critical for that reason. Consider deleting them.\n"
   else
     printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET} ($_repo_bits)\n"
   fi
@@ -9170,6 +9193,12 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_ASSESSED" ]; then
   fi
 elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_CONFIGURED" ]; then
   printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: Not using exports/imports\n"
+else
+  # No branch matched. This chain had no else, so when FAILING_INACTIVE was
+  # added the check DISAPPEARED from Best Practices Compliance -- no line at
+  # all, which reads as "not checked" rather than as a gap. Print the value
+  # rather than nothing: a rollup nobody wrote a branch for is still news.
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${BP_STORAGE_REPO_STATUS}\n"
 fi
 
 ELAPSED=$(($(date +%s) - START_TIME))
