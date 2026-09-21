@@ -1302,12 +1302,33 @@ else "" end) + "
           else "" end)
       + "</div>
       <table>
-        <thead><tr><th>Repository Name</th><th>Type</th><th>Profile</th><th>Status</th><th>Last Full Maintenance</th><th>Duration</th></tr></thead>
+        <thead><tr><th>Repository Name</th><th>Type</th><th>Profile</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Duration</th></tr></thead>
         <tbody>" +
       ([.storageRepositories.items[]? |
         "<tr><td><code>" + (.name | @html) + "</code></td>" +
         "<td>" + (.contentType | @html) + "</td>" +
         "<td>" + (if .profile != "N/A" then (.profile | @html) else "\u2014" end) + "</td>" +
+        # @html mandatory: cluster-supplied.
+        # "Bucket/Share", because a FileStore repository names a PVC backing an
+        # NFS or SMB share, not a bucket, and the header has to be true for
+        # every row. An object store needs no qualifier -- it is the common
+        # case and the header already says bucket -- so the bracket is added
+        # only when the target is something else.
+        #
+        # The bracket names the LOCATION TYPE and the kind of name, not the
+        # protocol: claimName says nothing about NFS vs SMB (that is the
+        # PV/StorageClass), and the distinction does not change what a reader
+        # does about it.
+        #
+        # Three-state on locationType: an unreadable one stays silent rather
+        # than defaulting to ObjectStore.
+        "<td>" + (if .target then
+                    (.target | @html)
+                    + (if .locationType == null or .locationType == "ObjectStore" then ""
+                       elif .locationType == "FileStore" then " (FileStore PVC Claim Name)"
+                       else " (" + (.locationType | @html) + ")"
+                       end)
+                  else "\u2014" end) + "</td>" +
         "<td>" + (
           # Ages carry two decimals from v2.5.1 so the 7-day threshold compares
           # exactly; one decimal is enough to read. Older reports hold whole

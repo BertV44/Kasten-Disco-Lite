@@ -5356,6 +5356,33 @@ STORAGE_REPO_MAINTENANCE=$(
           namespace: .metadata.namespace,
           profile: ((.metadata.labels // {})["k10.kasten.io/exportProfile"] // (.metadata.labels // {})["k10.kasten.io/policyName"] // "N/A"),
           contentType: (.status.contentType // "unknown"),
+          # NAME only. Not the endpoint, region or path: the endpoint names the
+          # provider, the path carries the K10 cluster UUID, and these reports
+          # get shared -- v2.4.0 drew the same line by declining to collect
+          # remote-write endpoint URLs. The name identifies WHICH target a
+          # stale repository points at, which is the question being asked, and
+          # nothing more. This holds for FileStore too: `fileStore.path` is
+          # `k10/<cluster-uuid>/...`, so only the claim name is taken.
+          locationType: (.status.location.type // null),
+          # A repository is not always an object store. FileStore (NFS/SMB
+          # backed by a PVC) names a claim instead of a bucket, and both answer
+          # the same question, so they share one field -- locationType says
+          # which kind of name it is. Reading only objectStore.name published
+          # an empty cell for every FileStore repository, which reads as "no
+          # target" rather than "a target this code did not look for".
+          #
+          # Deep scan for the claim, for the reason the profile PVC collection
+          # gives at KDL.sh:4929: the nesting of the FileStore block has
+          # differed between versions, and guessing a path is P4. Scoped to
+          # .status.location and to the claim key, so it cannot reach the path.
+          target: (
+            (.status.location // {}) as $loc
+            | [ ($loc.objectStore.name? // empty),
+                ($loc.fileStore.claimName? // empty),
+                ($loc | .. | objects | (.claimName? // empty)) ]
+            | map(select(type == "string" and . != ""))
+            | .[0] // null
+          ),
           disableMaintenance: (.spec.disableMaintenance // false),
           # Retained with its original meaning: the newest recorded aggregate
           # result. It is NOT evidence of success and no longer drives staleness.
