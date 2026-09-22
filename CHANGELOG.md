@@ -27,15 +27,36 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   hand-triggered run. Measured from the maintenance command itself now.
 - The summary card did not reconcile: statuses with no row left repositories
   unexplained against the total.
+- **Import repositories were reported `UNKNOWN`**, the same bucket as a denied
+  RBAC read, when nothing about them needs assessing: Kasten excludes
+  read-only repositories from background processing, so an absent maintenance
+  history is correct. Removed 4 false "not assessed" results on the validation
+  cluster.
+- A status the renderer did not recognise fell through to the **OK badge**, so
+  import repositories displayed as `OK (unknownd)` — an unknown state shown as
+  healthy, with the word "unknown" and a "d" appended. Both the HTML and
+  terminal chains now end in a branch that shows the unrecognised value.
+- The maintenance check **disappeared from the terminal's Best Practices
+  Compliance** entirely: the chain had no branch for the new
+  `FAILING_INACTIVE` value and no `else`, so it printed no line at all, which
+  reads as "not checked" rather than as a gap.
+- Status badges in the terminal printed their **colour codes literally**
+  (`033[0;33m[FAILING033[0m`). The badges are substituted with `sed`, which
+  does not interpret the escapes the colour variables carry. Pre-existing:
+  v2.5.0 as released has the same substitution, so `[OK]` and `[AMBER]` have
+  printed this way for terminal users since v2.4. Invisible to the test suite,
+  because colours are empty when output is not a terminal.
+- The reason shown beside a downgraded verdict was hard-coded to idleness, so
+  a cluster whose failing repositories were orphaned but written to the
+  previous day was told they had "no data written for 30+ days". Both reasons
+  are now derived from the failing set.
 
 ### Added
 - **Honest maintenance states.** `FAILING_STALE`, `FAILING`, `OVERDUE`,
   `READ_ONLY` and `UNKNOWN` join `OK`, `STALE` (renamed from `AMBER`),
   `NEVER_RAN` and `DISABLED`. `OVERDUE` catches a scheduler that stopped
   without recording a failure — a stall that staleness would not report for
-  another week. `READ_ONLY` reflects that Kasten excludes read-only
-  repositories from background processing, so an absent history is correct
-  rather than unassessed; they had been reported `UNKNOWN`.
+  another week. `READ_ONLY` is described below.
 - **Severity that is earned.** `storageRepositoryMaintenance` becomes
   **critical** only when a repository that is still being written to keeps
   failing. Where every failing repository has had no data written for
@@ -51,10 +72,35 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
 - **FileStore repositories.** A repository is not always an object store; an
   NFS/SMB FileStore names a PVC claim. Reading only `objectStore.name`
   published an empty target for every one of them.
-- Application, policy and target columns, with markers for a profile or
-  policy that no longer resolves and for import repositories. Bucket and
-  claim **names** only — endpoints and paths carry the cluster UUID and are
-  not collected.
+- Application, policy, target and **last data write** columns, with markers
+  for a profile or policy that no longer resolves and for import
+  repositories. Bucket and claim **names** only — endpoints and paths carry
+  the cluster UUID and are not collected.
+- **`READ_ONLY` status.** Kasten excludes read-only repositories from
+  background processing — `initRepo` skips them, `processArtifact` ignores
+  them, and the maintenance and storage-scan procedures reject them — so
+  maintenance never runs and an absent history is correct rather than
+  unassessed. Read from `status.readOnly`, three-state, so a Kasten that does
+  not report the field is assessed normally.
+- **Stale and idle are reported as different things.** Stale is maintenance
+  not having succeeded within `maintenanceThresholdDays`; idle is no data
+  written within `inactiveThresholdDays`, from `status.details.modifiedTime`,
+  which neither full maintenance nor a storage scan advances (confirmed
+  against the Kasten source). A repository can be either, both or neither,
+  and "stale but still being written to" is what earns the critical — so both
+  ages are shown side by side.
+- **`profileMismatch`.** A surviving profile *name* is not a surviving
+  target: repointing a profile at a new bucket, or at a new FileStore path,
+  strands every repository created against the old one. A repository is
+  reached only through the profile it refers to, so nothing will process it
+  and maintenance can never succeed again — these fail with "failed to fetch
+  K10 profile and the location", where the *location* half is the true one.
+  Measured on the validation cluster: 5 such repositories, all failing, none
+  healthy, caught through two different fields. Reported only: it drives no
+  severity, does not set `orphaned` and never reaches the rollup, and it does
+  not assert the old bucket is gone, which is not checked.
+- Repositories that have **never held data** say why where the data says why,
+  rather than only being counted.
 - Owner-pod detection: the StorageRepository object is written atomically at
   completion, so the `<repo>-owner` pod is the only signal that a run is in
   flight. Used to keep a long run from being reported overdue.
