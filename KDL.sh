@@ -5118,6 +5118,41 @@ REPO_NAMES_COUNT=$(_ep "$REPO_NAMES" | grep -c . 2>/dev/null || true)
 debug "Storage repository: Found $REPO_NAMES_COUNT repositories"
 [ -n "$REPO_NAMES" ] && debug "First repo: $(echo "$REPO_NAMES" | head -1)"
 
+_sr_list_readable() {
+  [ -s "$1" ] || return 1
+  jq -e 'has("items")' < "$1" >/dev/null 2>&1
+}
+# Where each profile points NOW, so a repository can be compared against it.
+# A profile name surviving is not the same as that profile still pointing at
+# the repository: repointing a profile at a new bucket (or a new FileStore
+# path) strands every repository created against the old one, and maintenance
+# on those can never succeed again. Name-only matching answers "yes, the
+# profile exists" for all of them.
+#
+# Measured on a 162-repository cluster: 5 repositories differ from their
+# profile, and all 5 are FAILING_STALE -- no healthy repository differs. Two
+# profiles, two different fields: one was moved to a different object-store
+# bucket, the other kept its FileStore claim and moved only its path prefix.
+# Both had to be compared to catch both.
+#
+# The path is READ for comparison and never published: it carries the K10
+# cluster UUID. Only a boolean leaves the tool.
+if _sr_list_readable "$TEMP_DIR/profiles_raw.json"; then
+  STORAGE_REPO_PROFILE_LOCS=$(_ep "$PROFILES_JSON" | jq -c '[.items[]?
+    | select(.metadata.name != null)
+    | {key: .metadata.name,
+       value: ((.spec.locationSpec // {}) as $l
+               | {type:   ($l.type // null),
+                  bucket: ($l.objectStore.name // null),
+                  claim:  ($l.fileStore.claimName // null),
+                  path:   ($l.fileStore.path // null)})}]
+    | from_entries' 2>/dev/null) || STORAGE_REPO_PROFILE_LOCS=null
+else
+  STORAGE_REPO_PROFILE_LOCS=null
+fi
+[ -n "$STORAGE_REPO_PROFILE_LOCS" ] || STORAGE_REPO_PROFILE_LOCS=null
+
+
 # Query details endpoint for each repository and build maintenance info.
 #
 # One repository per call -- /details is a subresource, so there is no list
@@ -5132,7 +5167,8 @@ debug "Storage repository: Found $REPO_NAMES_COUNT repositories"
 # `xargs -P` is not POSIX (it is a widely-implemented extension, but this
 # script is strict POSIX by house rule).
 _sr_fetch_details() {
-      $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/${NAMESPACE}/storagerepositories/${1}/details" 2>/dev/null | jq -c '
+      $CLI get --raw "/apis/repositories.kio.kasten.io/v1alpha1/namespaces/${NAMESPACE}/storagerepositories/${1}/details" 2>/dev/null \
+        | jq -c --argjson profileLocs "$STORAGE_REPO_PROFILE_LOCS" '
         # RFC3339Nano tolerance: status.details.kopiaMeta is Kopia'"'"'s own struct
         # passed through, not a metav1.Time, so Go emits fractional seconds
         # whenever they are non-zero - per cluster, not per edge case. Without
@@ -5412,6 +5448,65 @@ _sr_fetch_details() {
           # reported UNKNOWN were exactly the four carrying importProfile,
           # each with maintenanceInfo absent, processCount 0 and an empty
           # storageUsage.
+          # Does the profile still point where this repository actually lives?
+          #
+          # A surviving profile NAME is not a surviving target. Repointing a
+          # profile at a new bucket, or at a new FileStore path, strands every
+          # repository created against the old one, and maintenance on those
+          # can never succeed again -- they fail with "failed to fetch K10
+          # profile and the location", where it is the LOCATION half that is
+          # true. Name-only matching answers "the profile exists" for all of
+          # them, which is how this was missed.
+          #
+          # Measured on a 162-repository cluster: 5 repositories differ from
+          # their profile and all 5 are FAILING_STALE; no healthy repository
+          # differs. Two profiles, two different fields -- one moved to a
+          # different object-store bucket, the other kept its FileStore claim
+          # and moved only its path prefix -- so both must be compared.
+          #
+          # Computed HERE rather than in the status stage because the
+          # FileStore path is only in scope here, and the path carries the
+          # K10 cluster UUID. It is read for the comparison and never
+          # published: only this boolean leaves the tool.
+          #
+          # COMPARE AGAINST ITS OWN PROFILE, NOT AGAINST ALL OF THEM.
+          # A rewrite to "does any profile in the cluster still point here"
+          # was started and stopped, on the reasoning that two profiles can
+          # share a target -- the measured cluster does have pairs of
+          # profiles pointing at one bucket -- so a sibling would appear to
+          # cover a repointed profile and the flag would look like a false
+          # positive. That reasoning is WRONG. Per Jaiganesh: the repository
+          # refers to its own profile and is processed through that one.
+          # Another profile happening to point at the same bucket does not
+          # help, because the repository does not refer to it. It is still a
+          # mismatch and it still will not be processed.
+          #
+          # Three-state. null whenever there is nothing to compare -- no
+          # profile list, no profile named, no locationSpec, or two sides
+          # describing different kinds of target. A comparison that could not
+          # be made must never render as a match.
+          #
+          # REPORTED, NOT ACTED ON: it does not feed orphaned, does not reach
+          # the rollup and changes no severity.
+          profileMismatch: (
+            ((.metadata.labels // {}) as $l
+             | ($l["k10.kasten.io/exportProfile"] // $l["k10.kasten.io/importProfile"] // null)) as $pn
+            | (if ($profileLocs == null) or ($pn == null) then null else $profileLocs[$pn] end) as $pl
+            | (.status.location // {}) as $loc
+            | if $pl == null then null
+              elif ($loc.type // null) == "ObjectStore" then
+                (if ($pl.bucket == null) or (($loc.objectStore.name // null) == null) then null
+                 else (($loc.objectStore.name) != $pl.bucket) end)
+              elif ($loc.type // null) == "FileStore" then
+                (($loc.fileStore.claimName // null) as $rc
+                 | ($loc.fileStore.path // null) as $rp
+                 | if ($pl.claim != null) and ($rc != null) and ($rc != $pl.claim) then true
+                   elif ($pl.path == null) or ($rp == null) then null
+                   else (($rp | startswith(($pl.path | sub("/+$"; "")) + "/")) | not)
+                   end)
+              else null
+              end
+          ),
           repositoryRole: (
             (.metadata.labels // {}) as $l
             | if ($l["k10.kasten.io/importProfile"] // null) != null then "import"
@@ -5723,10 +5818,6 @@ debug "Maintenance owner pods: $(_ep "$STORAGE_REPO_MAINT_PODS" | jq -r 'length'
 # the defect class this whole section keeps turning up. The raw file tells
 # them apart -- a failed `$CLI get` leaves it empty, a successful one always
 # writes an items key.
-_sr_list_readable() {
-  [ -s "$1" ] || return 1
-  jq -e 'has("items")' < "$1" >/dev/null 2>&1
-}
 if _sr_list_readable "$TEMP_DIR/profiles_raw.json"; then
   STORAGE_REPO_PROFILE_NAMES=$(_ep "$PROFILES_JSON" | jq -c '[.items[]?.metadata.name | select(type == "string")]' 2>/dev/null) || STORAGE_REPO_PROFILE_NAMES=null
 else
@@ -6085,6 +6176,12 @@ STORAGE_REPO_OVERDUE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select
 STORAGE_REPO_OK_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "OK")] | length // 0')
 STORAGE_REPO_INACTIVE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.inactive == true)] | length // 0')
 STORAGE_REPO_UNUSED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.repositoryEmpty == true)] | length // 0')
+# How many of the never-used ones are read-only imports. "Never held any data"
+# on its own reads as alarming when the explanation is mundane -- an import
+# that has not pulled anything yet -- but it must be DERIVED, not assumed: a
+# freshly created export repository is also empty and is not an import.
+STORAGE_REPO_UNUSED_READONLY_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
+  | select((.repositoryEmpty == true) and (.status == "READ_ONLY"))] | length // 0')
 # The repositories that earn a critical: failing AND still being written to.
 # `.inactive != true` and not `== false` on purpose -- null means the write
 # date is unknown, and an unknown write date must keep the critical rather
@@ -6093,6 +6190,15 @@ STORAGE_REPO_ACTIVE_FAILING_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
   | select((.status == "FAILING_STALE" or .status == "NEVER_RAN")
            and (.inactive != true) and (.orphaned != true))] | length // 0')
 STORAGE_REPO_ORPHANED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.orphaned == true)] | length // 0')
+STORAGE_REPO_PROFILE_MISMATCH_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.profileMismatch == true)] | length // 0')
+# Restricted to the FAILING set, not the cluster. The rollup downgrade has two
+# independent causes and the summary has to name the one that actually applies:
+# a cluster whose failing repositories are orphaned but written to yesterday
+# must not be told "nothing has been written for 30+ days".
+STORAGE_REPO_FAILING_IDLE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
+  | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .inactive == true)] | length // 0')
+STORAGE_REPO_FAILING_ORPHAN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
+  | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .orphaned == true)] | length // 0')
 # Status-based, so it belongs in the tally: these repositories are NOT in
 # ageUnknown any more. An import that does carry maintenance evidence is
 # assessed normally and is deliberately not counted here.
@@ -6115,8 +6221,12 @@ STORAGE_REPO_LISTED=$(safe_int "$REPO_NAMES_COUNT")
 [ -z "$STORAGE_REPO_OK_COUNT" ] && STORAGE_REPO_OK_COUNT=0
 [ -z "$STORAGE_REPO_INACTIVE_COUNT" ] && STORAGE_REPO_INACTIVE_COUNT=0
 [ -z "$STORAGE_REPO_UNUSED_COUNT" ] && STORAGE_REPO_UNUSED_COUNT=0
+[ -z "$STORAGE_REPO_UNUSED_READONLY_COUNT" ] && STORAGE_REPO_UNUSED_READONLY_COUNT=0
 [ -z "$STORAGE_REPO_ACTIVE_FAILING_COUNT" ] && STORAGE_REPO_ACTIVE_FAILING_COUNT=0
 [ -z "$STORAGE_REPO_ORPHANED_COUNT" ] && STORAGE_REPO_ORPHANED_COUNT=0
+[ -z "$STORAGE_REPO_PROFILE_MISMATCH_COUNT" ] && STORAGE_REPO_PROFILE_MISMATCH_COUNT=0
+[ -z "$STORAGE_REPO_FAILING_IDLE_COUNT" ] && STORAGE_REPO_FAILING_IDLE_COUNT=0
+[ -z "$STORAGE_REPO_FAILING_ORPHAN_COUNT" ] && STORAGE_REPO_FAILING_ORPHAN_COUNT=0
 [ -z "$STORAGE_REPO_READONLY_COUNT" ] && STORAGE_REPO_READONLY_COUNT=0
 [ -z "$STORAGE_REPO_NEVER_RAN_COUNT" ] && STORAGE_REPO_NEVER_RAN_COUNT=0
 [ -z "$STORAGE_REPO_DISABLED_COUNT" ] && STORAGE_REPO_DISABLED_COUNT=0
@@ -6750,9 +6860,11 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoOkCount "$STORAGE_REPO_OK_COUNT" \
     --argjson storageRepoInactiveCount "$STORAGE_REPO_INACTIVE_COUNT" \
     --argjson storageRepoUnusedCount "$STORAGE_REPO_UNUSED_COUNT" \
+    --argjson storageRepoUnusedReadOnlyCount "$STORAGE_REPO_UNUSED_READONLY_COUNT" \
     --argjson storageRepoActiveFailingCount "$STORAGE_REPO_ACTIVE_FAILING_COUNT" \
     --argjson storageRepoInactiveThresholdDays "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS" \
     --argjson storageRepoOrphanedCount "$STORAGE_REPO_ORPHANED_COUNT" \
+    --argjson storageRepoProfileMismatchCount "$STORAGE_REPO_PROFILE_MISMATCH_COUNT" \
     --argjson storageRepoReadOnlyCount "$STORAGE_REPO_READONLY_COUNT" \
     --argjson storageRepoNeverRanCount "$STORAGE_REPO_NEVER_RAN_COUNT" \
     --argjson storageRepoDisabledCount "$STORAGE_REPO_DISABLED_COUNT" \
@@ -7423,13 +7535,16 @@ if [ "$MODE" = "json" ]; then
         ageUnknownCount: $storageRepoUnknownCount,
         inactiveCount: $storageRepoInactiveCount,
         unusedCount: $storageRepoUnusedCount,
+        unusedReadOnlyCount: $storageRepoUnusedReadOnlyCount,
         activeFailingCount: $storageRepoActiveFailingCount,
         orphanedCount: $storageRepoOrphanedCount,
+        profileMismatchCount: $storageRepoProfileMismatchCount,
         readOnlyCount: $storageRepoReadOnlyCount,
         maintenanceThresholdDays: 7,
         inactiveThresholdDays: $storageRepoInactiveThresholdDays,
         items: $storageRepoMaintenance,
         note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. Status is derived from evidence that a run SUCCEEDED, not from the newest recorded timestamp: a failed run can leave a fresh one behind. FAILING_STALE means the last run failed and none has succeeded within the threshold; FAILING means it failed but a success is still recent; STALE means the last success is older than the threshold; OVERDUE means a whole cycle passed with nothing running and nothing recorded; NEVER_RAN means readable history with no run in it; UNKNOWN means neither the procedure record nor the task history could answer, which is not the same as healthy.",
+        profileMismatchNote: "profileMismatch = the profile named by the repository label still exists, but its current locationSpec no longer points where the repository sits: a different objectStore bucket, or a FileStore path outside the current prefix. Compared against ITS OWN profile, deliberately, not against every profile: a repository is reached only through the profile it refers to, so another profile pointing at the same bucket does not make it reachable. It will not be processed and maintenance on it can never succeed again. Measured on a 162-repository cluster: 5 mismatched, all FAILING_STALE, no healthy repository mismatched. REPORTED ONLY - it feeds no count that drives severity, does not set orphaned, and does not reach the rollup. Whether the old bucket or share still exists is NOT checked, so this is not authority to delete: confirm nothing in it is needed, or open a support case. The FileStore path is read for the comparison and never published, because it carries the K10 cluster UUID.",
         inactivityNote: "inactive = no data written for longer than inactiveThresholdDays, from status.details.modifiedTime, which maintenance does not bump. Inactivity NEVER changes a repository status or a count: it only decides whether failures earn a critical. FAILING means at least one failing repository is still being written to; FAILING_INACTIVE means every failing repository is idle, which is normal after a profile migration and is cleanup rather than an incident. A repository whose last write cannot be dated counts as active, so an unknown never downgrades a finding. unusedCount counts repositories whose storageUsage is present and empty - nothing was ever written to them.",
         readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten), and the best practice reports NOT_ASSESSED rather than a clean result.",
         maintenanceTypeNote: "recentResults[0] is the most recent run: verified descending on all 9 repositories of a live Kasten 9.0.5 cluster. The entries carry no full/quick discriminator, but they are spaced one per day against a configured full interval of 24h and a quick interval of 1h (maintenanceInfo.full.interval / .quick.interval), and quick runs would produce roughly 24x more entries than observed - so recentResults holds full runs. runsTotal exceeds the number of entries kept, so the list is truncated to the most recent."
@@ -8406,6 +8521,10 @@ else
       + ((if has("lastRunDurationHuman") then .lastRunDurationHuman
            else .lastFullMaintenanceDurationHuman end) as $dur
          | if $dur then " duration=" + $dur else "" end)
+      # Only when idle, and only the age: every row carrying "write=Nd" would
+      # double the noise for the one fact that changes the verdict.
+      + (if .profileMismatch == true then " profile-mismatch" else "" end)
+      + (if .inactive == true then " idle=" + (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + "d" else "" end)
       + (if .status == "UNKNOWN" then " [UNKNOWN_STATUS]"
          elif .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
          elif .status == "DISABLED" then " [DISABLED_STATUS]"
@@ -8461,11 +8580,22 @@ else
   if [ "$STORAGE_REPO_INACTIVE_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_INACTIVE_COUNT have had no data written for $STORAGE_REPO_INACTIVE_THRESHOLD_DAYS+ days\n"
   fi
+  if [ "$STORAGE_REPO_PROFILE_MISMATCH_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_PROFILE_MISMATCH_COUNT sit where their profile no longer points - repointed profile, older repositories left behind\n"
+    printf "          Maintenance through that profile cannot succeed. Check whether the old target is still\n"
+    printf "          needed before deleting them, or open a support case - these hold backup data.\n"
+  fi
   if [ "$STORAGE_REPO_ORPHANED_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_ORPHANED_COUNT reference a profile or policy that no longer exists\n"
   fi
   if [ "$STORAGE_REPO_UNUSED_COUNT" -gt 0 ] 2>/dev/null; then
-    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation\n"
+    if [ "$STORAGE_REPO_UNUSED_READONLY_COUNT" -eq "$STORAGE_REPO_UNUSED_COUNT" ]; then
+      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation - all read-only imports that have received nothing yet\n"
+    elif [ "$STORAGE_REPO_UNUSED_READONLY_COUNT" -gt 0 ]; then
+      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation ($STORAGE_REPO_UNUSED_READONLY_COUNT read-only imports)\n"
+    else
+      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation\n"
+    fi
   fi
 fi
 
@@ -9175,12 +9305,21 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = 
   fi
   if [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ]; then
     printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Repository maintenance: ${COLOR_RED}FAILING${COLOR_RESET} ($_repo_bits)\n"
+    if [ "$STORAGE_REPO_ACTIVE_FAILING_COUNT" -gt 0 ]; then
+      printf "          %s still being written to - check the failure and work on resolving it.\n" "$STORAGE_REPO_ACTIVE_FAILING_COUNT"
+    fi
   elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING_INACTIVE" ]; then
     # Same failures, every one of them on a repository nothing writes to, so
     # nothing is accumulating. Without the reason this line reads as a wrong
     # severity next to "49 failing and stale".
     printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}CLEANUP${COLOR_RESET} ($_repo_bits)\n"
-    printf "          All of them idle ${STORAGE_REPO_INACTIVE_THRESHOLD_DAYS}+ days or with a deleted profile/policy - nothing is accumulating.\n"
+    if [ "$STORAGE_REPO_FAILING_ORPHAN_COUNT" -eq 0 ]; then
+      printf "          None of them has had data written for %s+ days, so nothing is accumulating.\n" "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS"
+    elif [ "$STORAGE_REPO_FAILING_IDLE_COUNT" -eq 0 ]; then
+      printf "          The profile or policy that owns each of them has been deleted, so nothing is accumulating.\n"
+    else
+      printf "          Each is either idle %s+ days or owned by a deleted profile/policy - nothing is accumulating.\n" "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS"
+    fi
     printf "          Not critical for that reason. Consider deleting them.\n"
   else
     printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET} ($_repo_bits)\n"

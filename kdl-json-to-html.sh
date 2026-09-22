@@ -849,11 +849,38 @@ else "" end) + "
           # Why it is a warning and not a critical, stated on the row itself.
           # A reader who sees "49 failing and stale" beside "Warning" will
           # otherwise assume the severity is wrong.
-          + (if $srVal == "FAILING_INACTIVE" then
-               " — all on repositories with no data written for "
-               + ((.storageRepositories.inactiveThresholdDays // 30) | tostring)
-               + "+ days, so nothing is accumulating. Cleanup, not an outage."
-             else "" end) + "</td>
+          # The reason is DERIVED, not assumed. Two independent things can
+          # downgrade this -- idleness and a deleted owner -- and the first
+          # wording claimed idleness always. On a cluster whose failing
+          # repositories were orphaned but written to yesterday, it read "no
+          # data written for 30+ days" about repositories written to 1 day
+          # ago. Inspect the failing set and say which it actually is.
+          + (([.storageRepositories.items[]?
+               | select(.status == "FAILING_STALE" or .status == "NEVER_RAN")]) as $bad
+             | ($bad | map(select(.inactive == true)) | length) as $bIdle
+             | ($bad | map(select(.orphaned == true)) | length) as $bOrph
+             | ((.storageRepositories.inactiveThresholdDays // 30) | tostring) as $ithr
+             | if $srVal == "FAILING_INACTIVE" then
+                 " \u2014 "
+                 + (if $bOrph == 0 then
+                      "none of them has had data written for " + $ithr + "+ days"
+                    elif $bIdle == 0 then
+                      "the profile or policy that owns each of them has since been deleted"
+                    else
+                      "each of them is either idle for " + $ithr + "+ days or owned by a deleted profile or policy"
+                    end)
+                 + ", so nothing is accumulating. Cleanup, not an outage."
+               elif $srVal == "FAILING" then
+                 # The mirror of the above: without it a reader cannot tell
+                 # why this one is red where the other is amber.
+                 ((.storageRepositories.activeFailingCount // 0) as $af
+                  | if $af > 0 then
+                      " \u2014 " + ($af | tostring)
+                      + (if $af == 1 then " is" else " are" end)
+                      + " still being written to \u2014 check the reason shown under its status and resolve the failure."
+                    else "" end)
+               else "" end)
+             + "</td>
       </tr>"
       else "" end) +
       (if .bestPractices.residualSnapshots then
@@ -1329,6 +1356,8 @@ else "" end) + "
        <li><strong>Read-only</strong> <code>READ_ONLY</code> &mdash; Kasten excludes read-only repositories from background processing, so maintenance never runs and no history is correct. These are imports: this cluster reads another cluster&rsquo;s exports from them, and the source cluster owns the maintenance. Nothing to do.</li>
        <li><strong>Not assessed</strong> <code>UNKNOWN</code> &mdash; neither source could answer. <strong>Not the same as healthy</strong>; usually the <code>storagerepositories/details</code> RBAC rule.</li>
      </ul>
+     <p class=\"section-description\"><strong>Profile mismatch</strong> means the repository refers to a profile that no longer points where the repository actually sits &mdash; typically a profile repointed at a new bucket or share, leaving the older repositories behind. It will not be processed: a repository is reached only through the profile it refers to, so another profile pointing at the same target does not help. Maintenance on it can never succeed again, and it needs manual cleanup. Whether the old bucket or share still exists is <strong>not</strong> something this tool checks, so confirm nothing in it is still needed before deleting, or open a support case &mdash; these hold backup data.</p>
+     <p class=\"section-description\"><strong>Stale is not the same as idle.</strong> <em>Stale</em> means maintenance has not <strong>succeeded</strong> within " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days. <em>Idle</em> (the Last Data Write column) means no <strong>data</strong> has been written within " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + " days &mdash; maintenance does not touch that timestamp. A repository can be either, both or neither, and a stale repository that is <strong>still being written to</strong> is the one worth acting on.</p>
      <p class=\"section-description\"><strong>How loud is it?</strong> Failures earn a critical only on repositories still being written to. Where every failing repository has had no data written for " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days, or its profile or policy has since been deleted, the finding stays but drops to a warning &mdash; nothing accumulates in a repository nobody writes to, so that is cleanup, typically after a profile migration. A repository whose last write cannot be dated counts as active, so an unknown never quietens a finding.</p>
      <p class=\"section-description\">Durations exclude time spent queued.</p>"
 + (if .storageRepositories then
@@ -1402,7 +1431,18 @@ else "" end) + "
             # configured imports that never received anything, not leftovers.
             # Whether a repository can be removed depends on who still points
             # at it, which the Profile and Policy columns show per row.
-            "<div class=\"stat-row\"><span class=\"stat-label\">Never held any data since creation</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.unusedCount) | tostring) + "</span></span></div>"
+            # Say WHY, when the data says why. An import that has received
+            # nothing is mundane; an empty export repository is not, so the
+            # qualifier is derived rather than assumed.
+            "<div class=\"stat-row\"><span class=\"stat-label\">Never held any data since creation"
+            + ((.storageRepositories.unusedReadOnlyCount // 0) as $uro
+               | if $uro <= 0 then ""
+                 elif $uro == (.storageRepositories.unusedCount // 0) then " \u2014 all read-only imports, nothing received yet"
+                 else " (" + ($uro | tostring) + " read-only imports)" end)
+            + "</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.unusedCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("profileMismatchCount")) and ((.storageRepositories.profileMismatchCount // 0) > 0) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Profile no longer points here \u2014 needs manual cleanup</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.profileMismatchCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories | has("orphanedCount")) and ((.storageRepositories.orphanedCount // 0) > 0) then
             "<div class=\"stat-row\"><span class=\"stat-label\">Profile or policy since deleted</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.orphanedCount) | tostring) + "</span></span></div>"
@@ -1418,7 +1458,7 @@ else "" end) + "
 
       + "</div>
       <table>
-        <thead><tr><th>Repository Name</th><th>Application</th><th>Type</th><th>Profile</th><th>Policy</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Duration</th></tr></thead>
+        <thead><tr><th>Repository Name</th><th>Application</th><th>Type</th><th>Profile</th><th>Policy</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Last Data Write</th><th>Duration</th></tr></thead>
         <tbody>" +
       ([.storageRepositories.items[]? |
         "<tr><td><code>" + (.name | @html) + "</code></td>" +
@@ -1439,6 +1479,9 @@ else "" end) + "
                     ((.exportProfile // .importProfile) | @html)
                     + (if .repositoryRole == "import" then " <span class=\"badge info\">import</span>" else "" end)
                     + (if .profileMissing == true then " <span class=\"badge warn\">deleted</span>" else "" end)
+                    # The profile exists but no longer points where this
+                    # repository lives, so the name alone looks healthy.
+                    + (if .profileMismatch == true then " <span class=\"badge warn\">profile mismatch</span>" else "" end)
                   elif .profile != "N/A" then (.profile | @html)
                   else "\u2014" end) + "</td>" +
         "<td>" + (if .policyName then
@@ -1520,6 +1563,17 @@ else "" end) + "
                else "" end)
         ) + "</td>" +
         "<td>" + (if .lastFullMaintenanceTime then (.lastFullMaintenanceTime | tostring | split("T")[0] + " " + split("T")[1] | split("Z")[0]) else "\u2014" end) + "</td>" +
+        # Beside the maintenance date on purpose: the two ages are what tell
+        # STALE apart from INACTIVE, and they measure different things.
+        # STALE  = maintenance has not SUCCEEDED in maintenanceThresholdDays.
+        # IDLE   = no DATA has been written in inactiveThresholdDays, from
+        #          modifiedTime, which maintenance does not bump.
+        # A repository can be any combination of the two, and "stale but
+        # still being written to" is the one that earns a critical.
+        "<td>" + (if .daysSinceLastWrite == null then "\u2014"
+                  else (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + "d"
+                       + (if .inactive == true then " <span class=\"badge info\">idle</span>" else "" end)
+                  end) + "</td>" +
         # The inner MaintenanceRun command window. The v2.4 field it falls back
         # to is completedTime - scheduledTime, which absorbs queue time and
         # goes negative on a hand-triggered run; kept only for reports that
