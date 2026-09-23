@@ -157,12 +157,18 @@ trap 'rm -rf "$_jq_tmpdir"; exit 143' TERM
 JQ_PROGRAM="$_jq_tmpdir/render.jq"
 
 cat > "$JQ_PROGRAM" <<'KDL_RENDER_JQ'
+# Every value a best-practice rollup can take needs a branch here. The final
+# else prints the value rather than a verdict, so a missing one is not silent -
+# but it renders neutral blue, and a crit rollup sitting in a blue badge beside
+# a red "Critical" cell contradicts itself. FAILING and FAILING_INACTIVE did
+# exactly that until they were added. Adding a rollup value is a change here
+# too; the gate asserts the pairing.
 def badge(v):
   if v == true or v == "VALID" or v == "ENABLED" or v == "IN_USE" or v == "COMPLIANT" or v == "CONFIGURED" or v == "COMPLETE" or v == "OK" then 
     "<span class=\"badge ok\">\u2713 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" or v == "CONFIGURED_NOT_HEALTHY" then
+  elif v == "EXPIRED" or v == "Failed" or v == "NOT_ENABLED" or v == "NOT_COMPLIANT" or v == "GAPS_DETECTED" or v == "EXCEEDED" or v == "NOT_CONFIGURED" or v == "CONFIGURED_NOT_HEALTHY" or v == "FAILING" then
     "<span class=\"badge error\">\u2717 " + (v | tostring | gsub("_"; " ")) + "</span>"
-  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "CONFIGURED_INCOMPLETE" or v == "WARN" then
+  elif v == "NOT_FOUND" or v == "NOT_USED" or v == "PARTIAL" or v == "CONFIGURED_INCOMPLETE" or v == "WARN" or v == "FAILING_INACTIVE" then
     "<span class=\"badge warn\">\u26a0 " + (v | tostring | gsub("_"; " ")) + "</span>"
   elif v == false then
     "<span class=\"badge warn\">\u2717 false</span>"
@@ -845,14 +851,23 @@ else "" end) + "
                       | if $wx > 0 then " (" + ($wx | tostring) + " policy/policies define an export action)"
                         else " (no policy defines an export action)" end)
                  else badge($srVal) end) +
-          (if (staleCountOf(.storageRepositories) + (.storageRepositories.failingCount // 0) + (.storageRepositories.failingStaleCount // 0) + (.storageRepositories.overdueCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
+          (if (staleCountOf(.storageRepositories) + (.storageRepositories.failingCount // 0) + (.storageRepositories.failingStaleCount // 0) + (.storageRepositories.overdueCount // 0) + ((.storageRepositories.neverRanCount) // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
             " (" +
             ([
               (if (.storageRepositories.failingStaleCount // 0) > 0 then ((.storageRepositories.failingStaleCount) | tostring) + " failing and stale" else empty end),
               (if (.storageRepositories.failingCount // 0) > 0 then ((.storageRepositories.failingCount) | tostring) + " failing" else empty end),
               (if staleCountOf(.storageRepositories) > 0 then (staleCountOf(.storageRepositories) | tostring) + " stale" else empty end),
               (if (.storageRepositories.overdueCount // 0) > 0 then ((.storageRepositories.overdueCount) | tostring) + " overdue" else empty end),
-              (if (.storageRepositories.neverRanCount // 0) > 0 then (.storageRepositories.neverRanCount | tostring) + " never-ran" else empty end),
+              # TWO terms. A not-due repository needs no attention but still
+              # DRIVES the PARTIAL verdict, so dropping it left a row reading
+              # "Warning - PARTIAL" and nothing else, while the terminal said
+              # "1 never ran, not yet overdue" for the same data.
+              (((if (.storageRepositories | has("neverRanDueCount"))
+                 then .storageRepositories.neverRanDueCount
+                 else .storageRepositories.neverRanCount end) // 0) as $nrd
+               | if $nrd > 0 then ($nrd | tostring) + " never-ran" else empty end),
+              (((.storageRepositories.neverRanNotDueCount) // 0) as $nrn
+               | if $nrn > 0 then ($nrn | tostring) + " never ran, not yet overdue" else empty end),
               (if (.storageRepositories.disabledCount // 0) > 0 then (.storageRepositories.disabledCount | tostring) + " disabled" else empty end)
             ] | join(", ")) + ")"
           else "" end)
@@ -877,6 +892,8 @@ else "" end) + "
                  // ([.storageRepositories.items[]? | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .inactive == true)] | length))) as $bIdle
              | ((.storageRepositories.quietFailingOrphanCount
                  // ([.storageRepositories.items[]? | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .orphaned == true)] | length))) as $bOrph
+                 | (((.storageRepositories.quietFailingNeverWrittenCount)
+                     // ([.storageRepositories.items[]? | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .neverWritten == true)] | length))) as $bEmpty
              | ((.storageRepositories.inactiveThresholdDays // 30) | tostring) as $ithr
              | ($nBad | tostring) as $nBad
              | if $srVal == "FAILING_INACTIVE" then
@@ -888,22 +905,65 @@ else "" end) + "
                  # yesterday could sit among them inside a sentence saying
                  # nothing had been written for a month.
                  " \u2014 of the " + $nBad + " failing without a recent success, "
-                 + (if $bOrph == 0 then
+                 # THREE reasons, not two. A repository that has never been written to is
+                 # neither idle nor orphaned, and "no data written for 30+ days" is false
+                 # about one created two days ago.
+                 + (if $bEmpty >= ($nBad | tonumber) then
+                      "none has ever been written to"
+                    elif $bOrph == 0 and $bEmpty == 0 then
                       "none has had data written for " + $ithr + "+ days"
-                    elif $bIdle == 0 then
+                    elif $bIdle == 0 and $bEmpty == 0 then
                       "the profile or policy that owns each has since been deleted"
                     else
-                      "each is either idle for " + $ithr + "+ days or owned by a deleted profile or policy"
+                      "each is idle for " + $ithr + "+ days, has never been written to, or is owned by a deleted profile or policy"
                     end)
-                 + ", so nothing is accumulating. Cleanup, not an outage."
+                 # Same scoping as the terminal: the downgrade is a claim
+                 # about a SET, and a repository whose /details could not be
+                 # read was never in it. Say so rather than escalating - see
+                 # the note beside the terminal line for why not.
+                 + ", so nothing is accumulating there."
+                 + (((.storageRepositories.listed // 0) - (.storageRepositories.total // 0)) as $unread
+                    # Reads the published flag, not a second derivation of
+                    # it: "Cleanup, not an outage" is a claim about the whole
+                    # estate, and a repository that answered UNKNOWN was as
+                    # unexamined as one that was never read.
+                    | if (.storageRepositories.fullyAssessed == false) or ($unread > 0) then
+                        " A repository that was not read, or did not answer, may be failing and still written to, so that cannot be ruled out."
+                      elif $bEmpty >= ($nBad | tonumber) then
+                        " Its first export has written nothing \u2014 find out why; deleting the repository will not fix the export."
+                      else " Cleanup rather than an outage \u2014 confirm why each is idle before deleting anything; these hold backup data." end)
                elif $srVal == "FAILING" then
                  # The mirror of the above: without it a reader cannot tell
                  # why this one is red where the other is amber.
+                 # The advice must match what the reader will find, and must
+                 # compare like with like: $af counts repositories still being
+                 # written to, so the never-ran figure beside it has to be the
+                 # never-ran subset of THAT set. Against every due never-ran
+                 # repository, idle ones included, one failing active
+                 # repository plus two idle never-ran ones was described as
+                 # having no maintenance run ever recorded.
+                 # activeFailingCount includes NEVER_RAN repositories that are
+                 # past due, and those carry no failure and no error -- telling
+                 # someone to check a reason shown under the status, when the
+                 # status shows none, sends them looking for nothing.
                  ((.storageRepositories.activeFailingCount // 0) as $af
+                  | ((if (.storageRepositories | has("activeNeverRanCount"))
+                      then .storageRepositories.activeNeverRanCount
+                      else 0 end) // 0) as $nrd
                   | if $af > 0 then
                       " \u2014 " + ($af | tostring)
                       + (if $af == 1 then " is" else " are" end)
-                      + " still being written to \u2014 check the reason shown under its status and resolve the failure."
+                      # The count includes repositories whose write date could
+                      # not be read -- they stay active so an unknown cannot
+                      # quieten a finding on its own -- so the flat claim
+                      # "still being written to" is more than this number
+                      # supports. Same clause as the terminal advice lines.
+                      + " still being written to, or with no write date to say otherwise \u2014 "
+                      + (if $nrd >= $af
+                         then "no maintenance run has ever been recorded; check that maintenance is being scheduled."
+                         elif $nrd > 0
+                         then "check the reason shown under each status, and for those that have never run, that maintenance is being scheduled."
+                         else "check the reason shown under its status and resolve the failure." end)
                     else "" end)
                else "" end)
           # A failure outranks a partial read in the rollup so that one
@@ -913,7 +973,14 @@ else "" end) + "
           # scan. The terminal says it; so does this.
           + (((.storageRepositories.listed // 0) - (.storageRepositories.total // 0)) as $unread
              | ((.storageRepositories.ageUnknownCount // 0)) as $unassessed
-             | if ($srVal == "FAILING") or ($srVal == "FAILING_INACTIVE") or ($srVal == "PARTIAL") then
+             # NOT_ASSESSED belongs here too, and was the one verdict left
+             # out. It is the verdict these two counts CAUSE, so the row
+             # rendered the bare words "Not assessed" with neither the number
+             # nor which of the two reasons applied, while the terminal named
+             # both. A reader cannot act on "not assessed" alone: unread is an
+             # RBAC or availability problem, an undeterminable outcome is not.
+             | if ($srVal == "FAILING") or ($srVal == "FAILING_INACTIVE")
+                  or ($srVal == "PARTIAL") or ($srVal == "NOT_ASSESSED") then
                  (if $unread > 0 then
                     " <span class=\"badge info\">" + ($unread | tostring) + " of "
                     + ((.storageRepositories.listed) | tostring)
@@ -921,7 +988,7 @@ else "" end) + "
                   else "" end)
                  + (if $unassessed > 0 then
                     " <span class=\"badge info\">" + ($unassessed | tostring)
-                    + " recorded neither a success nor a failure \u2014 not assessed</span>"
+                    + " whose outcome could not be established \u2014 not assessed</span>"
                   else "" end)
                else "" end)
              + "</td>
@@ -1395,14 +1462,14 @@ else "" end) + "
        <li><strong>Run failed &mdash; no success for Nd</strong> <code>FAILING_STALE</code> &mdash; urgent. Usually the maintenance pod cannot start or finish, or the repository is unreachable.</li>
        <li><strong>Past due (N cycles)</strong> <code>OVERDUE</code> &mdash; a cycle passed with no attempt recorded, so there is no failure to find. Check K10 is scheduling, and whether the repository is still used.</li>
        <li><strong>Stale (Nd)</strong> <code>STALE</code> &mdash; last success older than " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days, nothing failed. Start with whether its exports still run.</li>
-       <li><strong>Never Ran</strong> <code>NEVER_RAN</code> &mdash; readable history with no run in it. Normal under a day old.</li>
+       <li><strong>Never Ran</strong> <code>NEVER_RAN</code> &mdash; readable history with no run in it. A warning until the first run is overdue; after that it can earn a CRITICAL. Overdue means older than one full maintenance interval, or a full interval past its scheduled time, and never while a maintenance pod is running for it.</li>
        <li><strong>Disabled</strong> <code>DISABLED</code> &mdash; off in the Kasten spec or in Kopia. Space is never reclaimed while off.</li>
        <li><strong>Read-only</strong> <code>READ_ONLY</code> &mdash; Kasten excludes read-only repositories from background processing, so maintenance never runs and no history is correct. These are imports: this cluster reads another cluster&rsquo;s exports from them, and the source cluster owns the maintenance. Nothing to do.</li>
-       <li><strong>Not assessed</strong> <code>UNKNOWN</code> &mdash; neither source could answer. <strong>Not the same as healthy</strong>; usually the <code>storagerepositories/details</code> RBAC rule.</li>
+       <li><strong>Not assessed</strong> <code>UNKNOWN</code> &mdash; something needed could not be read. <strong>Not the same as healthy.</strong> Three causes: neither the run nor the task history recorded an outcome; a run succeeded but nothing can date it; or the repository is past due by a full cycle and the pod list could not be read, so whether a run is in flight is unknown. The last of those has a recent success behind it &mdash; it is the schedule that could not be checked, not the maintenance.</li>
      </ul>
      <p class=\"section-description\"><strong>Profile mismatch</strong> means the repository refers to a profile that no longer points where the repository actually sits &mdash; typically a profile repointed at a new bucket or share, leaving the older repositories behind. It will not be processed: a repository is reached only through the profile it refers to, so another profile pointing at the same target does not help. Maintenance on it can never succeed again, and it needs manual cleanup. Whether the old bucket or share still exists is <strong>not</strong> something this tool checks, so confirm nothing in it is still needed before deleting, or open a support case &mdash; these hold backup data.</p>
      <p class=\"section-description\"><strong>Stale is not the same as idle.</strong> <em>Stale</em> means maintenance has not <strong>succeeded</strong> within " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days. <em>Idle</em> (the Last Data Write column) means no <strong>data</strong> has been written within " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + " days &mdash; maintenance does not touch that timestamp. A repository can be either, both or neither, and a stale repository that is <strong>still being written to</strong> is the one worth acting on.</p>
-     <p class=\"section-description\"><strong>How loud is it?</strong> Failures earn a critical only on repositories still being written to. Where every failing repository has had no data written for " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days, or its profile or policy has since been deleted, the finding stays but drops to a warning &mdash; nothing accumulates in a repository nobody writes to, so that is cleanup, typically after a profile migration. A repository whose last write cannot be dated counts as active, so an unknown never quietens a finding.</p>
+     <p class=\"section-description\"><strong>How loud is it?</strong> Failures earn a critical only on repositories still being written to. Where every failing repository is quiet &mdash; no data written for " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days, never written to at all, or, <em>only where the last write date is unknown</em>, owned by a profile or policy that has since been deleted &mdash; the finding stays but drops to a warning. Nothing accumulates in a repository nobody writes to: for the idle and orphaned cases that is cleanup, typically after a profile migration, but a repository that has never been written to is not cleanup &mdash; its first export has produced nothing. A repository whose last write cannot be dated counts as active <em>on its own</em>, so an unknown alone never quietens a finding.</p>
      <p class=\"section-description\">Durations exclude time spent queued.</p>"
 + (if .storageRepositories then
     # "None readable" is not "none exist". Branching on total alone rendered
@@ -1440,7 +1507,16 @@ else "" end) + "
         + (if (.storageRepositories.overdueCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Past due, nothing running</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.overdueCount) | tostring) + "</span></span></div>"
           else "" end)
-        + (if (.storageRepositories.neverRanCount // 0) > 0 then
+        # Two rows where the counts are published, one where they are not, so
+        # an older report still renders and the rows still sum to the total.
+        + (if (.storageRepositories | has("neverRanDueCount")) then
+            (if (.storageRepositories.neverRanDueCount // 0) > 0 then
+               "<div class=\"stat-row\"><span class=\"stat-label\">Never ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanDueCount) | tostring) + "</span></span></div>"
+             else "" end)
+            + (if (.storageRepositories.neverRanNotDueCount // 0) > 0 then
+               "<div class=\"stat-row\"><span class=\"stat-label\">Never ran \u2014 first run not yet overdue</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.neverRanNotDueCount) | tostring) + "</span></span></div>"
+             else "" end)
+           elif (.storageRepositories.neverRanCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Never ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories.disabledCount // 0) > 0 then
@@ -1472,8 +1548,16 @@ else "" end) + "
         # count, so a report predating these fields says nothing rather than
         # claiming zero.
         + "</div>"
+        # PAIR. This condition opens the card and an identical copy below
+        # closes it, so a term added to one must be added to the other or the
+        # card opens without closing. profileMismatchCount was added to the
+        # rows in 2e84d89 and to neither condition, so a report whose only
+        # cross-cutting fact was a mismatch rendered that row inside the
+        # Maintenance status card instead -- under a caption promising the
+        # rows add up to the total, which a cross-cutting count does not.
         + (if (((.storageRepositories.inactiveCount // 0) + (.storageRepositories.unusedCount // 0)
-                + (.storageRepositories.orphanedCount // 0)) > 0)
+                + (.storageRepositories.orphanedCount // 0)
+                + (.storageRepositories.profileMismatchCount // 0)) > 0)
            then "<div class=\"card\"><div class=\"stat-group\" style=\"margin-top:0;\">Repository context</div>"
            else "" end)
         + (if (.storageRepositories | has("inactiveCount")) and ((.storageRepositories.inactiveCount // 0) > 0) then
@@ -1489,7 +1573,7 @@ else "" end) + "
             # Say WHY, when the data says why. An import that has received
             # nothing is mundane; an empty export repository is not, so the
             # qualifier is derived rather than assumed.
-            "<div class=\"stat-row\"><span class=\"stat-label\">Never held any data since creation"
+            "<div class=\"stat-row\"><span class=\"stat-label\">Never written to since creation"
             + ((.storageRepositories.unusedReadOnlyCount // 0) as $uro
                | if $uro <= 0 then ""
                  elif $uro == (.storageRepositories.unusedCount // 0) then " \u2014 all read-only imports, nothing received yet"
@@ -1507,7 +1591,8 @@ else "" end) + "
         # other card rather than pointing at it: grid-2 collapses to one
         # column on narrow screens, where "opposite" would be wrong.
         + (if (((.storageRepositories.inactiveCount // 0) + (.storageRepositories.unusedCount // 0)
-                + (.storageRepositories.orphanedCount // 0)) > 0)
+                + (.storageRepositories.orphanedCount // 0)
+                + (.storageRepositories.profileMismatchCount // 0)) > 0)
            then "<p class=\"section-description\" style=\"margin:0.8rem 0 0;font-size:0.78rem;\">Already counted under Maintenance status \u2014 not extra repositories.</p></div>"
            else "" end)
 
@@ -1519,8 +1604,8 @@ else "" end) + "
         "<tr><td><code>" + (.name | @html) + "</code></td>" +
         # The repository name is a generated suffix and identifies nothing a
         # reader can act on. The application and the policy do: "this failing
-        # repository belongs to mysql-backup-jai" is the sentence that leads
-        # somewhere. Both come from labels, both may legitimately be absent
+        # repository belongs to the mysql backup policy" is the sentence that
+        # leads somewhere. Both come from labels, both may legitimately be absent
         # (an on-demand export has no policy), so em-dash rather than a guess.
         "<td>" + (if .appName then (.appName | @html) else "\u2014" end) + "</td>" +
         "<td>" + (.contentType | @html) + "</td>" +
@@ -1575,12 +1660,45 @@ else "" end) + "
           # keeps reports that predate it rendering.
           ((if (. | has("successAgeDays")) then .successAgeDays
             else .daysSinceLastSuccess end)) as $succAge |
-          (if $succAge == null then "never"
+          # null, not the word "never": an undatable success and one that
+          # never happened are different things, and FAILING_STALE covers
+          # both -- the ladder reaches it when an attempt failed and no
+          # success is recorded inside the threshold, whether or not one
+          # exists further back. Saying "never" asserts the stronger of the
+          # two, and "no success for never" is not a sentence either. The
+          # terminal already said "an unknown number of days" for the same
+          # repository; the phrase below is that one, so the two outputs
+          # cannot read differently.
+          (if $succAge == null then null
            else ((($succAge * 10) | round) / 10 | tostring) + "d" end) as $succShown |
+          (if $succShown == null then "an unknown number of days"
+           else $succShown end) as $succPhrase |
           if .status == "DISABLED" then
-            "<span class=\"badge error\">Disabled</span>"
+            # Amber, not red. Disabled maintenance drives the section to
+            # PARTIAL, which is a warning, and both the card two sections up
+            # and the terminal already said amber -- this row was the only
+            # place the same repository looked critical. Space not being
+            # reclaimed is worth a line, not an alarm, and someone turned it
+            # off deliberately.
+            "<span class=\"badge warn\">Disabled</span>"
           elif .status == "NEVER_RAN" then
-            "<span class=\"badge error\">Never Ran</span>"
+            # Red only once the first run was actually due. A repository
+            # created an hour ago has an empty history because nothing has
+            # been scheduled yet, which the legend three sections up calls
+            # normal -- and this badge called it an error on the same page.
+            # firstRunDue is computed once in KDL.sh against the schedule and
+            # read here; deriving it again from daysSinceCreation would be the
+            # second copy that drifts.
+            # Three readings, not two. firstRunDue is false both when the
+            # first run has not come round yet AND while it is executing --
+            # the guard that stops a run in flight counting as late. Calling
+            # a run that is happening right now "not due yet" is wrong in the
+            # one place the reader can see which it is.
+            (if .firstRunDue == false and .maintenanceRunning == true
+             then "<span class=\"badge info\">Never ran \u2014 first run in progress</span>"
+             elif .firstRunDue == false
+             then "<span class=\"badge info\">Never ran \u2014 first run not yet overdue</span>"
+             else "<span class=\"badge error\">Never Ran</span>" end)
           # "Run failed" is only true when something reported a failure. A run
           # that merely came up short of the expected task set sets
           # lastRunSucceeded false with lastRunFailedTasks EMPTY and no error
@@ -1591,20 +1709,31 @@ else "" end) + "
             (if ((.lastRunFailedTasks // []) | length) == 0
                 and ((.procedureError // .lastRunError) == null)
                 and (.lastRunComplete == false) then
-               "<span class=\"badge error\">Run incomplete \u2014 no success for " + $succShown + "</span>"
+               "<span class=\"badge error\">Run incomplete \u2014 no success for " + $succPhrase + "</span>"
              else
-               "<span class=\"badge error\">Run failed \u2014 no success for " + $succShown + "</span>"
+               "<span class=\"badge error\">Run failed \u2014 no success for " + $succPhrase + "</span>"
              end)
           elif .status == "FAILING" then
             (if ((.lastRunFailedTasks // []) | length) == 0
                 and ((.procedureError // .lastRunError) == null)
                 and (.lastRunComplete == false) then
-               "<span class=\"badge warn\">Run incomplete ("
-               + ((.lastRunTaskCount // 0) | tostring) + " of "
-               + ((.expectedTaskCount // 0) | tostring)
-               + " expected tasks) \u2014 last success " + $succShown + " ago</span>"
+               # expectedTaskCount is a FLOOR -- the tasks present in >=90% of
+               # this repository own recent runs -- and it excludes the pair
+               # that alternates day by day. lastRunTaskCount counts every task
+               # that ran, alternating one included. So a run missing a
+               # required task can still meet or exceed the floor, and printing
+               # the fraction then gives "8 of 8" or "9 of 8": a mistake to any
+               # reader, and the exact shape the house rule forbids. The count
+               # is only evidence while it is BELOW the floor.
+               "<span class=\"badge warn\">Run incomplete"
+               + (if (.lastRunTaskCount != null) and (.expectedTaskCount != null)
+                     and (.lastRunTaskCount < .expectedTaskCount)
+                  then " (" + (.lastRunTaskCount | tostring) + " of "
+                       + (.expectedTaskCount | tostring) + " expected tasks)"
+                  else " \u2014 a required task did not run" end)
+               + " \u2014 last success " + $succPhrase + " ago</span>"
              else
-               "<span class=\"badge warn\">Run failed \u2014 last success " + $succShown + " ago</span>"
+               "<span class=\"badge warn\">Run failed \u2014 last success " + $succPhrase + " ago</span>"
              end)
           elif .status == "OVERDUE" then
             "<span class=\"badge warn\">Past due ("
@@ -1616,11 +1745,18 @@ else "" end) + "
             # -- and where the newest recorded run is not the newest successful
             # one the two are different numbers. AMBER, from a pre-2.6 report,
             # has no success age at all, so it keeps the only one it has.
+            # Both ages can be absent at once, and "unknown" + "d" is the
+            # unknownd defect the OK branch below was fixed for. Same guard,
+            # applied to the siblings this time rather than only to the site
+            # that was screenshotted.
             "<span class=\"badge warn\">Stale (last success "
-            + (if $succAge == null then $ageShown + "d" else $succShown end)
+            + (if $succAge != null then $succShown
+               elif $ageShown == "unknown" then "an unknown number of days"
+               else $ageShown + "d" end)
             + " ago)</span>"
           elif .status == "AMBER" then
-            "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>"
+            (if $ageShown == "unknown" then "<span class=\"badge warn\">Stale (age unknown)</span>"
+             else "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>" end)
           elif .status == "READ_ONLY" then
             "<span class=\"badge info\">Read-only \u2014 source cluster maintains</span>"
           elif .status == "UNKNOWN" then

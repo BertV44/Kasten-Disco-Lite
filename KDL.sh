@@ -5332,10 +5332,24 @@ _sr_fetch_details() {
          else null end) as $expected |
 
         (if $nObserved > 0 then $observedRuns[-1] else null end) as $newest |
+        # The oldest run was held out of the calibration window because its
+        # task set is legitimately smaller (see above), so judging it against a
+        # floor derived without it marks a healthy first maintenance
+        # incomplete. On a young repository that is the only success it has:
+        # the run drops out of $goodRuns, daysSinceLastSuccess goes null, and a
+        # warning becomes FAILING_STALE - a CRITICAL earned by arithmetic
+        # rather than by anything the repository did. It also holds whether or
+        # not the map is truly untruncated, since a short oldest cluster is a
+        # history boundary either way. Exempt it from the test for the same
+        # reason it was exempt from the floor. Identity comparison rather than
+        # an index: every call site gets it, and two runs cannot be equal when
+        # each task carries its own timestamps.
+        (if $nObserved >= 3 then $observedRuns[0] else null end) as $oldest |
         # null, not false: with too little history to calibrate we do not know
         # whether a run was complete, and guessing false would invent a failure.
         def complete($cl):
           if ($expected == null) or ($cl == null) then null
+          elif ($oldest != null) and ($cl == $oldest) then null
           else (([ $cl[].task ] | unique) as $have
                 | ([ $expected[] | select(. as $t | $have | index($t) | not) ] | length) == 0)
           end;
@@ -5382,6 +5396,15 @@ _sr_fetch_details() {
            | select(.procedure == "MaintenanceRun")
            | . + { _s: (.startTime | ts_try) } | select(._s != null) ] | sort_by(._s)) as $mruns |
         (if ($mruns | length) > 0 then $mruns[-1] else null end) as $mrun |
+        # The newest procedure that SUCCEEDED, which is not the newest
+        # procedure. A repository whose last attempt failed last night but
+        # succeeded the night before has a success 1 day old; keying the
+        # success clock off $mrun alone cannot see it, because $mrun failed.
+        # That is the whole of the FAILING vs FAILING_STALE distinction for
+        # a repository with no task history, and getting it wrong earns a
+        # CRITICAL where a warning is due.
+        ([ $mruns[] | select(.succeeded == true) ]
+         | if length > 0 then .[-1] else null end) as $mrunOk |
         # Select the inner command by desc, never by index: the command list
         # varies between runs and MaintenanceInfo can appear twice.
         (if $mrun == null then null
@@ -5434,8 +5457,8 @@ _sr_fetch_details() {
           # returned a confident and meaningless zero.
           #
           # These are also what a reader needs in order to act. "Repository
-          # kopia-metadata-repository-7vr4845xmv is failing" is not actionable;
-          # the application and the policy that own it are.
+          # kopia-metadata-repository-<random suffix> is failing" is not
+          # actionable; the application and the policy that own it are.
           # Kasten states this outright, so it does not have to be inferred:
           # the repository manager EXCLUDES a read-only repository from
           # background processing -- initRepo skips it, processArtifact
@@ -5521,14 +5544,31 @@ _sr_fetch_details() {
                  | ($loc.fileStore.path // null) as $rp
                  | if ($pl.claim != null) and ($rc != null) and ($rc != $pl.claim) then true
                    elif ($pl.path == null) or ($rp == null) then null
-                   else (($pl.path | sub("/+$"; "")) as $pp
-                         | ($rp | sub("/+$"; "")) as $rr
+                   else (($pl.path | sub("^/+"; "") | sub("/+$"; "")) as $pp
+                         | ($rp | sub("^/+"; "") | sub("/+$"; "")) as $rr
+                         # LEADING slashes are stripped as well as trailing.
+                         # Stripping only the trailing end left a profile path
+                         # of "" or "/" normalising to "", so the prefix became
+                         # "/" - and a repository path is relative, verified on
+                         # a live cluster on both sides, so NOTHING matched and
+                         # every repository on that profile was flagged. Same
+                         # for a profile path written "/backups" against a
+                         # relative repository path.
+                         #
+                         # An empty prefix is the ROOT: every path is under it,
+                         # so nothing can be outside it. Reachable - a FileStore
+                         # profile with no explicit path is what produces the
+                         # default k10/<cluster-uuid>/... layout, and a cluster
+                         # was observed carrying both that layout and an
+                         # explicit-prefix one on the SAME profile.
+                         #
                          # Equal counts as a match. Testing only for a strict
                          # child called a repository sitting exactly ON the
                          # profile prefix a mismatch, and the accompanying text
                          # is an absolute claim -- "maintenance through that
                          # profile cannot succeed" - printed next to an OK row.
-                         | if $rr == $pp then false
+                         | if $pp == "" then false
+                           elif $rr == $pp then false
                            else (($rr | startswith($pp + "/")) | not)
                            end)
                    end)
@@ -5582,12 +5622,31 @@ _sr_fetch_details() {
           # repository reading 02:13 the same morning. It tracks data writes,
           # which is exactly what this needs.
           lastWriteTime: ((.status.details.modifiedTime // null) | ts_clean),
-          # storageUsage PRESENT and EMPTY is a repository that has never held
-          # anything. ABSENT means we could not tell. `// {}` would collapse
-          # the two and report "never used" for a repository we never read.
+          # NEVER WRITTEN, which is not the same as repositoryEmpty. modifiedTime
+          # advances on writes, deletions and imports and is NOT touched by a
+          # storage scan, so equal-to-creation means nothing has ever been
+          # written. storageUsage, by contrast, is populated BY the scan: on a
+          # 547-repository estate all 364 repositories with storageUsage {} had
+          # simply never been processed, and 191 of them had been written to --
+          # 205 within the last 30 days. Quietening a failure on storageUsage
+          # would have silenced repositories receiving data daily.
+          neverWritten: (
+            ((.status.details.modifiedTime // null) | ts_clean) as $w
+            | ((.metadata.creationTimestamp // null) | ts_clean) as $c
+            | if ($w == null) or ($c == null) then null else ($w == $c) end
+          ),
+          # storageUsage PRESENT and EMPTY means NO STORAGE SCAN HAS MEASURED
+          # IT -- not that it holds nothing. The scan is what populates the
+          # field, so a repository nothing has processed reads empty whatever
+          # is in it: on a 547-repository estate all 364 with storageUsage {}
+          # had never been processed, and 191 of them had been written to, 205
+          # within the last 30 days. Use neverWritten, from modifiedTime, for
+          # "has anything ever been put here". ABSENT still means we could not
+          # tell, and `// {}` would collapse that into a false answer.
           repositoryEmpty: (
             (.status.details.kopiaMeta // null) as $km
-            | if ($km | type) != "object" then null
+            | if (.status.readOnly == true) then null
+              elif ($km | type) != "object" then null
               elif ($km | has("storageUsage") | not) then null
               else (($km.storageUsage // {}) | length) == 0
               end
@@ -5685,6 +5744,9 @@ _sr_fetch_details() {
           # the start alone `procedureTime` invited reading it as either.
           procedureStartTime: (if $mrun == null then null else ($mrun.startTime | ts_clean) end),
           procedureEndTime: (if $mrun == null then null else ($mrun.endTime // null | ts_clean) end),
+          # Sibling of procedureEndTime, and they must stay a pair: one is
+          # the newest run, this is the newest SUCCESSFUL run.
+          procedureSuccessTime: (if $mrunOk == null then null else ($mrunOk.endTime // null | ts_clean) end),
           # The inner MaintenanceRun command window. Its endTime is the exact
           # join key against kopiaMeta.maintenanceRun.recentResults[].completedTime.
           maintenanceCommandStartTime: (if $mcmd == null then null else ($mcmd.startTime // null | ts_clean) end),
@@ -5746,9 +5808,27 @@ _sr_fetch_details() {
 # default rather than failing the run: this is a performance knob, and a
 # typo in it must not cost someone their report.
 STORAGE_REPO_PARALLEL="${KDL_PARALLEL:-10}"
+# All digits is not the same as usable, and both of the remaining shapes broke
+# the promise above rather than falling back.
+#
+# A value longer than any real width is a typo, and it reached [ -lt ], which
+# rejected it with "integer expression expected" - an error about a comparison
+# the reader never made. Unparseable, so it takes the same route as letters do.
 case "$STORAGE_REPO_PARALLEL" in
-  ''|*[!0-9]*) STORAGE_REPO_PARALLEL=10 ;;
+  ''|*[!0-9]*|??????????*) STORAGE_REPO_PARALLEL=10 ;;
 esac
+# A leading zero makes it an OCTAL literal to $(( )), and 08 is not a valid
+# one: KDL_PARALLEL=08 ended the run with "value too great for base (error
+# token is 08)", naming neither the variable nor the cause, on a knob whose
+# whole point is that getting it wrong is cheap. 010 was worse - a valid octal,
+# so it ran quietly at width 8. Strip the zeros and the value means what it
+# looks like.
+while :; do
+  case "$STORAGE_REPO_PARALLEL" in
+    0?*) STORAGE_REPO_PARALLEL="${STORAGE_REPO_PARALLEL#0}" ;;
+    *) break ;;
+  esac
+done
 [ "$STORAGE_REPO_PARALLEL" -lt 1 ] && STORAGE_REPO_PARALLEL=1
 debug "Storage repository: fetching /details with parallelism $STORAGE_REPO_PARALLEL"
 
@@ -6031,7 +6111,10 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       # run executes. A repository mid-run therefore looks overdue by however
       # long the run has taken - which is why any verdict built on this must be
       # gated on maintenanceRunning. Collected as a signed number: negative
-      # simply means not due yet, and that is information, not an error.
+      # simply means not yet overdue, and that is information, not an error.
+      # "Not due yet" would be a stronger claim than the data supports: a
+      # first run an hour past its schedule but inside one interval of grace
+      # IS due, it is just not late enough to report.
       overdueSeconds: (
         if .nextFullMaintenanceTime == null then null
         else (try ((($now | ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime))
@@ -6064,6 +6147,15 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       daysSinceProcedure: (
         if .procedureEndTime == null then null
         else (days_ago($now; .procedureEndTime)
+              | if . == null then null elif . < 0 then 0 else . end)
+        end
+      ),
+      # Age of the newest SUCCESSFUL procedure. Same null-not-sentinel and
+      # future-clamp rules as its sibling above, because a skewed clock
+      # produces a negative here just as readily.
+      daysSinceProcedureSuccess: (
+        if .procedureSuccessTime == null then null
+        else (days_ago($now; .procedureSuccessTime)
               | if . == null then null elif . < 0 then 0 else . end)
         end
       ),
@@ -6123,17 +6215,73 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       # its own comment, and read by nothing, so such a repository reported
       # "no evidence either way" with 60 days of evidence in the object.
       #
-      # The procedure fallback is gated on the run having SUCCEEDED, by the
-      # same precedence as runFailed above: the age of a failed procedure is
-      # not the age of a success.
+      # The procedure fallback reads the newest SUCCESSFUL procedure, not the
+      # newest procedure gated on it having succeeded. Those differ in exactly
+      # the case that matters: last night failed, the night before succeeded.
+      # Gating on $mrun made the success undatable there, so the repository
+      # scored FAILING_STALE -- a CRITICAL -- when a success one day old means
+      # FAILING, a warning. Where the newest run did succeed the two sources
+      # are the same record, so nothing changes for the case that already
+      # worked.
+      #
+      # Still null when no success survives the window: recentResults holds 10
+      # entries and is SHARED with StorageScan, so a success can age out. Null
+      # keeps the critical, which is the safe direction -- an undatable success
+      # is precisely the unknown that must not quieten a finding.
+      #
+      # PRECEDENCE, and it is deliberately NOT the order the failure ladder
+      # uses. Do not "make these consistent" - it has been proposed once
+      # already, and it turns a finding into a pass.
+      #
+      # runFailed ranks the procedure ABOVE the task history, because a
+      # failure reported by any source is a failure. The success DATE ranks
+      # them the other way round, because the two sources answer different
+      # questions:
+      #
+      #   task clock      - when did a run last finish with no failed task AND
+      #                     its full expected task set?
+      #   procedure clock - when did K10 last record the procedure as
+      #                     succeeded?
+      #
+      # A procedure success means the run completed without erroring. It does
+      # NOT mean every task ran; only the task history can say that. So the
+      # task history is the stronger evidence for a success and the weaker
+      # evidence for a failure. Believe any source about failure, require the
+      # better source about success.
+      #
+      # The case that makes it concrete, and it is reachable: a run executes 8
+      # of its 9 tasks, fails nothing, and K10 records it as succeeded.
+      # complete() is false, so it is not a task success, and the task clock
+      # falls back to the last complete run - 12 days earlier when this was
+      # measured. Taking the NEWER of the two clocks there reported the
+      # repository OK while it had skipped a required task every night for 12
+      # days, with lastRunComplete=false sitting in the JSON driving nothing.
+      # That is this branch defect rebuilt out of the two clocks.
+      #
+      # The procedure clock is a FALLBACK, for a repository whose task history
+      # cannot be read at all. It never overrides a task-derived answer.
+      # GATED ON taskHistoryAvailable, which is what the paragraph above
+      # always said and the code did not do. Readable history holding no good
+      # run is not a gap to fill in -- it is evidence that nothing succeeded,
+      # and stronger evidence than an absent history. Letting the procedure
+      # clock answer there inverted the severity: a repository whose every
+      # recorded run carried a failed task reported OK, while the same
+      # repository with one good run twelve days ago reported FAILING_STALE.
       successAgeDays: (
-        (if .maintenanceCommandSucceeded != null then (.maintenanceCommandSucceeded == false)
-         elif .procedureSucceeded != null        then (.procedureSucceeded == false)
-         elif .lastRunSucceeded != null          then (.lastRunSucceeded == false)
-         else null end) as $f
-        | if .daysSinceLastSuccess != null then .daysSinceLastSuccess
-          elif ($f == false) and (.daysSinceProcedure != null) then .daysSinceProcedure
-          else null end
+        if .daysSinceLastSuccess != null then .daysSinceLastSuccess
+        # "Readable history with no good run" is only evidence when there ARE
+        # runs to judge. runs:{} is present-and-empty -- taskHistoryAvailable
+        # is true and observedRunCount is 0 -- and the task history then says
+        # nothing at all, so the procedure record must answer. Gating on
+        # readability alone lost the success date there: a repository whose
+        # newest procedure succeeded reported UNKNOWN, and one whose newest
+        # failed after an older success went back to FAILING_STALE, the false
+        # critical this branch removed. The state is not hypothetical; a live
+        # cluster carries runs:{} beside nine procedure records.
+        elif ((.taskHistoryAvailable != true) or (.observedRunCount == 0))
+             and (.daysSinceProcedureSuccess != null)
+          then .daysSinceProcedureSuccess
+        else null end
       )
     }
   )
@@ -6146,6 +6294,51 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   # hand-inlining each recomputation would drift.
   | map(
     . + {
+      # Has the FIRST full maintenance fallen due? Only meaningful for a
+      # repository with no run in its history, and it decides whether an empty
+      # history is a finding or simply a new repository.
+      #
+      # IN THE THIRD STAGE ON PURPOSE. It was first written beside
+      # daysSinceCreation in the second, where that field is a sibling being
+      # added by the same constructor and therefore invisible -- so it read
+      # null, took the "creation time cannot be dated" branch, and returned
+      # true for a repository two hours old. The comment directly above
+      # describes exactly this trap, and it still caught the next field added.
+      #
+      # Measured against the SCHEDULE, not the staleness threshold. Keying it
+      # off maintenanceThresholdDays called anything under that threshold "not due"
+      # while full maintenance runs DAILY, so a 3-day-old repository that had
+      # never run -- two cycles missed -- read as normal, while the HTML
+      # legend said "normal under a day old". The legend now states this rule
+      # instead of a fixed day, so the two cannot drift apart again.
+      #
+      # fullIntervalSeconds is the authority where it exists; where it does
+      # not, the fallback is the daily interval Kasten schedules, which is
+      # what the legend already promises.
+      #
+      # Never null itself: an undatable creation time cannot excuse an empty
+      # history, so it counts as DUE -- the same direction as an undated write
+      # counting as active.
+      # GUARDED THE SAME WAY AS OVERDUE, which keys off the same signal. The
+      # first cut treated any overdueSeconds > 0 as due, with no grace and no
+      # check for a run in flight -- but nextFullMaintenanceTime only advances
+      # when a run COMPLETES, and the first run starts minutes after the
+      # repository is created. So every new repository became a never-ran
+      # FAILURE, and the section went CRITICAL, from the moment its first run
+      # was scheduled until that run finished. Reproduced: created 2 hours
+      # ago, first run due 1 hour ago, reported FAILING.
+      #
+      #   * a run in flight is never late -- maintenanceRunning == true only,
+      #     so an unreadable pod list (null) does not suppress the finding;
+      #   * one full interval of grace before lateness counts, the same
+      #     allowance the OVERDUE branch gives.
+      firstRunDue: (
+        (if .fullIntervalSeconds == null then 86400 else .fullIntervalSeconds end) as $iv
+        | if .maintenanceRunning == true then false
+          elif .daysSinceCreation == null then true
+          else (((.daysSinceCreation * 86400) > $iv) or ((.overdueSeconds // 0) > $iv))
+          end
+      ),
       # THREE-STATE, and the third state is load-bearing. null means we could
       # not date the last write, and a repository we cannot date must never be
       # treated as inactive: inactivity downgrades severity, so defaulting the
@@ -6275,20 +6468,35 @@ STORAGE_REPO_FAILING_STALE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | 
 STORAGE_REPO_OVERDUE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "OVERDUE")] | length // 0')
 STORAGE_REPO_OK_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "OK")] | length // 0')
 STORAGE_REPO_INACTIVE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.inactive == true)] | length // 0')
-STORAGE_REPO_UNUSED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.repositoryEmpty == true)] | length // 0')
-# How many of the never-used ones are read-only imports. "Never held any data"
+# COUNTS neverWritten, not repositoryEmpty. The scan populates storageUsage,
+# so "empty" only ever meant "nothing has measured it" -- and read-only
+# repositories are never scanned at all, so every one of them read empty and
+# was reported as having "never held any data since creation" even when it had
+# been written to the day before.
+STORAGE_REPO_UNUSED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.neverWritten == true)] | length // 0')
+# How many of the never-written ones are read-only imports. "Never written to"
 # on its own reads as alarming when the explanation is mundane -- an import
 # that has not pulled anything yet -- but it must be DERIVED, not assumed: a
-# freshly created export repository is also empty and is not an import.
+# freshly created export repository has also never been written to and is not
+# an import.
 STORAGE_REPO_UNUSED_READONLY_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
-  | select((.repositoryEmpty == true) and (.status == "READ_ONLY"))] | length // 0')
-# The repositories that earn a critical: failing AND still being written to.
+  | select((.neverWritten == true) and (.status == "READ_ONLY"))] | length // 0')
+# The repositories that earn a critical: failing AND not shown to be idle.
+# "Written to" is the common case but not the whole set -- a repository whose
+# write date cannot be read is in here too, deliberately, because an unknown
+# must never quieten a finding on its own. Any sentence that prints THIS COUNT
+# therefore has to allow for it; only the definition of the verdict may say
+# "still being written to" flatly.
+#
+# THE EXCEPTION: a repository never written to is never "still being
+# written to", whatever its write date says. inactive needs 30 days of
+# silence, so a young empty repository passed this test and went critical.
 #
 # THE WRITE DATE WINS WHERE WE HAVE IT. Three states, and each decides:
 #   inactive == true   -> idle, quiet. Nothing accumulates.
-#   inactive == false  -> written to recently, LOUD, whatever else is true of
-#                         it. A deleted profile or policy used to override this
-#                         and quieten a repository written to an hour ago,
+#   inactive == false  -> written to recently, LOUD -- with ONE exception,
+#                         below. A deleted profile or policy used to override
+#                         this and quieten a repository written to an hour ago,
 #                         under a sentence saying nothing had been written for
 #                         a month -- a claim the Last Data Write column on the
 #                         same page contradicted.
@@ -6296,9 +6504,12 @@ STORAGE_REPO_UNUSED_READONLY_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
 #                         evidence left: a deleted owner quietens, and an
 #                         unknown on its own never does.
 #
-# A NEVER_RAN repository only counts once it is older than the staleness
-# threshold. One created an hour ago has not missed anything yet -- the
-# section says so outright ("normal under a day old") while the rollup called
+# A NEVER_RAN repository only counts once firstRunDue says so - older than
+# one full maintenance interval, or a full interval past
+# nextFullMaintenanceTime, and not while a pod is running for it. Measured
+# against the SCHEDULE, not the staleness threshold, which is seven times
+# more lenient. One created an hour ago has not missed anything yet -- the
+# section said so outright ("normal under a day old") while the rollup called
 # it critical and the terminal told the reader to "check the failure" on a
 # repository that has no failure. An unknown creation date counts, the safe
 # direction.
@@ -6311,23 +6522,45 @@ STORAGE_REPO_UNUSED_READONLY_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
 # the only shape that cannot drift.
 STORAGE_REPO_FAILSET=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   --arg thr "$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS" '
+  # firstRunDue, not a second copy of the rule. This re-derived it from
+  # daysSinceCreation against the STALENESS threshold -- 7 days -- while full
+  # maintenance runs daily, so a repository three days old with no run was
+  # ineligible here and "due" everywhere else. One published field, read by
+  # the ladder, the renderers and the gate.
   [ .[] | select(.status == "FAILING_STALE"
-                 or (.status == "NEVER_RAN"
-                     and ((.daysSinceCreation == null)
-                          or (.daysSinceCreation > ($thr | tonumber))))) ] as $eligible
-  | ([ $eligible[] | select((.inactive == false)
-                            or ((.inactive == null) and (.orphaned != true))) ]) as $active
-  | ([ $eligible[] | select((.inactive == true)
+                 or (.status == "NEVER_RAN" and (.firstRunDue != false))) ] as $eligible
+  # A repository that has NEVER held data cannot be one that is still being
+  # written to. inactive needs 30 days of silence, so a young empty repository
+  # was neither inactive nor orphaned and landed in the ACTIVE set: 2.5 days
+  # old, never run, never received a byte, reported FAILING and described as
+  # "still being written to". Shortening the due window from seven days to one
+  # made that the ordinary case for a new repository.
+  #
+  # Emptiness is tested FIRST in both arms so the two still partition
+  # $eligible exactly, whatever inactive and orphaned say.
+  | ([ $eligible[] | select((.neverWritten != true)
+                            and ((.inactive == false)
+                                 or ((.inactive == null) and (.orphaned != true)))) ]) as $active
+  | ([ $eligible[] | select((.neverWritten == true)
+                            or (.inactive == true)
                             or ((.inactive == null) and (.orphaned == true))) ]) as $quiet
   | { eligible: ($eligible | length),
       active:   ($active | length),
+      # The NEVER_RAN subset of the ACTIVE set. The advice after a FAILING
+      # verdict has to compare like with like: activeFailing counts
+      # repositories still being written to, and comparing it against every
+      # due never-ran repository -- idle ones included -- said "no maintenance
+      # run has ever been recorded" about a repository that ran and failed.
+      activeNeverRan: ([ $active[] | select(.status == "NEVER_RAN") ] | length),
       quiet:    ($quiet | length),
+      quietNeverWritten: ([ $quiet[] | select(.neverWritten == true) ] | length),
       quietIdle:   ([ $quiet[] | select(.inactive == true) ] | length),
       quietOrphan: ([ $quiet[] | select(.orphaned == true) ] | length) }' 2>/dev/null) \
-  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"quiet":0,"quietIdle":0,"quietOrphan":0}'
+  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"quiet":0,"quietNeverWritten":0,"quietIdle":0,"quietOrphan":0}'
 _ep "$STORAGE_REPO_FAILSET" | jq -e 'type == "object"' >/dev/null 2>&1 \
-  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"quiet":0,"quietIdle":0,"quietOrphan":0}'
+  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"quiet":0,"quietNeverWritten":0,"quietIdle":0,"quietOrphan":0}'
 STORAGE_REPO_ACTIVE_FAILING_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.active')
+STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeNeverRan // 0')
 # The same failures, every one of them quietened by idleness or a deleted
 # owner. Together with the active count this partitions the eligible set
 # exactly, so a repository can never fall between the two.
@@ -6338,6 +6571,7 @@ STORAGE_REPO_PROFILE_MISMATCH_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[]
 # downgrade has two independent causes and the summary has to name the one
 # that actually applies: a cluster whose failing repositories are orphaned but
 # written to yesterday must not be told "nothing has been written for 30+ days".
+STORAGE_REPO_FAILING_NEVERWRITTEN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietNeverWritten // 0')
 STORAGE_REPO_FAILING_IDLE_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietIdle')
 STORAGE_REPO_FAILING_ORPHAN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietOrphan')
 # Status-based, so it belongs in the tally: these repositories are NOT in
@@ -6345,6 +6579,17 @@ STORAGE_REPO_FAILING_ORPHAN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietO
 # assessed normally and is deliberately not counted here.
 STORAGE_REPO_READONLY_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "READ_ONLY")] | length // 0')
 STORAGE_REPO_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "NEVER_RAN")] | length // 0')
+# NEVER_RAN splits in two and only one half is a finding. A repository whose
+# first full maintenance is not yet overdue has an empty history because nothing
+# has been scheduled, which the HTML legend calls normal in as many words --
+# so a red [FAIL] for it contradicted the legend on the same page. Same grace
+# the rollup already applies through STORAGE_REPO_FAILSET, derived the same
+# way so the two cannot drift. The rollup itself stays PARTIAL for these on
+# purpose: not yet overdue is still not OK, and is worth a line.
+STORAGE_REPO_NEVER_RAN_DUE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" \
+  | jq '[.[] | select(.status == "NEVER_RAN" and (.firstRunDue != false))] | length // 0')
+STORAGE_REPO_NEVER_RAN_NEW_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" \
+  | jq '[.[] | select(.status == "NEVER_RAN" and (.firstRunDue == false))] | length // 0')
 STORAGE_REPO_DISABLED_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "DISABLED")] | length // 0')
 
 [ -z "$STORAGE_REPO_COUNT" ] && STORAGE_REPO_COUNT=0
@@ -6364,6 +6609,8 @@ STORAGE_REPO_LISTED=$(safe_int "$REPO_NAMES_COUNT")
 [ -z "$STORAGE_REPO_UNUSED_COUNT" ] && STORAGE_REPO_UNUSED_COUNT=0
 [ -z "$STORAGE_REPO_UNUSED_READONLY_COUNT" ] && STORAGE_REPO_UNUSED_READONLY_COUNT=0
 [ -z "$STORAGE_REPO_ACTIVE_FAILING_COUNT" ] && STORAGE_REPO_ACTIVE_FAILING_COUNT=0
+[ -z "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" ] && STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT=0
+case "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT=0 ;; esac
 [ -z "$STORAGE_REPO_QUIET_FAILING_COUNT" ] && STORAGE_REPO_QUIET_FAILING_COUNT=0
 [ -z "$STORAGE_REPO_ORPHANED_COUNT" ] && STORAGE_REPO_ORPHANED_COUNT=0
 [ -z "$STORAGE_REPO_PROFILE_MISMATCH_COUNT" ] && STORAGE_REPO_PROFILE_MISMATCH_COUNT=0
@@ -6371,9 +6618,24 @@ STORAGE_REPO_LISTED=$(safe_int "$REPO_NAMES_COUNT")
 [ -z "$STORAGE_REPO_FAILING_ORPHAN_COUNT" ] && STORAGE_REPO_FAILING_ORPHAN_COUNT=0
 [ -z "$STORAGE_REPO_READONLY_COUNT" ] && STORAGE_REPO_READONLY_COUNT=0
 [ -z "$STORAGE_REPO_NEVER_RAN_COUNT" ] && STORAGE_REPO_NEVER_RAN_COUNT=0
+[ -z "$STORAGE_REPO_NEVER_RAN_DUE_COUNT" ] && STORAGE_REPO_NEVER_RAN_DUE_COUNT=0
+[ -z "$STORAGE_REPO_NEVER_RAN_NEW_COUNT" ] && STORAGE_REPO_NEVER_RAN_NEW_COUNT=0
 [ -z "$STORAGE_REPO_DISABLED_COUNT" ] && STORAGE_REPO_DISABLED_COUNT=0
 
 debug "Storage repositories: $STORAGE_REPO_LISTED listed, $STORAGE_REPO_COUNT with details, $STORAGE_REPO_UNKNOWN_COUNT unknown, $STORAGE_REPO_FAILING_STALE_COUNT failing-stale, $STORAGE_REPO_FAILING_COUNT failing, $STORAGE_REPO_STALE_COUNT stale (>$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days), $STORAGE_REPO_OVERDUE_COUNT overdue, $STORAGE_REPO_NEVER_RAN_COUNT never ran, $STORAGE_REPO_DISABLED_COUNT disabled"
+
+# ONE notion of "we saw everything", read by every reassuring sentence.
+# "Cleanup, not an outage", "nothing critical" and "Not critical for that
+# reason" are all claims about the whole estate, and PARTIAL is decided BEFORE
+# the partial-read branch, so a cluster can be PARTIAL while repositories were
+# never read or never answered. Four separate conditions would be four copies
+# of one rule, which is the mistake firstRunDue already cost this branch.
+if [ "$STORAGE_REPO_COUNT" -lt "$STORAGE_REPO_LISTED" ] 2>/dev/null \
+   || [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ] 2>/dev/null; then
+  STORAGE_REPO_FULLY_ASSESSED=false
+else
+  STORAGE_REPO_FULLY_ASSESSED=true
+fi
 
 # Storage Repository Best Practice Assessment
 if [ "$STORAGE_REPO_COUNT" -eq 0 ] && [ "$STORAGE_REPO_LISTED" -gt 0 ]; then
@@ -7015,6 +7277,8 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoUnusedReadOnlyCount "$STORAGE_REPO_UNUSED_READONLY_COUNT" \
     --argjson storageRepoActiveFailingCount "$STORAGE_REPO_ACTIVE_FAILING_COUNT" \
     --argjson storageRepoQuietFailingCount "$STORAGE_REPO_QUIET_FAILING_COUNT" \
+    --argjson storageRepoFullyAssessed "$STORAGE_REPO_FULLY_ASSESSED" \
+    --argjson storageRepoQuietNeverWrittenCount "$STORAGE_REPO_FAILING_NEVERWRITTEN_COUNT" \
     --argjson storageRepoQuietIdleCount "$STORAGE_REPO_FAILING_IDLE_COUNT" \
     --argjson storageRepoQuietOrphanCount "$STORAGE_REPO_FAILING_ORPHAN_COUNT" \
     --argjson storageRepoInactiveThresholdDays "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS" \
@@ -7022,6 +7286,9 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoProfileMismatchCount "$STORAGE_REPO_PROFILE_MISMATCH_COUNT" \
     --argjson storageRepoReadOnlyCount "$STORAGE_REPO_READONLY_COUNT" \
     --argjson storageRepoNeverRanCount "$STORAGE_REPO_NEVER_RAN_COUNT" \
+    --argjson storageRepoNeverRanDueCount "$STORAGE_REPO_NEVER_RAN_DUE_COUNT" \
+    --argjson storageRepoActiveNeverRanCount "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" \
+    --argjson storageRepoNeverRanNotDueCount "$STORAGE_REPO_NEVER_RAN_NEW_COUNT" \
     --argjson storageRepoDisabledCount "$STORAGE_REPO_DISABLED_COUNT" \
     --argjson storageRepoUnknownCount "$STORAGE_REPO_UNKNOWN_COUNT" \
     --argjson storageRepoListed "$STORAGE_REPO_LISTED" \
@@ -7686,6 +7953,17 @@ if [ "$MODE" = "json" ]; then
         overdueCount: $storageRepoOverdueCount,
         okCount: $storageRepoOkCount,
         neverRanCount: $storageRepoNeverRanCount,
+        # The split, published rather than left for each renderer to derive.
+        # The terminal had it and the HTML did not, so the same repository was
+        # an [INFO] "not due" in one output and a red "Never Ran" in the other
+        # -- and the HTML could not have done better, because only the total
+        # reached it. neverRanCount stays the sum so the status tally still
+        # reconciles.
+        neverRanDueCount: $storageRepoNeverRanDueCount,
+        # The never-ran subset of activeFailingCount, so the advice after a
+        # FAILING verdict compares like with like.
+        activeNeverRanCount: $storageRepoActiveNeverRanCount,
+        neverRanNotDueCount: $storageRepoNeverRanNotDueCount,
         disabledCount: $storageRepoDisabledCount,
         ageUnknownCount: $storageRepoUnknownCount,
         inactiveCount: $storageRepoInactiveCount,
@@ -7697,6 +7975,11 @@ if [ "$MODE" = "json" ]; then
         # looser predicate, and told the reader "each of them is idle" about a
         # set three times larger than the one the downgrade was computed over.
         quietFailingCount: $storageRepoQuietFailingCount,
+        # Whether every listed repository was read AND answered. The
+        # reassuring sentences are claims about the whole estate and must not
+        # be made when part of it was not seen.
+        fullyAssessed: $storageRepoFullyAssessed,
+        quietFailingNeverWrittenCount: $storageRepoQuietNeverWrittenCount,
         quietFailingIdleCount: $storageRepoQuietIdleCount,
         quietFailingOrphanCount: $storageRepoQuietOrphanCount,
         orphanedCount: $storageRepoOrphanedCount,
@@ -7705,10 +7988,10 @@ if [ "$MODE" = "json" ]; then
         maintenanceThresholdDays: 7,
         inactiveThresholdDays: $storageRepoInactiveThresholdDays,
         items: $storageRepoMaintenance,
-        note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. Status is derived from evidence that a run SUCCEEDED, not from the newest recorded timestamp: a failed run can leave a fresh one behind. FAILING_STALE means the last run failed and none has succeeded within the threshold; FAILING means it failed but a success is still recent; STALE means the last success is older than the threshold; OVERDUE means a whole cycle passed with nothing running and nothing recorded; NEVER_RAN means readable history with no run in it; UNKNOWN means neither the procedure record nor the task history could answer, which is not the same as healthy.",
-        profileMismatchNote: "profileMismatch = the profile named by the repository label still exists, but its current locationSpec no longer points where the repository sits: a different objectStore bucket, or a FileStore path outside the current prefix. Compared against ITS OWN profile, deliberately, not against every profile: a repository is reached only through the profile it refers to, so another profile pointing at the same bucket does not make it reachable. It will not be processed and maintenance on it can never succeed again. Measured on a 162-repository cluster: 5 mismatched, all FAILING_STALE, no healthy repository mismatched. REPORTED ONLY - it feeds no count that drives severity, does not set orphaned, and does not reach the rollup. Whether the old bucket or share still exists is NOT checked, so this is not authority to delete: confirm nothing in it is needed, or open a support case. The FileStore path is read for the comparison and never published, because it carries the K10 cluster UUID.",
-        inactivityNote: "inactive = no data written for longer than inactiveThresholdDays, from status.details.modifiedTime, which maintenance does not bump. Inactivity NEVER changes a repository status or a count: it only decides whether failures earn a critical. FAILING means at least one failing repository is still being written to; FAILING_INACTIVE means every failing repository is idle, which is normal after a profile migration and is cleanup rather than an incident. A repository whose last write cannot be dated counts as active, so an unknown never downgrades a finding. unusedCount counts repositories whose storageUsage is present and empty - nothing was ever written to them.",
-        readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten), and the best practice reports NOT_ASSESSED rather than a clean result.",
+        note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. Status is derived from evidence that a run SUCCEEDED, not from the newest recorded timestamp: a failed run can leave a fresh one behind. FAILING_STALE means the last run failed and none has succeeded within the threshold; FAILING means it failed but a success is still recent; STALE means the last success is older than the threshold; OVERDUE means a whole cycle passed with nothing running and nothing recorded; NEVER_RAN means readable history with no run in it; UNKNOWN means the outcome could not be established: neither the procedure record nor the task history answered, or a success cannot be dated, or the repository is past due and the pod list could not be read so whether a run is in flight is unknown - that last case DOES have a recent success behind it. None of them is the same as healthy.",
+        profileMismatchNote: "profileMismatch = the profile named by the repository label still exists, but its current locationSpec no longer points where the repository sits: a different objectStore bucket, or a FileStore path outside the current prefix. Compared against ITS OWN profile, deliberately, not against every profile: a repository is reached only through the profile it refers to, so another profile pointing at the same bucket does not make it reachable. It will not be processed and maintenance on it can never succeed again. Measured on a 162-repository cluster: 5 mismatched, all FAILING_STALE, no healthy repository mismatched. Confirmed on FileStore separately: 3 of 5 repositories sat outside their profile current path prefix, all three FAILING_STALE and all three reporting a failure to fetch the profile and the location, while the two inside the prefix reported none. REPORTED ONLY - it feeds no count that drives severity, does not set orphaned, and does not reach the rollup. Whether the old bucket or share still exists is NOT checked, so this is not authority to delete: confirm nothing in it is needed, or open a support case. The FileStore path is read for the comparison and never published, because it carries the K10 cluster UUID.",
+        inactivityNote: "inactive = no data written for longer than inactiveThresholdDays, from status.details.modifiedTime, which maintenance does not bump. Inactivity NEVER changes a repository status or a count: it only decides whether failures earn a critical. FAILING means at least one failing repository is still being written to; FAILING_INACTIVE means every failing repository is quiet for one of THREE reasons - idle past the threshold, never written to at all, or - ONLY where the last write date is unknown - owned by a profile or policy that no longer resolves. A known write date always wins: a repository written to yesterday is never quietened by a deleted owner. Idle and orphaned are typically cleanup after a profile migration; never-written is not, because its first export has produced nothing and that is worth investigating. No repository is ever deleted or acted on by this tool, and none of these is authority to delete one. A repository whose last write cannot be dated counts as active, so an unknown ON ITS OWN never downgrades a finding - it takes a deleted owner alongside it, which is the third reason above. unusedCount counts repositories that have NEVER BEEN WRITTEN TO - neverWritten, which compares modifiedTime against creationTimestamp. It used to count storageUsage present-and-empty, which only means no storage scan has measured the repository: the scan populates that field, so an unprocessed repository reads empty whatever it holds, and on a 547-repository estate 191 of the 364 reading empty had been written to. repositoryEmpty still reports the scan-derived value and is null for a read-only repository, which Kasten never scans at all.",
+        readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten). The best practice then reports NOT_ASSESSED - UNLESS a verdict from the repositories that WERE read outranks it - any of FAILING, FAILING_INACTIVE or PARTIAL - in which case that verdict stands and the unread count is printed beside it. Ordering it that way is deliberate: one unreadable repository must not hide repositories that are definitively failing, and a partial read must never render as clean.",
         durationNote: "lastRunDurationSeconds is the inner MaintenanceRun command window (endTime - startTime of one record, so immune to clock skew between writers); lastRunSpanSeconds is the first task start to the last task end of the newest observed run. BOTH exclude time spent queued, and the renderers prefer the first and fall back to the second, because the procedure record the first comes from is evicted within hours on a busy repository. lastFullMaintenanceDurationSeconds is the legacy completedTime - scheduledTime figure: it ABSORBS queue time, overstated by 4-5x on measured clusters, and goes negative on a hand-triggered run. It is retained for continuity and is not what the reports show.",
         redactionNote: "procedureError and lastRunError are cluster-supplied text, published verbatim except that scheme://host, UUIDs and IPv4 addresses are masked and the string is truncated at 300 characters. Collected FIELDS carry names only - an object-store bucket or a FileStore claim - never an endpoint, region or path, because a repository path is k10/<cluster-uuid>/... .",
         maintenanceTypeNote: "recentResults[0] is the most recent run: verified descending on all 9 repositories of a live Kasten 9.0.5 cluster. The entries carry no full/quick discriminator, but they are spaced one per day against a configured full interval of 24h and a quick interval of 1h (maintenanceInfo.full.interval / .quick.interval), and quick runs would produce roughly 24x more entries than observed - so recentResults holds full runs. runsTotal exceeds the number of entries kept, so the list is truncated to the most recent."
@@ -8708,7 +8991,13 @@ else
       + (if .profileMismatch == true then " profile-mismatch" else "" end)
       + (if .inactive == true then " idle=" + (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + "d" else "" end)
       + (if .status == "UNKNOWN" then " [UNKNOWN_STATUS]"
-         elif .status == "NEVER_RAN" then " [NEVER_RAN_STATUS]"
+         # Three renderings, like the HTML row. firstRunDue is false both
+         # before the first run comes round and while it is executing, and a
+         # single red [NEVER RAN] for all three said a repository was a
+         # failure when the report said the opposite two columns over. The
+         # marker name varies, not the shape: the fixture assertion that
+         # every status has its own branch matches on `then " [`.
+         elif .status == "NEVER_RAN" then " [" + (if (.firstRunDue == false) and (.maintenanceRunning == true) then "NEVERRANRUNNING" elif .firstRunDue == false then "NEVERRANNOTDUE" else "NEVER_RAN" end) + "_STATUS]"
          elif .status == "DISABLED" then " [DISABLED_STATUS]"
          elif .status == "READ_ONLY" then " [READONLY_STATUS]"
          # $succShown, never $ageShown: these three states are DEFINED by the
@@ -8720,12 +9009,19 @@ else
          # error, and calling that "failed" contradicts the same object - #47
          # warned that Kopia does not run every full sub-task every cycle.
          elif .status == "FAILING_STALE" then " [FAILSTALE_STATUS - " + (if (((.lastRunFailedTasks // []) | length) == 0) and ((.procedureError // .lastRunError) == null) and (.lastRunComplete == false) then "incomplete run" else "run failed" end) + ", no success in " + (if $succShown == null then "an unknown number of" else $succShown end) + " days]"
-         elif .status == "FAILING" then " [FAILING_STATUS - " + (if (((.lastRunFailedTasks // []) | length) == 0) and ((.procedureError // .lastRunError) == null) and (.lastRunComplete == false) then "last run incomplete (" + ((.lastRunTaskCount // 0) | tostring) + " of " + ((.expectedTaskCount // 0) | tostring) + " expected tasks)" else "last run failed" end) + ", last success " + (if $succShown == null then "an unknown number of" else $succShown end) + " days ago]"
+         elif .status == "FAILING" then " [FAILING_STATUS - " + (if (((.lastRunFailedTasks // []) | length) == 0) and ((.procedureError // .lastRunError) == null) and (.lastRunComplete == false) then (if (.lastRunTaskCount != null) and (.expectedTaskCount != null) and (.lastRunTaskCount < .expectedTaskCount) then "last run incomplete (" + (.lastRunTaskCount | tostring) + " of " + (.expectedTaskCount | tostring) + " expected tasks)" else "last run incomplete - a required task did not run" end) else "last run failed" end) + ", last success " + (if $succShown == null then "an unknown number of" else $succShown end) + " days ago]"
          elif .status == "OVERDUE" then " [OVERDUE_STATUS - " + (((.overdueIntervals // 0) * 10 | round) / 10 | tostring) + " cycles past due, nothing running]"
          # An AMBER row from a pre-2.6 report has no success age at all, so the
-         # maintenance age is the only number it can show.
-         elif .status == "STALE" then " [STALE_STATUS - last success " + (if $succShown == null then $ageShown else $succShown end) + " days ago]"
-         elif .status == "OK" then " [OK_STATUS - " + $ageShown + " days ago]"
+         # maintenance age is the only number it can show -- and when THAT is
+         # absent too the fallback was the word itself, rendering "last
+         # success unknown days ago". Same defect as unknownd, in the third
+         # output path: the HTML STALE badge was guarded and this was not.
+         # The phrase is the one the two branches above already print.
+         elif .status == "STALE" then " [STALE_STATUS - last success " + (if $succShown != null then $succShown elif $ageShown == "unknown" then "an unknown number of" else $ageShown end) + " days ago]"
+         # The age is dropped when it is not known, rather than printed as the
+         # word: "OK - unknown days ago" is the unknownd defect in the third
+         # output path, and the HTML OK branch was already guarded against it.
+         elif .status == "OK" then " [OK_STATUS" + (if $ageShown == "unknown" then "]" else " - " + $ageShown + " days ago]" end)
          else " [" + .status + "]"
          end)
   ' 2>/dev/null | while IFS= read -r line; do
@@ -8737,6 +9033,8 @@ else
     printf "%s\n" "$line" | sed \
       -e "s/\[UNKNOWN_STATUS\]/${_SR_CYAN}[NOT ASSESSED]${_SR_RESET}/" \
       -e "s/\[READONLY_STATUS\]/${_SR_CYAN}[READ ONLY]${_SR_RESET}/" \
+      -e "s/\[NEVERRANRUNNING_STATUS\]/${_SR_CYAN}[NEVER RAN - first run in progress]${_SR_RESET}/" \
+      -e "s/\[NEVERRANNOTDUE_STATUS\]/${_SR_CYAN}[NEVER RAN - not yet overdue]${_SR_RESET}/" \
       -e "s/\[NEVER_RAN_STATUS\]/${_SR_RED}[NEVER RAN]${_SR_RESET}/" \
       -e "s/\[DISABLED_STATUS\]/${_SR_YELLOW}[DISABLED]${_SR_RESET}/" \
       -e "s/\[FAILSTALE_STATUS/${_SR_RED}[FAILING${_SR_RESET}/" \
@@ -8757,8 +9055,11 @@ else
   if [ "$STORAGE_REPO_OVERDUE_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_YELLOW}[WARN]  $STORAGE_REPO_OVERDUE_COUNT repository/repositories past due by a full cycle with nothing running${COLOR_RESET}\n"
   fi
-  if [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ] 2>/dev/null; then
-    printf "  ${COLOR_RED}[FAIL]  $STORAGE_REPO_NEVER_RAN_COUNT repository/repositories never had full maintenance run${COLOR_RESET}\n"
+  if [ "$STORAGE_REPO_NEVER_RAN_DUE_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_RED}[FAIL]  $STORAGE_REPO_NEVER_RAN_DUE_COUNT repository/repositories never had full maintenance run${COLOR_RESET}\n"
+  fi
+  if [ "$STORAGE_REPO_NEVER_RAN_NEW_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  $STORAGE_REPO_NEVER_RAN_NEW_COUNT repository/repositories with no maintenance yet - the first run is not yet overdue\n"
   fi
   if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_YELLOW}[INFO]  $STORAGE_REPO_DISABLED_COUNT repository/repositories with full maintenance disabled${COLOR_RESET}\n"
@@ -8782,11 +9083,11 @@ else
   fi
   if [ "$STORAGE_REPO_UNUSED_COUNT" -gt 0 ] 2>/dev/null; then
     if [ "$STORAGE_REPO_UNUSED_READONLY_COUNT" -eq "$STORAGE_REPO_UNUSED_COUNT" ]; then
-      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation - all read-only imports that have received nothing yet\n"
+      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never been written to since creation - all read-only imports that have received nothing yet\n"
     elif [ "$STORAGE_REPO_UNUSED_READONLY_COUNT" -gt 0 ]; then
-      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation ($STORAGE_REPO_UNUSED_READONLY_COUNT read-only imports)\n"
+      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never been written to since creation ($STORAGE_REPO_UNUSED_READONLY_COUNT read-only imports)\n"
     else
-      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never held any data since creation\n"
+      printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Of those, $STORAGE_REPO_UNUSED_COUNT have never been written to since creation\n"
     fi
   fi
 fi
@@ -9472,11 +9773,21 @@ if [ "$BP_STORAGE_REPO_STATUS" = "OK" ]; then
   # which Kasten never maintains - so "2 repo(s) maintained within 7 days" was
   # printed about a cluster where one of them is maintained somewhere else
   # entirely, one line after the section said so.
-  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}HEALTHY${COLOR_RESET} ($STORAGE_REPO_OK_COUNT of $STORAGE_REPO_COUNT repo(s) maintained within $STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days"
-  if [ "$STORAGE_REPO_READONLY_COUNT" -gt 0 ] 2>/dev/null; then
-    printf ", $STORAGE_REPO_READONLY_COUNT read-only - maintained by the cluster that owns them"
+  # An import-only cluster reaches OK with NOTHING maintained here: READ_ONLY
+  # is the one status that does not block the verdict, so okCount 0 with the
+  # rollup OK means every repository is read-only. The general sentence then
+  # read "maintenance is succeeding (0 of 4 repo(s) maintained within 7 days)"
+  # -- a success claim and a zero in the same breath, about a cluster where no
+  # maintenance is supposed to run at all. Say that instead.
+  if [ "$STORAGE_REPO_OK_COUNT" -eq 0 ] 2>/dev/null && [ "$STORAGE_REPO_READONLY_COUNT" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}OK${COLOR_RESET} - no maintenance runs on this cluster (all $STORAGE_REPO_READONLY_COUNT repo(s) read-only - maintained by the cluster that owns them)\n"
+  else
+    printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Repository maintenance: ${COLOR_GREEN}OK${COLOR_RESET} - maintenance is succeeding ($STORAGE_REPO_OK_COUNT of $STORAGE_REPO_COUNT repo(s) maintained within $STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS days"
+    if [ "$STORAGE_REPO_READONLY_COUNT" -gt 0 ] 2>/dev/null; then
+      printf ", $STORAGE_REPO_READONLY_COUNT read-only - maintained by the cluster that owns them"
+    fi
+    printf ")\n"
   fi
-  printf ")\n"
 elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = "PARTIAL" ] \
      || [ "$BP_STORAGE_REPO_STATUS" = "FAILING_INACTIVE" ]; then
   _repo_bits=""
@@ -9497,22 +9808,61 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = 
   fi
   if [ "$STORAGE_REPO_NEVER_RAN_COUNT" -gt 0 ]; then
     [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
-    _repo_bits="$_repo_bits$STORAGE_REPO_NEVER_RAN_COUNT never ran"
+    # Split the same way the HTML splits it. Lumping them printed "2 never
+    # ran" beside an HTML row that distinguished the overdue one from the one
+    # that is simply new.
+    if [ "$STORAGE_REPO_NEVER_RAN_DUE_COUNT" -eq 0 ] 2>/dev/null; then
+      _repo_bits="$_repo_bits$STORAGE_REPO_NEVER_RAN_COUNT never ran, not yet overdue"
+    elif [ "$STORAGE_REPO_NEVER_RAN_NEW_COUNT" -eq 0 ] 2>/dev/null; then
+      _repo_bits="$_repo_bits$STORAGE_REPO_NEVER_RAN_DUE_COUNT never ran"
+    else
+      _repo_bits="$_repo_bits$STORAGE_REPO_NEVER_RAN_DUE_COUNT never ran, $STORAGE_REPO_NEVER_RAN_NEW_COUNT not yet overdue"
+    fi
   fi
   if [ "$STORAGE_REPO_DISABLED_COUNT" -gt 0 ]; then
     [ -n "$_repo_bits" ] && _repo_bits="$_repo_bits, "
     _repo_bits="$_repo_bits$STORAGE_REPO_DISABLED_COUNT disabled"
   fi
+  # Every branch prints the VERDICT TOKEN first, then a plain-English gloss,
+  # then the counts. Four of the five used to print a friendly word instead --
+  # HEALTHY, CLEANUP, NEEDS ATTENTION, NOT ASSESSED -- while FAILING printed
+  # the token, so FAILING was the only verdict that could be correlated with
+  # the JSON and the HTML. A live run reported CLEANUP in the terminal and
+  # FAILING_INACTIVE in the other two for the same cluster, and the string
+  # FAILING_INACTIVE appeared nowhere in the terminal output at all. Grepping
+  # a support bundle for the verdict has to find it.
   if [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ]; then
-    printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Repository maintenance: ${COLOR_RED}FAILING${COLOR_RESET} ($_repo_bits)\n"
+    printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Repository maintenance: ${COLOR_RED}FAILING${COLOR_RESET} - a repository still being written to is not being maintained ($_repo_bits)\n"
     if [ "$STORAGE_REPO_ACTIVE_FAILING_COUNT" -gt 0 ]; then
-      printf "          %s still being written to - check the failure and work on resolving it.\n" "$STORAGE_REPO_ACTIVE_FAILING_COUNT"
+    # The advice must match what the reader will find. A NEVER_RAN repository
+    # carries no failure and no error, so "check the failure" sends them after
+    # something the row does not show. Compared against the never-ran subset
+    # of the ACTIVE set, not every due never-ran repository, or a cluster with
+    # idle never-ran ones would be told nothing had ever run about a
+    # repository that ran and failed.
+    if [ "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" -ge "$STORAGE_REPO_ACTIVE_FAILING_COUNT" ]; then
+      printf "          %s still being written to, or with no write date to say otherwise, and never maintained - check that maintenance is being scheduled.\n" "$STORAGE_REPO_ACTIVE_FAILING_COUNT"
+    elif [ "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" -gt 0 ]; then
+      printf "          %s still being written to, or with no write date to say otherwise - check the reason under each status, and for the %s that never ran, that maintenance is being scheduled.\n" "$STORAGE_REPO_ACTIVE_FAILING_COUNT" "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT"
+    else
+      printf "          %s still being written to, or with no write date to say otherwise - check the failure and work on resolving it.\n" "$STORAGE_REPO_ACTIVE_FAILING_COUNT"
+    fi
     fi
   elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING_INACTIVE" ]; then
     # Same failures, every one of them on a repository nothing writes to, so
     # nothing is accumulating. Without the reason this line reads as a wrong
     # severity next to "49 failing and stale".
-    printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}CLEANUP${COLOR_RESET} ($_repo_bits)\n"
+    # The gloss and the advice both change when emptiness is the reason. A
+    # repository that has never been written to, whose profile and policy are
+    # BOTH still there, is not cleanup -- its first export has written
+    # nothing, which is something to look into, not something to delete.
+    # "Safe to delete" was already disproved once on a live cluster, where
+    # every empty repository turned out to be a live import path.
+    if [ "$STORAGE_REPO_FAILING_NEVERWRITTEN_COUNT" -ge "$STORAGE_REPO_QUIET_FAILING_COUNT" ] 2>/dev/null; then
+      printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}FAILING_INACTIVE${COLOR_RESET} - the $STORAGE_REPO_QUIET_FAILING_COUNT without a recent success have never been written to ($_repo_bits)\n"
+    else
+      printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}FAILING_INACTIVE${COLOR_RESET} - manual cleanup may be required ($_repo_bits)\n"
+    fi
     # NAME THE SUBSET, and read the same count the rollup was decided from.
     # The downgrade is computed over the quietened failures only, but the
     # counts in parentheses above also list failing, stale, overdue and
@@ -9520,16 +9870,43 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = 
     # been computed over, and a repository written to yesterday sat inside a
     # sentence saying nothing had been written for a month. Same rule the
     # residual-snapshots section learned in v2.5.0.
-    if [ "$STORAGE_REPO_FAILING_ORPHAN_COUNT" -eq 0 ]; then
-      printf "          None of the %s failing without a recent success has had data written for %s+ days, so nothing is accumulating.\n" "$STORAGE_REPO_QUIET_FAILING_COUNT" "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS"
-    elif [ "$STORAGE_REPO_FAILING_IDLE_COUNT" -eq 0 ]; then
-      printf "          The profile or policy owning each of the %s failing without a recent success has been deleted, so nothing is accumulating.\n" "$STORAGE_REPO_QUIET_FAILING_COUNT"
+    # THREE reasons quieten a failure, not two. A repository that has never
+    # been written to is the third, and it is not an idle one: saying "no data
+    # written for 30+ days" about a repository created two days ago is false
+    # on its face.
+    if [ "$STORAGE_REPO_FAILING_NEVERWRITTEN_COUNT" -ge "$STORAGE_REPO_QUIET_FAILING_COUNT" ]; then
+      printf "          None of the %s failing without a recent success has ever been written to, so nothing is accumulating there.\n" "$STORAGE_REPO_QUIET_FAILING_COUNT"
+    elif [ "$STORAGE_REPO_FAILING_ORPHAN_COUNT" -eq 0 ] && [ "$STORAGE_REPO_FAILING_NEVERWRITTEN_COUNT" -eq 0 ]; then
+      printf "          None of the %s failing without a recent success has had data written for %s+ days, so nothing is accumulating there.\n" "$STORAGE_REPO_QUIET_FAILING_COUNT" "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS"
+    elif [ "$STORAGE_REPO_FAILING_IDLE_COUNT" -eq 0 ] && [ "$STORAGE_REPO_FAILING_NEVERWRITTEN_COUNT" -eq 0 ]; then
+      printf "          The profile or policy owning each of the %s failing without a recent success has been deleted, so nothing is accumulating there.\n" "$STORAGE_REPO_QUIET_FAILING_COUNT"
     else
-      printf "          Each of the %s failing without a recent success is either idle %s+ days or owned by a deleted profile/policy - nothing is accumulating.\n" "$STORAGE_REPO_QUIET_FAILING_COUNT" "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS"
+      printf "          Each of the %s failing without a recent success is idle %s+ days, has never been written to, or is owned by a deleted profile/policy - nothing is accumulating there.\n" "$STORAGE_REPO_QUIET_FAILING_COUNT" "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS"
     fi
-    printf "          Not critical for that reason. Consider deleting them.\n"
+    # The downgrade is a claim about a SET, and an unread repository was never
+    # in it. Escalating to critical instead was considered and rejected: on the
+    # estates measured almost everything is idle, /details is fanned out so a
+    # transient read failure is ordinary, and the verdict would flap between
+    # critical and warning with nothing changing in the cluster - which
+    # kdl-diff scores as a regression each time. The honest fix is to stop the
+    # sentence claiming more than was looked at.
+    # The count itself is printed once, below, for every verdict - do not
+    # repeat it here. What this line adds is what it MEANS for the severity.
+    if [ "$STORAGE_REPO_FULLY_ASSESSED" = "false" ]; then
+      printf "          Not critical on the evidence available - but a repository that was not read, or did not answer, may be failing and still written to. Confirm those before deleting any.\n"
+    else
+      if [ "$STORAGE_REPO_FAILING_NEVERWRITTEN_COUNT" -ge "$STORAGE_REPO_QUIET_FAILING_COUNT" ] 2>/dev/null; then
+        printf "          Not critical for that reason. Find out why the first export wrote nothing - deleting the repository will not fix the export.\n"
+      else
+        # Never advise deletion without naming what to check first. These
+        # hold backup data, and "safe to delete" has already been disproved
+        # once on a live cluster where every empty repository turned out to
+        # be a live import path. Same rule the profileMismatch guidance uses.
+        printf "          Not critical for that reason. Confirm why each is idle - a stopped policy, a profile migrated away - before deleting anything; these hold backup data.\n"
+      fi
+    fi
   else
-    printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}NEEDS ATTENTION${COLOR_RESET} ($_repo_bits)\n"
+    printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Repository maintenance: ${COLOR_YELLOW}PARTIAL${COLOR_RESET} - needs attention, %s ($_repo_bits)\n" "$(if [ "$STORAGE_REPO_FULLY_ASSESSED" = "false" ]; then printf 'nothing critical among those that could be assessed'; else printf 'nothing critical'; fi)"
   fi
   # A failure outranks a partial read in the rollup, deliberately - one
   # unreadable repository must not hide 49 broken ones. But the rollup is then
@@ -9541,22 +9918,38 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = 
       "$((STORAGE_REPO_LISTED - STORAGE_REPO_COUNT))" "$STORAGE_REPO_LISTED"
   fi
   if [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
-    printf "          %s repo(s) answered but recorded neither a success nor a failure - outcome not assessed.\n" "$STORAGE_REPO_UNKNOWN_COUNT"
+    printf "          %s repo(s) answered but their outcome could not be established - no recorded success or failure, a success that cannot be dated, or past due with the pod list unreadable.\n" "$STORAGE_REPO_UNKNOWN_COUNT"
   fi
 elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_ASSESSED" ]; then
   if [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
     # UNKNOWN no longer means "the timestamp would not parse", which is what
     # v2.4 counted here. It now means the outcome could not be established:
     # the maintenance command, the procedure record and the task history all
-    # abstain, or a run succeeded and its date cannot be recovered. Describing
-    # it as an unreadable timestamp sends the reader to look at the wrong
-    # field - a failure path rendering as a confident statement (P1/P5).
-    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_UNKNOWN_COUNT repo(s) with no evidence either way - no recorded success or failure, or a success that cannot be dated)\n"
+    # abstain, a run succeeded and its date cannot be recovered, or the
+    # repository is past due with the pod list unreadable. Describing it as an
+    # unreadable timestamp sent the reader to the wrong field - a failure path
+    # rendering as a confident statement (P1/P5).
+    #
+    # THREE causes, and the third was added after this line was last reworded.
+    # It is reached ONLY by repositories that DO have a recent success, so
+    # "no recorded success" is false for them: the schedule could not be
+    # checked, the maintenance is not the unknown.
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT_ASSESSED - could not be determined ($STORAGE_REPO_UNKNOWN_COUNT repo(s) whose outcome could not be established - no recorded success or failure, a success that cannot be dated, or past due with the pod list unreadable)\n"
+    # TWO causes reach NOT_ASSESSED and they are not exclusive: repositories
+    # that answered without a determinable outcome, and repositories that did
+    # not answer at all. This arm named only the first, so a cluster with both
+    # was told about the unknowns and never that some were never read - the
+    # same "I could not see all of them" turning into silence that the PARTIAL
+    # branch above prints its own line to prevent. Same sentence, same place.
+    if [ "$STORAGE_REPO_COUNT" -lt "$STORAGE_REPO_LISTED" ]; then
+      printf "          %s of %s listed repo(s) returned no details and are not assessed either way.\n" \
+        "$((STORAGE_REPO_LISTED - STORAGE_REPO_COUNT))" "$STORAGE_REPO_LISTED"
+    fi
   else
-    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_COUNT of $STORAGE_REPO_LISTED listed repo(s) returned details - check RBAC for storagerepositories/details)\n"
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT_ASSESSED - could not be determined ($STORAGE_REPO_COUNT of $STORAGE_REPO_LISTED listed repo(s) returned details - check RBAC for storagerepositories/details)\n"
   fi
 elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_CONFIGURED" ]; then
-  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: Not using exports/imports\n"
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT_CONFIGURED - not using exports or imports\n"
 else
   # No branch matched. This chain had no else, so when FAILING_INACTIVE was
   # added the check DISAPPEARED from Best Practices Compliance -- no line at

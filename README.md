@@ -136,29 +136,37 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   figure several-fold.
 
   **Severity is earned.** The check goes critical only when a failing
-  repository is still being written to. Where every failing repository has
-  had no data written for 30+ days, or its profile or policy has since been
-  deleted *and* the write date does not contradict that, the finding stays
-  but drops to a warning — nothing accumulates in a repository nobody writes
-  to, which is the normal state after a profile migration. The write date
+  repository is still being written to. Where every failing repository is
+  quiet — no data written for 30+ days, never written to at all, or owned by
+  a profile or policy that no longer resolves *and* the write date does not
+  contradict that — the finding stays but drops to a warning. Nothing
+  accumulates in a repository nobody writes to, which is the normal state
+  after a profile migration. "Never written to" is measured from
+  `modifiedTime`, not from `storageUsage`: the storage scan is what populates
+  `storageUsage`, so a repository nothing has processed reads empty whatever
+  it holds. The write date
   wins wherever it exists: a repository written to yesterday is never
   quietened, whatever else is true of it, and one whose last write cannot be
-  dated counts as active. `NEVER_RAN` earns a critical only once the
-  repository is older than the staleness threshold; below that no run has
-  been due yet.
+  dated counts as active *on its own* — it takes a deleted owner alongside an
+  undated write to quieten anything. `NEVER_RAN` earns a critical only once the
+  first run is overdue: older than one full maintenance interval, or a full
+  interval past its scheduled time, and never while a maintenance pod is
+  running for it. Below that it may already be due but is not yet overdue,
+  and the finding stays a warning.
 
   Each row names the application, policy and target (an object-store bucket
   or a FileStore PVC claim) so a failure can be traced to its owner. Bucket
   and claim **names** only: no endpoint, region or path is collected, because
   a repository path is `k10/<cluster-uuid>/…`. Failure messages come from the
-  cluster and are published with `scheme://host`, UUIDs and IP addresses
+  cluster and are published with `scheme://host`, UUIDs and IPv4 addresses
   masked, truncated at 300 characters. Repositories the cluster listed but
-  whose `/details` subresource could not be read are counted separately and
-  force `NOT_ASSESSED` rather than being reported as absent or clean — and
-  when a failure outranks that in the rollup, the unread count is still
-  printed beside it. The `/details` reads run concurrently (`KDL_PARALLEL`,
-  default 10). Reported in human output, JSON under `storageRepositories`,
-  and in the HTML dashboard.
+  whose `/details` subresource could not be read are counted separately: the
+  section reports `NOT_ASSESSED` rather than absent or clean, unless a
+  finding among the repositories that *were* read outranks it — a failure,
+  but also a merely stale, overdue, never-run or disabled one — in which case
+  that verdict stands and the unread count is printed beside it. The
+  `/details` reads run concurrently (`KDL_PARALLEL`, default 10). Reported in
+  human output, JSON under `storageRepositories`, and in the HTML dashboard.
 
 ## What's New in v2.3
 
@@ -487,7 +495,7 @@ New in v2.0:
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
 | K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
-| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when stale, overdue, never run or disabled; **critical** when a repository still being written to keeps failing |
+| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when a run failed but a success is still recent, or when repositories are stale, overdue, never run or disabled, or when every failure is quiet (idle, never written to, or orphaned); **critical** when a repository still being written to has no recent success, or has never run and its first run is overdue |
 | Residual snapshots     | Warning  | No local snapshot past 7 days that no policy retains | On-demand, policy-deleted or unbound snapshots left behind |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |

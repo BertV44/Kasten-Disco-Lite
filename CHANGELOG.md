@@ -52,20 +52,25 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   are now derived from the failing set.
 
 ### Added
-- **Honest maintenance states.** `FAILING_STALE`, `FAILING`, `OVERDUE`,
-  `READ_ONLY` and `UNKNOWN` join `OK`, `STALE` (renamed from `AMBER`),
-  `NEVER_RAN` and `DISABLED`. `OVERDUE` catches a scheduler that stopped
+- **Honest maintenance states.** `FAILING_STALE`, `FAILING`, `OVERDUE` and
+  `READ_ONLY` join `OK`, `STALE` (renamed from `AMBER`), `NEVER_RAN`,
+  `DISABLED` and `UNKNOWN`. `OVERDUE` catches a scheduler that stopped
   without recording a failure — a stall that staleness would not report for
-  another week. `READ_ONLY` is described below.
+  another week. `READ_ONLY` is described below. `UNKNOWN` is not new but no
+  longer means what it did: in v2.5.0 it was an unreadable timestamp, and it
+  now means the outcome itself could not be established.
 - **Severity that is earned.** `storageRepositoryMaintenance` becomes
   **critical** only when a repository that is still being written to keeps
-  failing. Where every failing repository has had no data written for
-  `inactiveThresholdDays` (30) or its profile or policy has since been
-  deleted, the rollup is `FAILING_INACTIVE` and stays a warning — nothing
-  accumulates in a repository nobody writes to, which is the normal state
-  after a profile migration. Inactivity only ever downgrades, never hides:
-  statuses and counts are unchanged, and a repository whose last write cannot
-  be dated counts as active.
+  failing. Where every failing repository is quiet — no data written for
+  `inactiveThresholdDays` (30), never written to at all, or, *only where the
+  last write date is unknown*, owned by a profile or policy that has since
+  been deleted — the rollup is `FAILING_INACTIVE` and stays a warning.
+  Nothing accumulates in a repository nobody writes to, which is the normal
+  state after a profile migration. A known write date always wins: a
+  repository written to yesterday is never quietened by a deleted owner.
+  Inactivity only ever downgrades, never hides: statuses and counts are
+  unchanged, and a repository whose last write cannot be dated counts as
+  active on its own — it takes a deleted owner alongside it to quieten one.
 - `NOT_CONFIGURED` no longer counts as a finding. A cluster with no
   repositories has nothing to maintain, and the row already read "Optional"
   while the hero tally contradicted it.
@@ -120,11 +125,16 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   neutral change and the exit code is unaffected.
 - **JSON: `storageRepositories.amberCount` is removed**, replaced by
   `staleCount` to follow the `AMBER` -> `STALE` rename. It is the only key
-  removed, against fifteen added: `staleCount` itself plus `okCount`,
-  `failingCount`, `failingStaleCount`, `overdueCount`, `readOnlyCount`,
-  `activeFailingCount`, `inactiveCount`, `orphanedCount`,
-  `profileMismatchCount`, `unusedCount`, `unusedReadOnlyCount`,
-  `inactiveThresholdDays`, `inactivityNote` and `profileMismatchNote`.
+  removed, against twenty-five added under `storageRepositories`:
+  `staleCount` itself plus `okCount`, `failingCount`, `failingStaleCount`,
+  `overdueCount`, `neverRanDueCount`, `neverRanNotDueCount`,
+  `activeNeverRanCount`, `readOnlyCount`, `activeFailingCount`,
+  `quietFailingCount`, `quietFailingIdleCount`,
+  `quietFailingNeverWrittenCount`, `quietFailingOrphanCount`,
+  `inactiveCount`, `orphanedCount`, `profileMismatchCount`, `unusedCount`,
+  `unusedReadOnlyCount`, `inactiveThresholdDays`, `fullyAssessed`,
+  `inactivityNote`, `profileMismatchNote`, `durationNote` and
+  `redactionNote`.
   `kdl-json-to-html.sh` reads whichever of the two is present, so reports
   produced by older versions still render; anything outside this repo parsing
   `amberCount` needs the new name.
@@ -164,8 +174,10 @@ every status, and by an independent audit of the branch.
 - **A repository created an hour ago and never yet maintained was reported
   critical**, while the section text called that normal and the terminal told
   the reader to "check the failure" on a repository that had none. `NEVER_RAN`
-  now only earns a critical once the repository is older than the staleness
-  threshold; below that it is a warning.
+  now only earns a critical once the first run is actually due — one full
+  maintenance interval (`full.interval`, a day by default) past creation, or
+  a whole interval past due — and never while the owner pod says a run is in
+  flight. Below that it is a warning.
 - **A repository past due by whole cycles reported `OK` when the pod list
   could not be read.** `maintenanceRunning` is null rather than false there,
   and the overdue arm requires false — so the verdict fell through to `OK`
@@ -222,12 +234,277 @@ every status, and by an independent audit of the branch.
   the repositories whose failure the rollup quietened, and which of the two
   reasons applied. Together with `activeFailingCount` they partition the
   eligible failures exactly.
-- `daysSinceCreation`, so "never ran" can be told from "not due yet".
+- `daysSinceCreation`, so "never ran" can be told from "not yet overdue".
 - `lastRunSpanHuman`: the task span, which is what issue #48 actually asked
   for. The command window is preferred where it exists, but it comes from a
   procedure record a busy repository evicts within hours, so publishing only
   that left the Duration column empty on most rows of a large estate. Both
   exclude queue time.
+
+### Fixed in follow-up review
+
+A second pass over the branch. Every finding was reproduced against a fixture
+before being accepted, and each fixture verified to fail on the preceding
+commit — an assertion only ever seen to pass proves nothing.
+
+- **A repository whose last attempt failed but which succeeded the night
+  before was reported CRITICAL.** The success clock fell back to the procedure
+  record only when the *newest* procedure had succeeded, so a success followed
+  by a failure could not be dated at all and the repository scored
+  `FAILING_STALE` — a critical — where `FAILING`, a warning, was due. The
+  fallback now reads the newest **successful** procedure. Where the newest run
+  did succeed the two are the same record, so nothing changes for the case
+  that already worked.
+- **`Run incomplete (8 of 8 expected tasks)` could be printed.**
+  `expectedTaskCount` is a floor derived from the tasks present in >=90% of a
+  repository's own runs, which excludes the pair that alternates day by day.
+  `lastRunTaskCount` counts every task that ran, that pair included. So a run
+  missing one required task can meet the floor exactly, and both renderers
+  printed a fraction whose numerator equalled or exceeded its denominator —
+  the shape the display rule exists to forbid. The count is now shown only
+  while it is below the floor; otherwise the text says a required task did not
+  run. Measured on a 547-repository estate: all 38 repositories with enough
+  history to calibrate run 9 tasks against a floor of 8, so the shape is
+  universal even though no incomplete run has yet been observed there.
+- **The profile-mismatch row rendered outside its own card**, landing inside
+  "Maintenance status" under a caption promising the rows add up to the total
+  — which a cross-cutting count does not. Both copies of the card condition
+  omitted `profileMismatchCount`; they open and close the same card, so a term
+  added to one must be added to the other.
+- **`UNKNOWN` was described as "neither source could answer", usually blamed
+  on the `storagerepositories/details` RBAC rule.** A third cause had been
+  added: past due by a full cycle with an unreadable pod list, which is
+  reached ONLY by repositories that have a recent success. Both sources
+  answered there and the pod list is the cause. All FOUR places that describe
+  the state now name all three causes: the HTML legend, both terminal lines
+  that report the count, and the `note` published in the JSON. A first pass
+  reworded only the legend and a second missed the JSON note; each time the
+  rest went on asserting that nothing had succeeded.
+- **A repository created an hour ago was reported as a failure**, on a report
+  whose own legend calls that state normal under a day old. Two errors behind
+  it. The first grace covered only the rollup severity and not the lines: the
+  counts behind them were every `NEVER_RAN` repository whatever its age, and
+  the JSON published only the total, so the HTML could not have told the two
+  apart. The second was the threshold — it used the 7-day STALENESS
+  threshold while full maintenance runs DAILY, so a three-day-old repository
+  with no run, two cycles missed, still read as normal. `firstRunDue` is now
+  computed once against the schedule and read by the rollup, the two
+  published counts, both renderers and the validation gate — the status
+  ladder itself is unchanged and still reports `NEVER_RAN` either way.
+  A repository is due once it is older than one full maintenance interval
+  (`fullIntervalSeconds`, falling back to the daily interval Kasten uses), or
+  more than one interval past `nextFullMaintenanceTime`, and never while a
+  maintenance pod is running for it — the same guard `OVERDUE` applies to
+  the same signal. Without that guard every new repository became a critical
+  from the moment its first run was scheduled until that run finished,
+  because `nextFullMaintenanceTime` only advances when a run COMPLETES:
+  reproduced with a repository created two hours ago whose first run was due
+  one hour ago, reported `FAILING`. Past due keeps the `[FAIL]` and the red
+  badge; not yet due gets an `[INFO]` and an info badge, and is named in the
+  best-practice parenthetical as "not yet overdue" rather than dropped from it —
+  it still drives the `PARTIAL` verdict, so a row stating the severity and
+  omitting the reason left "Warning - PARTIAL" and nothing else. The rollup
+  stays `PARTIAL` deliberately: not yet overdue is still not `OK`.
+- **A repository whose every recorded run failed could report `OK`.** The
+  success clock fell back to the procedure record whenever no task-derived
+  success existed, including when the task history was READABLE and simply
+  held no good run — which its own comment said it would not do. Readable
+  history with nothing successful in it is evidence, and stronger evidence
+  than an absent history: the fallback is gated on `taskHistoryAvailable`
+  now. The same repository with a failed procedure reaches `FAILING_STALE`
+  as it should.
+- **A present-but-empty task history lost its success date.** `runs: {}`
+  makes `taskHistoryAvailable` true while holding no task records at all, so
+  gating the procedure fallback on readability alone threw the only evidence
+  away: a repository whose newest procedure had succeeded reported `UNKNOWN`,
+  and one whose newest failed after an older success went back to
+  `FAILING_STALE`, a critical. The fallback applies when the history is
+  unreadable OR holds no runs. A live cluster carries `runs: {}` beside nine
+  procedure records, so this is not a constructed state.
+- **A young, empty repository was reported as "still being written to".**
+  `inactive` needs 30 days of silence, so a repository created two days ago
+  that never ran and never received a byte was neither idle nor orphaned and
+  counted as an active failure — a critical. Never having been written to is
+  a third reason a failure is quiet, published as
+  `quietFailingNeverWrittenCount`, and both outputs say "never been written
+  to" rather than "no data written for 30+ days", which is false about a
+  two-day-old repository.
+- **`repositoryEmpty` did not mean what it was used for.** It reads
+  `storageUsage` present-and-empty — but the storage scan is what POPULATES
+  that field, so a repository nothing has processed reads empty whatever it
+  holds. On a 547-repository estate all 364 reading empty had simply never
+  been processed, and **191 of them had been written to, 205 within the last
+  30 days**. It was being used to quieten failures, which on that estate
+  would have silenced repositories receiving data daily. A new field,
+  `neverWritten`, answers the question properly from `modifiedTime` — which
+  advances on writes and is untouched by a scan — and the quietening,
+  the counts and both outputs now read that instead, `unusedCount` and
+  `unusedReadOnlyCount` included. `repositoryEmpty` is `null` for a read-only
+  repository rather than `true`: Kasten never scans those, so the field is
+  empty by construction and answers nothing about them. It had been reporting
+  every read-only import as having "never held any data since creation",
+  including one written to the day before.
+- **Deletion was advised without saying what to check first.** An empty
+  repository whose profile and policy both still exist was told "manual
+  cleanup may be required — consider deleting them", when the real finding
+  is that its first export wrote nothing. Every destructive suggestion now
+  names the thing to validate and ends the same way: idle repositories get
+  "confirm why each is idle — a stopped policy, a profile migrated away";
+  empty ones get "find out why the first export wrote nothing"; and all of
+  them, like the profile-mismatch guidance already did, end with "these hold
+  backup data". "Safe to delete" was disproved once on a live cluster where
+  every empty repository turned out to be a live import path.
+- **Reassurances were given about repositories nobody looked at.** "Cleanup,
+  not an outage" and "nothing critical" are claims about the whole estate,
+  and `PARTIAL` is decided before the partial-read branch, so both were
+  printed on clusters where repositories went unread or answered `UNKNOWN`.
+  One published flag, `fullyAssessed`, now gates every such sentence in both
+  outputs.
+- **`PARTIAL` read "not failing" beside "(1 failing)".** The verdict also
+  covers repositories whose last run failed but which succeeded recently, so
+  the gloss contradicted its own parenthetical; it reads "needs attention,
+  nothing critical" now. The `FAILING` gloss said "keeps failing" about a
+  repository that has never run at all, and says "is not being maintained",
+  which is true of both.
+- **The advice after a `FAILING` verdict compared two different sets.** It
+  weighed the repositories still being written to against every due
+  never-ran repository, idle ones included, so one failing active repository
+  beside two idle never-ran ones was described as having no maintenance run
+  ever recorded. `activeNeverRanCount` is published and both outputs compare
+  against that.
+- **Every never-ran repository printed the same red `[NEVER RAN]` in the
+  terminal**, while the HTML distinguished three states. A repository whose
+  first run had not come round, or was executing, was a red failure in one
+  output and an informational note in the other, for the same run. The
+  terminal row now carries the same three renderings.
+- **"Not due yet" claimed more than the data supports.** A first run an hour
+  past its schedule but inside one interval of grace IS due — it is simply
+  not late enough to report — so every rendering now says "not yet
+  overdue". `firstRunDue` is also false while the first run is EXECUTING,
+  and the per-repository row is the one place a reader can tell which, so
+  that row says "first run in progress" instead.
+- **The HTML told the reader to resolve a failure that does not exist.** The
+  "still being written to — check the reason shown under its status" advice
+  counted `NEVER_RAN` repositories, which carry no failure and no error, so
+  it sent the reader looking for something the status does not show. Where
+  the whole active set has simply never run, the advice now says so and
+  points at the scheduler instead, in the terminal as well as the HTML.
+- **The terminal named the verdict differently from the other two outputs.**
+  Four of the five best-practice verdicts printed a friendly word — HEALTHY,
+  CLEANUP, NEEDS ATTENTION, NOT ASSESSED — while the fifth printed the token
+  `FAILING`. So `FAILING` was the only verdict that could be correlated
+  across the three outputs, and on a live 162-repository cluster the terminal
+  reported `CLEANUP` where the JSON and HTML reported `FAILING_INACTIVE`,
+  with the string `FAILING_INACTIVE` appearing nowhere in the terminal at
+  all. Every branch now prints the token, then a plain-English gloss, then
+  the counts — for example `FAILING_INACTIVE - manual cleanup may be
+  required (49 failing and stale, 1 failing, 108 stale)`. Grepping a support
+  bundle for the verdict finds it in any of the three now.
+- **The read note and the README claimed an unread repository forces
+  `NOT_ASSESSED`.** Reordering the rollup so a definitive failure outranks a
+  partial read was correct; the sentence describing the old order was left
+  behind, and the same commit that started printing the unread count beside
+  the failure made the contradiction plainer.
+- **A FileStore profile whose path was empty, `/`, or written with a leading
+  slash flagged every repository on it as mismatched**, next to text advising
+  the reader to confirm before deleting them. Only trailing slashes were
+  stripped, so an empty prefix became `/` and a repository path — relative on
+  both sides, verified on a live cluster — could never match it. Both ends
+  are normalised now, and an empty prefix is treated as the root: every path
+  is under it. Reachable rather than theoretical: a FileStore profile with no
+  explicit path is what produces the default `k10/<cluster-uuid>/...` layout,
+  and a live cluster was observed carrying that layout and an explicit-prefix
+  one on the SAME profile.
+- **`FAILING_INACTIVE` claimed every failing repository was quiet while some
+  had not been read.** The downgrade is a claim about a set, and a repository
+  whose `/details` could not be read was never in it. Both the terminal and
+  the HTML now scope the claim to what was read and say that an unread
+  repository may be failing and still written to. Escalating to critical
+  instead was considered and rejected: on the estates measured almost
+  everything is idle, `/details` is fanned out so a transient read failure is
+  ordinary, and the verdict would flap between critical and warning with
+  nothing changing in the cluster — which `kdl-diff.sh` scores as a
+  regression each time.
+
+### Added in follow-up review
+
+- `firstRunDue` per repository, plus `neverRanDueCount` and
+  `neverRanNotDueCount`: whether a repository with no run in its history has
+  reached its first scheduled maintenance. Published rather than derived per
+  renderer — the terminal derived it and the HTML could not, so one
+  repository was an informational "not due" in one output and a red failure
+  in the other. `neverRanCount` stays the sum, so the status tally still
+  reconciles.
+- `procedureSuccessTime` and `daysSinceProcedureSuccess`: the newest procedure
+  record that SUCCEEDED. They sit beside `procedureEndTime` and
+  `daysSinceProcedure`, which track the newest record whether it succeeded or
+  not, and the two pairs must stay in step.
+
+### Fixed in third review
+
+A third pass, again with each finding reproduced before being accepted.
+
+- **A repository whose only successful maintenance was its first was reported
+  CRITICAL.** The first full maintenance legitimately runs one task fewer —
+  `full-drop-deleted-content` has nothing to drop yet — which is why that run
+  is held out of the >=90% calibration window. It was still judged against
+  the floor derived without it, so it scored incomplete, the one success the
+  repository had was discarded, `daysSinceLastSuccess` went null and the
+  ladder returned `FAILING_STALE` instead of `FAILING`: a critical produced
+  by arithmetic rather than by anything the repository did, with a failure
+  streak one too high. The oldest run is now exempt from the completeness
+  test for the same reason it is exempt from the floor. New fixture
+  `first-run-good`, verified to fail beforehand.
+- **`FAILING` and `FAILING_INACTIVE` had no branch in the HTML `badge()`
+  chain**, so the rollup rendered as a neutral blue "info" badge beside a red
+  **Critical** cell in the same row. The third time a new status has slipped
+  past a renderer chain on this branch; the gate now checks, statically, that
+  every value `BP_STORAGE_REPO_STATUS` can take has a branch of its own.
+- **`Run failed — no success for never`.** `never` stood for two different
+  things — a success that never happened, and one that cannot be dated — and
+  `FAILING_STALE` is reached by both. The terminal already said "an unknown
+  number of days"; the HTML now says the same. The two remaining
+  `unknown` + `"d"` concatenations, in the `STALE` and `AMBER` badges, are
+  guarded as the `OK` badge already was.
+- **`last success unknown days ago`** in the terminal `STALE` line, which
+  falls back to the maintenance age when the success age is absent and
+  printed the word itself when that was absent too. The same defect as the
+  badge above, in the third output path: the HTML branch was guarded in the
+  same pass and this one was not. Found by auditing every remaining use of
+  the age bindings after the HTML change made them nullable.
+- **`KDL_PARALLEL=08` ended the run** with `value too great for base`, naming
+  neither the variable nor the cause, on a knob whose documented promise is
+  that a typo in it costs nothing. A leading zero made it an octal literal;
+  `010` was worse, since it is valid octal and ran quietly at width 8. A
+  value too long to be an integer reached `[ -lt ]` and produced an error
+  about a comparison the reader never made. All three are normalised now.
+- **`OK - unknown days ago`** in the terminal, and **`Disabled` painted red**
+  in the HTML table while the card and the terminal both called it amber and
+  the rollup it drives is a warning.
+- **An import-only cluster read `maintenance is succeeding (0 of 4 repo(s)
+  maintained)`** — a success claim and a zero together, about a cluster where
+  no maintenance is meant to run at all. `READ_ONLY` is the one status that
+  does not block `OK`, so that combination is exactly an all-import cluster,
+  and it now says so.
+- **`NOT_ASSESSED` named only one of its two causes.** Repositories that
+  answered without a determinable outcome and repositories that never
+  answered are not exclusive, and a cluster with both was told about the
+  first only — in the terminal, and in the HTML, which said neither.
+- The count of failures that earn a critical includes repositories whose last
+  write **cannot be dated** — deliberately, so an unknown cannot quieten a
+  finding on its own — but four sentences printed that count under the flat
+  claim that they were "still being written to".
+- Two comments carried validation-cluster object names.
+
+### Deliberately not changed
+
+- **The success clock prefers task history; the failure verdict prefers the
+  procedure record.** This looks like an inconsistency and is not one: a
+  procedure success means the run completed without erroring, not that every
+  task ran, so it is the weaker evidence for a success and the stronger
+  evidence for a failure. Unifying them was tried and measured — it reported
+  a repository `OK` while it had skipped a required task every night for
+  twelve days. The reasoning is recorded beside the code.
 
 ## [2.5.0] - 2026-09-17
 
