@@ -315,12 +315,17 @@ def bpSevMap:
 # dashboard, or the crit bucket stops meaning anything.
 #
 # NOT_CONFIGURED is not a finding for it at all: a cluster with no repositories
-# has nothing to maintain, which is why the row already reads "Optional". Today
+# has nothing to maintain, which is why the row reads "Not applicable". Today
 # bpIsOk omits NOT_CONFIGURED so it lands in the warn bucket, and the hero
 # tally has been contradicting that row since v2.4. Escalating without fixing
 # this would turn every snapshot-only cluster into a false CRITICAL. It cannot
 # be a blanket rule, because BP_AUTH_STATUS="NOT_CONFIGURED" means an
 # unauthenticated dashboard and must stay critical.
+#
+# It stays inside bpFindings.total, and so lands in the Passing tally: total is
+# what the hero prints as "N best-practice checks", and dropping one would make
+# that number disagree with the README and with bpSevMap. A check that does not
+# apply is not a finding, which is the distinction that matters here.
 #
 # FAILING_INACTIVE is the same failures on repositories nothing has written to
 # for a month -- typically a profile that was migrated away from. Maintenance
@@ -539,8 +544,13 @@ details.wl-item > summary::-webkit-details-marker { display:none; }
   thead { display:table-header-group; }
   tr { page-break-inside:avoid; break-inside:avoid; }
   .badge { border:1px solid #888; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
-  /* A paginated print would silently drop rows from the deliverable. */
-  tbody tr.tbl-hide-p { display:table-row; }
+  /* A paginated print would silently drop rows from the deliverable.
+     !important because the .tbl-hide-p rule that hides them is declared
+     LATER in this stylesheet at the same specificity (0,1,2) -- a media
+     query adds none -- so without it the later declaration won and printing
+     still dropped every row past page 1 of a 162-row table, under a
+     changelog entry saying printing is never paginated. */
+  tbody tr.tbl-hide-p { display:table-row !important; }
   .tbl-tools, .tbl-pager { display:none; }
 }
 @media (max-width:820px) {
@@ -855,19 +865,35 @@ else "" end) + "
           # repositories were orphaned but written to yesterday, it read "no
           # data written for 30+ days" about repositories written to 1 day
           # ago. Inspect the failing set and say which it actually is.
-          + (([.storageRepositories.items[]?
-               | select(.status == "FAILING_STALE" or .status == "NEVER_RAN")]) as $bad
-             | ($bad | map(select(.inactive == true)) | length) as $bIdle
-             | ($bad | map(select(.orphaned == true)) | length) as $bOrph
+          # READ THE PUBLISHED COUNTS, do not re-derive them. This block used
+          # to select every FAILING_STALE / NEVER_RAN item and describe that
+          # set, while KDL.sh decided the downgrade over a narrower one -- so
+          # the sentence covered repositories the verdict had never considered.
+          # The fallbacks to the items array keep reports that predate the
+          # published counts rendering.
+          + (((.storageRepositories.quietFailingCount
+               // ([.storageRepositories.items[]? | select(.status == "FAILING_STALE" or .status == "NEVER_RAN")] | length))) as $nBad
+             | ((.storageRepositories.quietFailingIdleCount
+                 // ([.storageRepositories.items[]? | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .inactive == true)] | length))) as $bIdle
+             | ((.storageRepositories.quietFailingOrphanCount
+                 // ([.storageRepositories.items[]? | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .orphaned == true)] | length))) as $bOrph
              | ((.storageRepositories.inactiveThresholdDays // 30) | tostring) as $ithr
+             | ($nBad | tostring) as $nBad
              | if $srVal == "FAILING_INACTIVE" then
-                 " \u2014 "
+                 # NAME THE SUBSET. $nBad is the quietened set -- exactly the
+                 # repositories the downgrade was computed over -- while the
+                 # counts in brackets just before this also list failing,
+                 # stale, overdue and disabled ones. "none of them" read as a
+                 # claim about all of those, and a repository written to
+                 # yesterday could sit among them inside a sentence saying
+                 # nothing had been written for a month.
+                 " \u2014 of the " + $nBad + " failing without a recent success, "
                  + (if $bOrph == 0 then
-                      "none of them has had data written for " + $ithr + "+ days"
+                      "none has had data written for " + $ithr + "+ days"
                     elif $bIdle == 0 then
-                      "the profile or policy that owns each of them has since been deleted"
+                      "the profile or policy that owns each has since been deleted"
                     else
-                      "each of them is either idle for " + $ithr + "+ days or owned by a deleted profile or policy"
+                      "each is either idle for " + $ithr + "+ days or owned by a deleted profile or policy"
                     end)
                  + ", so nothing is accumulating. Cleanup, not an outage."
                elif $srVal == "FAILING" then
@@ -879,6 +905,24 @@ else "" end) + "
                       + (if $af == 1 then " is" else " are" end)
                       + " still being written to \u2014 check the reason shown under its status and resolve the failure."
                     else "" end)
+               else "" end)
+          # A failure outranks a partial read in the rollup so that one
+          # unreadable repository cannot hide the broken ones. The cost is
+          # that this row then says FAILING and nothing else, and "I could
+          # not see all of them" disappears from the only line most readers
+          # scan. The terminal says it; so does this.
+          + (((.storageRepositories.listed // 0) - (.storageRepositories.total // 0)) as $unread
+             | ((.storageRepositories.ageUnknownCount // 0)) as $unassessed
+             | if ($srVal == "FAILING") or ($srVal == "FAILING_INACTIVE") or ($srVal == "PARTIAL") then
+                 (if $unread > 0 then
+                    " <span class=\"badge info\">" + ($unread | tostring) + " of "
+                    + ((.storageRepositories.listed) | tostring)
+                    + " listed returned no details \u2014 not assessed either way</span>"
+                  else "" end)
+                 + (if $unassessed > 0 then
+                    " <span class=\"badge info\">" + ($unassessed | tostring)
+                    + " recorded neither a success nor a failure \u2014 not assessed</span>"
+                  else "" end)
                else "" end)
              + "</td>
       </tr>"
@@ -1361,7 +1405,17 @@ else "" end) + "
      <p class=\"section-description\"><strong>How loud is it?</strong> Failures earn a critical only on repositories still being written to. Where every failing repository has had no data written for " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days, or its profile or policy has since been deleted, the finding stays but drops to a warning &mdash; nothing accumulates in a repository nobody writes to, so that is cleanup, typically after a profile migration. A repository whose last write cannot be dated counts as active, so an unknown never quietens a finding.</p>
      <p class=\"section-description\">Durations exclude time spent queued.</p>"
 + (if .storageRepositories then
-    (if (.storageRepositories.total // 0) == 0 then
+    # "None readable" is not "none exist". Branching on total alone rendered
+    # "not using exports or imports" on a cluster whose /details subresource
+    # was denied -- the exact false, confident sentence the #46 review caught
+    # on a cluster that had two repositories, and it contradicted the
+    # best-practice row one screen above, which says NOT ASSESSED. The
+    # `listed` count has existed since v2.4; nothing was reading it here.
+    (if ((.storageRepositories.total // 0) == 0) and ((.storageRepositories.listed // 0) > 0) then
+      "<div class=\"info-box\"><strong>Not assessed.</strong> The cluster listed "
+      + ((.storageRepositories.listed) | tostring)
+      + " storage repository/repositories, but none of them returned its <code>/details</code> subresource, so nothing about their maintenance could be read &mdash; this is <strong>not</strong> a clean result and <strong>not</strong> an absence of repositories. Check the RBAC rule for <code>repositories.kio.kasten.io storagerepositories/details</code>, or whether this Kasten is older than the subresource.</div>"
+    elif (.storageRepositories.total // 0) == 0 then
       "<div class=\"info-box\">No Storage Repositories found (not using exports or imports)</div>"
     else
       "<div class=\"grid-2\">
@@ -1398,12 +1452,13 @@ else "" end) + "
         + (if (.storageRepositories | has("okCount")) then
             "<div class=\"stat-row\"><span class=\"stat-label\">OK</span><span class=\"stat-value\"><span class=\"badge ok\">" + ((.storageRepositories.okCount) | tostring) + "</span></span></div>"
           else "" end)
-        + (if (.storageRepositories.neverRanCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Never Ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount // 0) | tostring) + "</span></span></div>"
-          else "" end)
-        + (if (.storageRepositories.disabledCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Disabled</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.disabledCount // 0) | tostring) + "</span></span></div>"
-          else "" end)
+        # The v2.4 "Never Ran" and "Disabled" rows used to sit here. They now
+        # have rows of their own above, reading the same two counts, and
+        # leaving both pairs in printed each of them TWICE - 16 badges against
+        # a total of 13, directly under a caption that promises "every
+        # repository counted once, adds up to the total". The summary card not
+        # reconciling is one of the defects this work set out to fix, so
+        # re-introducing it here was the worst possible place for it.
         + (if (.storageRepositories.readOnlyCount // 0) > 0 then
             "<div class=\"stat-row\"><span class=\"stat-label\">Read-only — maintained by the source cluster</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.readOnlyCount // 0) | tostring) + "</span></span></div>"
           else "" end)
@@ -1515,21 +1570,56 @@ else "" end) + "
           # numbers and round to themselves, so this renders both.
           (if .daysSinceLastMaintenance == null then "unknown"
            else (((.daysSinceLastMaintenance * 10) | round) / 10 | tostring) end) as $ageShown |
-          (if .daysSinceLastSuccess == null then "never"
-           else (((.daysSinceLastSuccess * 10) | round) / 10 | tostring) + "d" end) as $succShown |
+          # successAgeDays IS the number the staleness verdict was computed
+          # from, published by KDL.sh for exactly that reason; the fallback
+          # keeps reports that predate it rendering.
+          ((if (. | has("successAgeDays")) then .successAgeDays
+            else .daysSinceLastSuccess end)) as $succAge |
+          (if $succAge == null then "never"
+           else ((($succAge * 10) | round) / 10 | tostring) + "d" end) as $succShown |
           if .status == "DISABLED" then
             "<span class=\"badge error\">Disabled</span>"
           elif .status == "NEVER_RAN" then
             "<span class=\"badge error\">Never Ran</span>"
+          # "Run failed" is only true when something reported a failure. A run
+          # that merely came up short of the expected task set sets
+          # lastRunSucceeded false with lastRunFailedTasks EMPTY and no error
+          # anywhere -- the row then said "Run failed" while the same object
+          # said nothing had failed, which is #47's own caveat: Kopia does not
+          # run every full sub-task every cycle. Say what the data says.
           elif .status == "FAILING_STALE" then
-            "<span class=\"badge error\">Run failed \u2014 no success for " + $succShown + "</span>"
+            (if ((.lastRunFailedTasks // []) | length) == 0
+                and ((.procedureError // .lastRunError) == null)
+                and (.lastRunComplete == false) then
+               "<span class=\"badge error\">Run incomplete \u2014 no success for " + $succShown + "</span>"
+             else
+               "<span class=\"badge error\">Run failed \u2014 no success for " + $succShown + "</span>"
+             end)
           elif .status == "FAILING" then
-            "<span class=\"badge warn\">Run failed \u2014 last success " + $succShown + " ago</span>"
+            (if ((.lastRunFailedTasks // []) | length) == 0
+                and ((.procedureError // .lastRunError) == null)
+                and (.lastRunComplete == false) then
+               "<span class=\"badge warn\">Run incomplete ("
+               + ((.lastRunTaskCount // 0) | tostring) + " of "
+               + ((.expectedTaskCount // 0) | tostring)
+               + " expected tasks) \u2014 last success " + $succShown + " ago</span>"
+             else
+               "<span class=\"badge warn\">Run failed \u2014 last success " + $succShown + " ago</span>"
+             end)
           elif .status == "OVERDUE" then
             "<span class=\"badge warn\">Past due ("
             + ((((.overdueIntervals // 0) * 10 | round) / 10) | tostring)
             + " cycle" + (if (((.overdueIntervals // 0) * 10 | round) / 10) == 1 then "" else "s" end) + ")</span>"
-          elif .status == "STALE" or .status == "AMBER" then
+          elif .status == "STALE" then
+            # The success age, not the maintenance age. STALE is DEFINED by the
+            # first and the legend above says so, but this rendered the second
+            # -- and where the newest recorded run is not the newest successful
+            # one the two are different numbers. AMBER, from a pre-2.6 report,
+            # has no success age at all, so it keeps the only one it has.
+            "<span class=\"badge warn\">Stale (last success "
+            + (if $succAge == null then $ageShown + "d" else $succShown end)
+            + " ago)</span>"
+          elif .status == "AMBER" then
             "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>"
           elif .status == "READ_ONLY" then
             "<span class=\"badge info\">Read-only \u2014 source cluster maintains</span>"
@@ -1578,8 +1668,16 @@ else "" end) + "
         # to is completedTime - scheduledTime, which absorbs queue time and
         # goes negative on a hand-triggered run; kept only for reports that
         # predate the command window being collected.
-        "<td>" + (((if has("lastRunDurationHuman") then .lastRunDurationHuman
-                     else .lastFullMaintenanceDurationHuman end) // "\u2014")) + "</td></tr>"
+        # The command window first, the task span second. Both are the
+        # execution window with queue time excluded; the command window is the
+        # more precise of the two but comes from a procedure record that a busy
+        # repository evicts within hours, and publishing only that left this
+        # column empty on most rows of a large estate. The task span is what
+        # #48 asked for and exists wherever task history does.
+        "<td>" + (((if has("lastRunDurationHuman") then
+                      (if .lastRunDurationHuman != null then .lastRunDurationHuman
+                       else .lastRunSpanHuman end)
+                    else .lastFullMaintenanceDurationHuman end) // "\u2014")) + "</td></tr>"
       ] | join("")) +
       "</tbody>
       </table>"

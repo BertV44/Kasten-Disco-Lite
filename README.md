@@ -129,25 +129,36 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   Evidence comes from the per-task history in `maintenanceInfo.runs` and from
   `processResults`, which cover each other's gaps: a launch failure records no
   tasks at all, and a busy repository evicts its maintenance records within
-  hours. Durations are measured from the maintenance command itself rather
-  than from scheduling, which overstated them several-fold.
+  hours. Staleness is dated from whichever of the two can date the last
+  success. Durations are the execution window — the maintenance command
+  itself, or the task span where the command record has aged out — never
+  scheduling to completion, which absorbs queue time and overstated the
+  figure several-fold.
 
   **Severity is earned.** The check goes critical only when a failing
   repository is still being written to. Where every failing repository has
   had no data written for 30+ days, or its profile or policy has since been
-  deleted, the finding stays but drops to a warning — nothing accumulates in
-  a repository nobody writes to, which is the normal state after a profile
-  migration. A repository whose last write cannot be dated counts as active,
-  so an unknown never quietens a finding.
+  deleted *and* the write date does not contradict that, the finding stays
+  but drops to a warning — nothing accumulates in a repository nobody writes
+  to, which is the normal state after a profile migration. The write date
+  wins wherever it exists: a repository written to yesterday is never
+  quietened, whatever else is true of it, and one whose last write cannot be
+  dated counts as active. `NEVER_RAN` earns a critical only once the
+  repository is older than the staleness threshold; below that no run has
+  been due yet.
 
   Each row names the application, policy and target (an object-store bucket
   or a FileStore PVC claim) so a failure can be traced to its owner. Bucket
-  and claim **names** only: endpoints and paths carry the cluster UUID and
-  are never collected. Repositories the cluster listed but whose `/details`
-  subresource could not be read are counted separately and force
-  `NOT_ASSESSED` rather than being reported as absent or clean. The
-  `/details` reads run concurrently (`KDL_PARALLEL`, default 10). Reported in
-  human output, JSON under `storageRepositories`, and in the HTML dashboard.
+  and claim **names** only: no endpoint, region or path is collected, because
+  a repository path is `k10/<cluster-uuid>/…`. Failure messages come from the
+  cluster and are published with `scheme://host`, UUIDs and IP addresses
+  masked, truncated at 300 characters. Repositories the cluster listed but
+  whose `/details` subresource could not be read are counted separately and
+  force `NOT_ASSESSED` rather than being reported as absent or clean — and
+  when a failure outranks that in the rollup, the unread count is still
+  printed beside it. The `/details` reads run concurrently (`KDL_PARALLEL`,
+  default 10). Reported in human output, JSON under `storageRepositories`,
+  and in the HTML dashboard.
 
 ## What's New in v2.3
 
