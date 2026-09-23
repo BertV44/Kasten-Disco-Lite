@@ -9326,7 +9326,13 @@ elif [ "$BP_STORAGE_REPO_STATUS" = "FAILING" ] || [ "$BP_STORAGE_REPO_STATUS" = 
   fi
 elif [ "$BP_STORAGE_REPO_STATUS" = "NOT_ASSESSED" ]; then
   if [ "$STORAGE_REPO_UNKNOWN_COUNT" -gt 0 ]; then
-    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_UNKNOWN_COUNT repo(s) with an unreadable maintenance timestamp)\n"
+    # UNKNOWN no longer means "the timestamp would not parse", which is what
+    # v2.4 counted here. It now means the outcome could not be established:
+    # the maintenance command, the procedure record and the task history all
+    # abstain, or a run succeeded and its date cannot be recovered. Describing
+    # it as an unreadable timestamp sends the reader to look at the wrong
+    # field - a failure path rendering as a confident statement (P1/P5).
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_UNKNOWN_COUNT repo(s) with no evidence either way - no recorded success or failure, or a success that cannot be dated)\n"
   else
     printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Repository maintenance: NOT ASSESSED ($STORAGE_REPO_COUNT of $STORAGE_REPO_LISTED listed repo(s) returned details - check RBAC for storagerepositories/details)\n"
   fi

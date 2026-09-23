@@ -115,6 +115,20 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   is a true finding surfacing rather than a new defect, but it changes the
   exit code on the first run after upgrading. `FAILING_INACTIVE` is neither
   good nor a regression and scores as a neutral change.
+- **JSON: `storageRepositories.amberCount` is removed**, replaced by
+  `staleCount` to follow the `AMBER` -> `STALE` rename. It is the only key
+  removed, against fifteen added: `staleCount` itself plus `okCount`,
+  `failingCount`, `failingStaleCount`, `overdueCount`, `readOnlyCount`,
+  `activeFailingCount`, `inactiveCount`, `orphanedCount`,
+  `profileMismatchCount`, `unusedCount`, `unusedReadOnlyCount`,
+  `inactiveThresholdDays`, `inactivityNote` and `profileMismatchNote`.
+  `kdl-json-to-html.sh` reads whichever of the two is present, so reports
+  produced by older versions still render; anything outside this repo parsing
+  `amberCount` needs the new name.
+- **Terminal `NOT_ASSESSED` wording.** The line described the unassessed
+  repositories as having "an unreadable maintenance timestamp", which was
+  v2.4's meaning of `UNKNOWN`. It now means the outcome could not be
+  established at all, so the text says so.
 
 ## [2.5.0] - 2026-09-17
 
