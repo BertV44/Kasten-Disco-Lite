@@ -287,6 +287,15 @@ def formatRetention:
     "<span class=\"badge warn\">Not defined</span>"
   end;
 
+# staleCount replaced amberCount when AMBER was renamed STALE. has(), not //:
+# a legitimate 0 is truthy in jq so // would not fire, but an ABSENT key must
+# read as "not present" rather than zero for older reports.
+def staleCountOf(sr):
+  if (sr | type) != "object" then 0
+  elif (sr | has("staleCount")) then (sr.staleCount // 0)
+  elif (sr | has("amberCount")) then (sr.amberCount // 0)
+  else 0 end;
+
 def tunedBadge(val; dflt):
   if val != dflt then
     "<code>" + val + "</code> <span class=\"tuned-badge\">tuned</span>"
@@ -297,6 +306,41 @@ def tunedBadge(val; dflt):
 # v2.1 redesign: severity map + findings tally for the verdict hero.
 def bpSevMap:
   {"disasterRecovery":"crit","authentication":"crit","immutability":"warn","namespaceProtection":"warn","vmProtection":"warn","vmSnapshotConsistency":"warn","snapshotRetentionZero":"warn","exportRetentionExplicit":"warn","policiesWithoutExport":"warn","k10InfraVolumeAccessMode":"warn","storageRepositoryMaintenance":"warn","residualSnapshots":"warn","encryption":"info","resourceLimits":"info","policyPresets":"info","monitoring":"info","auditLogging":"info","snapshotRetentionHigh":"info","clusterScopedResources":"info"};
+# Severity per check AND value, not per check alone. bpSevMap gives the base;
+# this overrides it where the value carries the weight.
+#
+# storageRepositoryMaintenance earns crit only when the rollup says FAILING --
+# a repository failing with no recent success, or one that never succeeded.
+# "maintained 8 days ago" must not shout as loudly as an unauthenticated
+# dashboard, or the crit bucket stops meaning anything.
+#
+# NOT_CONFIGURED is not a finding for it at all: a cluster with no repositories
+# has nothing to maintain, which is why the row reads "Not applicable". Today
+# bpIsOk omits NOT_CONFIGURED so it lands in the warn bucket, and the hero
+# tally has been contradicting that row since v2.4. Escalating without fixing
+# this would turn every snapshot-only cluster into a false CRITICAL. It cannot
+# be a blanket rule, because BP_AUTH_STATUS="NOT_CONFIGURED" means an
+# unauthenticated dashboard and must stay critical.
+#
+# It stays inside bpFindings.total, and so lands in the Passing tally: total is
+# what the hero prints as "N best-practice checks", and dropping one would make
+# that number disagree with the README and with bpSevMap. A check that does not
+# apply is not a finding, which is the distinction that matters here.
+#
+# FAILING_INACTIVE is the same failures on repositories nothing has written to
+# for a month -- typically a profile that was migrated away from. Maintenance
+# reclaims space from deleted snapshots and compacts indexes, so where nothing
+# is written nothing accumulates: cleanup, not an incident. It stays a finding
+# (it is not OK), it just does not earn red. KDL.sh decides this, not the
+# renderer, so the verdict and its severity cannot drift apart.
+def bpSeverityOf($key; $v):
+  if $key == "storageRepositoryMaintenance" then
+    (if $v == "FAILING" then "crit"
+     elif $v == "FAILING_INACTIVE" then "warn"
+     elif $v == "NOT_CONFIGURED" then null
+     else bpSevMap[$key] end)
+  else bpSevMap[$key] end;
+
 def bpIsOk(v):
   (["CONFIGURED","IN_USE","ENABLED","COMPLETE","OK","VALID","COMPLIANT"] | index(v|tostring)) != null or (v == true);
 def bpFindings:
@@ -306,9 +350,10 @@ def bpFindings:
     if $v == null then .
     elif $v == "NOT_ASSESSED" then .total += 1 | .notAssessed += 1
     else .total += 1
+      | (bpSeverityOf($e.key; $v)) as $sev
       | if bpIsOk($v) then .
-        elif $e.value == "crit" then .crit += 1
-        elif $e.value == "warn" then .warn += 1
+        elif $sev == "crit" then .crit += 1
+        elif $sev == "warn" then .warn += 1
         else . end
     end)
   | .pass = (.total - .crit - .warn - .notAssessed);
@@ -428,6 +473,13 @@ h3 { font-size:1rem; margin:1.5rem 0 0.5rem; color:var(--text-muted); }
 .stat-row:last-child { border-bottom:none; }
 .stat-label { color:var(--text-muted); font-size:0.9rem; }
 .stat-value { font-weight:600; color:var(--text); }
+/* A card that mixes a breakdown with cross-cutting counts reads as one flat
+   list, and a reader then tries to add 161 into a total of 162. stat-total
+   marks the denominator, stat-group captions each block and says whether it
+   sums. */
+.stat-total { border-bottom:2px solid var(--border); }
+.stat-total .stat-label { color:var(--text); font-weight:600; font-size:0.95rem; }
+.stat-group { margin:0.9rem 0 0.1rem; font-size:0.7rem; letter-spacing:0.07em; text-transform:uppercase; color:var(--text-muted); opacity:0.8; }
 .progress-bar { background:var(--border); border-radius:8px; height:8px; overflow:hidden; margin-top:0.5rem; }
 .progress-fill { background:linear-gradient(90deg,var(--brand),var(--brand-solid)); height:100%; }
 
@@ -492,6 +544,14 @@ details.wl-item > summary::-webkit-details-marker { display:none; }
   thead { display:table-header-group; }
   tr { page-break-inside:avoid; break-inside:avoid; }
   .badge { border:1px solid #888; -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+  /* A paginated print would silently drop rows from the deliverable.
+     !important because the .tbl-hide-p rule that hides them is declared
+     LATER in this stylesheet at the same specificity (0,1,2) -- a media
+     query adds none -- so without it the later declaration won and printing
+     still dropped every row past page 1 of a 162-row table, under a
+     changelog entry saying printing is never paginated. */
+  tbody tr.tbl-hide-p { display:table-row !important; }
+  .tbl-tools, .tbl-pager { display:none; }
 }
 @media (max-width:820px) {
   .layout { grid-template-columns:1fr; }
@@ -506,6 +566,16 @@ th[data-sortable] { cursor:pointer; user-select:none; }
 .tbl-filter { flex:1; max-width:280px; background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:0.35rem 0.6rem; font:inherit; font-size:0.8rem; }
 .tbl-filter:focus { outline:none; border-color:var(--brand); }
 .tbl-hint { font-size:0.68rem; color:var(--text-muted); }
+/* Three things hide rows: the filter box, the issues-only toggle, and
+   pagination. They have to COMPOSE -- the filter used to set style.display
+   directly, which pagination would then stomp (and vice versa), so both now
+   use classes and only-issues stays pure CSS. */
+tbody tr.tbl-hide-f, tbody tr.tbl-hide-p { display:none; }
+.tbl-pager { display:flex; align-items:center; gap:0.4rem; margin-left:auto; font-size:0.75rem; color:var(--text-muted); }
+.tbl-page-btn { background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:0.2rem 0.5rem; font:inherit; font-size:0.75rem; cursor:pointer; }
+.tbl-page-btn:hover:not(:disabled) { border-color:var(--brand); }
+.tbl-page-btn:disabled { opacity:0.4; cursor:default; }
+.tbl-page-size { background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:0.2rem 0.3rem; font:inherit; font-size:0.75rem; }
 .copy { cursor:pointer; border:1px solid var(--border); background:var(--surface); color:var(--text-muted); border-radius:6px; padding:0.02rem 0.35rem; font-size:0.7rem; font-family:var(--mono); margin-left:0.4rem; }
 .copy:hover { color:var(--brand); border-color:var(--brand); }
 details.wl-item > summary .chev { color:var(--text-muted); display:inline-block; transition:transform 0.15s; }
@@ -753,25 +823,108 @@ else "" end) + "
       </tr>"
       else "" end) +
       (if .bestPractices.storageRepositoryMaintenance then
-      "
+      (.bestPractices.storageRepositoryMaintenance) as $srVal
+      | (bpSeverityOf("storageRepositoryMaintenance"; $srVal)) as $srSev
+      | "
       <tr>
         <td><strong>Storage Repository Maintenance</strong></td>
-        <td class=\"" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "sev-optional" else "sev-warning" end) + "\">" +
-          (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED" then "Optional" else "Warning" end) + "</td>
-        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
-                 then severityBadge("optional"; "NOT_USED")
-                 else severityBadge("warning"; .bestPractices.storageRepositoryMaintenance) end) + "</td>
-        <td>" + (if .bestPractices.storageRepositoryMaintenance == "NOT_CONFIGURED"
-                 then "<span class=\"badge info\">\u2014 not using exports</span>"
-                 else badge(.bestPractices.storageRepositoryMaintenance) end) +
-          (if ((.storageRepositories.amberCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
+        <td class=\"" + (if $srSev == "crit" then "sev-critical" elif $srSev == "warn" then "sev-warning" else "sev-optional" end) + "\">" +
+          (if $srSev == "crit" then "Critical" elif $srSev == "warn" then "Warning" else "Not applicable" end) + "</td>
+        <td>" + (if $srSev == "crit" then severityBadge("critical"; $srVal)
+                 elif $srSev == "warn" then severityBadge("warning"; $srVal)
+                 else severityBadge("optional"; "NOT_USED") end) + "</td>
+        <td>" + (if $srVal == "NOT_CONFIGURED" then
+                   # Absence stated plainly, not as a configuration gap the
+                   # reader should close. The export-policy count is context,
+                   # never a verdict: export can be enabled on a policy today
+                   # and disabled tomorrow, and a failed export may or may not
+                   # have created a repository depending on where it failed, so
+                   # policies and repositories cannot be reconciled reliably.
+                   "<span class=\"badge info\">No storage repositories \u2014 exports and imports not in use</span>"
+                   + (((.policies.withExport // 0)) as $wx
+                      | if $wx > 0 then " (" + ($wx | tostring) + " policy/policies define an export action)"
+                        else " (no policy defines an export action)" end)
+                 else badge($srVal) end) +
+          (if (staleCountOf(.storageRepositories) + (.storageRepositories.failingCount // 0) + (.storageRepositories.failingStaleCount // 0) + (.storageRepositories.overdueCount // 0) + (.storageRepositories.neverRanCount // 0) + (.storageRepositories.disabledCount // 0)) > 0 then
             " (" +
             ([
-              (if (.storageRepositories.amberCount // 0) > 0 then (.storageRepositories.amberCount | tostring) + " stale" else empty end),
+              (if (.storageRepositories.failingStaleCount // 0) > 0 then ((.storageRepositories.failingStaleCount) | tostring) + " failing and stale" else empty end),
+              (if (.storageRepositories.failingCount // 0) > 0 then ((.storageRepositories.failingCount) | tostring) + " failing" else empty end),
+              (if staleCountOf(.storageRepositories) > 0 then (staleCountOf(.storageRepositories) | tostring) + " stale" else empty end),
+              (if (.storageRepositories.overdueCount // 0) > 0 then ((.storageRepositories.overdueCount) | tostring) + " overdue" else empty end),
               (if (.storageRepositories.neverRanCount // 0) > 0 then (.storageRepositories.neverRanCount | tostring) + " never-ran" else empty end),
               (if (.storageRepositories.disabledCount // 0) > 0 then (.storageRepositories.disabledCount | tostring) + " disabled" else empty end)
             ] | join(", ")) + ")"
-          else "" end) + "</td>
+          else "" end)
+          # Why it is a warning and not a critical, stated on the row itself.
+          # A reader who sees "49 failing and stale" beside "Warning" will
+          # otherwise assume the severity is wrong.
+          # The reason is DERIVED, not assumed. Two independent things can
+          # downgrade this -- idleness and a deleted owner -- and the first
+          # wording claimed idleness always. On a cluster whose failing
+          # repositories were orphaned but written to yesterday, it read "no
+          # data written for 30+ days" about repositories written to 1 day
+          # ago. Inspect the failing set and say which it actually is.
+          # READ THE PUBLISHED COUNTS, do not re-derive them. This block used
+          # to select every FAILING_STALE / NEVER_RAN item and describe that
+          # set, while KDL.sh decided the downgrade over a narrower one -- so
+          # the sentence covered repositories the verdict had never considered.
+          # The fallbacks to the items array keep reports that predate the
+          # published counts rendering.
+          + (((.storageRepositories.quietFailingCount
+               // ([.storageRepositories.items[]? | select(.status == "FAILING_STALE" or .status == "NEVER_RAN")] | length))) as $nBad
+             | ((.storageRepositories.quietFailingIdleCount
+                 // ([.storageRepositories.items[]? | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .inactive == true)] | length))) as $bIdle
+             | ((.storageRepositories.quietFailingOrphanCount
+                 // ([.storageRepositories.items[]? | select((.status == "FAILING_STALE" or .status == "NEVER_RAN") and .orphaned == true)] | length))) as $bOrph
+             | ((.storageRepositories.inactiveThresholdDays // 30) | tostring) as $ithr
+             | ($nBad | tostring) as $nBad
+             | if $srVal == "FAILING_INACTIVE" then
+                 # NAME THE SUBSET. $nBad is the quietened set -- exactly the
+                 # repositories the downgrade was computed over -- while the
+                 # counts in brackets just before this also list failing,
+                 # stale, overdue and disabled ones. "none of them" read as a
+                 # claim about all of those, and a repository written to
+                 # yesterday could sit among them inside a sentence saying
+                 # nothing had been written for a month.
+                 " \u2014 of the " + $nBad + " failing without a recent success, "
+                 + (if $bOrph == 0 then
+                      "none has had data written for " + $ithr + "+ days"
+                    elif $bIdle == 0 then
+                      "the profile or policy that owns each has since been deleted"
+                    else
+                      "each is either idle for " + $ithr + "+ days or owned by a deleted profile or policy"
+                    end)
+                 + ", so nothing is accumulating. Cleanup, not an outage."
+               elif $srVal == "FAILING" then
+                 # The mirror of the above: without it a reader cannot tell
+                 # why this one is red where the other is amber.
+                 ((.storageRepositories.activeFailingCount // 0) as $af
+                  | if $af > 0 then
+                      " \u2014 " + ($af | tostring)
+                      + (if $af == 1 then " is" else " are" end)
+                      + " still being written to \u2014 check the reason shown under its status and resolve the failure."
+                    else "" end)
+               else "" end)
+          # A failure outranks a partial read in the rollup so that one
+          # unreadable repository cannot hide the broken ones. The cost is
+          # that this row then says FAILING and nothing else, and "I could
+          # not see all of them" disappears from the only line most readers
+          # scan. The terminal says it; so does this.
+          + (((.storageRepositories.listed // 0) - (.storageRepositories.total // 0)) as $unread
+             | ((.storageRepositories.ageUnknownCount // 0)) as $unassessed
+             | if ($srVal == "FAILING") or ($srVal == "FAILING_INACTIVE") or ($srVal == "PARTIAL") then
+                 (if $unread > 0 then
+                    " <span class=\"badge info\">" + ($unread | tostring) + " of "
+                    + ((.storageRepositories.listed) | tostring)
+                    + " listed returned no details \u2014 not assessed either way</span>"
+                  else "" end)
+                 + (if $unassessed > 0 then
+                    " <span class=\"badge info\">" + ($unassessed | tostring)
+                    + " recorded neither a success nor a failure \u2014 not assessed</span>"
+                  else "" end)
+               else "" end)
+             + "</td>
       </tr>"
       else "" end) +
       (if .bestPractices.residualSnapshots then
@@ -1234,43 +1387,297 @@ else "" end) + "
 
 <!-- Storage Repository Maintenance -->
 <h2>\uD83D\uDCBE Repository Maintenance</h2>
-     <p class=\"section-description\">Storage repositories require periodic full maintenance to optimize performance and detect corruption. Full maintenance runs include data verification, catalog cleanup, and garbage collection. Repositories should be maintained at least once every 7 days. <strong>Stale</strong> repositories (not maintained >7 days) and <strong>Disabled</strong> repositories require attention to maintain backup integrity and reliability.</p>"
+     <p class=\"section-description\">Full maintenance reclaims the space held by deleted snapshots and compacts the indexes. <strong>Nothing here means a backup has been lost</strong> &mdash; what suffers is storage cost and the speed of exports, imports and restores.</p>
+     <p class=\"section-description\">Missed runs compound: a bigger backlog makes a longer run, and a run outliving the process timeout (10h unless the repository overrides it) is killed partway, leaving more behind again. Status comes from evidence a run <strong>succeeded</strong>, not from the newest timestamp &mdash; a failed run leaves one of those too.</p>
+     <ul class=\"section-description\" style=\"margin-top:-0.6rem;padding-left:1.4rem;\">
+       <li><strong>OK</strong> &mdash; succeeded within " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days.</li>
+       <li><strong>Run failed &mdash; last success Nd ago</strong> <code>FAILING</code> &mdash; newest attempt failed, backlog still small. Read the reason under the status.</li>
+       <li><strong>Run failed &mdash; no success for Nd</strong> <code>FAILING_STALE</code> &mdash; urgent. Usually the maintenance pod cannot start or finish, or the repository is unreachable.</li>
+       <li><strong>Past due (N cycles)</strong> <code>OVERDUE</code> &mdash; a cycle passed with no attempt recorded, so there is no failure to find. Check K10 is scheduling, and whether the repository is still used.</li>
+       <li><strong>Stale (Nd)</strong> <code>STALE</code> &mdash; last success older than " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days, nothing failed. Start with whether its exports still run.</li>
+       <li><strong>Never Ran</strong> <code>NEVER_RAN</code> &mdash; readable history with no run in it. Normal under a day old.</li>
+       <li><strong>Disabled</strong> <code>DISABLED</code> &mdash; off in the Kasten spec or in Kopia. Space is never reclaimed while off.</li>
+       <li><strong>Read-only</strong> <code>READ_ONLY</code> &mdash; Kasten excludes read-only repositories from background processing, so maintenance never runs and no history is correct. These are imports: this cluster reads another cluster&rsquo;s exports from them, and the source cluster owns the maintenance. Nothing to do.</li>
+       <li><strong>Not assessed</strong> <code>UNKNOWN</code> &mdash; neither source could answer. <strong>Not the same as healthy</strong>; usually the <code>storagerepositories/details</code> RBAC rule.</li>
+     </ul>
+     <p class=\"section-description\"><strong>Profile mismatch</strong> means the repository refers to a profile that no longer points where the repository actually sits &mdash; typically a profile repointed at a new bucket or share, leaving the older repositories behind. It will not be processed: a repository is reached only through the profile it refers to, so another profile pointing at the same target does not help. Maintenance on it can never succeed again, and it needs manual cleanup. Whether the old bucket or share still exists is <strong>not</strong> something this tool checks, so confirm nothing in it is still needed before deleting, or open a support case &mdash; these hold backup data.</p>
+     <p class=\"section-description\"><strong>Stale is not the same as idle.</strong> <em>Stale</em> means maintenance has not <strong>succeeded</strong> within " + ((.storageRepositories.maintenanceThresholdDays // 7) | tostring) + " days. <em>Idle</em> (the Last Data Write column) means no <strong>data</strong> has been written within " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + " days &mdash; maintenance does not touch that timestamp. A repository can be either, both or neither, and a stale repository that is <strong>still being written to</strong> is the one worth acting on.</p>
+     <p class=\"section-description\"><strong>How loud is it?</strong> Failures earn a critical only on repositories still being written to. Where every failing repository has had no data written for " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days, or its profile or policy has since been deleted, the finding stays but drops to a warning &mdash; nothing accumulates in a repository nobody writes to, so that is cleanup, typically after a profile migration. A repository whose last write cannot be dated counts as active, so an unknown never quietens a finding.</p>
+     <p class=\"section-description\">Durations exclude time spent queued.</p>"
 + (if .storageRepositories then
-    (if (.storageRepositories.total // 0) == 0 then
+    # "None readable" is not "none exist". Branching on total alone rendered
+    # "not using exports or imports" on a cluster whose /details subresource
+    # was denied -- the exact false, confident sentence the #46 review caught
+    # on a cluster that had two repositories, and it contradicted the
+    # best-practice row one screen above, which says NOT ASSESSED. The
+    # `listed` count has existed since v2.4; nothing was reading it here.
+    (if ((.storageRepositories.total // 0) == 0) and ((.storageRepositories.listed // 0) > 0) then
+      "<div class=\"info-box\"><strong>Not assessed.</strong> The cluster listed "
+      + ((.storageRepositories.listed) | tostring)
+      + " storage repository/repositories, but none of them returned its <code>/details</code> subresource, so nothing about their maintenance could be read &mdash; this is <strong>not</strong> a clean result and <strong>not</strong> an absence of repositories. Check the RBAC rule for <code>repositories.kio.kasten.io storagerepositories/details</code>, or whether this Kasten is older than the subresource.</div>"
+    elif (.storageRepositories.total // 0) == 0 then
       "<div class=\"info-box\">No Storage Repositories found (not using exports or imports)</div>"
     else
-      "<div class=\"card\">
-        <div class=\"stat-row\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">" + ((.storageRepositories.total // 0) | tostring) + "</span></div>"
-        + (if (.storageRepositories.amberCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Stale (> 7 days)</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.amberCount // 0) | tostring) + "</span></span></div>"
+      "<div class=\"grid-2\">
+       <div class=\"card\">
+        <div class=\"stat-group\" style=\"margin-top:0;\">Maintenance status</div>
+        <div class=\"stat-row stat-total\"><span class=\"stat-label\">Total Repositories</span><span class=\"stat-value\">"
+        + ((.storageRepositories.total // 0) | tostring)
+        + (if ((.storageRepositories.listed // 0) > (.storageRepositories.total // 0))
+           then " <span class=\"badge info\">of " + ((.storageRepositories.listed) | tostring) + " listed \u2014 " + (((.storageRepositories.listed) - (.storageRepositories.total)) | tostring) + " unreadable</span>"
+           else "" end)
+        + "</span></div>"
+        + "<div class=\"stat-group\">Every repository counted once \u2014 adds up to the total</div>"
+        + (if (.storageRepositories.failingStaleCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Run failed, no recent success</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.failingStaleCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.failingCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Run failed, success still recent</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.failingCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if staleCountOf(.storageRepositories) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Stale (> 7 days)</span><span class=\"stat-value\"><span class=\"badge warn\">" + (staleCountOf(.storageRepositories) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories.overdueCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Past due, nothing running</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.overdueCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories.neverRanCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Never Ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount // 0) | tostring) + "</span></span></div>"
+            "<div class=\"stat-row\"><span class=\"stat-label\">Never ran</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.neverRanCount) | tostring) + "</span></span></div>"
           else "" end)
         + (if (.storageRepositories.disabledCount // 0) > 0 then
-            "<div class=\"stat-row\"><span class=\"stat-label\">Disabled</span><span class=\"stat-value\"><span class=\"badge error\">" + ((.storageRepositories.disabledCount // 0) | tostring) + "</span></span></div>"
+            "<div class=\"stat-row\"><span class=\"stat-label\">Disabled</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.disabledCount) | tostring) + "</span></span></div>"
           else "" end)
+        + (if (.storageRepositories.ageUnknownCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Not assessed</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.ageUnknownCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("okCount")) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">OK</span><span class=\"stat-value\"><span class=\"badge ok\">" + ((.storageRepositories.okCount) | tostring) + "</span></span></div>"
+          else "" end)
+        # The v2.4 "Never Ran" and "Disabled" rows used to sit here. They now
+        # have rows of their own above, reading the same two counts, and
+        # leaving both pairs in printed each of them TWICE - 16 badges against
+        # a total of 13, directly under a caption that promises "every
+        # repository counted once, adds up to the total". The summary card not
+        # reconciling is one of the defects this work set out to fix, so
+        # re-introducing it here was the worst possible place for it.
+        + (if (.storageRepositories.readOnlyCount // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Read-only — maintained by the source cluster</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.readOnlyCount // 0) | tostring) + "</span></span></div>"
+          else "" end)
+        # The status card ends here. The cross-cutting counts get their OWN
+        # card, because in one list they read as part of the breakdown and a
+        # reader tries to add 161 into a total of 162. They are facts about
+        # some of the repositories already counted opposite, not more of them.
+        #
+        # The whole second card is conditional: an empty card titled
+        # "Repository context" is worse than no card. has() rather than a
+        # count, so a report predating these fields says nothing rather than
+        # claiming zero.
+        + "</div>"
+        + (if (((.storageRepositories.inactiveCount // 0) + (.storageRepositories.unusedCount // 0)
+                + (.storageRepositories.orphanedCount // 0)) > 0)
+           then "<div class=\"card\"><div class=\"stat-group\" style=\"margin-top:0;\">Repository context</div>"
+           else "" end)
+        + (if (.storageRepositories | has("inactiveCount")) and ((.storageRepositories.inactiveCount // 0) > 0) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">No data written in " + ((.storageRepositories.inactiveThresholdDays // 30) | tostring) + "+ days</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.inactiveCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("unusedCount")) and ((.storageRepositories.unusedCount // 0) > 0) then
+            # State, NOT advice. "Safe to delete" was the first wording and it
+            # was wrong: on a live cluster all four such repositories were
+            # import paths whose profile AND policy still existed, so they are
+            # configured imports that never received anything, not leftovers.
+            # Whether a repository can be removed depends on who still points
+            # at it, which the Profile and Policy columns show per row.
+            # Say WHY, when the data says why. An import that has received
+            # nothing is mundane; an empty export repository is not, so the
+            # qualifier is derived rather than assumed.
+            "<div class=\"stat-row\"><span class=\"stat-label\">Never held any data since creation"
+            + ((.storageRepositories.unusedReadOnlyCount // 0) as $uro
+               | if $uro <= 0 then ""
+                 elif $uro == (.storageRepositories.unusedCount // 0) then " \u2014 all read-only imports, nothing received yet"
+                 else " (" + ($uro | tostring) + " read-only imports)" end)
+            + "</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.unusedCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("profileMismatchCount")) and ((.storageRepositories.profileMismatchCount // 0) > 0) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Profile no longer points here \u2014 needs manual cleanup</span><span class=\"stat-value\"><span class=\"badge warn\">" + ((.storageRepositories.profileMismatchCount) | tostring) + "</span></span></div>"
+          else "" end)
+        + (if (.storageRepositories | has("orphanedCount")) and ((.storageRepositories.orphanedCount // 0) > 0) then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Profile or policy since deleted</span><span class=\"stat-value\"><span class=\"badge info\">" + ((.storageRepositories.orphanedCount) | tostring) + "</span></span></div>"
+          else "" end)
+        # Says outright what the two cards are to each other, for a reader
+        # who sees 161 beside a total of 162 and starts adding. Names the
+        # other card rather than pointing at it: grid-2 collapses to one
+        # column on narrow screens, where "opposite" would be wrong.
+        + (if (((.storageRepositories.inactiveCount // 0) + (.storageRepositories.unusedCount // 0)
+                + (.storageRepositories.orphanedCount // 0)) > 0)
+           then "<p class=\"section-description\" style=\"margin:0.8rem 0 0;font-size:0.78rem;\">Already counted under Maintenance status \u2014 not extra repositories.</p></div>"
+           else "" end)
+
       + "</div>
       <table>
-        <thead><tr><th>Repository Name</th><th>Type</th><th>Profile</th><th>Status</th><th>Last Full Maintenance</th><th>Duration</th></tr></thead>
+        <thead><tr><th>Repository Name</th><th>Application</th><th>Type</th><th>Profile</th><th>Policy</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Last Data Write</th><th>Duration</th></tr></thead>
         <tbody>" +
       ([.storageRepositories.items[]? |
         "<tr><td><code>" + (.name | @html) + "</code></td>" +
+        # The repository name is a generated suffix and identifies nothing a
+        # reader can act on. The application and the policy do: "this failing
+        # repository belongs to mysql-backup-jai" is the sentence that leads
+        # somewhere. Both come from labels, both may legitimately be absent
+        # (an on-demand export has no policy), so em-dash rather than a guess.
+        "<td>" + (if .appName then (.appName | @html) else "\u2014" end) + "</td>" +
         "<td>" + (.contentType | @html) + "</td>" +
-        "<td>" + (if .profile != "N/A" then (.profile | @html) else "\u2014" end) + "</td>" +
+        # Profile, with the DIRECTION when it is an import: an import
+        # repository is this cluster reading the exports of another, so it is
+        # never maintained here and an empty history is correct, not a gap.
+        # Marked "deleted" when the name no longer resolves -- that is why
+        # maintenance fails with "failed to fetch K10 profile and the
+        # location", and it is the difference between fix it and delete it.
+        "<td>" + (if (.exportProfile // .importProfile) then
+                    ((.exportProfile // .importProfile) | @html)
+                    + (if .repositoryRole == "import" then " <span class=\"badge info\">import</span>" else "" end)
+                    + (if .profileMissing == true then " <span class=\"badge warn\">deleted</span>" else "" end)
+                    # The profile exists but no longer points where this
+                    # repository lives, so the name alone looks healthy.
+                    + (if .profileMismatch == true then " <span class=\"badge warn\">profile mismatch</span>" else "" end)
+                  elif .profile != "N/A" then (.profile | @html)
+                  else "\u2014" end) + "</td>" +
+        "<td>" + (if .policyName then
+                    (.policyName | @html)
+                    + (if .policyMissing == true then " <span class=\"badge warn\">deleted</span>" else "" end)
+                  else "\u2014" end) + "</td>" +
+        # @html mandatory: cluster-supplied.
+        # "Bucket/Share", because a FileStore repository names a PVC backing an
+        # NFS or SMB share, not a bucket, and the header has to be true for
+        # every row. An object store needs no qualifier -- it is the common
+        # case and the header already says bucket -- so the bracket is added
+        # only when the target is something else.
+        #
+        # The bracket names the LOCATION TYPE and the kind of name, not the
+        # protocol: claimName says nothing about NFS vs SMB (that is the
+        # PV/StorageClass), and the distinction does not change what a reader
+        # does about it.
+        #
+        # Three-state on locationType: an unreadable one stays silent rather
+        # than defaulting to ObjectStore.
+        "<td>" + (if .target then
+                    (.target | @html)
+                    + (if .locationType == null or .locationType == "ObjectStore" then ""
+                       elif .locationType == "FileStore" then " (FileStore PVC Claim Name)"
+                       else " (" + (.locationType | @html) + ")"
+                       end)
+                  else "\u2014" end) + "</td>" +
         "<td>" + (
+          # Ages carry two decimals from v2.5.1 so the 7-day threshold compares
+          # exactly; one decimal is enough to read. Older reports hold whole
+          # numbers and round to themselves, so this renders both.
+          (if .daysSinceLastMaintenance == null then "unknown"
+           else (((.daysSinceLastMaintenance * 10) | round) / 10 | tostring) end) as $ageShown |
+          # successAgeDays IS the number the staleness verdict was computed
+          # from, published by KDL.sh for exactly that reason; the fallback
+          # keeps reports that predate it rendering.
+          ((if (. | has("successAgeDays")) then .successAgeDays
+            else .daysSinceLastSuccess end)) as $succAge |
+          (if $succAge == null then "never"
+           else ((($succAge * 10) | round) / 10 | tostring) + "d" end) as $succShown |
           if .status == "DISABLED" then
             "<span class=\"badge error\">Disabled</span>"
           elif .status == "NEVER_RAN" then
             "<span class=\"badge error\">Never Ran</span>"
+          # "Run failed" is only true when something reported a failure. A run
+          # that merely came up short of the expected task set sets
+          # lastRunSucceeded false with lastRunFailedTasks EMPTY and no error
+          # anywhere -- the row then said "Run failed" while the same object
+          # said nothing had failed, which is #47's own caveat: Kopia does not
+          # run every full sub-task every cycle. Say what the data says.
+          elif .status == "FAILING_STALE" then
+            (if ((.lastRunFailedTasks // []) | length) == 0
+                and ((.procedureError // .lastRunError) == null)
+                and (.lastRunComplete == false) then
+               "<span class=\"badge error\">Run incomplete \u2014 no success for " + $succShown + "</span>"
+             else
+               "<span class=\"badge error\">Run failed \u2014 no success for " + $succShown + "</span>"
+             end)
+          elif .status == "FAILING" then
+            (if ((.lastRunFailedTasks // []) | length) == 0
+                and ((.procedureError // .lastRunError) == null)
+                and (.lastRunComplete == false) then
+               "<span class=\"badge warn\">Run incomplete ("
+               + ((.lastRunTaskCount // 0) | tostring) + " of "
+               + ((.expectedTaskCount // 0) | tostring)
+               + " expected tasks) \u2014 last success " + $succShown + " ago</span>"
+             else
+               "<span class=\"badge warn\">Run failed \u2014 last success " + $succShown + " ago</span>"
+             end)
+          elif .status == "OVERDUE" then
+            "<span class=\"badge warn\">Past due ("
+            + ((((.overdueIntervals // 0) * 10 | round) / 10) | tostring)
+            + " cycle" + (if (((.overdueIntervals // 0) * 10 | round) / 10) == 1 then "" else "s" end) + ")</span>"
+          elif .status == "STALE" then
+            # The success age, not the maintenance age. STALE is DEFINED by the
+            # first and the legend above says so, but this rendered the second
+            # -- and where the newest recorded run is not the newest successful
+            # one the two are different numbers. AMBER, from a pre-2.6 report,
+            # has no success age at all, so it keeps the only one it has.
+            "<span class=\"badge warn\">Stale (last success "
+            + (if $succAge == null then $ageShown + "d" else $succShown end)
+            + " ago)</span>"
           elif .status == "AMBER" then
-            "<span class=\"badge warn\">Stale (" + (.daysSinceLastMaintenance | tostring) + "d)</span>"
+            "<span class=\"badge warn\">Stale (" + $ageShown + "d)</span>"
+          elif .status == "READ_ONLY" then
+            "<span class=\"badge info\">Read-only \u2014 source cluster maintains</span>"
+          elif .status == "UNKNOWN" then
+            "<span class=\"badge info\">Not assessed</span>"
+          elif .status == "OK" then
+            # Never "OK (unknownd)": the age is appended to a string that is
+            # the word "unknown" when it could not be computed. The gate
+            # asserts OK is unreachable without an age, so this is a belt on
+            # top of braces -- but a nonsense label in the one column a
+            # reader scans is worth the two lines.
+            (if $ageShown == "unknown" then "<span class=\"badge ok\">OK</span>"
+             else "<span class=\"badge ok\">OK (" + $ageShown + "d)</span>" end)
           else
-            "<span class=\"badge ok\">OK (" + (.daysSinceLastMaintenance | tostring) + "d)</span>"
+            # NOT a fallback to OK. This chain used to end in the OK badge, so
+            # READ_ONLY -- a status added to KDL.sh but not here -- rendered
+            # every import repository as "OK (unknownd)": a state the renderer
+            # had never heard of, shown as healthy. Any status this renderer
+            # does not know now shows itself instead, which is ugly on purpose
+            # and impossible to mistake for a pass.
+            "<span class=\"badge info\">" + (.status | tostring | @html) + "</span>"
           end
+          # The reason, where there is one. For a launch failure this string is
+          # the most actionable line in the whole report, and until now it
+          # existed only in the JSON. procedureError first: it describes the
+          # run K10 itself judged, where lastRunError is one task inside a run.
+          # @html because it is cluster-supplied text.
+          + ((.procedureError // .lastRunError) as $err
+             | if ($err != null) and (.status | IN("FAILING","FAILING_STALE","NEVER_RAN")) then
+                 "<div class=\"muted\" style=\"font-size:11px;margin-top:4px\">" + ($err | @html) + "</div>"
+               else "" end)
         ) + "</td>" +
         "<td>" + (if .lastFullMaintenanceTime then (.lastFullMaintenanceTime | tostring | split("T")[0] + " " + split("T")[1] | split("Z")[0]) else "\u2014" end) + "</td>" +
-        "<td>" + (if .lastFullMaintenanceDurationHuman then .lastFullMaintenanceDurationHuman else "\u2014" end) + "</td></tr>"
+        # Beside the maintenance date on purpose: the two ages are what tell
+        # STALE apart from INACTIVE, and they measure different things.
+        # STALE  = maintenance has not SUCCEEDED in maintenanceThresholdDays.
+        # IDLE   = no DATA has been written in inactiveThresholdDays, from
+        #          modifiedTime, which maintenance does not bump.
+        # A repository can be any combination of the two, and "stale but
+        # still being written to" is the one that earns a critical.
+        "<td>" + (if .daysSinceLastWrite == null then "\u2014"
+                  else (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + "d"
+                       + (if .inactive == true then " <span class=\"badge info\">idle</span>" else "" end)
+                  end) + "</td>" +
+        # The inner MaintenanceRun command window. The v2.4 field it falls back
+        # to is completedTime - scheduledTime, which absorbs queue time and
+        # goes negative on a hand-triggered run; kept only for reports that
+        # predate the command window being collected.
+        # The command window first, the task span second. Both are the
+        # execution window with queue time excluded; the command window is the
+        # more precise of the two but comes from a procedure record that a busy
+        # repository evicts within hours, and publishing only that left this
+        # column empty on most rows of a large estate. The task span is what
+        # #48 asked for and exists wherever task history does.
+        "<td>" + (((if has("lastRunDurationHuman") then
+                      (if .lastRunDurationHuman != null then .lastRunDurationHuman
+                       else .lastRunSpanHuman end)
+                    else .lastFullMaintenanceDurationHuman end) // "\u2014")) + "</td></tr>"
       ] | join("")) +
       "</tbody>
       </table>"
@@ -2320,7 +2727,14 @@ else "" end) + "
   var densBtn = document.getElementById(`densityToggle`);
   if(densBtn){ densBtn.addEventListener(`click`, function(){ press(densBtn, body.classList.toggle(`dense`)); }); }
   var issuesBtn = document.getElementById(`issuesToggle`);
-  if(issuesBtn){ issuesBtn.addEventListener(`click`, function(){ press(issuesBtn, body.classList.toggle(`only-issues`)); }); }
+  // Tables register a repaginate callback here. Issues-only hides rows in
+  // CSS, which changes how many rows a page actually shows, so every pager
+  // has to recount when it is toggled.
+  var repagers = [];
+  if(issuesBtn){ issuesBtn.addEventListener(`click`, function(){
+    press(issuesBtn, body.classList.toggle(`only-issues`));
+    repagers.forEach(function(f){ f(true); });
+  }); }
 
   // ---------- 4. mark rows that carry an issue ----------
   Array.prototype.slice.call(content.querySelectorAll(`table tbody tr`)).forEach(function(tr){
@@ -2330,6 +2744,9 @@ else "" end) + "
   // ---------- 5. sortable + filterable tables ----------
   Array.prototype.slice.call(content.querySelectorAll(`table`)).forEach(function(table){
     var tbody = table.querySelector(`tbody`); if(!tbody){ return; }
+    // Assigned below only for tables that get a pager; the sort handler calls
+    // it unconditionally, so it must always be callable.
+    var repage = function(){};
     var ths = Array.prototype.slice.call(table.querySelectorAll(`thead th`));
     ths.forEach(function(th, idx){
       th.setAttribute(`data-sortable`, `1`);
@@ -2347,20 +2764,80 @@ else "" end) + "
           return r * (dir === `asc` ? 1 : -1);
         });
         rows.forEach(function(r){ tbody.appendChild(r); });
+        repage(true);
       });
     });
-    if(tbody.querySelectorAll(`tr`).length >= 8){
+    var total = tbody.querySelectorAll(`tr`).length;
+    if(total >= 8){
       var tools = el(`div`, `tbl-tools`);
-      var inp = el(`input`, `tbl-filter`); inp.type = `text`; inp.placeholder = `Filter ` + tbody.querySelectorAll(`tr`).length + ` rows...`;
+      var inp = el(`input`, `tbl-filter`); inp.type = `text`; inp.placeholder = `Filter ` + total + ` rows...`;
       var hint = el(`span`, `tbl-hint`); hint.textContent = `click a header to sort`;
       tools.appendChild(inp); tools.appendChild(hint);
       table.parentNode.insertBefore(tools, table);
       inp.addEventListener(`input`, function(){
         var q = inp.value.toLowerCase();
         Array.prototype.slice.call(tbody.querySelectorAll(`tr`)).forEach(function(tr){
-          tr.style.display = tr.textContent.toLowerCase().indexOf(q) > -1 ? `` : `none`;
+          tr.classList.toggle(`tbl-hide-f`, tr.textContent.toLowerCase().indexOf(q) === -1);
         });
+        repage(true);
       });
+
+      // ---------- pagination ----------
+      // Only for tables long enough to be a nuisance. A repository list grows
+      // with the estate -- 162 rows on one real cluster -- and scrolling past
+      // it to reach the next section is the actual complaint.
+      //
+      // The filter deliberately searches the WHOLE table, not the current
+      // page, so pagination never hides a row from the box above it.
+      if(total > 50){
+        var size = 50, page = 1;
+        var pager = el(`div`, `tbl-pager`);
+        var prev = el(`button`, `tbl-page-btn`); prev.type = `button`; prev.textContent = `\u2039 Prev`;
+        var info = el(`span`, `tbl-page-info`);
+        var next = el(`button`, `tbl-page-btn`); next.type = `button`; next.textContent = `Next \u203a`;
+        var sizeSel = el(`select`, `tbl-page-size`);
+        [[25,`25`],[50,`50`],[100,`100`],[0,`All`]].forEach(function(o){
+          var op = document.createElement(`option`); op.value = o[0]; op.textContent = o[1];
+          if(o[0] === size){ op.selected = true; }
+          sizeSel.appendChild(op);
+        });
+        pager.appendChild(sizeSel); pager.appendChild(prev);
+        pager.appendChild(info); pager.appendChild(next);
+        tools.appendChild(pager);
+
+        // Eligible = everything the OTHER two mechanisms are already showing.
+        // Paginating the raw row list would leave short pages once a filter
+        // or issues-only is on.
+        var eligible = function(){
+          var oi = body.classList.contains(`only-issues`);
+          return Array.prototype.slice.call(tbody.querySelectorAll(`tr`)).filter(function(tr){
+            if(tr.classList.contains(`tbl-hide-f`)){ return false; }
+            if(oi && !tr.classList.contains(`has-issue`)){ return false; }
+            return true;
+          });
+        };
+        repage = function(reset){
+          var rows = eligible(), all = Array.prototype.slice.call(tbody.querySelectorAll(`tr`));
+          if(reset){ page = 1; }
+          if(size === 0){
+            all.forEach(function(tr){ tr.classList.remove(`tbl-hide-p`); });
+            info.textContent = rows.length + ` rows`;
+            prev.disabled = true; next.disabled = true;
+            return;
+          }
+          var pages = Math.max(1, Math.ceil(rows.length / size));
+          if(page > pages){ page = pages; }
+          all.forEach(function(tr){ tr.classList.add(`tbl-hide-p`); });
+          rows.slice((page - 1) * size, page * size).forEach(function(tr){ tr.classList.remove(`tbl-hide-p`); });
+          info.textContent = `Page ` + page + ` of ` + pages + ` \u00b7 ` + rows.length + ` rows`;
+          prev.disabled = page <= 1; next.disabled = page >= pages;
+        };
+        prev.addEventListener(`click`, function(){ if(page > 1){ page--; repage(false); } });
+        next.addEventListener(`click`, function(){ page++; repage(false); });
+        sizeSel.addEventListener(`change`, function(){ size = parseInt(sizeSel.value, 10); repage(true); });
+        repagers.push(repage);
+        repage(true);
+      }
     }
   });
 
