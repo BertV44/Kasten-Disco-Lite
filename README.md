@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.5.0
+# Kasten Discovery Lite v2.6.0
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -56,13 +56,84 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp *(NEW v2.4)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp *(NEW v2.4, rebuilt v2.6)*
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New in v2.6
+
+- **Repository maintenance now reports whether the run succeeded.** v2.4 read
+  one field — the timestamp of the last maintenance run — and never whether
+  that run worked. A failed run leaves a timestamp behind too, so a repository
+  whose maintenance failed every night reported `OK` with a reassuring
+  "maintained 4 hours ago" beside it. On a 162-repository cluster, 49
+  repositories had failed every recorded attempt and the section read as fine.
+  Closes #47 and #48.
+
+- **Storage Repository Maintenance Status** — KDL queries the Kopia
+  StorageRepository objects in the K10 namespace and reports whether
+  maintenance **succeeded**, not merely when it last recorded a timestamp. A
+  failed run leaves a fresh timestamp behind too, so a repository failing
+  every night used to report as healthy.
+
+  Each repository lands on one status: `OK`, `STALE` (succeeded, but longer
+  ago than the 7-day threshold), `FAILING` (last attempt failed, a success is
+  still recent), `FAILING_STALE` (attempts failing and nothing has succeeded
+  inside the threshold), `OVERDUE` (a whole cycle passed with nothing
+  attempted and nothing running), `NEVER_RAN`, `DISABLED`, `READ_ONLY`
+  (Kasten excludes read-only repositories from background processing, so
+  these are maintained by the cluster that owns them), or `UNKNOWN`.
+
+  Evidence comes from the per-task history in `maintenanceInfo.runs` and from
+  `processResults`, which cover each other's gaps: a launch failure records no
+  tasks at all, and a busy repository evicts its maintenance records within
+  hours. Staleness is dated from whichever of the two can date the last
+  success. Durations are the execution window — the maintenance command
+  itself, or the task span where the command record has aged out — never
+  scheduling to completion, which absorbs queue time and overstated the
+  figure several-fold.
+
+  **Severity is earned.** The check goes critical only when a failing
+  repository is still being written to. Where every failing repository has
+  had no data written for 30+ days, or its profile or policy has since been
+  deleted *and* the write date does not contradict that, the finding stays
+  but drops to a warning — nothing accumulates in a repository nobody writes
+  to, which is the normal state after a profile migration. The write date
+  wins wherever it exists: a repository written to yesterday is never
+  quietened, whatever else is true of it, and one whose last write cannot be
+  dated counts as active. `NEVER_RAN` earns a critical only once the
+  repository is older than the staleness threshold; below that no run has
+  been due yet.
+
+  Each row names the application, policy and target (an object-store bucket
+  or a FileStore PVC claim) so a failure can be traced to its owner. Bucket
+  and claim **names** only: no endpoint, region or path is collected, because
+  a repository path is `k10/<cluster-uuid>/…`. Failure messages come from the
+  cluster and are published with `scheme://host`, UUIDs and IP addresses
+  masked, truncated at 300 characters. Repositories the cluster listed but
+  whose `/details` subresource could not be read are counted separately and
+  force `NOT_ASSESSED` rather than being reported as absent or clean — and
+  when a failure outranks that in the rollup, the unread count is still
+  printed beside it. The `/details` reads run concurrently (`KDL_PARALLEL`,
+  default 10). Reported in human output, JSON under `storageRepositories`,
+  and in the HTML dashboard.
+
+- **Faster.** The per-repository `/details` reads run concurrently
+  (`KDL_PARALLEL`, default 10): 4m31s to 1m55s on a 162-repository cluster.
+  Long HTML tables are paginated (over 50 rows, 25/50/100/All); filtering still
+  searches the whole table and printing is never paginated.
+
+- **Upgrading:** on a cluster that has a genuinely failing repository,
+  `kdl-diff.sh` reports `storageRepositoryMaintenance` moving away from `OK`
+  the first time it runs after this release, which changes its exit code. That
+  is a true finding becoming visible, not a new defect. One JSON key is
+  renamed: `storageRepositories.amberCount` becomes `staleCount`, alongside a
+  little over twenty new ones. `kdl-json-to-html.sh` reads whichever is
+  present, so older reports still render.
 
 ## What's New in v2.5
 
@@ -112,53 +183,9 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   so it is reported alongside the Monitoring best practice but does **not**
   change its verdict. Endpoint URLs are not collected.
 
-- **Storage Repository Maintenance Status** — KDL queries the Kopia
-  StorageRepository objects in the K10 namespace and reports whether
-  maintenance **succeeded**, not merely when it last recorded a timestamp. A
-  failed run leaves a fresh timestamp behind too, so a repository failing
-  every night used to report as healthy.
-
-  Each repository lands on one status: `OK`, `STALE` (succeeded, but longer
-  ago than the 7-day threshold), `FAILING` (last attempt failed, a success is
-  still recent), `FAILING_STALE` (attempts failing and nothing has succeeded
-  inside the threshold), `OVERDUE` (a whole cycle passed with nothing
-  attempted and nothing running), `NEVER_RAN`, `DISABLED`, `READ_ONLY`
-  (Kasten excludes read-only repositories from background processing, so
-  these are maintained by the cluster that owns them), or `UNKNOWN`.
-
-  Evidence comes from the per-task history in `maintenanceInfo.runs` and from
-  `processResults`, which cover each other's gaps: a launch failure records no
-  tasks at all, and a busy repository evicts its maintenance records within
-  hours. Staleness is dated from whichever of the two can date the last
-  success. Durations are the execution window — the maintenance command
-  itself, or the task span where the command record has aged out — never
-  scheduling to completion, which absorbs queue time and overstated the
-  figure several-fold.
-
-  **Severity is earned.** The check goes critical only when a failing
-  repository is still being written to. Where every failing repository has
-  had no data written for 30+ days, or its profile or policy has since been
-  deleted *and* the write date does not contradict that, the finding stays
-  but drops to a warning — nothing accumulates in a repository nobody writes
-  to, which is the normal state after a profile migration. The write date
-  wins wherever it exists: a repository written to yesterday is never
-  quietened, whatever else is true of it, and one whose last write cannot be
-  dated counts as active. `NEVER_RAN` earns a critical only once the
-  repository is older than the staleness threshold; below that no run has
-  been due yet.
-
-  Each row names the application, policy and target (an object-store bucket
-  or a FileStore PVC claim) so a failure can be traced to its owner. Bucket
-  and claim **names** only: no endpoint, region or path is collected, because
-  a repository path is `k10/<cluster-uuid>/…`. Failure messages come from the
-  cluster and are published with `scheme://host`, UUIDs and IP addresses
-  masked, truncated at 300 characters. Repositories the cluster listed but
-  whose `/details` subresource could not be read are counted separately and
-  force `NOT_ASSESSED` rather than being reported as absent or clean — and
-  when a failure outranks that in the rollup, the unread count is still
-  printed beside it. The `/details` reads run concurrently (`KDL_PARALLEL`,
-  default 10). Reported in human output, JSON under `storageRepositories`,
-  and in the HTML dashboard.
+- **Storage Repository Maintenance Status** — introduced here, reading the
+  Kopia StorageRepository objects in the K10 namespace. Rebuilt in v2.6, which
+  is where it is described.
 
 ## What's New in v2.3
 
@@ -878,7 +905,23 @@ Key portability measures:
 
 ## Version History
 
-- **v2.5.0** (Current) — **Residual snapshots**
+- **v2.6.0** (Current) — **Repository maintenance integrity**
+  - Maintenance status comes from evidence a run **succeeded**, not from the
+    newest recorded timestamp: `FAILING`, `FAILING_STALE`, `OVERDUE`,
+    `READ_ONLY` and `UNKNOWN` join `OK`, `STALE` (renamed from `AMBER`),
+    `NEVER_RAN` and `DISABLED`.
+  - The check can reach **critical**, but only for a repository that is still
+    being written to. Idleness and a deleted owner lower the volume, never the
+    counts, and the write date wins wherever it exists.
+  - Durations are the real execution window; the old figure measured from
+    scheduling and overstated by 4-5x. Application, policy, target and last
+    data write are reported per repository, FileStore included.
+  - The `/details` reads run concurrently and long tables paginate.
+  - Review corrections: the three outputs were printing different numbers under
+    the same words, and several computed unknowns reached the JSON but no
+    verdict. See the changelog.
+
+- **v2.5.0** — **Residual snapshots**
   - New `residualSnapshots` section and 19th best practice: local Kasten
     snapshots (`RestorePointContent`) past a 7-day threshold that no live policy
     retains, split into taken-on-demand, policy-deleted, application-gone and

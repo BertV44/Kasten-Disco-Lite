@@ -3,7 +3,7 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.6.0] - 2026-09-23
 
 ### Fixed
 - **A repository whose maintenance fails every night no longer reports `OK`.**
