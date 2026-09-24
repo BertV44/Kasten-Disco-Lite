@@ -6,6 +6,67 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
 ## [Unreleased]
 
 ### Fixed
+
+Defects in the v2.6.0 storage-repository maintenance check, found by
+review after the release was cut. Each was reproduced before being
+accepted, and the ones that are rendering defects are covered by a
+fixture that produces the state plus an assertion that catches it.
+
+- **A repository whose only successful maintenance was its first was reported
+  CRITICAL.** The first full maintenance legitimately runs one task fewer —
+  `full-drop-deleted-content` has nothing to drop yet — which is why that run
+  is held out of the >=90% calibration window. It was still judged against
+  the floor derived without it, so it scored incomplete, the one success the
+  repository had was discarded, `daysSinceLastSuccess` went null and the
+  ladder returned `FAILING_STALE` instead of `FAILING`: a critical produced
+  by arithmetic rather than by anything the repository did, with a failure
+  streak one too high. The oldest run is now exempt from the completeness
+  test for the same reason it is exempt from the floor. New fixture
+  `first-run-good`, verified to fail beforehand.
+- **`FAILING` and `FAILING_INACTIVE` had no branch in the HTML `badge()`
+  chain**, so the rollup rendered as a neutral blue "info" badge beside a red
+  **Critical** cell in the same row. The third time a new status has slipped
+  past a renderer chain on this branch; the gate now checks, statically, that
+  every value `BP_STORAGE_REPO_STATUS` can take has a branch of its own.
+- **`Run failed — no success for never`.** `never` stood for two different
+  things — a success that never happened, and one that cannot be dated — and
+  `FAILING_STALE` is reached by both. The terminal already said "an unknown
+  number of days"; the HTML now says the same. The two remaining
+  `unknown` + `"d"` concatenations, in the `STALE` and `AMBER` badges, are
+  guarded as the `OK` badge already was.
+- **`last success unknown days ago`** in the terminal `STALE` line, which
+  falls back to the maintenance age when the success age is absent and
+  printed the word itself when that was absent too. The same defect as the
+  badge above, in the third output path: the HTML branch was guarded in the
+  same pass and this one was not. Found by auditing every remaining use of
+  the age bindings after the HTML change made them nullable.
+- **`KDL_PARALLEL=08` ended the run** with `value too great for base`, naming
+  neither the variable nor the cause, on a knob whose documented promise is
+  that a typo in it costs nothing. A leading zero made it an octal literal;
+  `010` was worse, since it is valid octal and ran quietly at width 8. A
+  value too long to be an integer reached `[ -lt ]` and produced an error
+  about a comparison the reader never made. All three are normalised now.
+- **`OK - unknown days ago`** in the terminal, and **`Disabled` painted red**
+  in the HTML table while the card and the terminal both called it amber and
+  the rollup it drives is a warning.
+- **An import-only cluster read `maintenance is succeeding (0 of 4 repo(s)
+  maintained)`** — a success claim and a zero together, about a cluster where
+  no maintenance is meant to run at all. `READ_ONLY` is the one status that
+  does not block `OK`, so that combination is exactly an all-import cluster,
+  and it now says so.
+- **`NOT_ASSESSED` named only one of its two causes.** Repositories that
+  answered without a determinable outcome and repositories that never
+  answered are not exclusive, and a cluster with both was told about the
+  first only — in the terminal, and in the HTML, which said neither.
+- The count of failures that earn a critical includes repositories whose last
+  write **cannot be dated** — deliberately, so an unknown cannot quieten a
+  finding on its own — but four sentences printed that count under the flat
+  claim that they were "still being written to".
+- Two comments carried validation-cluster object names.
+
+## [2.6.0] - 2026-09-23
+
+### Fixed
 - **A repository whose maintenance fails every night no longer reports `OK`.**
   The check read only `kopiaMeta.maintenanceRun.recentResults[0].completedTime`
   and never whether the run succeeded — and a failed run leaves a fresh
@@ -439,62 +500,6 @@ commit — an assertion only ever seen to pass proves nothing.
   record that SUCCEEDED. They sit beside `procedureEndTime` and
   `daysSinceProcedure`, which track the newest record whether it succeeded or
   not, and the two pairs must stay in step.
-
-### Fixed in third review
-
-A third pass, again with each finding reproduced before being accepted.
-
-- **A repository whose only successful maintenance was its first was reported
-  CRITICAL.** The first full maintenance legitimately runs one task fewer —
-  `full-drop-deleted-content` has nothing to drop yet — which is why that run
-  is held out of the >=90% calibration window. It was still judged against
-  the floor derived without it, so it scored incomplete, the one success the
-  repository had was discarded, `daysSinceLastSuccess` went null and the
-  ladder returned `FAILING_STALE` instead of `FAILING`: a critical produced
-  by arithmetic rather than by anything the repository did, with a failure
-  streak one too high. The oldest run is now exempt from the completeness
-  test for the same reason it is exempt from the floor. New fixture
-  `first-run-good`, verified to fail beforehand.
-- **`FAILING` and `FAILING_INACTIVE` had no branch in the HTML `badge()`
-  chain**, so the rollup rendered as a neutral blue "info" badge beside a red
-  **Critical** cell in the same row. The third time a new status has slipped
-  past a renderer chain on this branch; the gate now checks, statically, that
-  every value `BP_STORAGE_REPO_STATUS` can take has a branch of its own.
-- **`Run failed — no success for never`.** `never` stood for two different
-  things — a success that never happened, and one that cannot be dated — and
-  `FAILING_STALE` is reached by both. The terminal already said "an unknown
-  number of days"; the HTML now says the same. The two remaining
-  `unknown` + `"d"` concatenations, in the `STALE` and `AMBER` badges, are
-  guarded as the `OK` badge already was.
-- **`last success unknown days ago`** in the terminal `STALE` line, which
-  falls back to the maintenance age when the success age is absent and
-  printed the word itself when that was absent too. The same defect as the
-  badge above, in the third output path: the HTML branch was guarded in the
-  same pass and this one was not. Found by auditing every remaining use of
-  the age bindings after the HTML change made them nullable.
-- **`KDL_PARALLEL=08` ended the run** with `value too great for base`, naming
-  neither the variable nor the cause, on a knob whose documented promise is
-  that a typo in it costs nothing. A leading zero made it an octal literal;
-  `010` was worse, since it is valid octal and ran quietly at width 8. A
-  value too long to be an integer reached `[ -lt ]` and produced an error
-  about a comparison the reader never made. All three are normalised now.
-- **`OK - unknown days ago`** in the terminal, and **`Disabled` painted red**
-  in the HTML table while the card and the terminal both called it amber and
-  the rollup it drives is a warning.
-- **An import-only cluster read `maintenance is succeeding (0 of 4 repo(s)
-  maintained)`** — a success claim and a zero together, about a cluster where
-  no maintenance is meant to run at all. `READ_ONLY` is the one status that
-  does not block `OK`, so that combination is exactly an all-import cluster,
-  and it now says so.
-- **`NOT_ASSESSED` named only one of its two causes.** Repositories that
-  answered without a determinable outcome and repositories that never
-  answered are not exclusive, and a cluster with both was told about the
-  first only — in the terminal, and in the HTML, which said neither.
-- The count of failures that earn a critical includes repositories whose last
-  write **cannot be dated** — deliberately, so an unknown cannot quieten a
-  finding on its own — but four sentences printed that count under the flat
-  claim that they were "still being written to".
-- Two comments carried validation-cluster object names.
 
 ### Deliberately not changed
 

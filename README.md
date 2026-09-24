@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.5.0
+# Kasten Discovery Lite v2.6.0
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -56,7 +56,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp *(NEW v2.4)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp *(NEW v2.4, rebuilt v2.6)*
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
@@ -64,53 +64,15 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 ---
 
-## What's New in v2.5
+## What's New in v2.6
 
-- **Residual Snapshots** — a new section and a 19th best practice
-  (`residualSnapshots`) covering local Kasten snapshots the cluster is still
-  holding past a 7-day threshold. Reads `RestorePointContent`, which carries the
-  actual artifacts, rather than `RestorePoint`, which is only the catalog entry
-  pointing at one. The resource is cluster-scoped and served by the aggregated
-  APIService, so `get crd` is never used as a presence probe and a denied list
-  reports `NOT_ASSESSED` instead of zero.
-
-  **Age past the threshold is not the finding.** A GFS policy legitimately
-  retains monthly and yearly points, and a *live* policy is not proof of
-  retention either: each snapshot is ranked among those of the same application
-  and policy, newest first, and counted as residual only when its rank is at or
-  past everything the declared retention could hold. The verdict keys on that
-  subset — taken on demand, policy since deleted, application gone, or ranked
-  past the retention window — while legitimately retained points are reported
-  as context. Unknown ages, an unreadable policy list and a policy declaring no
-  retention at all each block a clean pass rather than sitting beside one.
-
-  Local snapshots are told from exports by the **presence** of the
-  `k10.kasten.io/exportProfile` label, never its value. Sizes come from
-  `status.physicalSizeBytes`, where absent, non-numeric and negative all count
-  as unknown rather than as zero, and the total is never presented as
-  reclaimable space. Requires `list` on `restorepointcontents.apps.kio.kasten.io`
-  (added to `kdl-rbac.yaml`). The field model, export discriminator and
-  timestamp handling are taken from
-  [k10-snapshot-janitor](https://github.com/BertV44/k10-snapshot-janitor);
-  that tool retires these objects, KDL only counts them.
-
-- **Fixed: no report at all when exactly one cluster read was denied.** The RBAC
-  pre-flight warning ended with a false test as the last statement of a `while`
-  body closing a pipeline, which makes the pipeline fail and `set -eu` exit. The
-  bug was pre-existing and dormant — two or more denials happened to survive —
-  but the new `restorepointcontents` probe made one denial the normal state for
-  anyone who updates KDL without reapplying the ClusterRole.
-
-## What's New in v2.4
-
-- **Prometheus Remote Write Detection** — KDL now reports whether Prometheus is
-  configured to ship metrics off-cluster. Reported under
-  `monitoring.prometheusRemoteWrite` as `enabled` (`true` / `false` / `null`)
-  and `configSource` (the ConfigMap the answer came from). `null` means the
-  Prometheus config could not be read, which is deliberately distinct from
-  "configured without remote write". Remote write is an optional integration,
-  so it is reported alongside the Monitoring best practice but does **not**
-  change its verdict. Endpoint URLs are not collected.
+- **Repository maintenance now reports whether the run succeeded.** v2.4 read
+  one field — the timestamp of the last maintenance run — and never whether
+  that run worked. A failed run leaves a timestamp behind too, so a repository
+  whose maintenance failed every night reported `OK` with a reassuring
+  "maintained 4 hours ago" beside it. On a 162-repository cluster, 49
+  repositories had failed every recorded attempt and the section read as fine.
+  Closes #47 and #48.
 
 - **Storage Repository Maintenance Status** — KDL queries the Kopia
   StorageRepository objects in the K10 namespace and reports whether
@@ -167,6 +129,71 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   that verdict stands and the unread count is printed beside it. The
   `/details` reads run concurrently (`KDL_PARALLEL`, default 10). Reported in
   human output, JSON under `storageRepositories`, and in the HTML dashboard.
+
+- **Faster.** The per-repository `/details` reads run concurrently
+  (`KDL_PARALLEL`, default 10): 4m31s to 1m55s on a 162-repository cluster.
+  Long HTML tables are paginated (over 50 rows, 25/50/100/All); filtering still
+  searches the whole table and printing is never paginated.
+
+- **Upgrading:** on a cluster that has a genuinely failing repository,
+  `kdl-diff.sh` reports `storageRepositoryMaintenance` moving away from `OK`
+  the first time it runs after this release, which changes its exit code. That
+  is a true finding becoming visible, not a new defect. One JSON key is
+  renamed: `storageRepositories.amberCount` becomes `staleCount`, alongside a
+  little over twenty new ones. `kdl-json-to-html.sh` reads whichever is
+  present, so older reports still render.
+
+## What's New in v2.5
+
+- **Residual Snapshots** — a new section and a 19th best practice
+  (`residualSnapshots`) covering local Kasten snapshots the cluster is still
+  holding past a 7-day threshold. Reads `RestorePointContent`, which carries the
+  actual artifacts, rather than `RestorePoint`, which is only the catalog entry
+  pointing at one. The resource is cluster-scoped and served by the aggregated
+  APIService, so `get crd` is never used as a presence probe and a denied list
+  reports `NOT_ASSESSED` instead of zero.
+
+  **Age past the threshold is not the finding.** A GFS policy legitimately
+  retains monthly and yearly points, and a *live* policy is not proof of
+  retention either: each snapshot is ranked among those of the same application
+  and policy, newest first, and counted as residual only when its rank is at or
+  past everything the declared retention could hold. The verdict keys on that
+  subset — taken on demand, policy since deleted, application gone, or ranked
+  past the retention window — while legitimately retained points are reported
+  as context. Unknown ages, an unreadable policy list and a policy declaring no
+  retention at all each block a clean pass rather than sitting beside one.
+
+  Local snapshots are told from exports by the **presence** of the
+  `k10.kasten.io/exportProfile` label, never its value. Sizes come from
+  `status.physicalSizeBytes`, where absent, non-numeric and negative all count
+  as unknown rather than as zero, and the total is never presented as
+  reclaimable space. Requires `list` on `restorepointcontents.apps.kio.kasten.io`
+  (added to `kdl-rbac.yaml`). The field model, export discriminator and
+  timestamp handling are taken from
+  [k10-snapshot-janitor](https://github.com/BertV44/k10-snapshot-janitor);
+  that tool retires these objects, KDL only counts them.
+
+- **Fixed: no report at all when exactly one cluster read was denied.** The RBAC
+  pre-flight warning ended with a false test as the last statement of a `while`
+  body closing a pipeline, which makes the pipeline fail and `set -eu` exit. The
+  bug was pre-existing and dormant — two or more denials happened to survive —
+  but the new `restorepointcontents` probe made one denial the normal state for
+  anyone who updates KDL without reapplying the ClusterRole.
+
+## What's New in v2.4
+
+- **Prometheus Remote Write Detection** — KDL now reports whether Prometheus is
+  configured to ship metrics off-cluster. Reported under
+  `monitoring.prometheusRemoteWrite` as `enabled` (`true` / `false` / `null`)
+  and `configSource` (the ConfigMap the answer came from). `null` means the
+  Prometheus config could not be read, which is deliberately distinct from
+  "configured without remote write". Remote write is an optional integration,
+  so it is reported alongside the Monitoring best practice but does **not**
+  change its verdict. Endpoint URLs are not collected.
+
+- **Storage Repository Maintenance Status** — introduced here, reading the
+  Kopia StorageRepository objects in the K10 namespace. Rebuilt in v2.6, which
+  is where it is described.
 
 ## What's New in v2.3
 
@@ -886,7 +913,23 @@ Key portability measures:
 
 ## Version History
 
-- **v2.5.0** (Current) — **Residual snapshots**
+- **v2.6.0** (Current) — **Repository maintenance integrity**
+  - Maintenance status comes from evidence a run **succeeded**, not from the
+    newest recorded timestamp: `FAILING`, `FAILING_STALE`, `OVERDUE`,
+    `READ_ONLY` and `UNKNOWN` join `OK`, `STALE` (renamed from `AMBER`),
+    `NEVER_RAN` and `DISABLED`.
+  - The check can reach **critical**, but only for a repository that is still
+    being written to. Idleness and a deleted owner lower the volume, never the
+    counts, and the write date wins wherever it exists.
+  - Durations are the real execution window; the old figure measured from
+    scheduling and overstated by 4-5x. Application, policy, target and last
+    data write are reported per repository, FileStore included.
+  - The `/details` reads run concurrently and long tables paginate.
+  - Review corrections: the three outputs were printing different numbers under
+    the same words, and several computed unknowns reached the JSON but no
+    verdict. See the changelog.
+
+- **v2.5.0** — **Residual snapshots**
   - New `residualSnapshots` section and 19th best practice: local Kasten
     snapshots (`RestorePointContent`) past a 7-day threshold that no live policy
     retains, split into taken-on-demand, policy-deleted, application-gone and
