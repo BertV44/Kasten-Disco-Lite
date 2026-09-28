@@ -924,11 +924,19 @@ add_section_json "resourceLimits" "$RL_JSON"
 ### Best Practices
 ### -------------------------
 print_section "Best Practices"
-# vmSnapshotConsistency added in KDL v2.2.0, k10InfraVolumeAccessMode in v2.3.0,
-# storageRepositoryMaintenance after that;
-# both are absent on older baselines, which the "-n both values" guard below
-# already skips.
-BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging k10InfraVolumeAccessMode storageRepositoryMaintenance residualSnapshots"
+# This list must hold every key of `bestPractices`, and it is the ONLY thing
+# that decides which checks a diff can report on. Five were missing until
+# v2.7.0 -- clusterScopedResources, exportRetentionExplicit,
+# policiesWithoutExport, snapshotRetentionHigh and snapshotRetentionZero -- so a
+# regression in any of them was silently invisible to the tool whose whole job
+# is catching drift. Verified by flipping three checks in a real report: only
+# the one that was in the list got reported.
+# Keep it in step with `bpSevMap` in kdl-json-to-html.sh; checks added later
+# (vmSnapshotConsistency in v2.2.0, k10InfraVolumeAccessMode in v2.3.0,
+# storageRepositoryMaintenance after that, residualSnapshots in v2.5.0) are
+# absent from older baselines, which the "-n both values" guard below already
+# skips -- so adding a key here is always safe.
+BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging k10InfraVolumeAccessMode storageRepositoryMaintenance residualSnapshots clusterScopedResources exportRetentionExplicit policiesWithoutExport snapshotRetentionHigh snapshotRetentionZero"
 BP_CHANGES_JSON="["
 BP_FIRST=true
 BP_CHANGED=false
