@@ -20,3 +20,10 @@ CLAUDE.md
 # Claude Code working directory: agent worktrees live in .claude/worktrees/.
 # Committing them would import whole nested checkouts into the tree.
 .claude/
+
+# Section test harnesses: maintainer tooling, kept on the dev branches
+# (dev-2.7.0 and the per-version branches before it) and deliberately off the
+# published tree, like kdl-v9-validate.sh and RELEASING.md before them.
+kdl-dr-mode-test.sh
+kdl-runstats-test.sh
+kdl-policy-state-test.sh
