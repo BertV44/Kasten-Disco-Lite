@@ -7503,7 +7503,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                else $chk[0] end) + "."
         elif .maintenanceInfoCause == "scans-only" then
           (if $featPresent == false then
-             "Background maintenance is disabled by configuration: the backgroundMaintenanceRun key is absent from ConfigMap k10-features. Storage scans run; no repository is maintained and unreferenced data is never reclaimed. Re-enable with helm upgrade ... --set features.backgroundMaintenanceRun=true (any value enables it; only the absence of the key disables it)."
+             "Background maintenance is disabled by configuration: the backgroundMaintenanceRun key is absent from ConfigMap k10-features. Storage scans run; no repository is maintained and unreferenced data is never reclaimed. Re-enable it by setting the Helm value features.backgroundMaintenanceRun on the K10 release (any value enables it; only the absence of the key disables it)."
            elif $featPresent == true then
              "Storage scans run here but no maintenance attempt is on record. The backgroundMaintenanceRun key is present in k10-features, so the feature flag is not the cause; check the crypto-svc logs for the repositories service."
            else
@@ -8182,7 +8182,7 @@ case "$SR_DRBLOCK_AGE" in
   *)    _srv_age=", present for $SR_DRBLOCK_AGE days" ;;
 esac
 SR_BLOCK_SENTENCE="Kasten DR ownership block is in place: ConfigMap k10-dr-remove-to-get-ownership in $NAMESPACE$_srv_age. This cluster was restored from a Kasten DR backup and is deliberately not running repository maintenance or storage scans on any repository. Backups and exports continue, so the repositories grow unmaintained. Expected right after a DR restore or during a DR test. If the original Kasten instance, and any other instance restored from the same catalog, is permanently gone, hand ownership to this cluster by removing that ConfigMap; the Kasten dashboard exposes the same action. Maintenance resumes within an hour per repository, or immediately after a crypto-svc restart. Do not delete it while another instance may still maintain these repositories: two owners can corrupt backup data."
-SR_FEAT_SENTENCE="Background maintenance is disabled by configuration: the backgroundMaintenanceRun key is absent from ConfigMap k10-features. Storage scans run; no repository is maintained and unreferenced data is never reclaimed. Re-enable with helm upgrade ... --set features.backgroundMaintenanceRun=true (any value enables it; only the absence of the key disables it)."
+SR_FEAT_SENTENCE="Background maintenance is disabled by configuration: the backgroundMaintenanceRun key is absent from ConfigMap k10-features. Storage scans run; no repository is maintained and unreferenced data is never reclaimed. Re-enable it by setting the Helm value features.backgroundMaintenanceRun on the K10 release (any value enables it; only the absence of the key disables it)."
 SR_VERDICT_GLOSS=""
 SR_VERDICT_DETAIL=""
 SR_VERDICT_NOTES=""

@@ -190,12 +190,14 @@ unreclaimed space can still grow.
   without double-counting a repository already warn or error.
 
 ### Changed after review
-- **No remediation commands in the report.** The DR ownership block note
-  carried `kubectl delete configmap ...` in the terminal and the HTML. The
-  report names the ConfigMap and points at the dashboard action instead. A
-  wrong command in a support deliverable is worse than no command, and this
-  one is destructive: the same note warns that two owners can corrupt backup
-  data.
+- **No remediation commands in the report.** Two were introduced: the DR
+  ownership block note carried `kubectl delete configmap ...`, and the
+  background-maintenance note carried `helm upgrade ... --set ...`. Both in
+  the terminal and the HTML. The
+  report names the ConfigMap, points at the dashboard action, and names the
+  Helm value to set. A wrong command in a support deliverable is worse than
+  no command, and the first of these is destructive: the same note warns that
+  two owners can corrupt backup data.
 
 ### Fixed
 - **`kdl-diff.sh` compared only 14 of the 19 best-practice checks.** `BP_LIST`
