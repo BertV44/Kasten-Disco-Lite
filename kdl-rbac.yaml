@@ -219,7 +219,8 @@ rules:
   - apiGroups: [""]
     resources:
       - secrets        # k10-license + Helm release secret; drop if using --no-helm
-      - configmaps     # k10-config fallback
+      - configmaps     # k10-config fallback; k10-dr-remove-to-get-ownership and
+                       # k10-features (repository maintenance preconditions)
     verbs: ["get", "list"]
 ---
 # ---------------------------------------------------------------------------

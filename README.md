@@ -56,13 +56,102 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp *(NEW v2.4, rebuilt v2.6)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state unreleased)*
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New (unreleased)
+
+- **What the K10 scheduler is doing with each repository.** The repositories
+  service parks a healthy repository after five clean cycles since its last
+  write, and gives up on a failing one after a burst of retries. Neither left
+  a trace KDL could see, so a parked repository aged into `STALE` and a
+  given-up one read as though tonight's run would retry it. Each repository
+  now carries `k10SchedulerState` — `read-only`, `blocked`, `running`,
+  `scheduled`, `parked` or `dropped` — from the service's own timer, the pods
+  acting on the repository and the service's idle rule. A `dropped` repository
+  says K10 is not scheduling it and what will retry it, including when a
+  `crypto-svc` restart will not.
+
+- **The two settings above every repository are read.** The Kasten DR
+  ownership block, ConfigMap `k10-dr-remove-to-get-ownership`, is placed by
+  every DR restore; while it exists K10 processes no repository, and policies
+  keep running, so the repositories grow unmaintained. Every repository then
+  reads `blocked` (a parked one is not `IDLE`: parking describes a service
+  that is processing), every eligible failure is quiet (`dr-ownership-block`),
+  and the section verdict is `BLOCKED_DR_OWNERSHIP`, a warning, with the
+  remedy and its condition: delete the ConfigMap only when no other instance
+  restored from the same catalog may still maintain these repositories. The
+  `backgroundMaintenanceRun` key of ConfigMap `k10-features` enables
+  background maintenance by being present, whatever its value; when it is
+  absent, storage scans are all that runs, the verdict is
+  `DISABLED_BY_CONFIG`, and eligible failures are quiet
+  (`maintenance-feature-off`). A value that reads as off is called out,
+  because K10 does not read it. Both are published in
+  `k10MaintenancePreconditions`, and a read that fails is reported as not
+  checked, never as absent.
+
+- **`IDLE`** is the status of a repository K10 has parked. Not a fault. A
+  parked repository still holding stranded content — no snapshot left, most
+  of the store unreferenced, or content marked unused — is `IDLE` with a
+  warning, because nothing reclaims that space until the next write.
+
+- **Severity is earned by accumulation, not by writes.** An idle repository in
+  which a live policy still retires restore points keeps its critical: each
+  retirement leaves space that only maintenance reclaims. A quiet failure
+  drops to a warning only when the record proves nothing more accumulates —
+  every restore point has retired, the profile is gone or points elsewhere, or
+  no live policy retires restore points in it — and the row says which proof
+  applied. For `volumedata` the strongest proof is direct: no
+  RestorePointContents references the namespace any more, whatever an old
+  snapshot count says. A zero snapshot count proves every restore point
+  retired only when a storage scan took it after the last write, since an
+  earlier one can miss what an export added; then it settles even a
+  repository written to recently, because nothing is left to retire.
+
+- **A short run is not an abort.** Kopia exits non-zero on any task failure,
+  so a run it exited 0 on is a success, even with a conditional task skipped.
+  A quick cycle run by another client is reported as that, never as a short
+  full run.
+
+- **`DISABLED`** now reads only `spec.disableMaintenance`. K10 runs full
+  maintenance with `--full`, which bypasses Kopia's own switch, so a
+  repository with that switch off is still maintained.
+
+- **Orphaned** also covers a policy that no longer exports to the profile, and
+  a namespace deleted or recreated under the same name (compared by UID). Both
+  outputs list each reason separately rather than calling them all deleted.
+
+- **Fixes to the v2.6 maintenance check.** A known write date wins over the
+  owner: a repository written to recently is never quietened by a deleted
+  profile or policy, and one whose last write cannot be dated counts as active
+  on its own. A repository never written to at all is quiet, measured from
+  `modifiedTime` rather than `storageUsage`, which only a storage scan
+  populates. `NEVER_RAN` earns a critical only once the first run is overdue:
+  older than one full maintenance interval, or a full interval past its
+  scheduled time, and never while a maintenance pod is running for it; below
+  that it stays a warning. A repository whose every recorded run failed no
+  longer reports `OK`, and one that failed last night after succeeding the
+  night before is `FAILING`, not `FAILING_STALE`. The best-practices line,
+  each repository status label and the section summary read the same in the
+  terminal and the HTML: KDL.sh writes them once and both print them verbatim.
+  A failing repository is red only where it earns the critical, and the
+  sidebar counts repositories, not badges.
+
+- **Corrections to the v2.6 notes below.** A failed run leaves no timestamp
+  behind: Kasten records a maintenance result only after an exit-0 run, so
+  the *previous* success's timestamp stays and reads as fresh for up to a
+  week while every run fails. Failure messages mask IPv4 addresses, not all
+  IP addresses. And an unread repository forces `NOT_ASSESSED` only when no
+  repository that *was* read outranks it — a failure, but also a merely
+  stale, overdue, never-run or disabled one; that verdict then stands, with
+  the unread count printed beside it. A repository written to yesterday can
+  be quietened after all: by a zero snapshot count taken after that write,
+  since nothing is left to retire.
 
 ## What's New in v2.6
 
@@ -514,7 +603,7 @@ New in v2.0:
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
 | K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
-| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when stale, overdue, never run or disabled; **critical** when a repository still being written to keeps failing |
+| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when a run failed but a success is still recent, when repositories are stale, overdue, never run, disabled or parked with stranded content, when every failure is quiet and proven not to accumulate, or when the Kasten DR ownership block is in place or background maintenance is disabled in `k10-features`; **critical** when a repository still gaining unreclaimed space — written to, undated, or holding restore points a live policy still retires — has no recent success, or has never run and its first run is overdue |
 | Residual snapshots     | Warning  | No local snapshot past 7 days that no policy retains | On-demand, policy-deleted or unbound snapshots left behind |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
