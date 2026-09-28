@@ -36,9 +36,40 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   with the same tolerant `ts_clean`/`ts_epoch` pattern already used
   elsewhere in `KDL.sh`; a single still-unparseable timestamp now costs one
   data point, not the whole table.
+
+### Added
+- **Snapshot vs. export phase breakdown for Policy Run Statistics**
+  (`policyRunStats.phaseBreakdown`), over the same 14-day window and
+  application-policy scope as the fix above. For each in-window run, the
+  snapshot and export phases are resolved from the already-fetched
+  `BackupAction`/`ExportAction` objects (same `k10.kasten.io/policyName`
+  label used elsewhere for attribution; no new `kubectl` call, no new RBAC),
+  matched to the run by their own `startTime`/`endTime` falling inside the
+  run's window. Reported as overall summary cards and per policy in the
+  table, alongside the existing total duration.
+  - **A policy can carry more than one export action** (Kasten 9.0
+    additional export). The export phase of a run is the **wall-clock
+    envelope** of its export action(s) — latest end minus earliest start —
+    never their sum and never just the first one: two overlapping exports
+    must not make the export phase read as longer than the run itself.
+  - **The phases are not guaranteed disjoint or contiguous.** Snapshot
+    duration plus export duration is *not* presented as equal to the run's
+    total span; queue time between phases belongs to neither and is never
+    shown as a third phase.
+  - **Presence, not truthiness.** Export applicability is three-state —
+    `"measured"`, `"unknown"` (declared, but no surviving action found in the
+    window — evicted or otherwise unreadable) or `"not_configured"` (the
+    current policy spec declares no export action) — so a `// 0` can never
+    collapse "no export" and "an export of zero measurable duration" into
+    the same number; a genuinely zero-duration export is reported as
+    `0`, distinctly.
+  - Evicted actions (a total duration but no surviving phase record) are
+    counted and rendered as `unknown`, never as a silent `0`, in the JSON,
+    the terminal and the HTML alike.
 - `kdl-diff.sh`: new "Policy Run Statistics (scope & phases)" comparison
-  section reports the app-policy sample size as an informational delta. A
-  baseline predating this scope fix is detected and skipped rather than
+  section — app-policy sample size as an informational delta, and
+  snapshot/export `unknownCount` trend as a regression/improvement signal.
+  A baseline predating this scope fix is detected and skipped rather than
   misreported as a real trend (same handling as the v2.6.0
   `amberCount` → `staleCount` rename).
 

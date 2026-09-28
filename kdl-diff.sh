@@ -696,6 +696,13 @@ B_RUNSTATS_SCOPE=$(get_baseline '.policyRunStats.averageDuration.scope')
 C_RUNSTATS_SCOPE=$(get_current '.policyRunStats.averageDuration.scope')
 B_SAMPLE=$(get_baseline '.policyRunStats.averageDuration.sampleCount')
 C_SAMPLE=$(get_current '.policyRunStats.averageDuration.sampleCount')
+# Phase-breakdown unknown counts: only present from v2.7.0 on. A growing
+# unknown count means more snapshot/export actions are being evicted before
+# KDL can read them -- worth surfacing as a trend, not just a number.
+B_SNAP_UNKNOWN=$(get_baseline '.policyRunStats.phaseBreakdown.overall.snapshot.unknownCount')
+C_SNAP_UNKNOWN=$(get_current '.policyRunStats.phaseBreakdown.overall.snapshot.unknownCount')
+B_EXP_UNKNOWN=$(get_baseline '.policyRunStats.phaseBreakdown.overall.export.unknownCount')
+C_EXP_UNKNOWN=$(get_current '.policyRunStats.phaseBreakdown.overall.export.unknownCount')
 
 RUNSTATS_CHANGED=false
 if [ "$B_RUNSTATS_SCOPE" != "app-policies" ] || [ "$C_RUNSTATS_SCOPE" = "null" ] || [ -z "$C_RUNSTATS_SCOPE" ]; then
@@ -706,16 +713,40 @@ else
     print_change "[INFO]" "$COLOR_CYAN" "App-policy run sample size: ${B_SAMPLE} -> ${C_SAMPLE} runs (14d window; size alone is not a regression or an improvement)"
     RUNSTATS_CHANGED=true
   fi
+  if [ -n "$B_SNAP_UNKNOWN" ] && [ -n "$C_SNAP_UNKNOWN" ] && [ "$B_SNAP_UNKNOWN" != "null" ] && [ "$C_SNAP_UNKNOWN" != "null" ] && [ "$B_SNAP_UNKNOWN" != "$C_SNAP_UNKNOWN" ]; then
+    if [ "$C_SNAP_UNKNOWN" -gt "$B_SNAP_UNKNOWN" ] 2>/dev/null; then
+      print_change "[REGRESSION]" "$COLOR_RED" "Snapshot-phase unknown count: ${B_SNAP_UNKNOWN} -> ${C_SNAP_UNKNOWN} (more runs whose snapshot action could not be found in the window)"
+      mark_regression
+    else
+      print_change "[IMPROVED]" "$COLOR_GREEN" "Snapshot-phase unknown count: ${B_SNAP_UNKNOWN} -> ${C_SNAP_UNKNOWN}"
+      mark_improvement
+    fi
+    RUNSTATS_CHANGED=true
+  fi
+  if [ -n "$B_EXP_UNKNOWN" ] && [ -n "$C_EXP_UNKNOWN" ] && [ "$B_EXP_UNKNOWN" != "null" ] && [ "$C_EXP_UNKNOWN" != "null" ] && [ "$B_EXP_UNKNOWN" != "$C_EXP_UNKNOWN" ]; then
+    if [ "$C_EXP_UNKNOWN" -gt "$B_EXP_UNKNOWN" ] 2>/dev/null; then
+      print_change "[REGRESSION]" "$COLOR_RED" "Export-phase unknown count: ${B_EXP_UNKNOWN} -> ${C_EXP_UNKNOWN} (more runs whose export action could not be found in the window)"
+      mark_regression
+    else
+      print_change "[IMPROVED]" "$COLOR_GREEN" "Export-phase unknown count: ${B_EXP_UNKNOWN} -> ${C_EXP_UNKNOWN}"
+      mark_improvement
+    fi
+    RUNSTATS_CHANGED=true
+  fi
 fi
 if [ "$RUNSTATS_CHANGED" = false ] && [ "$SUMMARY_ONLY" = false ] && [ "$MODE" = "human" ]; then
-  print_change "[OK]" "$COLOR_GREEN" "No change (sample size ${C_SAMPLE:-n/a})"
+  print_change "[OK]" "$COLOR_GREEN" "No change (sample size ${C_SAMPLE:-n/a}, snapshot unknown ${C_SNAP_UNKNOWN:-n/a}, export unknown ${C_EXP_UNKNOWN:-n/a})"
 fi
 
 RUNSTATS_JSON=$(jq -c -n \
-  --arg bSample "${B_SAMPLE:-null}" --arg cSample "${C_SAMPLE:-null}" '
+  --arg bSample "${B_SAMPLE:-null}" --arg cSample "${C_SAMPLE:-null}" \
+  --arg bSnapUnknown "${B_SNAP_UNKNOWN:-null}" --arg cSnapUnknown "${C_SNAP_UNKNOWN:-null}" \
+  --arg bExpUnknown "${B_EXP_UNKNOWN:-null}" --arg cExpUnknown "${C_EXP_UNKNOWN:-null}" '
   def numOrNull: if . == "null" or . == "" then null else tonumber end;
   {
-    baselineSampleCount: ($bSample | numOrNull), currentSampleCount: ($cSample | numOrNull)
+    baselineSampleCount: ($bSample | numOrNull), currentSampleCount: ($cSample | numOrNull),
+    baselineSnapshotUnknown: ($bSnapUnknown | numOrNull), currentSnapshotUnknown: ($cSnapUnknown | numOrNull),
+    baselineExportUnknown: ($bExpUnknown | numOrNull), currentExportUnknown: ($cExpUnknown | numOrNull)
   }
 ')
 add_section_json "policyRunStats" "$RUNSTATS_JSON"

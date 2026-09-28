@@ -6976,6 +6976,7 @@ if [ "$MODE" = "json" ]; then
     --argjson runstatsSystemExcluded "$RUNSTATS_SYSTEM_EXCLUDED" \
     --argjson runstatsUnknownAttribution "$RUNSTATS_UNKNOWN_ATTRIBUTION" \
     --argjson runstatsScopedPolicyCount "$RUNSTATS_SCOPED_POLICY_COUNT" \
+    --slurpfile policyRunPhaseStats "$TEMP_DIR/policyRunPhaseStats.json" \
     --slurpfile unprotectedNs "$TEMP_DIR/unprotectedNs.json" \
     --argjson unprotectedCount "$UNPROTECTED_COUNT" \
     --slurpfile unprotectedBreakdown "$TEMP_DIR/unprotectedBreakdown.json" \
@@ -7250,6 +7251,7 @@ if [ "$MODE" = "json" ]; then
     ( $snapshotData[0] ) as $snapshotData |
     ( $licenseBlock[0] ) as $licenseBlock |
     ( $policyLastRun[0] ) as $policyLastRun |
+    ( $policyRunPhaseStats[0] ) as $policyRunPhaseStats |
     ( $unprotectedNs[0] ) as $unprotectedNs |
     ( $unprotectedBreakdown[0] ) as $unprotectedBreakdown |
     ( $protectionUnresolvedPolicies[0] // [] ) as $protectionUnresolvedPolicies |
@@ -7503,6 +7505,12 @@ if [ "$MODE" = "json" ]; then
           scopedPolicyCount: $runstatsScopedPolicyCount,
           note: ("App policies only (system DR/reports policies excluded), same scope as policyAnalysis and lastRuns above. " + ($runstatsScopedPolicyCount | tostring) + " app polic" + (if $runstatsScopedPolicyCount == 1 then "y" else "ies" end) + " in scope over the last 14 days. " + ($runstatsSystemExcluded | tostring) + " system-policy run(s) and " + ($runstatsUnknownAttribution | tostring) + " run(s) with an unresolved policy owner were excluded from this sample, not folded into it.")
         },
+        phaseBreakdown: (
+          ($policyRunPhaseStats // {scope:"app-policies",window:"14 days",durationMethod:"envelope",systemExcludedCount:0,unknownAttributionCount:0,scopedPolicyCount:0,overall:{total:{count:0,avg:null,min:null,max:null},snapshot:{measuredCount:0,avg:null,min:null,max:null,unknownCount:0},export:{measuredCount:0,avg:null,min:null,max:null,unknownCount:0,notConfiguredCount:0}},byPolicy:[]})
+          | . + {
+              note: "Snapshot and export phase durations, same 14-day window and app-policy scope as averageDuration above. The export phase duration is the WALL-CLOCK ENVELOPE of a run export action set (latest end minus earliest start), not their sum -- a policy can carry more than one export action since Kasten 9.0 (additional export), and summing overlapping/parallel exports would let the reported export phase exceed the total duration of the run itself. snapshotSeconds/exportSeconds are only meaningful where the matching phase state is \"measured\": \"unknown\" means the phase action object could not be found in the window (evicted or otherwise unreadable), not a zero-duration measurement; \"not_configured\" (export only) means the current policy spec declares no export action at all. snapshotPhase plus exportPhase is NOT expected to equal the total duration of the run: queue time between phases belongs to neither and is not reported as a third phase."
+            }
+        ),
         effectiveRpo: {
           summary: {
             totalPolicies: $rpoTotal,
@@ -8549,6 +8557,67 @@ if [ "$DURATION_SAMPLE_COUNT" -gt 0 ]; then
   printf "  Min: ${MIN_DURATION}s | Max: ${MAX_DURATION}s\n"
 else
   printf "  ${COLOR_YELLOW}[INFO]  No completed runs in the last 14 days${COLOR_RESET}\n"
+fi
+
+# Phase breakdown (snapshot vs export): read verbatim from
+# POLICY_RUN_PHASE_STATS, the single computation that also feeds the JSON
+# above and the HTML section -- no renderer here recomputes an average or
+# picks which duration to show (#54 three-chains-must-agree).
+RUNSTATS_SNAP_MEASURED=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.measuredCount // 0')
+RUNSTATS_SNAP_AVG=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.avg')
+RUNSTATS_SNAP_MIN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.min')
+RUNSTATS_SNAP_MAX=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.max')
+RUNSTATS_SNAP_UNKNOWN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.unknownCount // 0')
+RUNSTATS_EXP_MEASURED=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.measuredCount // 0')
+RUNSTATS_EXP_AVG=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.avg')
+RUNSTATS_EXP_MIN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.min')
+RUNSTATS_EXP_MAX=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.max')
+RUNSTATS_EXP_UNKNOWN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.unknownCount // 0')
+RUNSTATS_EXP_NA=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.notConfiguredCount // 0')
+[ -z "$RUNSTATS_SNAP_MEASURED" ] && RUNSTATS_SNAP_MEASURED=0
+[ -z "$RUNSTATS_EXP_MEASURED" ] && RUNSTATS_EXP_MEASURED=0
+[ -z "$RUNSTATS_SNAP_UNKNOWN" ] && RUNSTATS_SNAP_UNKNOWN=0
+[ -z "$RUNSTATS_EXP_UNKNOWN" ] && RUNSTATS_EXP_UNKNOWN=0
+[ -z "$RUNSTATS_EXP_NA" ] && RUNSTATS_EXP_NA=0
+
+printf "\n  ${COLOR_BOLD}Phase breakdown${COLOR_RESET} ${COLOR_CYAN}(snapshot vs export, same window/scope)${COLOR_RESET}\n"
+if [ "$RUNSTATS_SNAP_MEASURED" -gt 0 ] 2>/dev/null; then
+  printf "    Snapshot: avg ${RUNSTATS_SNAP_AVG}s | min ${RUNSTATS_SNAP_MIN}s | max ${RUNSTATS_SNAP_MAX}s (measured on $RUNSTATS_SNAP_MEASURED/$DURATION_SAMPLE_COUNT runs"
+  [ "$RUNSTATS_SNAP_UNKNOWN" -gt 0 ] 2>/dev/null && printf ", $RUNSTATS_SNAP_UNKNOWN unknown -- action evicted or unreadable"
+  printf ")\n"
+else
+  printf "    Snapshot: ${COLOR_YELLOW}no measurable phase data in this sample${COLOR_RESET}\n"
+fi
+if [ "$RUNSTATS_EXP_MEASURED" -gt 0 ] 2>/dev/null; then
+  printf "    Export:   avg ${RUNSTATS_EXP_AVG}s | min ${RUNSTATS_EXP_MIN}s | max ${RUNSTATS_EXP_MAX}s (measured on $RUNSTATS_EXP_MEASURED/$DURATION_SAMPLE_COUNT runs"
+  [ "$RUNSTATS_EXP_UNKNOWN" -gt 0 ] 2>/dev/null && printf ", $RUNSTATS_EXP_UNKNOWN unknown"
+  [ "$RUNSTATS_EXP_NA" -gt 0 ] 2>/dev/null && printf ", $RUNSTATS_EXP_NA not configured"
+  printf ")\n"
+else
+  printf "    Export:   ${COLOR_YELLOW}no measurable export-phase data in this sample${COLOR_RESET} ($RUNSTATS_EXP_NA not configured, $RUNSTATS_EXP_UNKNOWN unknown)\n"
+fi
+printf "    ${COLOR_CYAN}(export phase = wall-clock envelope of a run export action(s), not their sum; snapshot+export is NOT expected to equal the total -- queue time belongs to neither)${COLOR_RESET}\n"
+
+RUNSTATS_BYPOLICY_COUNT=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.byPolicy | length // 0')
+[ -z "$RUNSTATS_BYPOLICY_COUNT" ] && RUNSTATS_BYPOLICY_COUNT=0
+if [ "$RUNSTATS_BYPOLICY_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "\n  ${COLOR_BOLD}Per policy (14 days)${COLOR_RESET}\n"
+  _ep "$POLICY_RUN_PHASE_STATS" | jq -r '
+    def hms($s):
+      if $s == null then "n/a"
+      elif $s < 60 then "\($s|floor)s"
+      elif $s < 3600 then "\(($s/60)|floor)m\(($s%60)|floor)s"
+      else "\(($s/3600)|floor)h\((($s%3600)/60)|floor)m"
+      end;
+    .byPolicy[] |
+    "    " + .name + " | runs=\(.runCount)" +
+    " | total avg=" + hms(.total.avg) + " min=" + hms(.total.min) + " max=" + hms(.total.max) +
+    " | snapshot avg=" + hms(.snapshot.avg) + (if .snapshot.unknownCount > 0 then " (\(.snapshot.unknownCount) unknown)" else "" end) +
+    " | export avg=" + hms(.export.avg) +
+      (if .runCount > 0 and .export.notConfiguredCount == .runCount then " (not configured)"
+       elif .export.unknownCount > 0 then " (\(.export.unknownCount) unknown)"
+       else "" end)
+  ' 2>/dev/null
 fi
 
 ### Effective RPO (NEW v2.0 - patch 3/7)

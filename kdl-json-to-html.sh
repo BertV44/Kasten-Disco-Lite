@@ -1017,6 +1017,35 @@ else "" end) + "
       <div class=\"card\"><strong>Max <small>(sampled)</small></strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.max) + "</div></div>
       <div class=\"card new-feature\"><strong>Sample Size</strong><div class=\"card-value\">" + (.policyRunStats.averageDuration.sampleCount | tostring) + " runs</div></div>
     </div>" +
+    (if (.policyRunStats.phaseBreakdown // null) != null then
+      (.policyRunStats.phaseBreakdown) as $pb |
+      "<h3>Snapshot vs export phase <span class=\"new-badge\">v2.7.0</span></h3>
+      <p class=\"section-description\">Same 14-day window and app-policy scope as above. The export phase is the wall-clock <strong>envelope</strong> of a run\u2019s export action(s) (latest end minus earliest start), not their sum &mdash; a policy can carry more than one export action since Kasten 9.0 (additional export). \"Unknown\" means the phase\u2019s action object could not be found in the window (evicted or otherwise unreadable) &mdash; it is never rendered as a zero. \"Not configured\" (export only) means the policy\u2019s current spec declares no export action. Snapshot + export is <strong>not</strong> expected to equal the total duration: queue time between phases belongs to neither and is not shown as a third phase.</p>
+      <div class=\"grid\">
+        <div class=\"card new-feature\"><strong>Snapshot avg</strong><div class=\"card-value\">" + formatDuration($pb.overall.snapshot.avg) + "</div></div>
+        <div class=\"card\"><strong>Snapshot min/max</strong><div class=\"card-value\">" + formatDuration($pb.overall.snapshot.min) + " / " + formatDuration($pb.overall.snapshot.max) + "</div></div>
+        <div class=\"card" + (if ($pb.overall.snapshot.unknownCount // 0) > 0 then " warning-card" else "" end) + "\"><strong>Snapshot measured</strong><div class=\"card-value\">" + ($pb.overall.snapshot.measuredCount | tostring) + " / " + (.policyRunStats.averageDuration.sampleCount | tostring) + "</div></div>
+        <div class=\"card new-feature\"><strong>Export avg</strong><div class=\"card-value\">" + formatDuration($pb.overall.export.avg) + "</div></div>
+        <div class=\"card\"><strong>Export min/max</strong><div class=\"card-value\">" + formatDuration($pb.overall.export.min) + " / " + formatDuration($pb.overall.export.max) + "</div></div>
+        <div class=\"card" + (if ($pb.overall.export.unknownCount // 0) > 0 then " warning-card" else "" end) + "\"><strong>Export measured</strong><div class=\"card-value\">" + ($pb.overall.export.measuredCount | tostring) + " / " + (.policyRunStats.averageDuration.sampleCount | tostring) + "<small> (" + ($pb.overall.export.notConfiguredCount // 0 | tostring) + " not configured, " + ($pb.overall.export.unknownCount // 0 | tostring) + " unknown)</small></div></div>
+      </div>
+      <h3>Run duration by policy (14 days)</h3>
+      <table>
+      <thead><tr><th>Policy</th><th>Runs</th><th>Total (avg / min / max)</th><th>Snapshot (avg)</th><th>Export (avg)</th></tr></thead>
+      <tbody>" +
+      ([$pb.byPolicy[]? |
+        "<tr>
+          <td><strong>" + .name + "</strong></td>
+          <td>" + (.runCount | tostring) + "</td>
+          <td>" + formatDuration(.total.avg) + " / " + formatDuration(.total.min) + " / " + formatDuration(.total.max) + "</td>
+          <td>" + formatDuration(.snapshot.avg) + (if .snapshot.unknownCount > 0 then " <small>(" + (.snapshot.unknownCount|tostring) + " unknown)</small>" else "" end) + "</td>
+          <td>" + (if .runCount > 0 and .export.notConfiguredCount == .runCount then "<em>not configured</em>"
+                    else formatDuration(.export.avg) + (if .export.unknownCount > 0 then " <small>(" + (.export.unknownCount|tostring) + " unknown)</small>" else "" end)
+                    end) + "</td>
+        </tr>"
+      ] | join("")) +
+      "</tbody></table>"
+    else "" end) +
     "<h3>Last run per policy</h3>
     <table>
     <thead><tr><th>Policy</th><th>Last Run</th><th>Status</th><th>Duration</th></tr></thead>
