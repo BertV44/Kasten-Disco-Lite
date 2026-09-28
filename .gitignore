@@ -16,3 +16,7 @@ report-*.txt
 # Internal working notes: references customer/lab clusters and
 # house conventions. Deliberately not published.
 CLAUDE.md
+
+# Claude Code working directory: agent worktrees live in .claude/worktrees/.
+# Committing them would import whole nested checkouts into the tree.
+.claude/

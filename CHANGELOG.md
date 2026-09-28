@@ -3,6 +3,828 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.7.0] - 2026-09-28
+
+Four reported defects, one pull request, and the fixes that came out of
+reviewing both. The through-line is the one this project keeps relearning:
+a report must not state, in any of its three outputs, something the data does
+not support -- and the only way to know it does not is to compare the rendered
+text against the data, every time.
+
+- **Disaster Recovery mode was misreported on almost every Quick DR cluster**
+  (#53): KDL read two fields Kasten does not write, so a cluster taking local
+  catalog snapshots was told it took none.
+- **Policy Run Statistics measured the wrong population** (#54): system DR and
+  reporting runs were mixed into a distribution readers take as being about
+  their application backups. On the validation cluster that moved the average
+  from 32s to 53s and the minimum from 3s to 30s.
+- **A switched-off policy still counted as protection** (#51): `spec.paused`
+  was never read, so a namespace covered only by a paused policy reported as
+  protected -- the direction of error that hides the gap the section exists to
+  find.
+- **The monitoring card asserted a measurement that never happened** (#49):
+  an unread Prometheus config rendered as a confident "No" beside a Best
+  Practices row that correctly said "not assessed", in the same document.
+- **Storage-repository maintenance now reads what the K10 scheduler decides**
+  (PR #52 by Jaiganesh J K), which on a cluster restored from a Kasten DR
+  backup names the reason maintenance has not run -- where 2.6.0 could only
+  report the symptom.
+- **`kdl-diff.sh` compared only 14 of the 19 best-practice checks**, so a
+  regression in five of them was invisible to the tool whose job is catching
+  drift.
+
+The storage-repository maintenance check now reads what the K10 repositories
+service decides for each repository — whether it holds a timer, has parked the
+repository, or has given up on it — and the section critical is kept only where
+unreclaimed space can still grow.
+
+### Added
+
+- **Scheduler state per repository** (`k10SchedulerState`): `read-only`,
+  `blocked`, `running`, `scheduled`, `parked` or `dropped`, and null only when
+  it cannot be determined. Read from the repositories service timer
+  (`status.details.nextProessTime` — misspelled in Kasten — published as
+  `nextProcessTime`), the pods acting on the repository, and the service's own
+  idle rule. A `dropped` repository says that K10 is not scheduling it and what
+  will retry it. Where the ten retained process results are all failures
+  started at or after the last write, a `crypto-svc` restart skips the
+  repository as well (`k10RestartWontHelp`), and the row says so. On a
+  repository that still holds a timer, the row advises against the restart,
+  because the daily retries continue on their own. Where the profile is gone
+  or points elsewhere, neither retry is the remedy: the row gives the profile
+  remedy instead (`profileNote`), wherever maintenance is expected and not
+  succeeding, whether or not the repository is still written to. A timer more
+  than five minutes in the past with no pod is published as
+  `k10TimerOverdueSeconds`.
+- **The Kasten DR ownership block.** The section reads ConfigMap
+  `k10-dr-remove-to-get-ownership`, which every Kasten DR restore places.
+  While it exists K10 processes no repository and records nothing, so the
+  history stays as it was, and on a restored cluster it is the source
+  cluster's and can look fresh. Every repository reads `k10SchedulerState:
+  blocked`, above `running` and `scheduled`, because the block is cluster-wide
+  and authoritative; every eligible failure is quiet in the severity gate
+  (`dr-ownership-block`); and the section verdict is `BLOCKED_DR_OWNERSHIP`, a
+  warning at any age, with the remedy and its condition: delete the ConfigMap
+  only when the original instance, and any other instance restored from the
+  same catalog, is permanently gone, because two owners can corrupt backup
+  data. Policies keep running, so the section sentence says the repositories
+  grow unmaintained. The ladder judges each repository from its evidence as
+  before, with one exception: `IDLE` means K10 parked the repository, which
+  describes a service that is processing, so under the block a parked
+  repository reads what its age says instead (`OK`, `STALE` or `OVERDUE`). In
+  a live test on a 162-repository cluster, 108 parked repositories read
+  `STALE` under the block.
+- **The background maintenance feature flag.** The section reads the
+  `backgroundMaintenanceRun` key of ConfigMap `k10-features`. K10 reads the
+  key's presence, not its value: present, whatever the value, background
+  maintenance runs; absent, every repository gets storage scans only. With the
+  key absent the section verdict is `DISABLED_BY_CONFIG`, a warning, the
+  scans-only row names the cause and the remedy, and eligible failures are
+  quiet (`maintenance-feature-off`). A value such as `false` is called out as
+  not read. A `k10-features` that cannot be found is not read as "disabled":
+  Helm always creates it.
+- Both preconditions are published in `k10MaintenancePreconditions`, with
+  `quietDrOwnershipBlockCount`, `quietMaintenanceFeatureOffCount` and the
+  section sentences in `summary.preconditionNotes`. Presence is proven by the
+  ConfigMap object itself, never by an exit status, and a read that fails for
+  any reason other than NotFound is reported as not checked, with the reason,
+  never as absent. **This can change the exit code:** `kdl-diff` scores `OK`
+  to `BLOCKED_DR_OWNERSHIP` or `DISABLED_BY_CONFIG` as a regression.
+- **`IDLE`**, a status for a repository K10 has parked: five clean cycles since
+  its last write, after which the service stops scheduling it until the next
+  write. Not a fault, and evaluated above `STALE` and `OVERDUE`, which are what
+  parking looks like a week later. A parked repository still holding
+  **stranded content** is `IDLE` with a warning and takes the section to
+  `PARTIAL`; the row gives the size and the reason. Stranded means no snapshot
+  left, most of the store unreferenced, or content marked unused and not
+  reclaimed. Every signal is bounded by physical bytes, and the floor is 1 GB
+  or a quarter of the estate's stored total, whichever is smaller. A parked
+  repository whose newest procedure failed is never `IDLE`.
+- **Pod kinds** per repository: maintenance (`<repo>-owner`,
+  `repository-operations`), repository upgrade (`<repo>-owner`,
+  `upgrade-repository`) and storage scan (`repo-access-<repo>`).
+- **Why a repository has no maintenance history**, where the record says:
+  - never processed at all;
+  - storage scans running with no maintenance attempted — check
+    `backgroundMaintenanceRun` in `k10-features`;
+  - maintenance attempted but the failures evicted from the retained history
+    by scans.
+- **The failure cause**, where the maintenance command names clock skew
+  between the node and the repository.
+- **A short run Kopia exited 0 on** is a success with a qualifier, not a
+  failure. `shortRuns` and `missingTasks` name the skipped conditional task.
+- **A quick maintenance cycle run by another client** — `compact-single-epoch`
+  and `advance-epoch` alone, which K10 never runs — is reported as such and
+  kept out of every full-run judgement.
+- Collected per repository: snapshot count, when it was taken
+  (`snapshotCountTime`) and whether a zero was counted after the last write
+  (`countZeroAfterWrite`); stored, in-use and unused bytes; the storage-scan
+  time; the owning policy's paused state; who still retires
+  restore points in the repository (`retainerPolicies`); and, for
+  `volumedata`, whether the namespace it was created for still exists under
+  the same UID.
+
+- `disasterRecovery.quickMode` (`true` / `false` / `null`) in the JSON,
+  surfacing `quickDisasterRecoveryEnabled` directly so a reader can audit
+  the mode independently of the derived label. `localCatalogSnapshot` /
+  `exportCatalogSnapshot` are now three-state (`true` / `false` / `null`)
+  instead of always `true`/`false` — `null` means not determined or not
+  recognised, never guessed toward either direction.
+- `kdl-dr-mode-test.sh` (maintainer tooling, off the published tree, in the
+  style of `kdl-maintenance-test.sh`): a fully offline fake-cluster harness
+  covering every row of the catalog-snapshot classification table, all four
+  `quickDisasterRecoveryEnabled` states (`"true"`, `"false"`, key absent,
+  ConfigMap unreadable), `--no-helm` parity, HTML-escaping of an
+  attacker/operator-shaped mode string, and confirmation that the DR
+  verdict and the ransomware-readiness DR pillar score never move with the
+  mode across the whole fixture set.
+
+- **Snapshot vs. export phase breakdown for Policy Run Statistics**
+  (`policyRunStats.phaseBreakdown`), over the same 14-day window and
+  application-policy scope as the fix above. For each in-window run, the
+  snapshot and export phases are resolved from the already-fetched
+  `BackupAction`/`ExportAction` objects (same `k10.kasten.io/policyName`
+  label used elsewhere for attribution; no new `kubectl` call, no new RBAC),
+  matched to the run by their own `startTime`/`endTime` falling inside the
+  run's window. Reported as overall summary cards and per policy in the
+  table, alongside the existing total duration.
+  - **A policy can carry more than one export action** (Kasten 9.0
+    additional export). The export phase of a run is the **wall-clock
+    envelope** of its export action(s) — latest end minus earliest start —
+    never their sum and never just the first one: two overlapping exports
+    must not make the export phase read as longer than the run itself.
+  - **The phases are not guaranteed disjoint or contiguous.** Snapshot
+    duration plus export duration is *not* presented as equal to the run's
+    total span; queue time between phases belongs to neither and is never
+    shown as a third phase.
+  - **Presence, not truthiness.** Export applicability is three-state —
+    `"measured"`, `"unknown"` (declared, but no surviving action found in the
+    window — evicted or otherwise unreadable) or `"not_configured"` (the
+    current policy spec declares no export action) — so a `// 0` can never
+    collapse "no export" and "an export of zero measurable duration" into
+    the same number; a genuinely zero-duration export is reported as
+    `0`, distinctly.
+  - Evicted actions (a total duration but no surviving phase record) are
+    counted and rendered as `unknown`, never as a silent `0`, in the JSON,
+    the terminal and the HTML alike.
+- `kdl-diff.sh`: new "Policy Run Statistics (scope & phases)" comparison
+  section — app-policy sample size as an informational delta, and
+  snapshot/export `unknownCount` trend as a regression/improvement signal.
+  A baseline predating this scope fix is detected and skipped rather than
+  misreported as a real trend (same handling as the v2.6.0
+  `amberCount` → `staleCount` rename).
+
+- **Policy paused/enabled state** (`spec.paused`, #51). A switched-off policy
+  used to be indistinguishable from one running nightly in every output.
+  Three states -- `enabled` / `paused` / `unknown` -- keyed on a CRD SCHEMA
+  probe rather than on whether any given policy instance happens to carry the
+  field: Kasten's Go `omitempty` drops `false`, so an absent key means "not
+  paused" only once the installed Kasten version's CRD is confirmed to declare
+  `spec.paused` at all; on a CRD that does not (older Kasten) or a CRD read
+  that was refused (RBAC), every policy reads `unknown` instead of being
+  guessed as enabled. Probed once via `get
+  customresourcedefinitions.apiextensions.k8s.io policies.config.kio.kasten.io
+  -o json` -- the same pattern already used for the KubeVirt VM CRD, and no
+  RBAC change (`kdl-rbac.yaml` already grants `customresourcedefinitions`
+  cluster-wide). An explicit `true`/`false` on a policy instance is read the
+  same way regardless of schema status: direct evidence outranks the
+  cluster-wide schema signal, never the other way around. Confirmed live on
+  the oc11 lab (OpenShift 4.20.30 / Kasten 9.0.5): `oc explain
+  policies.config.kio.kasten.io.spec` lists `paused <boolean>`, a server-side
+  dry-run patch round-trips both values, and all 5 lab policies omit the field
+  (all resolve `enabled`, disabled/unknown counts 0, every other field
+  byte-for-byte unchanged against the v2.6.0 report of the same capture).
+  - Surfaced per policy (`paused`, `pausedState`, `pausedReason`) in
+    `policyAnalysis.resolved[]` and in `policies.items[]` (the HTML Backup
+    Policies table); counted in `policyAnalysis.summary` (`pausedCount`,
+    `enabledCount`, `pausedStateUnknownCount`, `pausedSchemaStatus`) and in
+    `policies.pausedCount` / `policies.pausedSchemaStatus`.
+  - **Coverage**: a CONFIRMED-paused policy no longer counts as protection --
+    excluded from `coverage.policiesTargetingAllNamespaces`, the catch-all
+    check, `PROTECTED_NAMESPACES`, and the selector-resolvability checks that
+    gate `coverage.protection.status`. A namespace whose only policy is
+    paused now renders as unprotected. The EVIDENCE view
+    (`namespaceProtectionStatus` / `unprotectedBreakdown.backedUpDespiteSelector`)
+    is untouched and still wins: a namespace with a real successful backup on
+    record is never a gap, even once its only policy has been paused.
+  - **`policyAnalysis.redundantPairs`**: no finding when either side of a pair
+    is confirmed-paused -- a policy parked instead of deleted no longer earns
+    an "these two overlap" finding against the one still running.
+  - **`policyRunStats.effectiveRpo`**: every item now carries `pausedState`,
+    so zero samples in the 14-day window reads as a decision (paused) rather
+    than indistinguishable from a broken schedule.
+  - Terminal and HTML both gained a paused count (Namespace Protection and
+    Policy Analysis sections; a dedicated "Paused policies" table and a badge
+    per policy row in the HTML) and both fall back to an explicit "state
+    could not be read" message, naming the reason, whenever the schema is not
+    confirmed -- never a silent "every policy enabled".
+  - No new best-practice check -- a badge, not a 20th check (adding one means
+    touching six places, per CLAUDE.md, for a signal the issue only asked for
+    a badge on).
+  - `kdl-diff.sh`: a neutral (non-regression, non-improvement) entry for
+    policies newly paused/resumed between two snapshots, in `policyAnalysis`.
+    Existing coverage diffing needed no changes: a namespace that loses its
+    only policy to a pause already surfaces there as a regression.
+  - Verified offline (`kdl-policy-state-test.sh`, 46 assertions, each checked
+    to fail against pre-#51 `KDL.sh` and pass after; not on `main`, same
+    convention as `kdl-residual-test.sh`), and replayed against the real oc11
+    capture behind the v2.6.0 lab validation: every existing field in
+    `coverage` / `policyAnalysis` / `policies` came back byte-for-byte
+    unchanged, since none of its 5 real policies are paused.
+
+### Changed
+
+- **The severity gate.** A quiet failure — idle, or orphaned with no datable
+  write — used to drop to a warning on idleness alone. It now keeps the
+  critical unless the record proves nothing more accumulates:
+  - every restore point has retired, counted by a storage scan at least an
+    hour after the last write. An earlier count can miss the snapshots an
+    export added since; a later zero outranks even a recent write, because
+    nothing is left to retire, and the next export makes the repository
+    active again;
+  - retirement cannot reach the repository, because its profile is gone or
+    points elsewhere;
+  - no live policy retires restore points in it. A deleted or paused policy
+    retires nothing, since retirement is a phase of a policy run;
+  - for `volumedata`, no RestorePointContents references its namespace any
+    more — read from the list already fetched, and only when that list was
+    readable and not empty. This outranks an inferred retainer. The snapshot
+    count is refreshed only by a successful scan, so on a failing repository it
+    can be weeks old: on a 162-repository cluster it kept 31 repositories
+    critical with a count 35 days old, 30 of them for namespaces with no
+    restore point left. The row gives the count, its age and the stored size.
+    An entry naming neither of its two profile labels counts for the
+    namespace; one naming a profile counts for that profile's repository, and
+    the block-mode profile is one of the two, because block-mode volume data
+    lands in the repository of the block-mode profile.
+
+  An idle repository in which a live policy still retires restore points is
+  critical, because every retirement leaves space that only maintenance
+  reclaims. Each downgrade names its reason under the repository.
+  **This can change the exit code.** A repository kept critical by a live
+  retainer moves the rollup from `FAILING_INACTIVE` to `FAILING`.
+- **`DISABLED` reads only `spec.disableMaintenance`.** Kopia's own
+  full-maintenance switch is bypassed by the `kopia maintenance run --full`
+  that K10 performs, so a repository with it off is still maintained. It is
+  now assessed normally, with a note.
+- **Orphaned** also covers two new cases. One is a policy that no longer backs
+  up or exports to the repository's profile, read from a complete action list.
+  The other is a `volumedata` repository whose namespace was deleted, or
+  recreated under the same name; this is compared by UID, and the path is read
+  but never published. `orphanReason` names which case applies, and both
+  outputs list the reasons apart — profile/policy deleted, policy no longer
+  exporting to the profile, namespace deleted, namespace deleted and recreated
+  with the same name (UID changed) — from four published counts that add up
+  to `orphanedCount`: `orphanedOwnerDeletedCount`,
+  `orphanedStoppedExportingCount`, `orphanedNamespaceDeletedCount` and
+  `orphanedNamespaceRecreatedCount`.
+- `OVERDUE` is excused by an owner pod of any kind that is running, including
+  a repository upgrade, which holds the same owner name. A storage scan never
+  excuses it. `maintenanceRunning` now counts full-maintenance pods only.
+- A profile that K10 follows through `spec.overrideLocation` is no longer
+  reported as a mismatch.
+- Every sentence published for a repository is also collected in `rowNotes`,
+  and the terminal and the HTML print that list verbatim.
+
+- `k10-config` is now fetched once and shared, instead of separately at
+  four call sites (Helm release name, Disaster Recovery quick-mode read,
+  KubeVirt freeze timeout, VM snapshot concurrency, and the general
+  configuration-fallback block). Still independent of `--no-helm`, same as
+  before.
+
+### Fixed
+- **`kdl-diff.sh` compared only 14 of the 19 best-practice checks.** `BP_LIST`
+  had never been extended with `clusterScopedResources`,
+  `exportRetentionExplicit`, `policiesWithoutExport`, `snapshotRetentionHigh`
+  or `snapshotRetentionZero`, so a regression in any of those five was
+  invisible to the one tool whose job is catching drift between two
+  discoveries. Confirmed by flipping three checks in a real report: only
+  `monitoring`, the one in the list, was reported — `snapshotRetentionZero`
+  (`OK` -> `FOUND`) and `policiesWithoutExport` (`WARN` -> `FOUND`) passed
+  silently. `BP_LIST` and `bpSevMap` now hold the same 19 keys, and the comment
+  above the list says so, since the two drifting apart is what caused this.
+  Baselines predating a key are unaffected: the existing "both values present"
+  guard already skips them.
+
+- **A short run Kopia exited 0 on was reported `FAILING`** whenever the
+  procedure record had been evicted. The same repository read `UNKNOWN` or
+  `STALE` while the record survived.
+- **A quick cycle from another client made a healthy repository `FAILING`**:
+  judged as a full run, its two tasks scored short.
+- **An upgrade pod carrying the kanister label read as maintenance running**,
+  and one without it left the repository `OVERDUE` for the length of the
+  upgrade.
+- **An exit-0 record the task history does not support** — no run in its
+  window, or a failed task in the run — is now named
+  (`evidenceConflicts: ["exit-zero-unsupported"]`) and dates nothing.
+- **"No successful run on record"** replaces "an unknown number of days"
+  wherever the record proves no run ever exited 0. An undatable success still
+  says it cannot be dated.
+- `neverWritten` compared the two timestamps as strings, to the second; it now
+  allows a minute between writers, and a value that will not parse is unknown.
+- The newest aggregate maintenance result is chosen by `completedTime` rather
+  than by position.
+
+- **Disaster Recovery mode was misreported for almost every Quick DR
+  cluster.** KDL read `kdrSnapshotConfiguration.enabled` and
+  `.exportData.enabled`; neither field exists under that object (Kasten
+  writes `takeLocalCatalogSnapshot` and `exportCatalogSnapshot`; `.enabled`
+  is not a thing here and `exportData.enabled` belongs to a different object,
+  the export action's `exportParameters`). Both reads silently fell back to
+  `false`, so every Quick DR cluster read as "Quick DR (No Catalog
+  Snapshot)" regardless of its real configuration — including the default
+  and most common setup, `{takeLocalCatalogSnapshot: true}` alone (the shape
+  measured on a live Kasten 9.0.5 cluster), which now correctly reads "Quick
+  DR (Local Catalog Snapshot)". Precedence was also inverted: export
+  requires local, so a cluster with both flags `true` would still have read
+  as "Local" instead of "Exported" even with the field names fixed — fixed
+  by testing "both true" first.
+- **Legacy DR was inferred from the policy, not read from its authoritative
+  source.** An absent `kdrSnapshotConfiguration` was taken to mean Legacy DR.
+  Whether Legacy or Quick DR is active is decided by
+  `quickDisasterRecoveryEnabled` in the `k10-config` ConfigMap — the Helm
+  value `kastenDisasterRecovery.quickMode.enabled` (default `true`) AS
+  RENDERED, so it carries the chart default even when never set explicitly,
+  and it is read even under `--no-helm`. A Quick DR policy configured for no
+  catalog snapshot at all carries no `kdrSnapshotConfiguration`, and used to
+  read as Legacy DR outright.
+- A catalog-snapshot shape KDL does not recognise — the invalid
+  `exportCatalogSnapshot: true` without `takeLocalCatalogSnapshot`, or any
+  other unrecognised key under `kdrSnapshotConfiguration` (including the two
+  wrong field names above) — is now reported as "not recognised", with its
+  settings listed, instead of silently becoming "No Catalog Snapshot".
+- The Disaster Recovery HTML card rendered a `null` (not-determined /
+  not-recognised) catalog-snapshot flag as "✗ No" — the same `boolBadge`-on-
+  `null` bug as the Monitoring card below. Both DR flags now use a
+  three-state badge, and the card gained an "Exported Catalog Snapshot" row
+  (the JSON has always carried the flag; the card never displayed it) and a
+  "Quick DR Setting (k10-config)" row.
+- **`monitoring.prometheusRemoteWrite.enabled == null` ("could not be
+  read") rendered as "✗ No" on the Monitoring card**, contradicting the
+  adjacent Best Practices row, which already said "not assessed" for the
+  same field in the same document. Root cause: `boolBadge(... // false)` —
+  the same `a // b`-fires-on-`false` trap as three earlier bugs in this
+  project. Only this one call site changed; `boolBadge` itself is
+  unmodified. It has 9 other call sites (not the 11 originally reported —
+  recount confirmed by grep), every one of them audited: each reaches this
+  file as a plain `true`/`false` (`($x == "true")` at the KDL.sh producer
+  side, never a raw passthrough), so none of them can render `null` as "No"
+  either.
+- A Disaster Recovery mode string can now carry policy content verbatim
+  (the "not recognised" fallback lists the settings it does not
+  understand). The HTML card and the Best Practices row now `@html`-escape
+  it, and the terminal no longer interpolates it into a `printf` FORMAT
+  string at any of its three print sites (the Mode line, and both
+  Best-Practices-compliance lines) — it is passed as a `%s` argument
+  instead, so a value containing `%s`/`%n` prints unharmed rather than being
+  reinterpreted.
+- The `N/A (export target set outside policy)` profile hint was keyed on
+  the exact string "Quick DR (No Catalog Snapshot)", which — before this
+  fix — was every Quick DR cluster's mode. Re-keyed on the Quick DR setting
+  itself, so its output is unchanged now that the sub-modes are told apart
+  correctly.
+- A stale comment above the KDR verdict explained away the old misread "No
+  Catalog Snapshot" value as a quirk; rewritten to describe what the
+  catalog-snapshot setting actually governs, now that it is read correctly.
+
+- **Policy Run Statistics counted every RunAction, not just application
+  ones.** The summary cards (average/min/max duration) and the per-policy
+  table (`policyRunStats.lastRuns`, `policyRunStats.effectiveRpo`) mixed
+  `k10-disaster-recovery-policy` and `k10-system-reports-policy` into the same
+  distribution as application backups. On a live cluster this produced "Avg
+  2h 26m, Min 2s, Max 14h 1m over 70 runs": the reported Min belonged to the
+  7-second-per-run reporting policy, the average was dragged down by two
+  policies moving no application data, and the one number that mattered — a
+  14-hour application backup — read as an outlier against a mean it had
+  itself been used to compute. Fixed by resolving each RunAction's owning
+  policy from `.spec.subject.name` and excluding names matching
+  `SYSTEM_POLICY_PATTERNS` — the same predicate `policyAnalysis` already
+  applies, shared rather than duplicated, so the two sections cannot disagree
+  about what "policy" means again. A RunAction whose owner cannot be resolved
+  (`subject.name` absent) is counted separately as
+  `unknownAttributionCount`, never silently folded into the application
+  sample. `averageDuration` now also reports `scope`, `scopedPolicyCount` and
+  `systemExcludedCount` so the sample's population is stated, not implied,
+  and the terminal/HTML text say so in words, not just the JSON.
+- **A non-zero fractional second in a RunAction timestamp silently emptied
+  the entire "Policy Last Run Status" table and truncated `effectiveRpo`'s
+  interval samples**, found live while building the fixture this same fix
+  needed for RFC3339Nano coverage. `fromdateiso8601` throws on the fractional
+  second Kasten emits whenever it is non-zero; uncaught, that failure
+  propagated out of the whole `jq` call, and the shell-level empty-array
+  fallback swallowed it without a line on stderr — every policy's last-run
+  row disappeared whenever its most recent run had one such timestamp. Fixed
+  with the same tolerant `ts_clean`/`ts_epoch` pattern already used
+  elsewhere in `KDL.sh`; a single still-unparseable timestamp now costs one
+  data point, not the whole table.
+
+### Fixed after review of the maintenance work
+- **Background maintenance switched off in `k10-features` is now a scheduler
+  state of its own** (`maintenance-off`). The state ladder had a rung for the
+  DR ownership block and none for this, so a parked repository still read
+  `IDLE` -- labelled "Not a fault", `statusLevel: info`, contributing nothing
+  -- directly under a section note saying no repository is maintained and
+  nothing is reclaimed. The new rung sits below `running`, because scans keep
+  running when only maintenance is off, and above `scheduled`/`parked`/
+  `dropped`, because none of those describes a service that is not
+  maintaining at all.
+- **A `dropped` repository no longer promises a retry that cannot happen.**
+  With maintenance switched off, the row said "It retries only when data is
+  next written to it or when crypto-svc restarts" — neither of which retries
+  anything while the key is absent — beside a note saying the opposite. The
+  sentence was already suppressed for the DR block and for a deleted profile;
+  it is now suppressed here too.
+- **A repository whose first maintenance is not yet due is no longer told K10
+  has stopped scheduling it.** `NEVER RAN - first run not yet overdue` printed
+  "K10 is not scheduling this repository" beside it. No timer on a new
+  repository is what "too new" looks like, not what "given up on" looks like.
+  The first attempt at this guard was itself inert: it read `.firstRunDue` from
+  inside the same `. + {...}` constructor that adds it, where `.` is the INPUT,
+  so it saw `null`, never fired, and the sentence printed anyway. That is the
+  exact trap the comment above that stage documents. `firstRunDue` is now
+  computed once and bound before the constructor, so the published key and
+  every reader of it cannot disagree.
+- **A critical repository no longer loses its only explanation when the
+  snapshot count has never been measured.** `activeReason` tested
+  `(.snapshotCount // 0) > 0`, and `snapshotCount` is `null` until a storage
+  scan populates `storageUsage` -- which on a failing repository may never
+  have happened. So a repository a live policy IS still retiring restore
+  points in fell through to `unverified`, which the code defines as "the gate
+  could not establish either way", and `gateNote` printed nothing. The
+  severity was correct either way, but the best-practices line tells the
+  reader to check the reason under each status and that row had none. New
+  state `retained-uncounted`, with a note that says the retainer is known and
+  the remaining count is not, plus its own section counter.
+- **`disasterRecovery.localCatalogSnapshot` / `.exportCatalogSnapshot` are
+  `null`, not `false`, when no DR policy exists.** There is no policy to have
+  a catalog-snapshot setting, so `false` asserted a measurement that was never
+  made -- inconsistent with the three-state contract #53 introduces. Not
+  rendered (the card is gated on `.enabled`), but the JSON is read directly by
+  `kdl-diff.sh` and by downstream consumers.
+- **Stranded content is keyed on the evidence that K10 parked the repository,
+  not on the `IDLE` status.** `strandedSignal` and `strandedBytes` are read
+  nowhere except `idleStranded` and `idleNote`, both of which were gated on
+  `status == "IDLE"`. Any cluster-wide rung that pre-empts the `parked`
+  scheduler state -- the DR ownership block, or background maintenance
+  switched off -- therefore deleted the entire finding: a parked repository
+  holding 5 GB of unreferenced blobs reported it as nothing, `idleStrandedCount`
+  read 0, and the row could render a green `OK` directly under a section note
+  saying unreferenced data is never reclaimed. Both are now keyed on
+  `k10Parked`, a repository holding stranded content is never green, and
+  "Not a fault" is reserved for a genuine `IDLE`.
+- **`OK` printed the wrong age.** The label used `daysSinceLastMaintenance`
+  (the newest exit-0 record) while the verdict is decided by `successAgeDays`.
+  They diverge whenever the newest exit-0 record is newer than the newest run
+  that counts as a success, so a verdict taken from a six-day-old success
+  could render "OK - maintained 1 day ago". `STALE` already preferred the
+  deciding age; `OK` now does too.
+- **`k10-features` missing entirely produced no rendered note at all.** The
+  JSON recorded `checked: false` with a reason and both outputs printed
+  nothing, so the unknown reached the data and neither reader. The verdict
+  deliberately stays loud — an absent ConfigMap is not read as "disabled" —
+  but the reader is now told the flag could not be established. A blank
+  server message no longer renders as "not checked ()".
+- **The sidebar counted no warnings for a section showing warning badges.**
+  The new `data-crit`/`data-warn` heading attributes counted only
+  `statusLevel`, and `profileMismatch` deliberately does not feed status, so
+  an `OK` repository with a repointed profile gave `data-warn="0"` beside two
+  amber badges. Cross-cutting warn-badged context rows are counted back in,
+  without double-counting a repository already warn or error.
+
+### Changed after review
+- **No remediation commands in the report.** Two were introduced: the DR
+  ownership block note carried `kubectl delete configmap ...`, and the
+  background-maintenance note carried `helm upgrade ... --set ...`. Both in
+  the terminal and the HTML. The
+  report names the ConfigMap, points at the dashboard action, and names the
+  Helm value to set. A wrong command in a support deliverable is worse than
+  no command, and the first of these is destructive: the same note warns that
+  two owners can corrupt backup data.
+
+### Correction to the 2.6.0 entry
+
+The 2.6.0 entry says a failed run "leaves a fresh timestamp behind too". It
+does not. Kasten appends to `maintenanceRun.recentResults` only after
+`kopia maintenance run --full` exits 0, so a failure appends nothing. The
+v2.4 defect was that the *previous* success's timestamp stayed, and read as
+fresh for up to a week while every run failed. The evidence-of-success design
+is unchanged; it now also uses that record as a proven success where the task
+history cannot answer.
+
+It also lists `UNKNOWN` among the new states. `UNKNOWN` was not new; its
+meaning changed: in v2.5.0 it was an unreadable timestamp, and from v2.6.0 it
+means the outcome itself could not be established.
+
+Its list of new `storageRepositories` keys leaves out five that v2.6.0 did
+publish: `quietFailingCount`, `quietFailingIdleCount`,
+`quietFailingOrphanCount`, `durationNote` and `redactionNote`.
+
+It says the write date wins wherever it exists, `inactive == false` keeping
+the critical whatever else is true. One thing now outranks it: a zero
+snapshot count taken by a storage scan at least an hour after the last write
+makes a failing repository quiet (`count-zero`), because nothing is left to
+retire.
+
+### Fixed in the 2.6.0 check
+
+Defects in the v2.6.0 storage-repository maintenance check, found after the
+release was cut. Each was reproduced before being accepted.
+
+- **A repository whose last attempt failed but which succeeded the night
+  before was reported CRITICAL.** The success clock fell back to the procedure
+  record only when the *newest* procedure had succeeded, so a success followed
+  by a failure could not be dated at all and the repository scored
+  `FAILING_STALE` — a critical — where `FAILING`, a warning, was due. The
+  fallback now reads the newest **successful** procedure. Where the newest run
+  did succeed the two are the same record, so nothing changes for the case
+  that already worked.
+- **`Run incomplete (8 of 8 expected tasks)` could be printed.**
+  `expectedTaskCount` is a floor derived from the tasks present in >=90% of a
+  repository's own runs, which excludes the pair that alternates day by day.
+  `lastRunTaskCount` counts every task that ran, that pair included. So a run
+  missing one required task can meet the floor exactly, and both renderers
+  printed a fraction whose numerator equalled or exceeded its denominator —
+  the shape the display rule exists to forbid. The count is now shown only
+  while it is below the floor; otherwise the text says a required task did not
+  run. Measured on a 547-repository estate: all 38 repositories with enough
+  history to calibrate run 9 tasks against a floor of 8, so the shape is
+  universal even though no incomplete run has yet been observed there.
+- **The profile-mismatch row rendered outside its own card**, landing inside
+  "Maintenance status" under a caption promising the rows add up to the total
+  — which a cross-cutting count does not. Both copies of the card condition
+  omitted `profileMismatchCount`; they open and close the same card, so a term
+  added to one must be added to the other.
+- **`UNKNOWN` was described as "neither source could answer", usually blamed
+  on the `storagerepositories/details` RBAC rule.** A third cause had been
+  added: past due by a full cycle with an unreadable pod list, which is
+  reached ONLY by repositories that have a recent success. Both sources
+  answered there and the pod list is the cause. All FOUR places that describe
+  the state now name all three causes: the HTML legend, both terminal lines
+  that report the count, and the `note` published in the JSON. A first pass
+  reworded only the legend and a second missed the JSON note; each time the
+  rest went on asserting that nothing had succeeded.
+- **A repository created an hour ago was reported as a failure**, on a report
+  whose own legend calls that state normal under a day old. Two errors behind
+  it. The first grace covered only the rollup severity and not the lines: the
+  counts behind them were every `NEVER_RAN` repository whatever its age, and
+  the JSON published only the total, so the HTML could not have told the two
+  apart. The second was the threshold — it used the 7-day STALENESS
+  threshold while full maintenance runs DAILY, so a three-day-old repository
+  with no run, two cycles missed, still read as normal. `firstRunDue` is now
+  computed once against the schedule and read by the rollup, the two
+  published counts, both renderers and the validation gate — the status
+  ladder itself is unchanged and still reports `NEVER_RAN` either way.
+  A repository is due once it is older than one full maintenance interval
+  (`fullIntervalSeconds`, falling back to the daily interval Kasten uses), or
+  more than one interval past `nextFullMaintenanceTime`, and never while a
+  maintenance pod is running for it — the same guard `OVERDUE` applies to
+  the same signal. Without that guard every new repository became a critical
+  from the moment its first run was scheduled until that run finished,
+  because `nextFullMaintenanceTime` only advances when a run COMPLETES:
+  reproduced with a repository created two hours ago whose first run was due
+  one hour ago, reported `FAILING`. Past due keeps the `[FAIL]` and the red
+  badge; not yet due gets an `[INFO]` and an info badge, and is named in the
+  best-practice parenthetical as "not yet overdue" rather than dropped from it —
+  it still drives the `PARTIAL` verdict, so a row stating the severity and
+  omitting the reason left "Warning - PARTIAL" and nothing else. The rollup
+  stays `PARTIAL` deliberately: not yet overdue is still not `OK`.
+- **A repository whose every recorded run failed could report `OK`.** The
+  success clock fell back to the procedure record whenever no task-derived
+  success existed, including when the task history was READABLE and simply
+  held no good run — which its own comment said it would not do. Readable
+  history with nothing successful in it is evidence, and stronger evidence
+  than an absent history: the fallback is gated on `taskHistoryAvailable`
+  now. The same repository with a failed procedure reaches `FAILING_STALE`
+  as it should.
+- **A present-but-empty task history lost its success date.** `runs: {}`
+  makes `taskHistoryAvailable` true while holding no task records at all, so
+  gating the procedure fallback on readability alone threw the only evidence
+  away: a repository whose newest procedure had succeeded reported `UNKNOWN`,
+  and one whose newest failed after an older success went back to
+  `FAILING_STALE`, a critical. The fallback applies when the history is
+  unreadable OR holds no runs. A live cluster carries `runs: {}` beside nine
+  procedure records, so this is not a constructed state.
+- **A young, empty repository was reported as "still being written to".**
+  `inactive` needs 30 days of silence, so a repository created two days ago
+  that never ran and never received a byte was neither idle nor orphaned and
+  counted as an active failure — a critical. Never having been written to is
+  a third reason a failure is quiet, published as
+  `quietFailingNeverWrittenCount`, and both outputs say "never been written
+  to" rather than "no data written for 30+ days", which is false about a
+  two-day-old repository.
+- **`repositoryEmpty` did not mean what it was used for.** It reads
+  `storageUsage` present-and-empty — but the storage scan is what POPULATES
+  that field, so a repository nothing has processed reads empty whatever it
+  holds. On a 547-repository estate all 364 reading empty had simply never
+  been processed, and **191 of them had been written to, 205 within the last
+  30 days**. It was being used to quieten failures, which on that estate
+  would have silenced repositories receiving data daily. A new field,
+  `neverWritten`, answers the question properly from `modifiedTime` — which
+  advances on writes and is untouched by a scan — and the quietening,
+  the counts and both outputs now read that instead, `unusedCount` and
+  `unusedReadOnlyCount` included. `repositoryEmpty` is `null` for a read-only
+  repository rather than `true`: Kasten never scans those, so the field is
+  empty by construction and answers nothing about them. It had been reporting
+  every read-only import as having "never held any data since creation",
+  including one written to the day before.
+- **Deletion was advised without saying what to check first.** An empty
+  repository whose profile and policy both still exist was told "manual
+  cleanup may be required — consider deleting them", when the real finding is
+  that its first export wrote nothing. Every destructive suggestion now names
+  the thing to validate: a quiet failure is told to "confirm the reason under
+  each before deleting anything", with the reason printed under each
+  repository, and that advice ends, like the profile-mismatch guidance, with
+  "these hold backup data"; an empty one is told to find out why its first
+  export wrote nothing, because deleting the repository will not fix the
+  export. "Safe to delete" was disproved once on a live cluster where every
+  empty repository turned out to be a live import path.
+- **Reassurances were given about repositories nobody looked at.** "Not
+  critical for that reason" and "nothing critical" are claims about the whole
+  estate, and `PARTIAL` is decided before the partial-read branch, so both
+  were printed on clusters where repositories went unread or answered
+  `UNKNOWN`. One published flag, `fullyAssessed`, now gates every such
+  sentence in both outputs.
+- **`PARTIAL` read "not failing" beside "(1 failing)".** The verdict also
+  covers repositories whose last run failed but which succeeded recently, so
+  the gloss contradicted its own parenthetical; it reads "needs attention,
+  nothing critical" now. The `FAILING` gloss said "keeps failing" about a
+  repository that has never run at all, and says "is not being maintained",
+  which is true of both.
+- **The advice after a `FAILING` verdict compared two different sets.** It
+  weighed the repositories still being written to against every due
+  never-ran repository, idle ones included, so one failing active repository
+  beside two idle never-ran ones was described as having no maintenance run
+  ever recorded. `activeNeverRanCount` is published and both outputs compare
+  against that.
+- **Every never-ran repository printed the same red `[NEVER RAN]` in the
+  terminal**, while the HTML distinguished three states. A repository whose
+  first run had not come round, or was executing, was a red failure in one
+  output and an informational note in the other, for the same run. The
+  terminal row now carries the same three renderings.
+- **"Not due yet" claimed more than the data supports.** A first run an hour
+  past its schedule but inside one interval of grace IS due — it is simply
+  not late enough to report — so every rendering now says "not yet
+  overdue". `firstRunDue` is also false while the first run is EXECUTING,
+  and the per-repository row is the one place a reader can tell which, so
+  that row says "first run in progress" instead.
+- **The HTML told the reader to resolve a failure that does not exist.** The
+  "still being written to — check the reason shown under its status" advice
+  counted `NEVER_RAN` repositories, which carry no failure and no error, so
+  it sent the reader looking for something the status does not show. Where
+  the whole active set has simply never run, the advice now says so and
+  points at the scheduler instead, in the terminal as well as the HTML.
+- **The terminal named the verdict differently from the other two outputs.**
+  Four of the five best-practice verdicts printed a friendly word — HEALTHY,
+  CLEANUP, NEEDS ATTENTION, NOT ASSESSED — while the fifth printed the token
+  `FAILING`. So `FAILING` was the only verdict that could be correlated across
+  the three outputs, and on a live 162-repository cluster the terminal
+  reported `CLEANUP` where the JSON and HTML reported `FAILING_INACTIVE`, with
+  the string `FAILING_INACTIVE` appearing nowhere in the terminal at all.
+  Every branch now prints the token, then a plain-English gloss, then the
+  counts — for example `FAILING_INACTIVE - manual cleanup may be required (1
+  failing and stale, 1 parked with stranded content)`. Grepping a support
+  bundle for the verdict finds it in any of the three now.
+- **The best-practices line said different things in the terminal and the
+  HTML.** Each output built it separately, so one verdict carried a gloss in
+  the terminal and none in the HTML, different advice — on a live cluster,
+  "check the failure and work on resolving it" beside "check the reason shown
+  under its status and resolve the failure", about two repositories — and
+  counts worded differently ("never ran" beside "never-ran"). KDL.sh now
+  builds the line once — the gloss, the detail in brackets and the sentences
+  under it — and the terminal and the HTML print it verbatim, as they already
+  print each repository's `rowNotes`.
+- **Repository status labels and the section summary said different things in
+  the terminal and the HTML.** Each output wrote its own. `FAILING_STALE`
+  printed as `FAILING` in the terminal, told apart only by a colour that saved
+  output does not carry; only the HTML said who maintains a read-only
+  repository, and only the terminal said no maintenance was running on an
+  overdue one; 13 of 16 summary rows were labelled differently; and the HTML
+  told the reader a repointed-profile repository "needs manual cleanup" where
+  the terminal said to check whether the old target is still needed first,
+  because these hold backup data. KDL.sh now publishes each repository label
+  and its colour, and the section summary, once, and both outputs print them
+  verbatim. One day is now "1 day", not "1 days". A failing repository is red
+  only where it earns the section critical: a quiet one is yellow, as the
+  legend always said, and the summary lists the critical and the not-critical
+  ones apart. A never-written repository now says under its status why it is
+  quiet. The sidebar counted every badge in the section, the summary counts
+  included, so two critical repositories read as three; it now counts the
+  repositories at each level. The reasons a repository lost its owner sit
+  under that row in the HTML, as the terminal indents them, instead of
+  reading as more counts beside it.
+- **The read note and the README claimed an unread repository forces
+  `NOT_ASSESSED`.** Reordering the rollup so a definitive failure outranks a
+  partial read was correct; the sentence describing the old order was left
+  behind, and the same commit that started printing the unread count beside
+  the failure made the contradiction plainer.
+- **A FileStore profile whose path was empty, `/`, or written with a leading
+  slash flagged every repository on it as mismatched**, next to text advising
+  the reader to confirm before deleting them. Only trailing slashes were
+  stripped, so an empty prefix became `/` and a repository path — relative on
+  both sides, verified on a live cluster — could never match it. Both ends
+  are normalised now, and an empty prefix is treated as the root: every path
+  is under it. Reachable rather than theoretical: a FileStore profile with no
+  explicit path is what produces the default `k10/<cluster-uuid>/...` layout,
+  and a live cluster was observed carrying that layout and an explicit-prefix
+  one on the SAME profile.
+- **`FAILING_INACTIVE` claimed every failing repository was quiet while some
+  had not been read.** The downgrade is a claim about a set, and a repository
+  whose `/details` could not be read was never in it. Both the terminal and
+  the HTML now scope the claim to what was read and say that an unread
+  repository may be failing and still written to. Escalating to critical
+  instead was considered and rejected: on the estates measured almost
+  everything is idle, `/details` is fanned out so a transient read failure is
+  ordinary, and the verdict would flap between critical and warning with
+  nothing changing in the cluster — which `kdl-diff.sh` scores as a
+  regression each time.
+- **A deleted profile or policy quietened a repository still being written
+  to.** 2.6.0 counted a failing repository as quiet when its profile or policy
+  had been deleted, even with a recent write on record, so a repository
+  written to the day before could drop to a warning. A known write date now
+  wins over a deleted owner, which makes a repository quiet only where its
+  last write cannot be dated.
+- **A repository whose only successful maintenance was its first was reported
+  CRITICAL.** The first full maintenance legitimately runs one task fewer —
+  `full-drop-deleted-content` has nothing to drop yet — which is why that run
+  is held out of the >=90% calibration window. It was still judged against
+  the floor derived without it, so it scored incomplete, the one success the
+  repository had was discarded, `daysSinceLastSuccess` went null and the
+  ladder returned `FAILING_STALE` instead of `FAILING`: a critical produced
+  by arithmetic rather than by anything the repository did, with a failure
+  streak one too high. The oldest run is now exempt from the completeness
+  test for the same reason it is exempt from the floor. New fixture
+  `first-run-good`, verified to fail beforehand.
+- **`FAILING` and `FAILING_INACTIVE` had no branch in the HTML `badge()`
+  chain**, so the rollup rendered as a neutral blue "info" badge beside a red
+  **Critical** cell in the same row. The third time a new status has slipped
+  past a renderer chain on this branch; the gate now checks, statically, that
+  every value `BP_STORAGE_REPO_STATUS` can take has a branch of its own.
+- **`Run failed — no success for never`.** `never` stood for two different
+  things — a success that never happened, and one that cannot be dated — and
+  `FAILING_STALE` is reached by both. The terminal already said "an unknown
+  number of days"; the HTML now says the same. The two remaining
+  `unknown` + `"d"` concatenations, in the `STALE` and `AMBER` badges, are
+  guarded as the `OK` badge already was.
+- **`last success unknown days ago`** in the terminal `STALE` line, which
+  falls back to the maintenance age when the success age is absent and
+  printed the word itself when that was absent too. The same defect as the
+  badge above, in the third output path: the HTML branch was guarded in the
+  same pass and this one was not. Found by auditing every remaining use of
+  the age bindings after the HTML change made them nullable.
+- **`KDL_PARALLEL=08` ended the run** with `value too great for base`, naming
+  neither the variable nor the cause, on a knob whose documented promise is
+  that a typo in it costs nothing. A leading zero made it an octal literal;
+  `010` was worse, since it is valid octal and ran quietly at width 8. A
+  value too long to be an integer reached `[ -lt ]` and produced an error
+  about a comparison the reader never made. All three are normalised now.
+- **`OK - unknown days ago`** in the terminal, and **`Disabled` painted red**
+  in the HTML table while the card and the terminal both called it amber and
+  the rollup it drives is a warning.
+- **An import-only cluster read `maintenance is succeeding (0 of 4 repo(s)
+  maintained)`** — a success claim and a zero together, about a cluster where
+  no maintenance is meant to run at all. `READ_ONLY` is the one status that
+  does not block `OK`, so that combination is exactly an all-import cluster,
+  and it now says so.
+- **`NOT_ASSESSED` named only one of its two causes.** Repositories that
+  answered without a determinable outcome and repositories that never
+  answered are not exclusive, and a cluster with both was told about the
+  first only — in the terminal, and in the HTML, which said neither.
+- The count of failures that earn a critical includes repositories whose last
+  write **cannot be dated** — deliberately, so an unknown cannot quieten a
+  finding on its own — but four sentences printed that count under the flat
+  claim that they were "still being written to".
+- Two comments carried validation-cluster object names.
+
+### Added to the 2.6.0 check
+
+- `firstRunDue` per repository, plus `neverRanDueCount` and
+  `neverRanNotDueCount`: whether a repository with no run in its history has
+  reached its first scheduled maintenance. Published rather than derived per
+  renderer — the terminal derived it and the HTML could not, so one
+  repository was an informational "not due" in one output and a red failure
+  in the other. `neverRanCount` stays the sum, so the status tally still
+  reconciles.
+- `procedureSuccessTime` and `daysSinceProcedureSuccess`: the newest procedure
+  record that SUCCEEDED. They sit beside `procedureEndTime` and
+  `daysSinceProcedure`, which track the newest record whether it succeeded or
+  not, and the two pairs must stay in step.
+- `verdictGloss`, `verdictDetail` and `verdictNotes`: the best-practices line
+  for the section, published so every output prints the same words.
+- `statusLabel` and `statusLevel` per repository, and `summary` for the
+  section (the total, the status rows, the context rows and their notes, or a
+  message when there is nothing to count): published so every output prints
+  the same words.
+
+### Deliberately not changed
+
+- **The success clock prefers task history; the failure verdict prefers the
+  procedure record.** This looks like an inconsistency and is not one: a
+  procedure success means the run completed without erroring, not that every
+  task ran, so it is the weaker evidence for a success and the stronger
+  evidence for a failure. Unifying them was tried and measured — it reported
+  a repository `OK` while it had skipped a required task every night for
+  twelve days. The reasoning is recorded beside the code.
+
 ## [2.6.0] - 2026-09-23
 
 ### Fixed

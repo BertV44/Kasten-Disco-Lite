@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.6.0
+# Kasten Discovery Lite v2.7.0
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -50,19 +50,108 @@ These join the existing v1.9 features:
 - **Catalog Size** with **Free Space** alerts
 - **K10 infrastructure volumes** — access mode and backend shape of the PVCs the Helm chart creates for K10 itself (catalog, jobs, logging, metering, Prometheus), scoped to exclude FileStore profile targets
 - **Orphaned RestorePoints** detection
-- **Average Policy Run Duration**
+- **Policy Run Statistics** — average/min/max run duration, and a snapshot-vs-export phase breakdown, both scoped to **application policies only** and both over the last 14 days *(scope + phases NEW v2.7.0)*
 - **Location Profiles** with immutability detection (supports `Xh` and `Xd` formats)
 - **PolicyPresets** inventory
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp *(NEW v2.4, rebuilt v2.6)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state unreleased)*
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
 
 ---
+
+## What's New (unreleased)
+
+- **What the K10 scheduler is doing with each repository.** The repositories
+  service parks a healthy repository after five clean cycles since its last
+  write, and gives up on a failing one after a burst of retries. Neither left
+  a trace KDL could see, so a parked repository aged into `STALE` and a
+  given-up one read as though tonight's run would retry it. Each repository
+  now carries `k10SchedulerState` — `read-only`, `blocked`, `running`,
+  `scheduled`, `parked` or `dropped` — from the service's own timer, the pods
+  acting on the repository and the service's idle rule. A `dropped` repository
+  says K10 is not scheduling it and what will retry it, including when a
+  `crypto-svc` restart will not.
+
+- **The two settings above every repository are read.** The Kasten DR
+  ownership block, ConfigMap `k10-dr-remove-to-get-ownership`, is placed by
+  every DR restore; while it exists K10 processes no repository, and policies
+  keep running, so the repositories grow unmaintained. Every repository then
+  reads `blocked` (a parked one is not `IDLE`: parking describes a service
+  that is processing), every eligible failure is quiet (`dr-ownership-block`),
+  and the section verdict is `BLOCKED_DR_OWNERSHIP`, a warning, with the
+  remedy and its condition: delete the ConfigMap only when no other instance
+  restored from the same catalog may still maintain these repositories. The
+  `backgroundMaintenanceRun` key of ConfigMap `k10-features` enables
+  background maintenance by being present, whatever its value; when it is
+  absent, storage scans are all that runs, the verdict is
+  `DISABLED_BY_CONFIG`, and eligible failures are quiet
+  (`maintenance-feature-off`). A value that reads as off is called out,
+  because K10 does not read it. Both are published in
+  `k10MaintenancePreconditions`, and a read that fails is reported as not
+  checked, never as absent.
+
+- **`IDLE`** is the status of a repository K10 has parked. Not a fault. A
+  parked repository still holding stranded content — no snapshot left, most
+  of the store unreferenced, or content marked unused — is `IDLE` with a
+  warning, because nothing reclaims that space until the next write.
+
+- **Severity is earned by accumulation, not by writes.** An idle repository in
+  which a live policy still retires restore points keeps its critical: each
+  retirement leaves space that only maintenance reclaims. A quiet failure
+  drops to a warning only when the record proves nothing more accumulates —
+  every restore point has retired, the profile is gone or points elsewhere, or
+  no live policy retires restore points in it — and the row says which proof
+  applied. For `volumedata` the strongest proof is direct: no
+  RestorePointContents references the namespace any more, whatever an old
+  snapshot count says. A zero snapshot count proves every restore point
+  retired only when a storage scan took it after the last write, since an
+  earlier one can miss what an export added; then it settles even a
+  repository written to recently, because nothing is left to retire.
+
+- **A short run is not an abort.** Kopia exits non-zero on any task failure,
+  so a run it exited 0 on is a success, even with a conditional task skipped.
+  A quick cycle run by another client is reported as that, never as a short
+  full run.
+
+- **`DISABLED`** now reads only `spec.disableMaintenance`. K10 runs full
+  maintenance with `--full`, which bypasses Kopia's own switch, so a
+  repository with that switch off is still maintained.
+
+- **Orphaned** also covers a policy that no longer exports to the profile, and
+  a namespace deleted or recreated under the same name (compared by UID). Both
+  outputs list each reason separately rather than calling them all deleted.
+
+- **Fixes to the v2.6 maintenance check.** A known write date wins over the
+  owner: a repository written to recently is never quietened by a deleted
+  profile or policy, and one whose last write cannot be dated counts as active
+  on its own. A repository never written to at all is quiet, measured from
+  `modifiedTime` rather than `storageUsage`, which only a storage scan
+  populates. `NEVER_RAN` earns a critical only once the first run is overdue:
+  older than one full maintenance interval, or a full interval past its
+  scheduled time, and never while a maintenance pod is running for it; below
+  that it stays a warning. A repository whose every recorded run failed no
+  longer reports `OK`, and one that failed last night after succeeding the
+  night before is `FAILING`, not `FAILING_STALE`. The best-practices line,
+  each repository status label and the section summary read the same in the
+  terminal and the HTML: KDL.sh writes them once and both print them verbatim.
+  A failing repository is red only where it earns the critical, and the
+  sidebar counts repositories, not badges.
+
+- **Corrections to the v2.6 notes below.** A failed run leaves no timestamp
+  behind: Kasten records a maintenance result only after an exit-0 run, so
+  the *previous* success's timestamp stays and reads as fresh for up to a
+  week while every run fails. Failure messages mask IPv4 addresses, not all
+  IP addresses. And an unread repository forces `NOT_ASSESSED` only when no
+  repository that *was* read outranks it — a failure, but also a merely
+  stale, overdue, never-run or disabled one; that verdict then stands, with
+  the unread count printed beside it. A repository written to yesterday can
+  be quietened after all: by a zero snapshot count taken after that write,
+  since nothing is left to retire.
 
 ## What's New in v2.6
 
@@ -247,15 +336,26 @@ The "biggest gap" (largest unscored pillar) is identified as actionable advice. 
 
 > **Note**: the score is a synthesis indicator for executive / CISO communication — not a compliance assertion. Pillar weighting is empirical. See [Appendix A: Ransomware Readiness Score — Rationale](#appendix-a-ransomware-readiness-score--rationale) for the full justification of each pillar weight, evidence rules, and known limitations.
 
+### Policy Run Statistics: scope & phase breakdown (v2.7.0)
+
+The duration cards and the per-policy table are scoped to **application policies only** — the same `SYSTEM_POLICY_PATTERNS` exclusion `policyAnalysis` already applies, so the two sections cannot disagree about what "policy" means. Before v2.7.0 the sample mixed in `k10-disaster-recovery-policy` and `k10-system-reports-policy`: on one real cluster this dragged a reporting policy's 7-second runs into the reported Min and a DR policy's 3m31s runs into the average, while the actual multi-hour application backup read as an outlier against a mean it had itself been used to compute. `averageDuration` now also reports `scopedPolicyCount`, `systemExcludedCount`, and `unknownAttributionCount` (RunActions whose `.spec.subject.name` could not be resolved to a policy at all — counted separately, never silently folded into the application sample).
+
+`policyRunStats.phaseBreakdown` adds a snapshot-vs-export duration split, over the same 14-day window and application-policy scope, both as overall summary cards and per policy in the table. Each run's snapshot and export phases are resolved by matching `BackupAction`/`ExportAction` objects that carry the same `k10.kasten.io/policyName` label and whose own `startTime`/`endTime` fall inside the run's window — no extra `kubectl` call or RBAC, the actions were already fetched. Four rules govern the numbers:
+
+- **A policy can carry more than one export action** (Kasten 9.0 additional export). The export phase of a run is the **wall-clock envelope** of its export action(s) — latest end minus earliest start — never their sum: two parallel exports must not make the export phase read as longer than the run itself, and the export actions are never reduced to just the first one.
+- **The phases are not guaranteed disjoint or contiguous.** Snapshot + export duration is *not* expected to equal the run's total span: queue time between phases belongs to neither and is never presented as a third phase.
+- **Presence, not truthiness.** An export action's absence and an export of genuinely zero measurable duration are different answers (`exportState` is `"not_configured"` / `"unknown"` / `"measured"`, and only a `"measured"` row's `exportSeconds` is meaningful — never a bare `// 0`).
+- **Evicted actions read as `unknown`, never as `0`.** On a busy cluster some runs in the window will have a total duration but no surviving phase action; `unknownCount` (per phase) says how many, and it feeds the rendered text, not just the JSON.
+
 ### Effective RPO per Policy (patch 3/7)
 
-For each policy, KDL measures the **median interval** between consecutive `Complete` RunActions over the same 14-day window used by Average Run Duration. Median (not mean) is used because it is robust to outliers (a single 12h backup after a maintenance window doesn't blow up the metric).
+Application policies only, same scope as above (`k10-disaster-recovery-policy` / `k10-system-reports-policy` excluded since v2.7.0). For each policy, KDL measures the **median interval** between consecutive `Complete` RunActions over the same 14-day window used by Average Run Duration. Median (not mean) is used because it is robust to outliers (a single 12h backup after a maintenance window doesn't blow up the metric).
 
 Drift detection: `median > theoretical × 1.5` (50% retard). Only flagged for policies declared with a K10 frequency alias (`@hourly`, `@daily`, `@weekly`, `@monthly`=30 days, `@yearly`); custom cron expressions and manual policies report stats without drift judgement.
 
 Failed, Cancelled, and Running runs are excluded — RPO measures time between two **successful** backups. With fewer than 2 samples, the policy is reported with null fields and no drift verdict (cannot conclude).
 
-Exposed under `policyRunStats.effectiveRpo` with summary stats plus per-policy items: `{name, frequencyDeclared, frequencyTheoreticalSeconds, samples, median, max, drift}`.
+Exposed under `policyRunStats.effectiveRpo` with summary stats plus per-policy items: `{name, frequencyDeclared, frequencyTheoreticalSeconds, samples, median, max, drift, paused, pausedState, pausedReason}`. Zero samples reads differently depending on `pausedState`: a paused policy is a decision, anything else is at best a corroborating signal something is wrong — see [Policy Paused/Enabled State](#policy-pausedenabled-state).
 
 ### Policy Analysis: Empty + Redundant (patch 4/7)
 
@@ -277,7 +377,27 @@ Selector kinds handled:
 - **Genuine** — two non-catchall policies overlap (actionable, real redundancy)
 - **With catchall** — by-design redundancy that exists whenever a catch-all policy is used (informational)
 
-Exposed under JSON top-level key `policyAnalysis`.
+A pair is never reported when either side is a confirmed-paused policy (#51) — see [Policy Paused/Enabled State](#policy-pausedenabled-state).
+
+Exposed under JSON top-level key `policyAnalysis`. Each `resolved[]` entry also carries `paused`, `pausedState`, `pausedReason`; `summary` carries `pausedCount`, `enabledCount`, `pausedStateUnknownCount`, `pausedSchemaStatus`.
+
+### Policy Paused/Enabled State
+
+Kasten policies can be individually switched off via `spec.paused` (boolean) without deleting them (#51). KDL reads this and treats a paused policy as protecting nothing — three states, never two:
+
+- **`enabled`** — `paused: false`, or the field is absent and the cluster's CRD is confirmed to declare it (Kasten's Go `omitempty` drops a `false` on write, so absence means "not paused" only once the field is known to exist at all).
+- **`paused`** — `paused: true`. Read the same way regardless of whether the CRD schema could be confirmed: an explicit value on the policy instance is direct evidence and outranks the schema probe.
+- **`unknown`** — the field is absent AND the installed Kasten version's CRD does not declare `spec.paused` (older Kasten), or the CRD read itself was refused (RBAC). `pausedReason` distinguishes the two (`schema_absent` vs `probe_refused`) even though both resolve to `unknown`. An `unknown` policy is treated exactly like `enabled` for coverage purposes — KDL never guesses a policy is paused, since that would be the overstating-protection direction of error in reverse (silently hiding a namespace that a schema-less cluster genuinely protects).
+
+Schema support is probed once, cluster-wide, via `get customresourcedefinitions.apiextensions.k8s.io policies.config.kio.kasten.io -o json` (`policies.config.kio.kasten.io` is a real CRD served locally, unlike `restorepointcontents` — see the RestorePointContent note above — so this probe is valid). No extra RBAC: `kdl-rbac.yaml` already grants `get`/`list` on `customresourcedefinitions` cluster-wide for the KubeVirt VM-CRD probe this reuses the pattern from.
+
+What changes when a policy is confirmed paused:
+
+- **Coverage**: excluded from `coverage.policiesTargetingAllNamespaces`, the catch-all detection, and selector-based `PROTECTED_NAMESPACES` — a namespace whose only policy is paused is reported unprotected. This does **not** override the evidence view: a namespace with a real successful backup on record (`namespaceProtectionStatus` / `unprotectedBreakdown.backedUpDespiteSelector`) still reads as protected even if its only policy is now paused — evidence always wins over selector inference.
+- **Redundant pairs**: no finding when either side is paused (see above).
+- **Effective RPO**: `pausedState` travels onto each `policyRunStats.effectiveRpo` item, so a paused policy with 0 samples in the 14-day window is not confused with a broken one.
+
+No new best-practice check was added for this — it is a badge on existing sections (Backup Policies table, Policy Analysis, Effective RPO), not a 20th check in [Best Practices Compliance](#best-practices-compliance-19-checks).
 
 ### K10 RBAC Inventory (patch 2/7)
 
@@ -297,7 +417,7 @@ No new kubectl call, no new RBAC — the data is derived from `namespaces_raw.js
 
 ### `kdl-diff.sh` standalone JSON comparator (patch 6/7)
 
-Separate POSIX sh script that takes two KDL JSON outputs and reports changes across 16 sections: metadata, ransomware readiness (delta grade + per-pillar), licence, backup health, catalog, policies (added/removed), namespace coverage, policy analysis, effective RPO, K10 RBAC subjects, profiles, disaster recovery, virtualization, resource limits, best practices.
+Separate POSIX sh script that takes two KDL JSON outputs and reports changes across 17 sections: metadata, ransomware readiness (delta grade + per-pillar), licence, backup health, catalog, policies (added/removed), namespace coverage, policy analysis, effective RPO, policy run statistics (sample size, snapshot/export unknown-count trend) *(NEW v2.7.0)*, K10 RBAC subjects, profiles, disaster recovery, virtualization, resource limits, best practices.
 
 Classifies each change as improvement / regression / neutral. Exit code = number of regressions (capped at 99), 100 = usage error. Three output modes: `--human` (default), `--json` (structured), `--summary` (suppress no-change lines).
 
@@ -339,7 +459,7 @@ This branch folds in all v1.9.2 fixes:
 ### v1.9 — Features
 
 - **BP-RET-HIGH threshold raised from `> 2` to `> 7`** — the old threshold flagged perfectly reasonable retention strategies as bad practice. New threshold aligns with the K10 documented `daily=7` default. Rationale documented inline.
-- **Disaster Recovery section** now displays both `kdrSnapshotConfiguration.enabled` and `kdrSnapshotConfiguration.exportData.enabled`. Quick DR variants (Local Snapshot, Exported Catalog, No Snapshot) are surfaced as distinct modes.
+- **Disaster Recovery section** now surfaces the Quick DR catalog-snapshot variants (Local Snapshot, Exported Catalog, No Snapshot) as distinct modes. *(Corrected in a later release: the fields actually read are `kdrSnapshotConfiguration.takeLocalCatalogSnapshot` and `.exportCatalogSnapshot` — the field names originally shipped here, `.enabled` / `.exportData.enabled`, do not exist in that object and always read as absent; see the Disaster Recovery output section below and the CHANGELOG.)*
 - **Failed Actions Top 5** — dedicated section, recursive cause-chain unwrapping via `JQ_DEEPEST_MSG` helper (bounded recursion, 5 levels).
 - **Per-Namespace Protection Status** — last successful backup per namespace, stale detection (default threshold: 7 days, configurable via `STALE_DAYS_THRESHOLD`).
 - **Stuck Actions detection** — `state=Running` for more than `STUCK_HOURS_THRESHOLD` hours (default 24) flags hung Kanister jobs or kubectl exec calls that never returned.
@@ -458,8 +578,8 @@ echo "Regressions: $?"   # exit code = number of regressions
 12. **Policy Presets** — Presets with frequency and retention, policies using presets
 13. **Kasten Policies** — Policies with frequency, schedule, actions, selectors, retention (snapshot + export)
 14. **Policy Last Run Status** — Timestamp, state, duration, deepest cause-chain error
-15. **Policy Run Duration** — Average, min, max over last 14 days
-16. **Effective RPO per Policy** *(NEW v2.0)* — Median interval between successful runs, drift vs theoretical
+15. **Policy Run Duration** — Average, min, max over last 14 days, **application policies only** (system DR/reports policies excluded from the sample and from the per-policy table); plus a snapshot-vs-export phase breakdown per policy, over the same window and scope *(scope fix + phase breakdown NEW v2.7.0)*
+16. **Effective RPO per Policy** *(NEW v2.0)* — Median interval between successful runs, drift vs theoretical, **application policies only** *(scope fix NEW v2.7.0)*
 17. **Policy Analysis: Empty + Redundant** *(NEW v2.0)* — Empty policies, redundant pairs (genuine vs catchall)
 18. **Per-Namespace Protection Status** — Last successful backup per namespace, stale detection
 19. **Namespace Protection** — Catch-all detection, unprotected namespaces
@@ -514,7 +634,7 @@ New in v2.0:
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
 | K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
-| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when stale, overdue, never run or disabled; **critical** when a repository still being written to keeps failing |
+| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when a run failed but a success is still recent, when repositories are stale, overdue, never run, disabled or parked with stranded content, when every failure is quiet and proven not to accumulate, or when the Kasten DR ownership block is in place or background maintenance is disabled in `k10-features`; **critical** when a repository still gaining unreclaimed space — written to, undated, or holding restore points a live policy still retires — has no recent success, or has never run and its first run is overdue |
 | Residual snapshots     | Warning  | No local snapshot past 7 days that no policy retains | On-demand, policy-deleted or unbound snapshots left behind |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
@@ -905,7 +1025,15 @@ Key portability measures:
 
 ## Version History
 
-- **v2.6.0** (Current) — **Repository maintenance integrity**
+- **v2.7.0** (Current) — **DR mode, run-statistics scope, policy paused state,
+  and what the K10 scheduler decides.** Fixes #49, #51, #53, #54 and merges
+  PR #52. Disaster Recovery mode is read from the fields Kasten actually
+  writes; Policy Run Statistics is scoped to application policies and breaks
+  each run into its snapshot and export phases; a paused policy no longer
+  counts as protection; an unmeasured state is never rendered as a negative
+  finding; and storage-repository maintenance reads the K10 scheduler state,
+  the DR ownership block and the background-maintenance feature flag.
+- **v2.6.0** — **Repository maintenance integrity**
   - Maintenance status comes from evidence a run **succeeded**, not from the
     newest recorded timestamp: `FAILING`, `FAILING_STALE`, `OVERDUE`,
     `READ_ONLY` and `UNKNOWN` join `OK`, `STALE` (renamed from `AMBER`),

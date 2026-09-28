@@ -613,6 +613,16 @@ FIXED_EMPTY_COUNT=$(echo "$FIXED_EMPTY" | jq 'length')
 B_REDUNDANT=$(get_baseline '.policyAnalysis.summary.redundantPairsGenuine')
 C_REDUNDANT=$(get_current '.policyAnalysis.summary.redundantPairsGenuine')
 
+# #51: paused is an operator DECISION, not a regression or an improvement --
+# neither mark_regression nor mark_improvement fires for it, same as the
+# other neutral [INFO] changes in this script (KDR mode, VM count, ...).
+B_PAUSED=$(get_baseline_json '[.policyAnalysis.resolved[]? | select(.pausedState == "paused") | .name]')
+C_PAUSED=$(get_current_json '[.policyAnalysis.resolved[]? | select(.pausedState == "paused") | .name]')
+NEWLY_PAUSED=$(set_diff "$C_PAUSED" "$B_PAUSED")
+RESUMED_PAUSED=$(set_diff "$B_PAUSED" "$C_PAUSED")
+NEWLY_PAUSED_COUNT=$(echo "$NEWLY_PAUSED" | jq 'length')
+RESUMED_PAUSED_COUNT=$(echo "$RESUMED_PAUSED" | jq 'length')
+
 PA_CHANGED=false
 if [ "$NEW_EMPTY_COUNT" -gt 0 ]; then
   print_change "[REGRESSION]" "$COLOR_RED" "${NEW_EMPTY_COUNT} new empty policy/policies: $(echo "$NEW_EMPTY" | jq -r 'join(", ")')"
@@ -636,6 +646,16 @@ if [ -n "$B_REDUNDANT" ] && [ -n "$C_REDUNDANT" ] && [ "$B_REDUNDANT" != "$C_RED
   fi
   PA_CHANGED=true
 fi
+if [ "$NEWLY_PAUSED_COUNT" -gt 0 ]; then
+  print_change "[INFO]" "$COLOR_CYAN" "${NEWLY_PAUSED_COUNT} polic(y/ies) newly paused: $(echo "$NEWLY_PAUSED" | jq -r 'join(", ")') (now excluded from coverage and redundant-pair checks)"
+  mark_neutral
+  PA_CHANGED=true
+fi
+if [ "$RESUMED_PAUSED_COUNT" -gt 0 ]; then
+  print_change "[INFO]" "$COLOR_CYAN" "${RESUMED_PAUSED_COUNT} polic(y/ies) resumed (no longer paused): $(echo "$RESUMED_PAUSED" | jq -r 'join(", ")')"
+  mark_neutral
+  PA_CHANGED=true
+fi
 if [ "$PA_CHANGED" = false ] && [ "$SUMMARY_ONLY" = false ] && [ "$MODE" = "human" ]; then
   _e=$(echo "$C_EMPTY" | jq 'length')
   print_change "[OK]" "$COLOR_GREEN" "No change (${_e} empty, ${C_REDUNDANT:-0} redundant pairs)"
@@ -643,9 +663,11 @@ fi
 
 PA_JSON=$(jq -c -n \
   --argjson newE "$NEW_EMPTY" --argjson fixedE "$FIXED_EMPTY" \
-  --argjson br "${B_REDUNDANT:-0}" --argjson cr "${C_REDUNDANT:-0}" '
+  --argjson br "${B_REDUNDANT:-0}" --argjson cr "${C_REDUNDANT:-0}" \
+  --argjson newP "$NEWLY_PAUSED" --argjson resumedP "$RESUMED_PAUSED" '
   {newlyEmpty: $newE, resolvedEmpty: $fixedE,
-   baselineRedundantGenuine: $br, currentRedundantGenuine: $cr, redundantDelta: ($cr - $br)}
+   baselineRedundantGenuine: $br, currentRedundantGenuine: $cr, redundantDelta: ($cr - $br),
+   newlyPaused: $newP, resumedFromPaused: $resumedP}
 ')
 add_section_json "policyAnalysis" "$PA_JSON"
 
@@ -681,6 +703,75 @@ RPO_JSON=$(jq -c -n \
   {newlyInDrift: $newD, recoveredFromDrift: $recD}
 ')
 add_section_json "effectiveRpo" "$RPO_JSON"
+
+### -------------------------
+### Policy Run Statistics: scope & phase breakdown (v2.7.0, #54)
+### -------------------------
+# averageDuration.{seconds,min,max,sampleCount} are pre-existing keys, not
+# renamed: their MEANING changed (app-policy scope instead of every policy),
+# so a baseline taken before v2.7.0 and a current report taken after it will
+# show a population shift here that is not a real trend -- expected, same
+# discontinuity as the v2.6.0 amberCount -> staleCount rename. Only compare
+# them when both sides already report a scope (i.e. both are v2.7.0+).
+print_section "Policy Run Statistics (scope & phases)"
+B_RUNSTATS_SCOPE=$(get_baseline '.policyRunStats.averageDuration.scope')
+C_RUNSTATS_SCOPE=$(get_current '.policyRunStats.averageDuration.scope')
+B_SAMPLE=$(get_baseline '.policyRunStats.averageDuration.sampleCount')
+C_SAMPLE=$(get_current '.policyRunStats.averageDuration.sampleCount')
+# Phase-breakdown unknown counts: only present from v2.7.0 on. A growing
+# unknown count means more snapshot/export actions are being evicted before
+# KDL can read them -- worth surfacing as a trend, not just a number.
+B_SNAP_UNKNOWN=$(get_baseline '.policyRunStats.phaseBreakdown.overall.snapshot.unknownCount')
+C_SNAP_UNKNOWN=$(get_current '.policyRunStats.phaseBreakdown.overall.snapshot.unknownCount')
+B_EXP_UNKNOWN=$(get_baseline '.policyRunStats.phaseBreakdown.overall.export.unknownCount')
+C_EXP_UNKNOWN=$(get_current '.policyRunStats.phaseBreakdown.overall.export.unknownCount')
+
+RUNSTATS_CHANGED=false
+if [ "$B_RUNSTATS_SCOPE" != "app-policies" ] || [ "$C_RUNSTATS_SCOPE" = "null" ] || [ -z "$C_RUNSTATS_SCOPE" ]; then
+  print_change "[INFO]" "$COLOR_CYAN" "Baseline predates the v2.7.0 app-policy scope fix (#54) -- sample size/min/max/avg are not comparable across this boundary; not diffed."
+  RUNSTATS_CHANGED=true
+else
+  if [ -n "$B_SAMPLE" ] && [ -n "$C_SAMPLE" ] && [ "$B_SAMPLE" != "$C_SAMPLE" ] && [ "$B_SAMPLE" != "null" ] && [ "$C_SAMPLE" != "null" ]; then
+    print_change "[INFO]" "$COLOR_CYAN" "App-policy run sample size: ${B_SAMPLE} -> ${C_SAMPLE} runs (14d window; size alone is not a regression or an improvement)"
+    RUNSTATS_CHANGED=true
+  fi
+  if [ -n "$B_SNAP_UNKNOWN" ] && [ -n "$C_SNAP_UNKNOWN" ] && [ "$B_SNAP_UNKNOWN" != "null" ] && [ "$C_SNAP_UNKNOWN" != "null" ] && [ "$B_SNAP_UNKNOWN" != "$C_SNAP_UNKNOWN" ]; then
+    if [ "$C_SNAP_UNKNOWN" -gt "$B_SNAP_UNKNOWN" ] 2>/dev/null; then
+      print_change "[REGRESSION]" "$COLOR_RED" "Snapshot-phase unknown count: ${B_SNAP_UNKNOWN} -> ${C_SNAP_UNKNOWN} (more runs whose snapshot action could not be found in the window)"
+      mark_regression
+    else
+      print_change "[IMPROVED]" "$COLOR_GREEN" "Snapshot-phase unknown count: ${B_SNAP_UNKNOWN} -> ${C_SNAP_UNKNOWN}"
+      mark_improvement
+    fi
+    RUNSTATS_CHANGED=true
+  fi
+  if [ -n "$B_EXP_UNKNOWN" ] && [ -n "$C_EXP_UNKNOWN" ] && [ "$B_EXP_UNKNOWN" != "null" ] && [ "$C_EXP_UNKNOWN" != "null" ] && [ "$B_EXP_UNKNOWN" != "$C_EXP_UNKNOWN" ]; then
+    if [ "$C_EXP_UNKNOWN" -gt "$B_EXP_UNKNOWN" ] 2>/dev/null; then
+      print_change "[REGRESSION]" "$COLOR_RED" "Export-phase unknown count: ${B_EXP_UNKNOWN} -> ${C_EXP_UNKNOWN} (more runs whose export action could not be found in the window)"
+      mark_regression
+    else
+      print_change "[IMPROVED]" "$COLOR_GREEN" "Export-phase unknown count: ${B_EXP_UNKNOWN} -> ${C_EXP_UNKNOWN}"
+      mark_improvement
+    fi
+    RUNSTATS_CHANGED=true
+  fi
+fi
+if [ "$RUNSTATS_CHANGED" = false ] && [ "$SUMMARY_ONLY" = false ] && [ "$MODE" = "human" ]; then
+  print_change "[OK]" "$COLOR_GREEN" "No change (sample size ${C_SAMPLE:-n/a}, snapshot unknown ${C_SNAP_UNKNOWN:-n/a}, export unknown ${C_EXP_UNKNOWN:-n/a})"
+fi
+
+RUNSTATS_JSON=$(jq -c -n \
+  --arg bSample "${B_SAMPLE:-null}" --arg cSample "${C_SAMPLE:-null}" \
+  --arg bSnapUnknown "${B_SNAP_UNKNOWN:-null}" --arg cSnapUnknown "${C_SNAP_UNKNOWN:-null}" \
+  --arg bExpUnknown "${B_EXP_UNKNOWN:-null}" --arg cExpUnknown "${C_EXP_UNKNOWN:-null}" '
+  def numOrNull: if . == "null" or . == "" then null else tonumber end;
+  {
+    baselineSampleCount: ($bSample | numOrNull), currentSampleCount: ($cSample | numOrNull),
+    baselineSnapshotUnknown: ($bSnapUnknown | numOrNull), currentSnapshotUnknown: ($cSnapUnknown | numOrNull),
+    baselineExportUnknown: ($bExpUnknown | numOrNull), currentExportUnknown: ($cExpUnknown | numOrNull)
+  }
+')
+add_section_json "policyRunStats" "$RUNSTATS_JSON"
 
 ### -------------------------
 ### K10 RBAC (v2.0)
@@ -924,11 +1015,19 @@ add_section_json "resourceLimits" "$RL_JSON"
 ### Best Practices
 ### -------------------------
 print_section "Best Practices"
-# vmSnapshotConsistency added in KDL v2.2.0, k10InfraVolumeAccessMode in v2.3.0,
-# storageRepositoryMaintenance after that;
-# both are absent on older baselines, which the "-n both values" guard below
-# already skips.
-BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging k10InfraVolumeAccessMode storageRepositoryMaintenance residualSnapshots"
+# This list must hold every key of `bestPractices`, and it is the ONLY thing
+# that decides which checks a diff can report on. Five were missing until
+# v2.7.0 -- clusterScopedResources, exportRetentionExplicit,
+# policiesWithoutExport, snapshotRetentionHigh and snapshotRetentionZero -- so a
+# regression in any of them was silently invisible to the tool whose whole job
+# is catching drift. Verified by flipping three checks in a real report: only
+# the one that was in the list got reported.
+# Keep it in step with `bpSevMap` in kdl-json-to-html.sh; checks added later
+# (vmSnapshotConsistency in v2.2.0, k10InfraVolumeAccessMode in v2.3.0,
+# storageRepositoryMaintenance after that, residualSnapshots in v2.5.0) are
+# absent from older baselines, which the "-n both values" guard below already
+# skips -- so adding a key here is always safe.
+BP_LIST="disasterRecovery immutability policyPresets monitoring resourceLimits namespaceProtection vmProtection vmSnapshotConsistency authentication encryption auditLogging k10InfraVolumeAccessMode storageRepositoryMaintenance residualSnapshots clusterScopedResources exportRetentionExplicit policiesWithoutExport snapshotRetentionHigh snapshotRetentionZero"
 BP_CHANGES_JSON="["
 BP_FIRST=true
 BP_CHANGED=false
