@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.6.0
+# Kasten Discovery Lite v2.7.0
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -1025,7 +1025,15 @@ Key portability measures:
 
 ## Version History
 
-- **v2.6.0** (Current) — **Repository maintenance integrity**
+- **v2.7.0** (Current) — **DR mode, run-statistics scope, policy paused state,
+  and what the K10 scheduler decides.** Fixes #49, #51, #53, #54 and merges
+  PR #52. Disaster Recovery mode is read from the fields Kasten actually
+  writes; Policy Run Statistics is scoped to application policies and breaks
+  each run into its snapshot and export phases; a paused policy no longer
+  counts as protection; an unmeasured state is never rendered as a negative
+  finding; and storage-repository maintenance reads the K10 scheduler state,
+  the DR ownership block and the background-maintenance feature flag.
+- **v2.6.0** — **Repository maintenance integrity**
   - Maintenance status comes from evidence a run **succeeded**, not from the
     newest recorded timestamp: `FAILING`, `FAILING_STALE`, `OVERDUE`,
     `READ_ONLY` and `UNKNOWN` join `OK`, `STALE` (renamed from `AMBER`),

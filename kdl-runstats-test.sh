@@ -247,8 +247,14 @@ eq "byPolicy run counts sum to 4 (5 total minus the ghost-policy run)" 4 "$BYPOL
 # checking the whole terminal output would make those false failures.
 TERM=$(TSEC mix); HTML=$(HSEC mix)
 has  "terminal prints the corrected sample size" "Sample size: 5 runs" "$TERM"
-has  "terminal prints the corrected Min"         "Min: 100s"           "$TERM"
-has  "terminal prints the corrected Max"         "Max: 28800s"         "$TERM"
+# v2.7.0: the summary line formats durations with the same _hms() the
+# per-policy rows use. Same values (100s, 28800s), human-readable, and no
+# longer two formats for one number in one section -- the summary said
+# "Max: 87s" where the row beneath said "max=1m27s". 28800s is also simply
+# unreadable for the 8-hour backup window this fixture represents, which is
+# the case issue #54 was raised about.
+has  "terminal prints the corrected Min"         "Min: 1m40s"          "$TERM"
+has  "terminal prints the corrected Max"         "Max: 8h0m"           "$TERM"
 has  "terminal states the app-only scope"        "App policies only (2 in scope)" "$TERM"
 has  "terminal names how many were excluded"     "excluded 2 system-policy run(s) and 1 run(s) with an unresolved policy owner" "$TERM"
 has  "terminal shows the export envelope, not a sum" "Export:   avg 1350s | min 0s | max 2700s" "$TERM"

@@ -261,7 +261,7 @@ trap '' PIPE 2>/dev/null || true
 ### -------------------------
 ### Args & flags
 ### -------------------------
-KDL_VERSION="2.6.0"
+KDL_VERSION="2.7.0"
 
 # Highest Kasten release this build was validated against (#kasten-v9).
 # Surfaced in the report so a newer cluster is flagged as "not yet validated"
@@ -11056,13 +11056,25 @@ _ep "$POLICY_LAST_RUN" | jq -r '.[]? |
   else "Never" end)
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}No run data available${COLOR_RESET}\n"
 
+# Shell twin of the jq hms() used by the per-policy run rows below. The
+# summary printed raw seconds ("Max: 87s") while the rows printed "max=1m27s"
+# for the same number, in the same section. One formatter, both places.
+_hms() {
+  _h_s=${1:-}
+  case "$_h_s" in ''|*[!0-9]*) printf 'n/a'; return 0 ;; esac
+  if [ "$_h_s" -lt 60 ]; then printf '%ss' "$_h_s"
+  elif [ "$_h_s" -lt 3600 ]; then printf '%sm%ss' "$((_h_s/60))" "$((_h_s%60))"
+  else printf '%sh%sm' "$((_h_s/3600))" "$(((_h_s%3600)/60))"
+  fi
+}
+
 ### Average Policy Run Duration (NEW v1.5; v2.7.0 #54: app-policy scope + phases)
 printf "\n${COLOR_BOLD}[TIME] Policy Run Duration${COLOR_RESET} ${COLOR_CYAN}(NEW, v2.7.0: app-policy scope)${COLOR_RESET}\n"
 printf "  ${COLOR_CYAN}App policies only ($RUNSTATS_SCOPED_POLICY_COUNT in scope); excluded $RUNSTATS_SYSTEM_EXCLUDED system-policy run(s) and $RUNSTATS_UNKNOWN_ATTRIBUTION run(s) with an unresolved policy owner from this sample${COLOR_RESET}\n"
 printf "  Sample size: $DURATION_SAMPLE_COUNT runs (last 14 days)\n"
 if [ "$DURATION_SAMPLE_COUNT" -gt 0 ]; then
-  printf "  Average: ${COLOR_GREEN}${AVG_DURATION}s${COLOR_RESET}\n"
-  printf "  Min: ${MIN_DURATION}s | Max: ${MAX_DURATION}s\n"
+  printf "  Average: ${COLOR_GREEN}%s${COLOR_RESET}\n" "$(_hms "$AVG_DURATION")"
+  printf "  Min: %s | Max: %s\n" "$(_hms "$MIN_DURATION")" "$(_hms "$MAX_DURATION")"
 else
   printf "  ${COLOR_YELLOW}[INFO]  No completed runs in the last 14 days${COLOR_RESET}\n"
 fi

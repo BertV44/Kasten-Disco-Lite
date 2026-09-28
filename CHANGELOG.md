@@ -3,7 +3,35 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.7.0] - 2026-09-28
+
+Four reported defects, one pull request, and the fixes that came out of
+reviewing both. The through-line is the one this project keeps relearning:
+a report must not state, in any of its three outputs, something the data does
+not support -- and the only way to know it does not is to compare the rendered
+text against the data, every time.
+
+- **Disaster Recovery mode was misreported on almost every Quick DR cluster**
+  (#53): KDL read two fields Kasten does not write, so a cluster taking local
+  catalog snapshots was told it took none.
+- **Policy Run Statistics measured the wrong population** (#54): system DR and
+  reporting runs were mixed into a distribution readers take as being about
+  their application backups. On the validation cluster that moved the average
+  from 32s to 53s and the minimum from 3s to 30s.
+- **A switched-off policy still counted as protection** (#51): `spec.paused`
+  was never read, so a namespace covered only by a paused policy reported as
+  protected -- the direction of error that hides the gap the section exists to
+  find.
+- **The monitoring card asserted a measurement that never happened** (#49):
+  an unread Prometheus config rendered as a confident "No" beside a Best
+  Practices row that correctly said "not assessed", in the same document.
+- **Storage-repository maintenance now reads what the K10 scheduler decides**
+  (PR #52 by Jaiganesh J K), which on a cluster restored from a Kasten DR
+  backup names the reason maintenance has not run -- where 2.6.0 could only
+  report the symptom.
+- **`kdl-diff.sh` compared only 14 of the 19 best-practice checks**, so a
+  regression in five of them was invisible to the tool whose job is catching
+  drift.
 
 The storage-repository maintenance check now reads what the K10 repositories
 service decides for each repository — whether it holds a timer, has parked the
@@ -264,89 +292,6 @@ unreclaimed space can still grow.
   configuration-fallback block). Still independent of `--no-helm`, same as
   before.
 
-### Fixed after review of the maintenance work
-- **Background maintenance switched off in `k10-features` is now a scheduler
-  state of its own** (`maintenance-off`). The state ladder had a rung for the
-  DR ownership block and none for this, so a parked repository still read
-  `IDLE` -- labelled "Not a fault", `statusLevel: info`, contributing nothing
-  -- directly under a section note saying no repository is maintained and
-  nothing is reclaimed. The new rung sits below `running`, because scans keep
-  running when only maintenance is off, and above `scheduled`/`parked`/
-  `dropped`, because none of those describes a service that is not
-  maintaining at all.
-- **A `dropped` repository no longer promises a retry that cannot happen.**
-  With maintenance switched off, the row said "It retries only when data is
-  next written to it or when crypto-svc restarts" — neither of which retries
-  anything while the key is absent — beside a note saying the opposite. The
-  sentence was already suppressed for the DR block and for a deleted profile;
-  it is now suppressed here too.
-- **A repository whose first maintenance is not yet due is no longer told K10
-  has stopped scheduling it.** `NEVER RAN - first run not yet overdue` printed
-  "K10 is not scheduling this repository" beside it. No timer on a new
-  repository is what "too new" looks like, not what "given up on" looks like.
-  The first attempt at this guard was itself inert: it read `.firstRunDue` from
-  inside the same `. + {...}` constructor that adds it, where `.` is the INPUT,
-  so it saw `null`, never fired, and the sentence printed anyway. That is the
-  exact trap the comment above that stage documents. `firstRunDue` is now
-  computed once and bound before the constructor, so the published key and
-  every reader of it cannot disagree.
-- **A critical repository no longer loses its only explanation when the
-  snapshot count has never been measured.** `activeReason` tested
-  `(.snapshotCount // 0) > 0`, and `snapshotCount` is `null` until a storage
-  scan populates `storageUsage` -- which on a failing repository may never
-  have happened. So a repository a live policy IS still retiring restore
-  points in fell through to `unverified`, which the code defines as "the gate
-  could not establish either way", and `gateNote` printed nothing. The
-  severity was correct either way, but the best-practices line tells the
-  reader to check the reason under each status and that row had none. New
-  state `retained-uncounted`, with a note that says the retainer is known and
-  the remaining count is not, plus its own section counter.
-- **`disasterRecovery.localCatalogSnapshot` / `.exportCatalogSnapshot` are
-  `null`, not `false`, when no DR policy exists.** There is no policy to have
-  a catalog-snapshot setting, so `false` asserted a measurement that was never
-  made -- inconsistent with the three-state contract #53 introduces. Not
-  rendered (the card is gated on `.enabled`), but the JSON is read directly by
-  `kdl-diff.sh` and by downstream consumers.
-- **Stranded content is keyed on the evidence that K10 parked the repository,
-  not on the `IDLE` status.** `strandedSignal` and `strandedBytes` are read
-  nowhere except `idleStranded` and `idleNote`, both of which were gated on
-  `status == "IDLE"`. Any cluster-wide rung that pre-empts the `parked`
-  scheduler state -- the DR ownership block, or background maintenance
-  switched off -- therefore deleted the entire finding: a parked repository
-  holding 5 GB of unreferenced blobs reported it as nothing, `idleStrandedCount`
-  read 0, and the row could render a green `OK` directly under a section note
-  saying unreferenced data is never reclaimed. Both are now keyed on
-  `k10Parked`, a repository holding stranded content is never green, and
-  "Not a fault" is reserved for a genuine `IDLE`.
-- **`OK` printed the wrong age.** The label used `daysSinceLastMaintenance`
-  (the newest exit-0 record) while the verdict is decided by `successAgeDays`.
-  They diverge whenever the newest exit-0 record is newer than the newest run
-  that counts as a success, so a verdict taken from a six-day-old success
-  could render "OK - maintained 1 day ago". `STALE` already preferred the
-  deciding age; `OK` now does too.
-- **`k10-features` missing entirely produced no rendered note at all.** The
-  JSON recorded `checked: false` with a reason and both outputs printed
-  nothing, so the unknown reached the data and neither reader. The verdict
-  deliberately stays loud — an absent ConfigMap is not read as "disabled" —
-  but the reader is now told the flag could not be established. A blank
-  server message no longer renders as "not checked ()".
-- **The sidebar counted no warnings for a section showing warning badges.**
-  The new `data-crit`/`data-warn` heading attributes counted only
-  `statusLevel`, and `profileMismatch` deliberately does not feed status, so
-  an `OK` repository with a repointed profile gave `data-warn="0"` beside two
-  amber badges. Cross-cutting warn-badged context rows are counted back in,
-  without double-counting a repository already warn or error.
-
-### Changed after review
-- **No remediation commands in the report.** Two were introduced: the DR
-  ownership block note carried `kubectl delete configmap ...`, and the
-  background-maintenance note carried `helm upgrade ... --set ...`. Both in
-  the terminal and the HTML. The
-  report names the ConfigMap, points at the dashboard action, and names the
-  Helm value to set. A wrong command in a support deliverable is worse than
-  no command, and the first of these is destructive: the same note warns that
-  two owners can corrupt backup data.
-
 ### Fixed
 - **`kdl-diff.sh` compared only 14 of the 19 best-practice checks.** `BP_LIST`
   had never been extended with `clusterScopedResources`,
@@ -472,6 +417,89 @@ unreclaimed space can still grow.
   with the same tolerant `ts_clean`/`ts_epoch` pattern already used
   elsewhere in `KDL.sh`; a single still-unparseable timestamp now costs one
   data point, not the whole table.
+
+### Fixed after review of the maintenance work
+- **Background maintenance switched off in `k10-features` is now a scheduler
+  state of its own** (`maintenance-off`). The state ladder had a rung for the
+  DR ownership block and none for this, so a parked repository still read
+  `IDLE` -- labelled "Not a fault", `statusLevel: info`, contributing nothing
+  -- directly under a section note saying no repository is maintained and
+  nothing is reclaimed. The new rung sits below `running`, because scans keep
+  running when only maintenance is off, and above `scheduled`/`parked`/
+  `dropped`, because none of those describes a service that is not
+  maintaining at all.
+- **A `dropped` repository no longer promises a retry that cannot happen.**
+  With maintenance switched off, the row said "It retries only when data is
+  next written to it or when crypto-svc restarts" — neither of which retries
+  anything while the key is absent — beside a note saying the opposite. The
+  sentence was already suppressed for the DR block and for a deleted profile;
+  it is now suppressed here too.
+- **A repository whose first maintenance is not yet due is no longer told K10
+  has stopped scheduling it.** `NEVER RAN - first run not yet overdue` printed
+  "K10 is not scheduling this repository" beside it. No timer on a new
+  repository is what "too new" looks like, not what "given up on" looks like.
+  The first attempt at this guard was itself inert: it read `.firstRunDue` from
+  inside the same `. + {...}` constructor that adds it, where `.` is the INPUT,
+  so it saw `null`, never fired, and the sentence printed anyway. That is the
+  exact trap the comment above that stage documents. `firstRunDue` is now
+  computed once and bound before the constructor, so the published key and
+  every reader of it cannot disagree.
+- **A critical repository no longer loses its only explanation when the
+  snapshot count has never been measured.** `activeReason` tested
+  `(.snapshotCount // 0) > 0`, and `snapshotCount` is `null` until a storage
+  scan populates `storageUsage` -- which on a failing repository may never
+  have happened. So a repository a live policy IS still retiring restore
+  points in fell through to `unverified`, which the code defines as "the gate
+  could not establish either way", and `gateNote` printed nothing. The
+  severity was correct either way, but the best-practices line tells the
+  reader to check the reason under each status and that row had none. New
+  state `retained-uncounted`, with a note that says the retainer is known and
+  the remaining count is not, plus its own section counter.
+- **`disasterRecovery.localCatalogSnapshot` / `.exportCatalogSnapshot` are
+  `null`, not `false`, when no DR policy exists.** There is no policy to have
+  a catalog-snapshot setting, so `false` asserted a measurement that was never
+  made -- inconsistent with the three-state contract #53 introduces. Not
+  rendered (the card is gated on `.enabled`), but the JSON is read directly by
+  `kdl-diff.sh` and by downstream consumers.
+- **Stranded content is keyed on the evidence that K10 parked the repository,
+  not on the `IDLE` status.** `strandedSignal` and `strandedBytes` are read
+  nowhere except `idleStranded` and `idleNote`, both of which were gated on
+  `status == "IDLE"`. Any cluster-wide rung that pre-empts the `parked`
+  scheduler state -- the DR ownership block, or background maintenance
+  switched off -- therefore deleted the entire finding: a parked repository
+  holding 5 GB of unreferenced blobs reported it as nothing, `idleStrandedCount`
+  read 0, and the row could render a green `OK` directly under a section note
+  saying unreferenced data is never reclaimed. Both are now keyed on
+  `k10Parked`, a repository holding stranded content is never green, and
+  "Not a fault" is reserved for a genuine `IDLE`.
+- **`OK` printed the wrong age.** The label used `daysSinceLastMaintenance`
+  (the newest exit-0 record) while the verdict is decided by `successAgeDays`.
+  They diverge whenever the newest exit-0 record is newer than the newest run
+  that counts as a success, so a verdict taken from a six-day-old success
+  could render "OK - maintained 1 day ago". `STALE` already preferred the
+  deciding age; `OK` now does too.
+- **`k10-features` missing entirely produced no rendered note at all.** The
+  JSON recorded `checked: false` with a reason and both outputs printed
+  nothing, so the unknown reached the data and neither reader. The verdict
+  deliberately stays loud — an absent ConfigMap is not read as "disabled" —
+  but the reader is now told the flag could not be established. A blank
+  server message no longer renders as "not checked ()".
+- **The sidebar counted no warnings for a section showing warning badges.**
+  The new `data-crit`/`data-warn` heading attributes counted only
+  `statusLevel`, and `profileMismatch` deliberately does not feed status, so
+  an `OK` repository with a repointed profile gave `data-warn="0"` beside two
+  amber badges. Cross-cutting warn-badged context rows are counted back in,
+  without double-counting a repository already warn or error.
+
+### Changed after review
+- **No remediation commands in the report.** Two were introduced: the DR
+  ownership block note carried `kubectl delete configmap ...`, and the
+  background-maintenance note carried `helm upgrade ... --set ...`. Both in
+  the terminal and the HTML. The
+  report names the ConfigMap, points at the dashboard action, and names the
+  Helm value to set. A wrong command in a support deliverable is worse than
+  no command, and the first of these is destructive: the same note warns that
+  two owners can corrupt backup data.
 
 ### Correction to the 2.6.0 entry
 
