@@ -96,6 +96,21 @@ unreclaimed space can still grow.
   `volumedata`, whether the namespace it was created for still exists under
   the same UID.
 
+- `disasterRecovery.quickMode` (`true` / `false` / `null`) in the JSON,
+  surfacing `quickDisasterRecoveryEnabled` directly so a reader can audit
+  the mode independently of the derived label. `localCatalogSnapshot` /
+  `exportCatalogSnapshot` are now three-state (`true` / `false` / `null`)
+  instead of always `true`/`false` — `null` means not determined or not
+  recognised, never guessed toward either direction.
+- `kdl-dr-mode-test.sh` (maintainer tooling, off the published tree, in the
+  style of `kdl-maintenance-test.sh`): a fully offline fake-cluster harness
+  covering every row of the catalog-snapshot classification table, all four
+  `quickDisasterRecoveryEnabled` states (`"true"`, `"false"`, key absent,
+  ConfigMap unreadable), `--no-helm` parity, HTML-escaping of an
+  attacker/operator-shaped mode string, and confirmation that the DR
+  verdict and the ransomware-readiness DR pillar score never move with the
+  mode across the whole fixture set.
+
 ### Changed
 
 - **The severity gate.** A quiet failure — idle, or orphaned with no datable
@@ -149,6 +164,12 @@ unreclaimed space can still grow.
   reported as a mismatch.
 - Every sentence published for a repository is also collected in `rowNotes`,
   and the terminal and the HTML print that list verbatim.
+
+- `k10-config` is now fetched once and shared, instead of separately at
+  four call sites (Helm release name, Disaster Recovery quick-mode read,
+  KubeVirt freeze timeout, VM snapshot concurrency, and the general
+  configuration-fallback block). Still independent of `--no-helm`, same as
+  before.
 
 ### Fixed after review of the maintenance work
 - **Background maintenance switched off in `k10-features` is now a scheduler
@@ -231,6 +252,68 @@ unreclaimed space can still grow.
   allows a minute between writers, and a value that will not parse is unknown.
 - The newest aggregate maintenance result is chosen by `completedTime` rather
   than by position.
+
+- **Disaster Recovery mode was misreported for almost every Quick DR
+  cluster.** KDL read `kdrSnapshotConfiguration.enabled` and
+  `.exportData.enabled`; neither field exists under that object (Kasten
+  writes `takeLocalCatalogSnapshot` and `exportCatalogSnapshot`; `.enabled`
+  is not a thing here and `exportData.enabled` belongs to a different object,
+  the export action's `exportParameters`). Both reads silently fell back to
+  `false`, so every Quick DR cluster read as "Quick DR (No Catalog
+  Snapshot)" regardless of its real configuration — including the default
+  and most common setup, `{takeLocalCatalogSnapshot: true}` alone (the shape
+  measured on a live Kasten 9.0.5 cluster), which now correctly reads "Quick
+  DR (Local Catalog Snapshot)". Precedence was also inverted: export
+  requires local, so a cluster with both flags `true` would still have read
+  as "Local" instead of "Exported" even with the field names fixed — fixed
+  by testing "both true" first.
+- **Legacy DR was inferred from the policy, not read from its authoritative
+  source.** An absent `kdrSnapshotConfiguration` was taken to mean Legacy DR.
+  Whether Legacy or Quick DR is active is decided by
+  `quickDisasterRecoveryEnabled` in the `k10-config` ConfigMap — the Helm
+  value `kastenDisasterRecovery.quickMode.enabled` (default `true`) AS
+  RENDERED, so it carries the chart default even when never set explicitly,
+  and it is read even under `--no-helm`. A Quick DR policy configured for no
+  catalog snapshot at all carries no `kdrSnapshotConfiguration`, and used to
+  read as Legacy DR outright.
+- A catalog-snapshot shape KDL does not recognise — the invalid
+  `exportCatalogSnapshot: true` without `takeLocalCatalogSnapshot`, or any
+  other unrecognised key under `kdrSnapshotConfiguration` (including the two
+  wrong field names above) — is now reported as "not recognised", with its
+  settings listed, instead of silently becoming "No Catalog Snapshot".
+- The Disaster Recovery HTML card rendered a `null` (not-determined /
+  not-recognised) catalog-snapshot flag as "✗ No" — the same `boolBadge`-on-
+  `null` bug as the Monitoring card below. Both DR flags now use a
+  three-state badge, and the card gained an "Exported Catalog Snapshot" row
+  (the JSON has always carried the flag; the card never displayed it) and a
+  "Quick DR Setting (k10-config)" row.
+- **`monitoring.prometheusRemoteWrite.enabled == null` ("could not be
+  read") rendered as "✗ No" on the Monitoring card**, contradicting the
+  adjacent Best Practices row, which already said "not assessed" for the
+  same field in the same document. Root cause: `boolBadge(... // false)` —
+  the same `a // b`-fires-on-`false` trap as three earlier bugs in this
+  project. Only this one call site changed; `boolBadge` itself is
+  unmodified. It has 9 other call sites (not the 11 originally reported —
+  recount confirmed by grep), every one of them audited: each reaches this
+  file as a plain `true`/`false` (`($x == "true")` at the KDL.sh producer
+  side, never a raw passthrough), so none of them can render `null` as "No"
+  either.
+- A Disaster Recovery mode string can now carry policy content verbatim
+  (the "not recognised" fallback lists the settings it does not
+  understand). The HTML card and the Best Practices row now `@html`-escape
+  it, and the terminal no longer interpolates it into a `printf` FORMAT
+  string at any of its three print sites (the Mode line, and both
+  Best-Practices-compliance lines) — it is passed as a `%s` argument
+  instead, so a value containing `%s`/`%n` prints unharmed rather than being
+  reinterpreted.
+- The `N/A (export target set outside policy)` profile hint was keyed on
+  the exact string "Quick DR (No Catalog Snapshot)", which — before this
+  fix — was every Quick DR cluster's mode. Re-keyed on the Quick DR setting
+  itself, so its output is unchanged now that the sub-modes are told apart
+  correctly.
+- A stale comment above the KDR verdict explained away the old misread "No
+  Catalog Snapshot" value as a quirk; rewritten to describe what the
+  catalog-snapshot setting actually governs, now that it is read correctly.
 
 ### Correction to the 2.6.0 entry
 

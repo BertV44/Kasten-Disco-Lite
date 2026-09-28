@@ -1045,10 +1045,68 @@ wait
 
 debug "Parallel fetch complete"
 
+# k10-config ConfigMap: read ONCE here and shared by the Helm release-name
+# lookup below, the Disaster Recovery quickDisasterRecoveryEnabled tri-state
+# read (#53), and every other k10-config-derived setting further down (VM
+# freeze timeout, snapshot concurrency, Prometheus remote write, --no-helm
+# fallback config, ...) -- those each used to re-fetch the same ConfigMap
+# (was: also at :3861, :3867, :4012). Kept independent of SKIP_HELM/--no-helm
+# on purpose: the whole point of falling back to this ConfigMap is that it
+# still works when the Helm release read is skipped.
+#
+# `if VAR=$(cmd); then ... else ... fi` (not a bare `VAR=$(cmd)`) is
+# deliberate: verified empirically that a bare assignment from a failing
+# command substitution trips `set -eu` in bash, macOS /bin/sh AND dash alike
+# (the pipeline-into-jq idiom used elsewhere in this file only survives
+# because jq exits 0 on empty stdin -- it does NOT survive non-empty invalid
+# input). Only the guarded form lets us tell "ConfigMap unreadable" apart
+# from "read fine, key absent" without risking the script dying on exactly
+# one denied read (the same class of defect as the `RBAC_MISSING` bug this
+# file documents elsewhere).
+if K10_CM_RAW=$($CLI -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null); then
+  K10_CM_READABLE=true
+else
+  K10_CM_READABLE=false
+  K10_CM_RAW='{}'
+fi
+K10_CM_RAW=$(safe_json "$K10_CM_RAW" '{}')
+
 # Extract K10 Helm release name from k10-config ConfigMap labels (defaults to "k10" if not found)
-K10_RELEASE=$($CLI -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.metadata.labels["app.kubernetes.io/instance"] // "k10"' 2>/dev/null)
+K10_RELEASE=$(_ep "$K10_CM_RAW" | jq -r '.metadata.labels["app.kubernetes.io/instance"] // "k10"' 2>/dev/null || echo "k10")
 [ -z "$K10_RELEASE" ] && K10_RELEASE="k10"
+K10_CM_JSON=$(_ep "$K10_CM_RAW" | jq -c '.data // {}' 2>/dev/null || echo '{}')
 debug "K10 Helm release name: $K10_RELEASE"
+debug "k10-config ConfigMap readable: $K10_CM_READABLE"
+
+### -------------------------
+### Quick vs Legacy DR setting (#53)
+### -------------------------
+# quickDisasterRecoveryEnabled in k10-config is the authoritative source: it
+# is the Helm value kastenDisasterRecovery.quickMode.enabled (default true)
+# AS RENDERED, so it carries the chart default even when the operator never
+# set it -- unlike the Helm values KDL collects separately (.config, user
+# overrides only). Reading it here, from the ConfigMap, also means it is
+# available under --no-helm, which skips the Helm release secret entirely.
+#
+# ConfigMap `.data` values are always strings, so "true"/"false" survive jq
+# `//` unharmed -- but they are compared explicitly below anyway, so that an
+# unreadable ConfigMap, an absent key, or any other value all land on
+# "not determined" rather than silently defaulting to Quick or Legacy.
+# Never `// "true"` / `// "false"` here: that is the exact `a // b` trap
+# this file's jq comments warn about elsewhere -- it fires on a legitimate
+# `false` exactly as hard as on `null`/missing, which would make an
+# unreadable ConfigMap read as a confident Legacy DR.
+if [ "$K10_CM_READABLE" = true ]; then
+  QUICK_DR_ENABLED_RAW=$(_ep "$K10_CM_JSON" | jq -r 'if has("quickDisasterRecoveryEnabled") then (.quickDisasterRecoveryEnabled | tostring) else "" end' 2>/dev/null || echo "")
+else
+  QUICK_DR_ENABLED_RAW=""
+fi
+case "$QUICK_DR_ENABLED_RAW" in
+  true)  KDR_QUICK_MODE="true" ;;
+  false) KDR_QUICK_MODE="false" ;;
+  *)     KDR_QUICK_MODE="null" ;;
+esac
+debug "Quick DR setting: raw='$QUICK_DR_ENABLED_RAW' (configmap readable=$K10_CM_READABLE) -> quickMode=$KDR_QUICK_MODE"
 
 ### -------------------------
 ### License info — multi-secret, type, duration, node reconciliation (#14)
@@ -1673,29 +1731,67 @@ if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
     // ( [ .spec.actions[]? | .backupParameters.profile.name | select(. != null and . != "") ] | first )
     // "N/A"')
 
-  # Detect KDR mode from kdrSnapshotConfiguration
-  KDR_SNAPSHOT_CONFIG=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration // empty')
-  if [ -n "$KDR_SNAPSHOT_CONFIG" ]; then
-    KDR_LOCAL_SNAPSHOT=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.enabled // false')
-    KDR_EXPORT_CATALOG=$(_ep "$KDR_POLICY_JSON" | jq -r '.spec.kdrSnapshotConfiguration.exportData.enabled // false')
-    if [ "$KDR_LOCAL_SNAPSHOT" = "true" ]; then
-      KDR_MODE="Quick DR (Local Catalog Snapshot)"
-    elif [ "$KDR_EXPORT_CATALOG" = "true" ]; then
-      KDR_MODE="Quick DR (Exported Catalog Snapshot)"
+  # Detect KDR mode (#53). Quick vs Legacy is decided by KDR_QUICK_MODE
+  # (quickDisasterRecoveryEnabled in k10-config, hoisted above), NOT by
+  # whether the policy happens to carry kdrSnapshotConfiguration -- Legacy DR
+  # is the default, and a Quick DR policy with no catalog snapshot may carry
+  # no kdrSnapshotConfiguration at all, so its mere absence proves nothing.
+  #
+  # Within Quick DR, the real field names are takeLocalCatalogSnapshot /
+  # exportCatalogSnapshot -- `enabled` / `exportData.enabled` do not exist
+  # under kdrSnapshotConfiguration (exportData.enabled exists, but on the
+  # export ACTION's exportParameters, a different object entirely). Wrong
+  # names plus `// false` used to turn "key absent" into a confident `false`
+  # for every cluster, so almost every Quick DR cluster read as "No Catalog
+  # Snapshot" regardless of its real configuration. Export REQUIRES local
+  # (Kasten docs, operating/dr), so local must be tested before export, not
+  # after. Any other shape present under kdrSnapshotConfiguration -- including
+  # export=true without local=true, which is not a valid configuration -- is
+  # reported as "not recognised" with its settings listed, rather than
+  # guessed into one of the three real modes.
+  KDR_CLASSIFICATION=$(_ep "$KDR_POLICY_JSON" | jq -c --arg quick "$KDR_QUICK_MODE" '
+    .spec as $s |
+    (if $quick == "false" then
+      {mode: "Legacy DR (Full Catalog Exports)", local: false, export: false}
+    elif $quick != "true" then
+      {mode: "Not determined (Quick DR setting not readable)", local: null, export: null}
     else
-      KDR_MODE="Quick DR (No Catalog Snapshot)"
-    fi
-  else
-    KDR_MODE="Legacy DR (Full Catalog Exports)"
-    KDR_LOCAL_SNAPSHOT="false"
-    KDR_EXPORT_CATALOG="false"
+      ($s.kdrSnapshotConfiguration // {}) as $c |
+      ($c.takeLocalCatalogSnapshot == true) as $l |
+      ($c.exportCatalogSnapshot == true) as $e |
+      ([$c | keys[] | select(. != "takeLocalCatalogSnapshot" and . != "exportCatalogSnapshot")] | length) as $other |
+      if $l and $e then
+        {mode: "Quick DR (Exported Catalog Snapshot)", local: true, export: true}
+      elif $l then
+        {mode: "Quick DR (Local Catalog Snapshot)", local: true, export: false}
+      elif ($e | not) and $other == 0 then
+        {mode: "Quick DR (No Catalog Snapshot)", local: false, export: false}
+      else
+        {mode: ("Quick DR (catalog snapshot settings not recognised: "
+                + ($c | to_entries | map(.key + "=" + (.value | tostring)) | join(", ")) + ")"),
+         local: null, export: null}
+      end
+    end)
+  ' 2>/dev/null || echo '{}')
+  if ! _ep "$KDR_CLASSIFICATION" | jq -e '.mode' >/dev/null 2>&1; then
+    _jq_fail "Disaster Recovery mode classification"
+    KDR_CLASSIFICATION='{"mode":"Not determined (Quick DR setting not readable)","local":null,"export":null}'
   fi
+
+  KDR_MODE=$(_ep "$KDR_CLASSIFICATION" | jq -r '.mode')
+  KDR_LOCAL_SNAPSHOT=$(_ep "$KDR_CLASSIFICATION" | jq -r '.local')
+  KDR_EXPORT_CATALOG=$(_ep "$KDR_CLASSIFICATION" | jq -r '.export')
 
   # The KDR export target is not exposed inline as exportParameters.profile.name
   # (it is configured outside the policy, via the DR secret/config), so it reads
   # as "N/A" even for a healthy DR that does export. Make the N/A informative so
-  # operators don't mistake it for a missing/broken value.
-  if [ "$KDR_PROFILE" = "N/A" ] && [ "$KDR_MODE" = "Quick DR (No Catalog Snapshot)" ]; then
+  # operators don't mistake it for a missing/broken value. Keyed on Quick DR as
+  # a whole (any catalog-snapshot sub-mode), not on one specific mode string:
+  # before the fix, misclassification meant every Quick DR cluster fell into
+  # "No Catalog Snapshot", so keying on that one string happened to cover all
+  # of them; keying on KDR_QUICK_MODE instead keeps that coverage now that the
+  # sub-modes are told apart correctly.
+  if [ "$KDR_PROFILE" = "N/A" ] && [ "$KDR_QUICK_MODE" = "true" ]; then
     KDR_PROFILE="N/A (export target set outside policy)"
   fi
 else
@@ -1707,7 +1803,7 @@ else
   KDR_EXPORT_CATALOG="false"
 fi
 
-debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE"
+debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE, quickMode: $KDR_QUICK_MODE, local: $KDR_LOCAL_SNAPSHOT, export: $KDR_EXPORT_CATALOG"
 
 ### -------------------------
 ### Policy Last Run Status (NEW v1.5)
@@ -1770,13 +1866,19 @@ debug "Policy last run info collected (enriched with error messages)"
 #
 # The DR verdict is NOT gated on the DR mode or on resolving an inline export
 # profile. Unlike application policies, the KDR export target is configured
-# outside the policy (DR secret/config), and Quick/Legacy DR export the catalog
-# by design once the DR policy runs successfully. Reading
-# .spec.actions[0].exportParameters.profile.name returns "N/A" for a perfectly
-# healthy DR, and "Quick DR (No Catalog Snapshot)" (from kdrSnapshotConfiguration)
-# does not mean "no export" — the policy still carries an export action. Gating
-# completeness on those signals wrongly reported working clusters as
-# CONFIGURED_INCOMPLETE, so an enabled DR whose last run succeeds is healthy.
+# outside the policy (DR secret/config), and the policy's OWN backup/export
+# actions run and are graded below from RunAction history, regardless of
+# catalog-snapshot mode. Reading .spec.actions[0].exportParameters.profile.name
+# returns "N/A" for a perfectly healthy DR (see the N/A hint above instead).
+#
+# kdrSnapshotConfiguration and quickDisasterRecoveryEnabled (#53) answer a
+# DIFFERENT question: whether and how the K10 CATALOG itself gets a
+# continuity snapshot. That is orthogonal to whether the policy's actions
+# succeed, so Legacy DR, every Quick DR catalog-snapshot mode (including "No
+# Catalog Snapshot"), and even a "not determined" / "not recognised" mode are
+# all compatible with a healthy DR verdict here. Gating completeness on those
+# signals wrongly reported working clusters as CONFIGURED_INCOMPLETE, so an
+# enabled DR whose last run succeeds is healthy.
 if [ "$KDR_ENABLED" = true ]; then
   KDR_CONFIG_COMPLETE=true
 
@@ -3857,14 +3959,14 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
   VMS_FREEZE_DISABLED=$(_ep "$VMS_JSON" | jq '[.items[] | select(.metadata.annotations["k10.kasten.io/freezeVM"] == "false")] | length')
   VMS_FREEZE_ENABLED=$((TOTAL_VMS - VMS_FREEZE_DISABLED))
 
-  # Freeze timeout from K10 config
-  FREEZE_TIMEOUT="$($CLI -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["kubeVirtVMs.snapshot.unfreezeTimeout"] // empty' || echo '')"
+  # Freeze timeout from K10 config (shares the hoisted K10_CM_JSON -- #53)
+  FREEZE_TIMEOUT="$(_ep "$K10_CM_JSON" | jq -r '.["kubeVirtVMs.snapshot.unfreezeTimeout"] // empty' 2>/dev/null || echo '')"
   if [ -z "$FREEZE_TIMEOUT" ]; then
     FREEZE_TIMEOUT="5m0s"
   fi
 
-  # VM snapshot concurrency setting
-  VM_SNAPSHOT_CONCURRENCY="$($CLI -n "$NAMESPACE" get configmap k10-config -o json 2>/dev/null | jq -r '.data["limiter.vmSnapshotsPerCluster"] // empty' || echo '')"
+  # VM snapshot concurrency setting (shares the hoisted K10_CM_JSON -- #53)
+  VM_SNAPSHOT_CONCURRENCY="$(_ep "$K10_CM_JSON" | jq -r '.["limiter.vmSnapshotsPerCluster"] // empty' 2>/dev/null || echo '')"
   if [ -z "$VM_SNAPSHOT_CONCURRENCY" ]; then
     VM_SNAPSHOT_CONCURRENCY="1"
   fi
@@ -4008,8 +4110,9 @@ helm_bool() {
   [ "$_v" = "true" ] && echo "true" || echo "false"
 }
 
-# k10-config ConfigMap (shared fallback source)
-K10_CM_JSON=$($CLI -n "$NAMESPACE" get configmaps k10-config -o json 2>/dev/null | jq -c '.data // {}' || echo '{}')
+# k10-config ConfigMap (shared fallback source) -- fetched once, hoisted to
+# just above the Disaster Recovery block (#53); K10_CM_JSON is already
+# populated from there, reused here rather than re-fetched.
 
 # --- Prometheus Remote Write Configuration (NEW v2.4) ---
 # Three states, not two: enabled / not-configured / unknown. "We could not read
@@ -8861,6 +8964,7 @@ if [ "$MODE" = "json" ]; then
     --arg kdrLastSuccessfulRun "$KDR_LAST_SUCCESS_TS" \
     --arg kdrLocalSnapshot "$KDR_LOCAL_SNAPSHOT" \
     --arg kdrExportCatalog "$KDR_EXPORT_CATALOG" \
+    --arg kdrQuickMode "$KDR_QUICK_MODE" \
     --argjson presetCount "$PRESET_COUNT" \
     --slurpfile presets "$TEMP_DIR/presets.json" \
     --argjson blueprintCount "$BLUEPRINT_COUNT" \
@@ -9297,8 +9401,14 @@ if [ "$MODE" = "json" ]; then
         mode: $kdrMode,
         frequency: $kdrFrequency,
         profile: $kdrProfile,
-        localCatalogSnapshot: ($kdrLocalSnapshot == "true"),
-        exportCatalogSnapshot: ($kdrExportCatalog == "true"),
+        # Three-state (true/false/null), not `// false`: the shell side hands
+        # these through as the literal strings "true"/"false"/"null" (#53),
+        # and a missing/unrecognised reading must reach the JSON as a real
+        # `null`, never as the string "null" or "" (see the quick-mode and
+        # KDR classification comments in the Disaster Recovery block above).
+        quickMode: (if $kdrQuickMode == "true" then true elif $kdrQuickMode == "false" then false else null end),
+        localCatalogSnapshot: (if $kdrLocalSnapshot == "true" then true elif $kdrLocalSnapshot == "false" then false else null end),
+        exportCatalogSnapshot: (if $kdrExportCatalog == "true" then true elif $kdrExportCatalog == "false" then false else null end),
         lastRunState: $kdrLastRunState,
         lastSuccessfulRun: (if $kdrLastSuccessfulRun == "" then null else $kdrLastSuccessfulRun end)
       },
@@ -10274,7 +10384,7 @@ if [ "$KDR_ENABLED" = true ]; then
     *)
       printf "  Status:    ${COLOR_YELLOW}[WARN] %s${COLOR_RESET}\n" "$KDR_STATUS" ;;
   esac
-  printf "  Mode:      $KDR_MODE\n"
+  printf "  Mode:      %s\n" "$KDR_MODE"
   printf "  Frequency: $KDR_FREQUENCY\n"
   printf "  Profile:   $KDR_PROFILE\n"
   if [ -n "$KDR_LAST_SUCCESS_TS" ]; then
@@ -11482,9 +11592,9 @@ printf "\n${COLOR_BOLD}[LIST] Best Practices Compliance${COLOR_RESET}\n"
 
 # Disaster Recovery
 if [ "$BP_DR_STATUS" = "ENABLED" ]; then
-  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} ($KDR_MODE)\n"
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Disaster Recovery:    ${COLOR_GREEN}ENABLED${COLOR_RESET} (%s)\n" "$KDR_MODE"
 elif [ "$KDR_ENABLED" = true ]; then
-  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Disaster Recovery:    ${COLOR_YELLOW}%s${COLOR_RESET} ($KDR_MODE)\n" "$KDR_STATUS"
+  printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Disaster Recovery:    ${COLOR_YELLOW}%s${COLOR_RESET} (%s)\n" "$KDR_STATUS" "$KDR_MODE"
 else
   printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} Disaster Recovery:    ${COLOR_RED}NOT ENABLED${COLOR_RESET}\n"
 fi

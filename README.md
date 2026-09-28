@@ -428,7 +428,7 @@ This branch folds in all v1.9.2 fixes:
 ### v1.9 — Features
 
 - **BP-RET-HIGH threshold raised from `> 2` to `> 7`** — the old threshold flagged perfectly reasonable retention strategies as bad practice. New threshold aligns with the K10 documented `daily=7` default. Rationale documented inline.
-- **Disaster Recovery section** now displays both `kdrSnapshotConfiguration.enabled` and `kdrSnapshotConfiguration.exportData.enabled`. Quick DR variants (Local Snapshot, Exported Catalog, No Snapshot) are surfaced as distinct modes.
+- **Disaster Recovery section** now surfaces the Quick DR catalog-snapshot variants (Local Snapshot, Exported Catalog, No Snapshot) as distinct modes. *(Corrected in a later release: the fields actually read are `kdrSnapshotConfiguration.takeLocalCatalogSnapshot` and `.exportCatalogSnapshot` — the field names originally shipped here, `.enabled` / `.exportData.enabled`, do not exist in that object and always read as absent; see the Disaster Recovery output section below and the CHANGELOG.)*
 - **Failed Actions Top 5** — dedicated section, recursive cause-chain unwrapping via `JQ_DEEPEST_MSG` helper (bounded recursion, 5 levels).
 - **Per-Namespace Protection Status** — last successful backup per namespace, stale detection (default threshold: 7 days, configurable via `STALE_DAYS_THRESHOLD`).
 - **Stuck Actions detection** — `state=Running` for more than `STUCK_HOURS_THRESHOLD` hours (default 24) flags hung Kanister jobs or kubectl exec calls that never returned.
