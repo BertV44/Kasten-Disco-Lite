@@ -119,6 +119,10 @@ rules:
     verbs: ["get", "list"]
 
   # --- CRD + webhook discovery ---
+  # Consumers: the KubeVirt VirtualMachine CRD presence probe, and (#51) the
+  # policies.config.kio.kasten.io CRD schema probe that resolves whether
+  # spec.paused is readable at all on this Kasten version. Both are `get`
+  # probes on individual CRD names -- no wider grant is needed for either.
   - apiGroups: ["apiextensions.k8s.io"]
     resources:
       - customresourcedefinitions

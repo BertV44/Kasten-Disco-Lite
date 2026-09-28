@@ -553,6 +553,57 @@ def policy_scope:
   if ($keys | any(. == vm_ref_key or . == vm_ns_key)) then "virtualMachine"
   else "namespace" end;
 
+# Policy paused/enabled/unknown three-state (#51).
+#
+# spec.paused is a BOOLEAN (confirmed live: `oc explain
+# policies.config.kio.kasten.io.spec` on a 9.0.5 cluster lists `paused
+# <boolean>`, no default, not in spec.required). A boolean field is exactly
+# the `a // b` trap CLAUDE.md warns about -- `.spec.paused // false` cannot
+# tell an explicit `false` from an absent key -- so every branch below is an
+# explicit `==` comparison, never `//`.
+#
+# Whether the field exists AT ALL depends on the CRD of the installed Kasten
+# version, which is a CLUSTER-WIDE fact, not a per-policy one -- so it is
+# passed in ($schemaStatus, one of "schema_confirmed" / "schema_absent" /
+# "probe_refused", computed once by the CRD probe below) rather than guessed
+# from whether any single policy happens to carry the key. The Kasten Go
+# marshalling drops `false` (`omitempty`), so on a schema that DOES declare
+# the field, an absent key means "not paused". On a schema that does not (an
+# older Kasten), or a CRD read that was refused, that same absence cannot be
+# told apart from "the concept does not apply here" -- reporting it as
+# "enabled" would silently overstate protection, the forbidden direction of
+# error. So both of those cases stay `unknown`, but pausedReason keeps them
+# distinguishable (it is exactly $schemaStatus).
+# Order matters: an EXPLICIT true/false on the instance is direct evidence and
+# is read the same way regardless of $schemaStatus -- direct evidence always
+# outranks an indirect signal, never the other way around (CLAUDE.md). The
+# schema probe is a cluster-wide, indirect signal; it only gets a vote once
+# the instance itself is silent (absent). A confirmed `true` still surfaces the caveat via
+# pausedReason when the schema could not vouch for the field, but the STATE
+# itself -- and therefore the coverage exclusion below, which reads the raw
+# value directly and never consults schema status -- agrees.
+def paused_state($schemaStatus):
+  (.spec.paused) as $p |
+  if ($p == true) then
+    { paused: true, pausedState: "paused",
+      pausedReason: (if $schemaStatus == "schema_confirmed" then null else $schemaStatus end) }
+  elif ($p == false) then
+    { paused: false, pausedState: "enabled", pausedReason: null }
+  elif ($p != null) then
+    # Present, but neither true nor false. Schema says boolean, so a live
+    # cluster should never put anything else there -- never guess which way
+    # a malformed value leans.
+    { paused: null, pausedState: "unknown", pausedReason: "unexpected_value" }
+  elif ($schemaStatus != "schema_confirmed") then
+    # Absent, AND the schema does not confirm the field exists at all:
+    # omitempty-dropped-false and does-not-apply-here are indistinguishable.
+    { paused: null, pausedState: "unknown", pausedReason: $schemaStatus }
+  else
+    # Absent, but the schema IS confirmed to declare the field: omitempty
+    # dropped a `false`, not an unknown value.
+    { paused: false, pausedState: "enabled", pausedReason: null }
+  end;
+
 # Namespace patterns a policy explicitly EXCLUDES (operator NotIn on a
 # namespace-bearing key). Must be subtracted from the included set: the
 # common catch-all-with-exceptions shape is `appNamespace In ["*"]` plus
@@ -1536,6 +1587,10 @@ ALL_NS_POLICIES="$(_ep "$APP_POLICIES_JSON" | jq '[
        (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
     )
     and ([.spec.actions[]?.action] | index("backup"))
+    # #51: a PAUSED catch-all confers no protection. `!= true` (not `//`) so
+    # `false` and absent both still count as active, only a confirmed pause
+    # is excluded.
+    and (.spec.paused != true)
   )
 ] | length // 0')"
 [ -z "$ALL_NS_POLICIES" ] && ALL_NS_POLICIES=0
@@ -1614,6 +1669,38 @@ debug "App policies targeting all namespaces: $ALL_NS_POLICIES"
 debug "Policies with export: $POLICIES_WITH_EXPORT (no-export: $POLICIES_NO_EXPORT_COUNT)"
 debug "Policies using presets: $POLICIES_WITH_PRESETS"
 debug "Import policies: $IMPORT_POLICY_COUNT"
+
+### -------------------------
+### Policy paused/enabled state -- CRD schema probe (#51)
+### -------------------------
+# See paused_state() in JQ_SELECTOR_LIB for why this has to be a schema probe
+# rather than an instance-level guess. policies.config.kio.kasten.io is a REAL
+# CRD -- served by the v1alpha1.config.kio.kasten.io APIService, not the
+# aggregated apiserver that serves restorepointcontents -- so `get crd` is a
+# valid presence probe here, unlike restorepointcontents (see CLAUDE.md). Same
+# pattern as VM_CRD_EXISTS further down (#virt-detect); kdl-rbac.yaml already
+# grants get/list on customresourcedefinitions cluster-wide (Part A), so no
+# RBAC change is needed.
+#
+# The assignment sits INSIDE the `if` condition on purpose: a bare
+# `VAR=$(cmd)` whose command exits non-zero would otherwise be killed by
+# `set -eu` before POLICY_PAUSED_SCHEMA_STATUS could be given its safe
+# default -- an `if` condition is one of the recognised `set -e` exemptions
+# (same reasoning as RBAC_MISSING and every other fallible call in this file).
+POLICY_PAUSED_SCHEMA_STATUS="probe_refused"   # schema_confirmed | schema_absent | probe_refused
+if POLICY_CRD_JSON=$($CLI get customresourcedefinitions.apiextensions.k8s.io policies.config.kio.kasten.io -o json 2>/dev/null); then
+  if _ep "$POLICY_CRD_JSON" | jq -e '.' >/dev/null 2>&1; then
+    if _ep "$POLICY_CRD_JSON" | jq -e '
+      [.spec.versions[]?.schema.openAPIV3Schema.properties.spec.properties.paused]
+      | any(. != null)
+    ' >/dev/null 2>&1; then
+      POLICY_PAUSED_SCHEMA_STATUS="schema_confirmed"
+    else
+      POLICY_PAUSED_SCHEMA_STATUS="schema_absent"
+    fi
+  fi
+fi
+debug "Policy paused/enabled schema probe: $POLICY_PAUSED_SCHEMA_STATUS"
 
 ### -------------------------
 ### k10-system-reports-policy state + ReportActions (NEW v1.9)
@@ -1893,7 +1980,7 @@ debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT ru
 # numeric fields null and drift null (cannot conclude).
 
 if [ -n "$FOURTEEN_DAYS_AGO" ]; then
-  EFFECTIVE_RPO=$(_ep "$POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" '
+  EFFECTIVE_RPO=$(_ep "$POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB"'
     ($runsArr[0] // {"items":[]}) as $runs |
     # Map K10 frequency alias to theoretical interval in seconds.
     # 30-day month is the K10 documented convention for @monthly.
@@ -1943,7 +2030,12 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
           else ($intervals | median) > ($theoretical * 1.5)
           end
         )
-      }
+      # #51: "no recent completed runs" is a decision when the policy is
+      # paused and (at best) a corroborating signal of trouble when it is
+      # not -- opposite verdicts that used to render identically. Publishing
+      # pausedState here, once, is what lets every renderer say which one it
+      # is instead of guessing from the absence of runs alone.
+      } + ($policy | paused_state($schemaStatus))
     ]
   ' 2>/dev/null || echo '[]')
 else
@@ -1963,6 +2055,10 @@ RPO_WITH_FREQ=$(_ep "$EFFECTIVE_RPO" | jq '[.[] | select(.frequencyTheoreticalSe
 RPO_WITH_SAMPLES=$(_ep "$EFFECTIVE_RPO" | jq '[.[] | select(.samples > 0)] | length // 0')
 [ -z "$RPO_WITH_SAMPLES" ] && RPO_WITH_SAMPLES=0
 RPO_IN_DRIFT=$(_ep "$EFFECTIVE_RPO" | jq '[.[] | select(.drift == true)] | length // 0')
+# #51: same field the terminal, JSON summary and HTML all read (see
+# paused_state() in JQ_SELECTOR_LIB) -- so "0 samples" never has to be
+# silently re-interpreted three different ways.
+RPO_PAUSED_COUNT=$(safe_int "$(_ep "$EFFECTIVE_RPO" | jq '[.[] | select(.pausedState == "paused")] | length // 0')")
 [ -z "$RPO_IN_DRIFT" ] && RPO_IN_DRIFT=0
 
 debug "Effective RPO: $RPO_TOTAL policies analysed, $RPO_WITH_SAMPLES with samples, $RPO_IN_DRIFT in drift"
@@ -2053,6 +2149,9 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
   # and restore-only catch-all policies are excluded so they do not mask genuine
   # coverage gaps (which made `unprotectedNamespaces` report 0 while the
   # per-namespace protection status showed namespaces never backed up).
+  # #51: a PAUSED policy -- catch-all or not -- confers no protection. `!=
+  # true` (never `//`) so only a CONFIRMED pause drops out; `false` and absent
+  # both still count as active, exactly like before this field was read.
   CATCHALL_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -r '
     [.items[]? | select(
       (
@@ -2062,6 +2161,7 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
         (.spec.selector | keys | length == 0)
       )
       and ([.spec.actions[]?.action] | index("backup"))
+      and (.spec.paused != true)
     ) | .metadata.name] | join(", ")
   ')
   CATCHALL_COUNT=$(_ep "$APP_POLICIES_JSON" | jq '
@@ -2073,6 +2173,7 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
         (.spec.selector | keys | length == 0)
       )
       and ([.spec.actions[]?.action] | index("backup"))
+      and (.spec.paused != true)
     )] | length
   ')
   
@@ -2085,18 +2186,22 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
   # resolves nothing or, worse, matches unrelated namespaces that happen to
   # carry the same label. VM label selectors are resolved in the
   # virtualization section instead, against the VM inventory.
+  # #51: excludes confirmed-paused policies too -- a label selector on a
+  # switched-off policy must not produce "cannot determine coverage" noise.
   COMPLEX_SELECTOR_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -r "$JQ_SELECTOR_LIB"'
     [.items[]? | select(
       .spec.selector != null and
       (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0) and
-      (policy_scope == "namespace")
+      (policy_scope == "namespace") and
+      (.spec.paused != true)
     ) | .metadata.name] | join(", ")
   ' 2>/dev/null || echo "")
   COMPLEX_COUNT=$(_ep "$APP_POLICIES_JSON" | jq "$JQ_SELECTOR_LIB"'
     [.items[]? | select(
       .spec.selector != null and
       (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0) and
-      (policy_scope == "namespace")
+      (policy_scope == "namespace") and
+      (.spec.paused != true)
     )] | length
   ' 2>/dev/null || echo "0")
   
@@ -2173,6 +2278,12 @@ PROTECTED_NAMESPACES=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile allNs "$TEMP
   [ .items[]?
     | select([.spec.actions[]?.action] | index("backup"))
     | select(policy_scope == "namespace")
+    # #51: a CONFIRMED-paused policy protects nothing. This is the core
+    # coverage fix -- a namespace whose only policy is paused now has to fall
+    # through to the evidence view (namespaceProtectionStatus /
+    # backedUpDespiteSelector) to still read as protected, instead of being
+    # assumed protected from the selector alone.
+    | select(.spec.paused != true)
     | policy_target_ns($allNs).namespaces[]? ]
   | map(select(type == "string" and . != "")) | unique
 ' 2>/dev/null || echo '[]')
@@ -2192,6 +2303,10 @@ PROTECTION_UNRESOLVED_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile al
   [ .items[]?
     | select([.spec.actions[]?.action] | index("backup"))
     | select(policy_scope == "namespace")
+    # #51: a paused policy is excluded from coverage entirely (see
+    # PROTECTED_NAMESPACES above), so an unresolvable selector on it must not
+    # force the whole coverage verdict to NOT_ASSESSED -- it no longer matters.
+    | select(.spec.paused != true)
     | select((policy_target_ns($allNs)).resolvable | not)
     | .metadata.name ]
 ' 2>/dev/null || echo '[]')
@@ -2208,6 +2323,10 @@ PROTECTION_NONSTANDARD_PATTERNS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile a
   ( $allNs[0] // [] ) as $allNs |
   [ .items[]?
     | select([.spec.actions[]?.action] | index("backup"))
+    # #51: same reasoning as PROTECTION_UNRESOLVED_POLICIES -- a paused
+    # policy is out of the coverage computation, so its wildcard shape can no
+    # longer force NOT_ASSESSED.
+    | select(.spec.paused != true)
     | . as $p
     | (policy_target_ns($allNs)).nonStandardPatterns as $np
     | select(($np | length) > 0)
@@ -2296,7 +2415,7 @@ debug "Unprotected list: $UNPROTECTED_NS_JSON"
 # matchLabels resolution returns []; matchNames still flag empty correctly.
 
 printf '%s' "${ALL_NAMESPACES_LABELED:-[]}" > "$TEMP_DIR/pa_nslabeled.json"
-POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" "$JQ_SELECTOR_LIB"'
+POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB"'
   # Resolve targeted namespaces for a single policy.
   # Returns {namespaces: [...], resolvable: bool, kind: "catchall"|"matchNames"|...}
   # v2.2.0 (#one-resolver): this used to be a second, independent selector
@@ -2347,7 +2466,7 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
       targetedCount: ($r.namespaces | length),
       effectiveCount: ($existing | length),
       isEmpty: ($r.resolvable and ($existing | length) == 0)
-    }
+    } + ($p | paused_state($schemaStatus))
   ]) as $resolved |
 
   # Generate all pairs (i,j) with i<j, keep those with intersect NS and intersect actions
@@ -2362,8 +2481,14 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
     # protect different Kasten application types (appType=virtualMachine vs the
     # namespace app), so pairing them produced noise on every 9.0 cluster that
     # mixes VM and namespace protection.
+    # #51: neither side of a redundant pair may be a CONFIRMED-paused policy.
+    # An operator who parked one policy instead of deleting it does not need a
+    # "these two overlap" finding against the one still running -- that trains
+    # people to ignore the card. (A pair where BOTH sides are paused is
+    # dropped too: neither is live, so there is no overlap to act on.)
     if ($sharedNs | length) > 0 and ($sharedActions | length) > 0
-       and ($p1.scope == $p2.scope) then
+       and ($p1.scope == $p2.scope)
+       and ($p1.pausedState != "paused") and ($p2.pausedState != "paused") then
       {
         policies: [$p1.name, $p2.name],
         scope: $p1.scope,
@@ -2403,14 +2528,20 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
       withNonExistingNsCount: ([$resolved[] | select(.nonExistingReferences | length > 0)] | length),
       redundantPairCount: ($pairs | length),
       redundantPairsGenuine: ([$pairs[] | select(.involvesCatchall | not)] | length),
-      redundantPairsWithCatchall: ([$pairs[] | select(.involvesCatchall)] | length)
+      redundantPairsWithCatchall: ([$pairs[] | select(.involvesCatchall)] | length),
+      # #51: published so the terminal, HTML and any future caller all read
+      # the SAME count rather than each re-deriving it from .resolved.
+      pausedCount: ([$resolved[] | select(.pausedState == "paused")] | length),
+      enabledCount: ([$resolved[] | select(.pausedState == "enabled")] | length),
+      pausedStateUnknownCount: ([$resolved[] | select(.pausedState == "unknown")] | length),
+      pausedSchemaStatus: $schemaStatus
     }
   }
-' 2>/dev/null) || { _jq_fail "policy analysis"; POLICY_ANALYSIS='{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0}}'; }
+' 2>/dev/null) || { _jq_fail "policy analysis"; POLICY_ANALYSIS='{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0,"pausedCount":0,"enabledCount":0,"pausedStateUnknownCount":0,"pausedSchemaStatus":"probe_refused"}}'; }
 
 # Validate
 if ! _ep "$POLICY_ANALYSIS" | jq -e '.summary' >/dev/null 2>&1; then
-  POLICY_ANALYSIS='{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0}}'
+  POLICY_ANALYSIS='{"resolved":[],"empty":[],"unresolvable":[],"withNonExistingNs":[],"redundantPairs":[],"summary":{"totalPolicies":0,"emptyCount":0,"unresolvableCount":0,"withNonExistingNsCount":0,"redundantPairCount":0,"redundantPairsGenuine":0,"redundantPairsWithCatchall":0,"pausedCount":0,"enabledCount":0,"pausedStateUnknownCount":0,"pausedSchemaStatus":"probe_refused"}}'
 fi
 
 # Extract summary stats for human output
@@ -2419,6 +2550,10 @@ POLICY_UNRESOLVABLE_COUNT=$(_ep "$POLICY_ANALYSIS" | jq '.summary.unresolvableCo
 POLICY_NONEXISTING_COUNT=$(_ep "$POLICY_ANALYSIS" | jq '.summary.withNonExistingNsCount // 0')
 POLICY_REDUNDANT_GENUINE=$(_ep "$POLICY_ANALYSIS" | jq '.summary.redundantPairsGenuine // 0')
 POLICY_REDUNDANT_CATCHALL=$(_ep "$POLICY_ANALYSIS" | jq '.summary.redundantPairsWithCatchall // 0')
+# #51: same counter the JSON and HTML read -- see policyAnalysis.summary.
+POLICY_PAUSED_COUNT=$(safe_int "$(_ep "$POLICY_ANALYSIS" | jq '.summary.pausedCount // 0')")
+POLICY_PAUSED_UNKNOWN_COUNT=$(safe_int "$(_ep "$POLICY_ANALYSIS" | jq '.summary.pausedStateUnknownCount // 0')")
+debug "Policy paused state: paused=$POLICY_PAUSED_COUNT unknown=$POLICY_PAUSED_UNKNOWN_COUNT (schema: $POLICY_PAUSED_SCHEMA_STATUS)"
 [ -z "$POLICY_EMPTY_COUNT" ] && POLICY_EMPTY_COUNT=0
 [ -z "$POLICY_UNRESOLVABLE_COUNT" ] && POLICY_UNRESOLVABLE_COUNT=0
 [ -z "$POLICY_NONEXISTING_COUNT" ] && POLICY_NONEXISTING_COUNT=0
@@ -6786,7 +6921,9 @@ if [ "$MODE" = "json" ]; then
     --argjson rpoWithFreq "$RPO_WITH_FREQ" \
     --argjson rpoWithSamples "$RPO_WITH_SAMPLES" \
     --argjson rpoInDrift "$RPO_IN_DRIFT" \
+    --argjson rpoPausedCount "$RPO_PAUSED_COUNT" \
     --slurpfile policyAnalysis "$TEMP_DIR/policyAnalysis.json" \
+    --arg policyPausedSchemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" \
     --argjson ransomImmut "$RANSOM_IMMUT" \
     --argjson ransomImmutMax "$RANSOM_IMMUT_MAX" \
     --argjson ransomExport "$RANSOM_EXPORT" \
@@ -7285,9 +7422,13 @@ if [ "$MODE" = "json" ]; then
             withKnownFrequency: $rpoWithFreq,
             withEnoughSamples: $rpoWithSamples,
             inDrift: $rpoInDrift,
+            # #51: 0 samples reads very differently depending on this -- a
+            # paused policy earns no alarm, anything else is worth a look.
+            paused: $rpoPausedCount,
+            pausedSchemaStatus: $policyPausedSchemaStatus,
             driftThreshold: "median > theoretical × 1.5",
             window: "14 days",
-            note: "Median interval between consecutive successful (Complete) RunActions per policy. Custom cron expressions are reported with stats but no drift judgement."
+            note: "Median interval between consecutive successful (Complete) RunActions per policy. Custom cron expressions are reported with stats but no drift judgement. Paused policies stay in totalPolicies/items (see pausedState on each item) -- a policy with 0 samples because it is paused is a decision, not an incident."
           },
           items: $effectiveRpo
         }
@@ -7739,19 +7880,9 @@ if [ "$MODE" = "json" ]; then
       immutabilitySignal: ($immutability == "true"),
       immutabilityDays: $immutabilityDays,
 
-      policies: {
-        count: ($policies.items | length),
-        withExport: $policiesWithExport,
-        withPresets: $policiesWithPresets,
-        # Kasten 9.0 additional export (Technical Preview): app policies with
-        # more than one export destination (#kasten-v9).
-        additionalExport: {
-          count: $multiExportCount,
-          items: $multiExportPolicies,
-          sameProfileTwice: $multiExportSameProfile
-        },
-        items: [
-          $policies.items[] | {
+      policies: (
+        ($policies.items | map(
+          {
             name: .metadata.name,
             frequency: .spec.frequency,
             subFrequency: .spec.subFrequency,
@@ -7798,9 +7929,27 @@ if [ "$MODE" = "json" ]; then
               blockModeProfile: (.exportParameters.blockModeProfile.name // null)
             }],
             presetRef: .spec.presetRef.name
-          }
-        ]
-      },
+          # #51: covers every policy here, system DR/reports policies included
+          # (policyAnalysis.summary.pausedCount is the app-policies-only twin
+          # of this same field, used by coverage and redundant-pair checks).
+          } + paused_state($policyPausedSchemaStatus)
+        )) as $policyItemsOut |
+        {
+          count: ($policies.items | length),
+          withExport: $policiesWithExport,
+          withPresets: $policiesWithPresets,
+          # Kasten 9.0 additional export (Technical Preview): app policies with
+          # more than one export destination (#kasten-v9).
+          additionalExport: {
+            count: $multiExportCount,
+            items: $multiExportPolicies,
+            sameProfileTwice: $multiExportSameProfile
+          },
+          pausedCount: ([$policyItemsOut[] | select(.pausedState == "paused")] | length),
+          pausedSchemaStatus: $policyPausedSchemaStatus,
+          items: $policyItemsOut
+        }
+      ),
 
       profiles: {
         # count is the raw CR total and spans both families. locationCount /
@@ -8337,6 +8486,13 @@ if [ "$RPO_IN_DRIFT" -gt 0 ] 2>/dev/null; then
 else
   printf "  In drift (median > 1.5×): ${COLOR_GREEN}0${COLOR_RESET}\n"
 fi
+# #51: same field everywhere -- see policyAnalysis's "Paused policies" line
+# below for what this excludes from coverage and redundant-pair checks.
+if [ "$POLICY_PAUSED_SCHEMA_STATUS" != "schema_confirmed" ]; then
+  printf "  ${COLOR_YELLOW}Paused/enabled state:     could not be read (%s)${COLOR_RESET}\n" "$POLICY_PAUSED_SCHEMA_STATUS"
+elif [ "$RPO_PAUSED_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  Paused (0 samples expected): ${COLOR_CYAN}$RPO_PAUSED_COUNT${COLOR_RESET}\n"
+fi
 
 # Per-policy details: only show policies with samples (otherwise NA on every column)
 if [ "$RPO_WITH_SAMPLES" -gt 0 ] 2>/dev/null; then
@@ -8357,7 +8513,8 @@ if [ "$RPO_WITH_SAMPLES" -gt 0 ] 2>/dev/null; then
     " | freq=" + (.frequencyDeclared // "n/a") +
     " | median=" + hms(.median) +
     " | max=" + hms(.max) +
-    " | n=\(.samples)"
+    " | n=\(.samples)" +
+    (if .pausedState == "paused" then " | PAUSED" else "" end)
   ' 2>/dev/null
 fi
 
@@ -8365,9 +8522,15 @@ fi
 RPO_NOT_ANALYSED=$((RPO_TOTAL - RPO_WITH_SAMPLES))
 if [ "$RPO_NOT_ANALYSED" -gt 0 ] 2>/dev/null; then
   printf "\n  ${COLOR_CYAN}Not analysed (no/insufficient samples in 14d):${COLOR_RESET}\n"
+  # #51: "samples=0" alone used to look identical whether a policy is off or
+  # broken -- opposite verdicts. pausedState (published once, see
+  # paused_state() in JQ_SELECTOR_LIB) is what tells them apart here.
   _ep "$EFFECTIVE_RPO" | jq -r '
     .[] | select(.samples == 0) |
-    "    - " + .name + " (freq=" + (.frequencyDeclared // "manual") + ", samples=0)"
+    "    - " + .name + " (freq=" + (.frequencyDeclared // "manual") + ", samples=0" +
+    (if .pausedState == "paused" then ", PAUSED -- expected, not an incident"
+     elif .pausedState == "unknown" then ", paused-state unknown"
+     else "" end) + ")"
   ' 2>/dev/null | head -10
   if [ "$RPO_NOT_ANALYSED" -gt 10 ] 2>/dev/null; then
     printf "    ... and $((RPO_NOT_ANALYSED - 10)) more\n"
@@ -8380,6 +8543,14 @@ printf "  ${COLOR_CYAN}(Based on $APP_POLICY_COUNT app policies, excludes DR/rep
 printf "  Total namespaces in cluster: $(_ep "$ALL_NAMESPACES" | jq 'length')\n"
 printf "  Application namespaces (non-system): $APP_NS_COUNT\n"
 printf "  Explicitly targeted by policies: $PROTECTED_NS_COUNT\n"
+# #51: paused policies are excluded from every count above (PROTECTED_NS_COUNT,
+# HAS_CATCHALL_POLICY, ...); this line says how many and, when the cluster's
+# CRD does not confirm the field exists, says so instead of a silent "0".
+if [ "$POLICY_PAUSED_SCHEMA_STATUS" != "schema_confirmed" ]; then
+  printf "  ${COLOR_YELLOW}[INFO]  Paused/enabled state could not be read (%s) -- coverage below assumes every policy is active, as it always has${COLOR_RESET}\n" "$POLICY_PAUSED_SCHEMA_STATUS"
+elif [ "$POLICY_PAUSED_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_CYAN}Paused (excluded from coverage): $POLICY_PAUSED_COUNT${COLOR_RESET}\n"
+fi
 
 if [ "$APP_POLICY_COUNT" -eq 0 ]; then
   printf "  ${COLOR_RED}[WARN]  No application backup policies found!${COLOR_RESET}\n"
@@ -8434,6 +8605,21 @@ fi
 ### Policy Analysis: empty + redundant (NEW v2.0 - patch 4/7)
 printf "\n${COLOR_BOLD}[POLICY-ANALYSIS] Policy Analysis${COLOR_RESET} ${COLOR_CYAN}(NEW v2.0)${COLOR_RESET}\n"
 printf "  ${COLOR_CYAN}Scope: $APP_POLICY_COUNT app policies (system DR/reports excluded)${COLOR_RESET}\n"
+
+# Paused/enabled state (#51)
+if [ "$POLICY_PAUSED_SCHEMA_STATUS" != "schema_confirmed" ]; then
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Paused/enabled state:  could not be read (%s)\n" "$POLICY_PAUSED_SCHEMA_STATUS"
+elif [ "$POLICY_PAUSED_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Paused policies:       $POLICY_PAUSED_COUNT (excluded from coverage and redundant-pair checks)\n"
+  _ep "$POLICY_ANALYSIS" | jq -r '.resolved[]? | select(.pausedState == "paused") |
+    "    - " + .name + " | selector=" + .selectorKind + " | targeted namespaces=" + (.targetedCount | tostring)
+  ' 2>/dev/null | head -10
+  if [ "$POLICY_PAUSED_COUNT" -gt 10 ] 2>/dev/null; then
+    printf "    ... and $((POLICY_PAUSED_COUNT - 10)) more\n"
+  fi
+else
+  printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Paused policies:       0\n"
+fi
 
 # Empty policies (B3)
 if [ "$POLICY_EMPTY_COUNT" -eq 0 ] 2>/dev/null; then

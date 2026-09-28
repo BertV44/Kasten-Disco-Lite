@@ -613,6 +613,16 @@ FIXED_EMPTY_COUNT=$(echo "$FIXED_EMPTY" | jq 'length')
 B_REDUNDANT=$(get_baseline '.policyAnalysis.summary.redundantPairsGenuine')
 C_REDUNDANT=$(get_current '.policyAnalysis.summary.redundantPairsGenuine')
 
+# #51: paused is an operator DECISION, not a regression or an improvement --
+# neither mark_regression nor mark_improvement fires for it, same as the
+# other neutral [INFO] changes in this script (KDR mode, VM count, ...).
+B_PAUSED=$(get_baseline_json '[.policyAnalysis.resolved[]? | select(.pausedState == "paused") | .name]')
+C_PAUSED=$(get_current_json '[.policyAnalysis.resolved[]? | select(.pausedState == "paused") | .name]')
+NEWLY_PAUSED=$(set_diff "$C_PAUSED" "$B_PAUSED")
+RESUMED_PAUSED=$(set_diff "$B_PAUSED" "$C_PAUSED")
+NEWLY_PAUSED_COUNT=$(echo "$NEWLY_PAUSED" | jq 'length')
+RESUMED_PAUSED_COUNT=$(echo "$RESUMED_PAUSED" | jq 'length')
+
 PA_CHANGED=false
 if [ "$NEW_EMPTY_COUNT" -gt 0 ]; then
   print_change "[REGRESSION]" "$COLOR_RED" "${NEW_EMPTY_COUNT} new empty policy/policies: $(echo "$NEW_EMPTY" | jq -r 'join(", ")')"
@@ -636,6 +646,16 @@ if [ -n "$B_REDUNDANT" ] && [ -n "$C_REDUNDANT" ] && [ "$B_REDUNDANT" != "$C_RED
   fi
   PA_CHANGED=true
 fi
+if [ "$NEWLY_PAUSED_COUNT" -gt 0 ]; then
+  print_change "[INFO]" "$COLOR_CYAN" "${NEWLY_PAUSED_COUNT} polic(y/ies) newly paused: $(echo "$NEWLY_PAUSED" | jq -r 'join(", ")') (now excluded from coverage and redundant-pair checks)"
+  mark_neutral
+  PA_CHANGED=true
+fi
+if [ "$RESUMED_PAUSED_COUNT" -gt 0 ]; then
+  print_change "[INFO]" "$COLOR_CYAN" "${RESUMED_PAUSED_COUNT} polic(y/ies) resumed (no longer paused): $(echo "$RESUMED_PAUSED" | jq -r 'join(", ")')"
+  mark_neutral
+  PA_CHANGED=true
+fi
 if [ "$PA_CHANGED" = false ] && [ "$SUMMARY_ONLY" = false ] && [ "$MODE" = "human" ]; then
   _e=$(echo "$C_EMPTY" | jq 'length')
   print_change "[OK]" "$COLOR_GREEN" "No change (${_e} empty, ${C_REDUNDANT:-0} redundant pairs)"
@@ -643,9 +663,11 @@ fi
 
 PA_JSON=$(jq -c -n \
   --argjson newE "$NEW_EMPTY" --argjson fixedE "$FIXED_EMPTY" \
-  --argjson br "${B_REDUNDANT:-0}" --argjson cr "${C_REDUNDANT:-0}" '
+  --argjson br "${B_REDUNDANT:-0}" --argjson cr "${C_REDUNDANT:-0}" \
+  --argjson newP "$NEWLY_PAUSED" --argjson resumedP "$RESUMED_PAUSED" '
   {newlyEmpty: $newE, resolvedEmpty: $fixedE,
-   baselineRedundantGenuine: $br, currentRedundantGenuine: $cr, redundantDelta: ($cr - $br)}
+   baselineRedundantGenuine: $br, currentRedundantGenuine: $cr, redundantDelta: ($cr - $br),
+   newlyPaused: $newP, resumedFromPaused: $resumedP}
 ')
 add_section_json "policyAnalysis" "$PA_JSON"
 

@@ -3,6 +3,67 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+### Added
+- **Policy paused/enabled state** (`spec.paused`, #51). A switched-off policy
+  used to be indistinguishable from one running nightly in every output.
+  Three states -- `enabled` / `paused` / `unknown` -- keyed on a CRD SCHEMA
+  probe rather than on whether any given policy instance happens to carry the
+  field: Kasten's Go `omitempty` drops `false`, so an absent key means "not
+  paused" only once the installed Kasten version's CRD is confirmed to declare
+  `spec.paused` at all; on a CRD that does not (older Kasten) or a CRD read
+  that was refused (RBAC), every policy reads `unknown` instead of being
+  guessed as enabled. Probed once via `get
+  customresourcedefinitions.apiextensions.k8s.io policies.config.kio.kasten.io
+  -o json` -- the same pattern already used for the KubeVirt VM CRD, and no
+  RBAC change (`kdl-rbac.yaml` already grants `customresourcedefinitions`
+  cluster-wide). An explicit `true`/`false` on a policy instance is read the
+  same way regardless of schema status: direct evidence outranks the
+  cluster-wide schema signal, never the other way around. Confirmed live on
+  the oc11 lab (OpenShift 4.20.30 / Kasten 9.0.5): `oc explain
+  policies.config.kio.kasten.io.spec` lists `paused <boolean>`, a server-side
+  dry-run patch round-trips both values, and all 5 lab policies omit the field
+  (all resolve `enabled`, disabled/unknown counts 0, every other field
+  byte-for-byte unchanged against the v2.6.0 report of the same capture).
+  - Surfaced per policy (`paused`, `pausedState`, `pausedReason`) in
+    `policyAnalysis.resolved[]` and in `policies.items[]` (the HTML Backup
+    Policies table); counted in `policyAnalysis.summary` (`pausedCount`,
+    `enabledCount`, `pausedStateUnknownCount`, `pausedSchemaStatus`) and in
+    `policies.pausedCount` / `policies.pausedSchemaStatus`.
+  - **Coverage**: a CONFIRMED-paused policy no longer counts as protection --
+    excluded from `coverage.policiesTargetingAllNamespaces`, the catch-all
+    check, `PROTECTED_NAMESPACES`, and the selector-resolvability checks that
+    gate `coverage.protection.status`. A namespace whose only policy is
+    paused now renders as unprotected. The EVIDENCE view
+    (`namespaceProtectionStatus` / `unprotectedBreakdown.backedUpDespiteSelector`)
+    is untouched and still wins: a namespace with a real successful backup on
+    record is never a gap, even once its only policy has been paused.
+  - **`policyAnalysis.redundantPairs`**: no finding when either side of a pair
+    is confirmed-paused -- a policy parked instead of deleted no longer earns
+    an "these two overlap" finding against the one still running.
+  - **`policyRunStats.effectiveRpo`**: every item now carries `pausedState`,
+    so zero samples in the 14-day window reads as a decision (paused) rather
+    than indistinguishable from a broken schedule.
+  - Terminal and HTML both gained a paused count (Namespace Protection and
+    Policy Analysis sections; a dedicated "Paused policies" table and a badge
+    per policy row in the HTML) and both fall back to an explicit "state
+    could not be read" message, naming the reason, whenever the schema is not
+    confirmed -- never a silent "every policy enabled".
+  - No new best-practice check -- a badge, not a 20th check (adding one means
+    touching six places, per CLAUDE.md, for a signal the issue only asked for
+    a badge on).
+  - `kdl-diff.sh`: a neutral (non-regression, non-improvement) entry for
+    policies newly paused/resumed between two snapshots, in `policyAnalysis`.
+    Existing coverage diffing needed no changes: a namespace that loses its
+    only policy to a pause already surfaces there as a regression.
+  - Verified offline (`kdl-policy-state-test.sh`, 46 assertions, each checked
+    to fail against pre-#51 `KDL.sh` and pass after; not on `main`, same
+    convention as `kdl-residual-test.sh`), and replayed against the real oc11
+    capture behind the v2.6.0 lab validation: every existing field in
+    `coverage` / `policyAnalysis` / `policies` came back byte-for-byte
+    unchanged, since none of its 5 real policies are paused.
+
 ## [2.6.0] - 2026-09-23
 
 ### Fixed
