@@ -3304,11 +3304,10 @@ debug "Pods: $PODS (Running: $PODS_RUNNING, Ready: $PODS_READY)"
 ### -------------------------
 ### Backup/Export Actions
 ### -------------------------
-BACKUP_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/backupactions_raw.json" 2>/dev/null)")
-EXPORT_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/exportactions_raw.json" 2>/dev/null)")
-printf '%s' "$BACKUP_ACTIONS_JSON" > "$TEMP_DIR/backupactions_clean.json"  # for jq --slurpfile (see runactions note)
-printf '%s' "$EXPORT_ACTIONS_JSON" > "$TEMP_DIR/exportactions_clean.json"  # for jq --slurpfile (see runactions note)
-
+# BACKUP_ACTIONS_JSON / EXPORT_ACTIONS_JSON are sanitised earlier now (v2.7.0,
+# #54, see the comment above RUNACTIONS_JSON in the Policy Run Statistics
+# section) so the phase-breakdown computation there can reach them too; the
+# shell variables and the _clean.json temp files are still valid here.
 BACKUP_ACTIONS_TOTAL=$(_ep "$BACKUP_ACTIONS_JSON" | jq '.items | length // 0')
 [ -z "$BACKUP_ACTIONS_TOTAL" ] && BACKUP_ACTIONS_TOTAL=0
 BACKUP_ACTIONS_COMPLETED=$(_ep "$BACKUP_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')
