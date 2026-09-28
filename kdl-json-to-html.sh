@@ -220,6 +220,17 @@ def triBadge(v):
   elif v == false then "<span class=\"badge warn\">\u2717 No</span>"
   else "<span class=\"badge info\">\u2139 Not assessed</span>" end;
 
+# #51: one wording for "this policy is paused / its state is unknown",
+# reused wherever a policy is rendered (Backup Policies, Effective RPO,
+# Policy Analysis) instead of three renderers each choosing their own text.
+# Input: any object carrying .pausedState ("paused" | "enabled" | "unknown").
+def pausedBadge:
+  if .pausedState == "paused" then
+    "<br><span class=\"badge warn\">\u23f8 paused</span>"
+  elif .pausedState == "unknown" then
+    "<br><span class=\"badge info\">paused state unknown</span>"
+  else "" end;
+
 def severityBadge(sev; status):
   if status == "NOT_ASSESSED" then
     "<span class=\"badge info\">ℹ N/A</span>"
@@ -2353,7 +2364,13 @@ else "" end) + "
     "<div class=\"info-box\">\u2139 " + ((.profiles.undeterminedCount) | tostring) + " profile(s) could not be classified as location or infrastructure and are shown in the location table above.</div>"
   else "" end)
 + "
-<h2>\uD83D\uDCDC Backup Policies</h2>
+<h2>\uD83D\uDCDC Backup Policies</h2>"
++ (if ((.policies.pausedSchemaStatus // "") != "schema_confirmed") then
+    "<div class=\"info-box\">\u2139 Paused/enabled state could not be verified on this cluster (" + (.policies.pausedSchemaStatus // "unknown") + "). None of the policies below could be confirmed enabled or paused; coverage and redundant-pair checks treat them as active, exactly as they did before this was tracked.</div>"
+  elif ((.policies.pausedCount // 0) > 0) then
+    "<div class=\"warning-box\">\u23F8 " + (.policies.pausedCount | tostring) + " polic" + (if (.policies.pausedCount) == 1 then "y is" else "ies are" end) + " paused and excluded from coverage and from the redundant-pair checks below.</div>"
+  else "" end)
++ "
 <table>
 <thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Export destinations</th><th>Retention</th></tr></thead>
 <tbody>"
@@ -2368,7 +2385,8 @@ else "" end) + "
       ((.actions // []) | index("export")) as $hasExportAction |
       "<tr>
         <td><strong>" + .name + "</strong>" + (if .presetRef then "<br><small>\uD83D\uDCCB " + .presetRef + "</small>" else "" end) +
-          (if (.scope // "namespace") == "virtualMachine" then "<br><span class=\"badge info\">VM policy</span>" else "" end) + "</td>
+          (if (.scope // "namespace") == "virtualMachine" then "<br><span class=\"badge info\">VM policy</span>" else "" end) +
+          pausedBadge + "</td>
         <td><code>" + .frequency + "</code></td>
         <td>" + (.actions | join(", ")) + "</td>
         <td>" + (.selector | formatNamespaceSelector) + "</td>
@@ -2663,14 +2681,22 @@ else "" end) + "
        <div class=\"card\"><strong>With theoretical frequency</strong><div class=\"card-value\">" + ([$rpo[] | select(.frequencyTheoreticalSeconds != null)] | length | tostring) + "</div></div>
        <div class=\"card\"><strong>With samples</strong><div class=\"card-value\">" + ([$rpo[] | select(.samples > 0)] | length | tostring) + "</div></div>
        <div class=\"card warning-card\"><strong>In drift</strong><div class=\"card-value\">" + ([$rpo[] | select(.drift == true)] | length | tostring) + "</div></div>
+       <div class=\"card\"><strong>Paused</strong><div class=\"card-value\">" + ([$rpo[] | select(.pausedState == "paused")] | length | tostring) + "</div></div>
      </div>
-     <p class=\"section-description\">Median interval between consecutive successful (Complete) RunActions over the last 14 days. Drift = median > theoretical \u00d7 1.5.</p>
-     <table>
+     <p class=\"section-description\">Median interval between consecutive successful (Complete) RunActions over the last 14 days. Drift = median > theoretical \u00d7 1.5.</p>" +
+     # #51: 0 samples reads very differently as "paused" (a decision) vs
+     # anything else (at best a corroborating signal something is wrong) --
+     # this is the one place that note can be given without repeating it on
+     # every row of the table below (see pausedBadge for the per-row badge).
+     (if (($rpoObj.summary.pausedSchemaStatus // "") != "schema_confirmed") then
+        "<div class=\"info-box\">\u2139 Paused/enabled state could not be verified (" + ($rpoObj.summary.pausedSchemaStatus // "unknown") + "): a policy with 0 samples below could be paused OR failing to run -- this report cannot tell which.</div>"
+      else "" end) +
+     "<table>
        <thead><tr><th>Policy</th><th>Declared</th><th>Theoretical</th><th>Samples</th><th>Median</th><th>Max</th><th>Drift</th></tr></thead>
        <tbody>" +
      ([$rpo[] |
        "<tr>
-          <td><strong>" + .name + "</strong></td>
+          <td><strong>" + .name + "</strong>" + pausedBadge + "</td>
           <td>" + (.frequencyDeclared // "<em>manual</em>") + "</td>
           <td>" + (if .frequencyTheoreticalSeconds then formatDuration(.frequencyTheoreticalSeconds) else "<em>n/a</em>" end) + "</td>
           <td>" + (.samples | tostring) + "</td>
@@ -2678,6 +2704,7 @@ else "" end) + "
           <td>" + (if .max != null then formatDuration(.max | floor) else "<em>n/a</em>" end) + "</td>
           <td>" + (if .drift == true then "<span class=\"badge error\">\u2717 drift</span>"
                    elif .drift == false then "<span class=\"badge ok\">\u2713 on schedule</span>"
+                   elif .pausedState == "paused" then "<span class=\"badge info\">paused</span>"
                    else "<span class=\"badge info\">n/a</span>" end) + "</td>
         </tr>"
      ] | join("")) +
@@ -2699,7 +2726,32 @@ else "" end) + "
        <div class=\"card warning-card\"><strong>Refs non-existing NS</strong><div class=\"card-value\">" + ($s.withNonExistingNsCount | tostring) + "</div></div>
        <div class=\"card warning-card\"><strong>Redundant pairs (genuine)</strong><div class=\"card-value\">" + ($s.redundantPairsGenuine | tostring) + "</div></div>
        <div class=\"card\"><strong>Redundant pairs (with catch-all)</strong><div class=\"card-value\">" + ($s.redundantPairsWithCatchall | tostring) + "</div></div>
+       <div class=\"card\"><strong>Paused (excluded)</strong><div class=\"card-value\">" + ($s.pausedCount // 0 | tostring) + "</div></div>
      </div>" +
+
+     # #51: paused policies are pulled OUT of coverage and redundant-pair
+     # checks before this page ever sees them (KDL.sh, not this renderer,
+     # decides that) -- this box says so, or says the state could not be
+     # confirmed at all, instead of a silent "0" either way.
+     (if (($s.pausedSchemaStatus // "") != "schema_confirmed") then
+       "<div class=\"info-box\">\u2139 Paused/enabled state could not be verified on this cluster (" + ($s.pausedSchemaStatus // "unknown") + "). Every policy below is treated as active, exactly as it was before this was tracked.</div>"
+     else "" end) +
+
+     (if ($s.pausedCount // 0) > 0 then
+       "<h3>Paused policies</h3>
+       <div class=\"info-box\">\u23F8 Excluded from selector-based coverage above and from the redundant-pair checks below. A namespace whose only policy is one of these is not counted as protected unless it has a successful backup on record.</div>
+       <table>
+         <thead><tr><th>Policy</th><th>Selector kind</th><th>Targeted namespaces</th></tr></thead>
+         <tbody>" +
+       ([.policyAnalysis.resolved[]? | select(.pausedState == "paused") |
+         "<tr>
+            <td><strong>" + .name + "</strong></td>
+            <td><code>" + .selectorKind + "</code></td>
+            <td>" + (.targetedCount | tostring) + "</td>
+          </tr>"
+       ] | join("")) +
+       "</tbody></table>"
+     else "" end) +
 
      (if ($s.emptyCount // 0) > 0 then
        "<h3>Empty policies</h3>

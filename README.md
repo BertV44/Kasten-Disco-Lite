@@ -355,7 +355,7 @@ Drift detection: `median > theoretical × 1.5` (50% retard). Only flagged for po
 
 Failed, Cancelled, and Running runs are excluded — RPO measures time between two **successful** backups. With fewer than 2 samples, the policy is reported with null fields and no drift verdict (cannot conclude).
 
-Exposed under `policyRunStats.effectiveRpo` with summary stats plus per-policy items: `{name, frequencyDeclared, frequencyTheoreticalSeconds, samples, median, max, drift}`.
+Exposed under `policyRunStats.effectiveRpo` with summary stats plus per-policy items: `{name, frequencyDeclared, frequencyTheoreticalSeconds, samples, median, max, drift, paused, pausedState, pausedReason}`. Zero samples reads differently depending on `pausedState`: a paused policy is a decision, anything else is at best a corroborating signal something is wrong — see [Policy Paused/Enabled State](#policy-pausedenabled-state).
 
 ### Policy Analysis: Empty + Redundant (patch 4/7)
 
@@ -377,7 +377,27 @@ Selector kinds handled:
 - **Genuine** — two non-catchall policies overlap (actionable, real redundancy)
 - **With catchall** — by-design redundancy that exists whenever a catch-all policy is used (informational)
 
-Exposed under JSON top-level key `policyAnalysis`.
+A pair is never reported when either side is a confirmed-paused policy (#51) — see [Policy Paused/Enabled State](#policy-pausedenabled-state).
+
+Exposed under JSON top-level key `policyAnalysis`. Each `resolved[]` entry also carries `paused`, `pausedState`, `pausedReason`; `summary` carries `pausedCount`, `enabledCount`, `pausedStateUnknownCount`, `pausedSchemaStatus`.
+
+### Policy Paused/Enabled State
+
+Kasten policies can be individually switched off via `spec.paused` (boolean) without deleting them (#51). KDL reads this and treats a paused policy as protecting nothing — three states, never two:
+
+- **`enabled`** — `paused: false`, or the field is absent and the cluster's CRD is confirmed to declare it (Kasten's Go `omitempty` drops a `false` on write, so absence means "not paused" only once the field is known to exist at all).
+- **`paused`** — `paused: true`. Read the same way regardless of whether the CRD schema could be confirmed: an explicit value on the policy instance is direct evidence and outranks the schema probe.
+- **`unknown`** — the field is absent AND the installed Kasten version's CRD does not declare `spec.paused` (older Kasten), or the CRD read itself was refused (RBAC). `pausedReason` distinguishes the two (`schema_absent` vs `probe_refused`) even though both resolve to `unknown`. An `unknown` policy is treated exactly like `enabled` for coverage purposes — KDL never guesses a policy is paused, since that would be the overstating-protection direction of error in reverse (silently hiding a namespace that a schema-less cluster genuinely protects).
+
+Schema support is probed once, cluster-wide, via `get customresourcedefinitions.apiextensions.k8s.io policies.config.kio.kasten.io -o json` (`policies.config.kio.kasten.io` is a real CRD served locally, unlike `restorepointcontents` — see the RestorePointContent note above — so this probe is valid). No extra RBAC: `kdl-rbac.yaml` already grants `get`/`list` on `customresourcedefinitions` cluster-wide for the KubeVirt VM-CRD probe this reuses the pattern from.
+
+What changes when a policy is confirmed paused:
+
+- **Coverage**: excluded from `coverage.policiesTargetingAllNamespaces`, the catch-all detection, and selector-based `PROTECTED_NAMESPACES` — a namespace whose only policy is paused is reported unprotected. This does **not** override the evidence view: a namespace with a real successful backup on record (`namespaceProtectionStatus` / `unprotectedBreakdown.backedUpDespiteSelector`) still reads as protected even if its only policy is now paused — evidence always wins over selector inference.
+- **Redundant pairs**: no finding when either side is paused (see above).
+- **Effective RPO**: `pausedState` travels onto each `policyRunStats.effectiveRpo` item, so a paused policy with 0 samples in the 14-day window is not confused with a broken one.
+
+No new best-practice check was added for this — it is a badge on existing sections (Backup Policies table, Policy Analysis, Effective RPO), not a 20th check in [Best Practices Compliance](#best-practices-compliance-19-checks).
 
 ### K10 RBAC Inventory (patch 2/7)
 
