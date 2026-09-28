@@ -111,6 +111,41 @@ unreclaimed space can still grow.
   verdict and the ransomware-readiness DR pillar score never move with the
   mode across the whole fixture set.
 
+- **Snapshot vs. export phase breakdown for Policy Run Statistics**
+  (`policyRunStats.phaseBreakdown`), over the same 14-day window and
+  application-policy scope as the fix above. For each in-window run, the
+  snapshot and export phases are resolved from the already-fetched
+  `BackupAction`/`ExportAction` objects (same `k10.kasten.io/policyName`
+  label used elsewhere for attribution; no new `kubectl` call, no new RBAC),
+  matched to the run by their own `startTime`/`endTime` falling inside the
+  run's window. Reported as overall summary cards and per policy in the
+  table, alongside the existing total duration.
+  - **A policy can carry more than one export action** (Kasten 9.0
+    additional export). The export phase of a run is the **wall-clock
+    envelope** of its export action(s) — latest end minus earliest start —
+    never their sum and never just the first one: two overlapping exports
+    must not make the export phase read as longer than the run itself.
+  - **The phases are not guaranteed disjoint or contiguous.** Snapshot
+    duration plus export duration is *not* presented as equal to the run's
+    total span; queue time between phases belongs to neither and is never
+    shown as a third phase.
+  - **Presence, not truthiness.** Export applicability is three-state —
+    `"measured"`, `"unknown"` (declared, but no surviving action found in the
+    window — evicted or otherwise unreadable) or `"not_configured"` (the
+    current policy spec declares no export action) — so a `// 0` can never
+    collapse "no export" and "an export of zero measurable duration" into
+    the same number; a genuinely zero-duration export is reported as
+    `0`, distinctly.
+  - Evicted actions (a total duration but no surviving phase record) are
+    counted and rendered as `unknown`, never as a silent `0`, in the JSON,
+    the terminal and the HTML alike.
+- `kdl-diff.sh`: new "Policy Run Statistics (scope & phases)" comparison
+  section — app-policy sample size as an informational delta, and
+  snapshot/export `unknownCount` trend as a regression/improvement signal.
+  A baseline predating this scope fix is detected and skipped rather than
+  misreported as a real trend (same handling as the v2.6.0
+  `amberCount` → `staleCount` rename).
+
 ### Changed
 
 - **The severity gate.** A quiet failure — idle, or orphaned with no datable
@@ -314,6 +349,37 @@ unreclaimed space can still grow.
 - A stale comment above the KDR verdict explained away the old misread "No
   Catalog Snapshot" value as a quirk; rewritten to describe what the
   catalog-snapshot setting actually governs, now that it is read correctly.
+
+- **Policy Run Statistics counted every RunAction, not just application
+  ones.** The summary cards (average/min/max duration) and the per-policy
+  table (`policyRunStats.lastRuns`, `policyRunStats.effectiveRpo`) mixed
+  `k10-disaster-recovery-policy` and `k10-system-reports-policy` into the same
+  distribution as application backups. On a live cluster this produced "Avg
+  2h 26m, Min 2s, Max 14h 1m over 70 runs": the reported Min belonged to the
+  7-second-per-run reporting policy, the average was dragged down by two
+  policies moving no application data, and the one number that mattered — a
+  14-hour application backup — read as an outlier against a mean it had
+  itself been used to compute. Fixed by resolving each RunAction's owning
+  policy from `.spec.subject.name` and excluding names matching
+  `SYSTEM_POLICY_PATTERNS` — the same predicate `policyAnalysis` already
+  applies, shared rather than duplicated, so the two sections cannot disagree
+  about what "policy" means again. A RunAction whose owner cannot be resolved
+  (`subject.name` absent) is counted separately as
+  `unknownAttributionCount`, never silently folded into the application
+  sample. `averageDuration` now also reports `scope`, `scopedPolicyCount` and
+  `systemExcludedCount` so the sample's population is stated, not implied,
+  and the terminal/HTML text say so in words, not just the JSON.
+- **A non-zero fractional second in a RunAction timestamp silently emptied
+  the entire "Policy Last Run Status" table and truncated `effectiveRpo`'s
+  interval samples**, found live while building the fixture this same fix
+  needed for RFC3339Nano coverage. `fromdateiso8601` throws on the fractional
+  second Kasten emits whenever it is non-zero; uncaught, that failure
+  propagated out of the whole `jq` call, and the shell-level empty-array
+  fallback swallowed it without a line on stderr — every policy's last-run
+  row disappeared whenever its most recent run had one such timestamp. Fixed
+  with the same tolerant `ts_clean`/`ts_epoch` pattern already used
+  elsewhere in `KDL.sh`; a single still-unparseable timestamp now costs one
+  data point, not the whole table.
 
 ### Correction to the 2.6.0 entry
 

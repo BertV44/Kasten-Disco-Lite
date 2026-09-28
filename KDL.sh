@@ -1815,10 +1815,37 @@ RUNACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/runactions_raw.json" 2>/dev/null)"
 # E2BIG (Argument list too long). --slurpfile reads from a file, no arg limit.
 printf '%s' "$RUNACTIONS_JSON" > "$TEMP_DIR/runactions_clean.json"
 
+# v2.7.0 (#54): BackupActions/ExportActions sanitised here (moved up from the
+# "Backup/Export Actions" section below, #backupexport-early) because the
+# scoped policyRunStats phase breakdown -- computed further down in THIS
+# section -- needs them: it joins each in-window RunAction to the snapshot
+# and export child actions that share its k10.kasten.io/policyName label and
+# fall inside its [startTime,endTime] window. BACKUP_ACTIONS_JSON/
+# EXPORT_ACTIONS_JSON stay set for the rest of the script (shell vars are not
+# block-scoped); the original section below only reads them now.
+BACKUP_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/backupactions_raw.json" 2>/dev/null)")
+EXPORT_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/exportactions_raw.json" 2>/dev/null)")
+printf '%s' "$BACKUP_ACTIONS_JSON" > "$TEMP_DIR/backupactions_clean.json"  # for jq --slurpfile (see runactions note)
+printf '%s' "$EXPORT_ACTIONS_JSON" > "$TEMP_DIR/exportactions_clean.json"  # for jq --slurpfile (see runactions note)
+
 # Build policy last run info
 # v1.9: enriched with `error` field (deepest cause-chain message via the
 # JQ_DEEPEST_MSG helper, only populated when state=Failed)
-POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG"'
+# v2.7.0 (#54): source is APP_POLICIES_JSON, not POLICIES_JSON -- this is the
+# per-policy table policyRunStats renders, and it must use the same app-only
+# scope policyAnalysis already states ("App policies only (system DR/reports
+# policies excluded)"). k10-disaster-recovery-policy and
+# k10-system-reports-policy have their own dedicated status elsewhere
+# (KDR_STATUS / REPORTS_POLICY_LAST_RUN_STATE below), so nothing is lost.
+POLICY_LAST_RUN=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG"'
+  # v2.7.0 (#54): found via the runstats RFC3339Nano test fixture -- a raw
+  # fromdateiso8601 on a timestamp with a non-zero fractional second throws,
+  # which is uncaught here, so the WHOLE jq call fails and the shell-level
+  # empty-array fallback silently emptied this ENTIRE table (not just one
+  # policy row) whenever the latest run of ANY app policy had one. Same fix
+  # as the rest of the file: strip the fraction before parsing.
+  def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
+  def ts_epoch: (try (ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch null);
   ($runsArr[0] // {"items":[]}) as $runs |
   [.items[]? | . as $policy | {
     name: .metadata.name,
@@ -1832,7 +1859,8 @@ POLICY_LAST_RUN=$(_ep "$POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/ru
           state: (.status.state // "Unknown"),
           duration: (
             if .status.endTime and .status.startTime then
-              ((.status.endTime | fromdateiso8601) - (.status.startTime | fromdateiso8601))
+              ( ((.status.endTime | ts_epoch) as $e | (.status.startTime | ts_epoch) as $s |
+                 if $e != null and $s != null then ($e - $s) else null end) )
             else null end
           ),
           error: (
@@ -1936,42 +1964,218 @@ debug "KDR status: $KDR_STATUS (config_complete=$KDR_CONFIG_COMPLETE lastRun=$KD
 ### -------------------------
 # Calculate average duration from completed RunActions (last 14 days)
 FOURTEEN_DAYS_AGO=$(date -d '14 days ago' -Iseconds 2>/dev/null || date -v-14d -Iseconds 2>/dev/null || awk 'BEGIN {print strftime("%Y-%m-%dT%H:%M:%S%z", systime() - 14*86400)}' 2>/dev/null || echo "")
-if [ -n "$FOURTEEN_DAYS_AGO" ]; then
-  AVG_DURATION_STATS=$(_ep "$RUNACTIONS_JSON" | jq --arg cutoff "$FOURTEEN_DAYS_AGO" '
-    [(.items // [])[] 
-      | select(.metadata.creationTimestamp >= $cutoff)
-      | select(.status.state == "Complete")
-      | select(.status.endTime and .status.startTime)
-      | ((.status.endTime | fromdateiso8601) - (.status.startTime | fromdateiso8601))
-    ] | if length > 0 then {
-      count: length,
-      avg: (add / length | floor),
-      min: min,
-      max: max
-    } else {
-      count: 0,
-      avg: 0,
-      min: 0,
-      max: 0
-    } end
-  ' 2>/dev/null || echo '{"count":0,"avg":0,"min":0,"max":0}')
-else
-  AVG_DURATION_STATS='{"count":0,"avg":0,"min":0,"max":0}'
-fi
 
-# Extract values with defaults
-AVG_DURATION=$(_ep "$AVG_DURATION_STATS" | jq '.avg // 0')
-MIN_DURATION=$(_ep "$AVG_DURATION_STATS" | jq '.min // 0')
-MAX_DURATION=$(_ep "$AVG_DURATION_STATS" | jq '.max // 0')
-DURATION_SAMPLE_COUNT=$(_ep "$AVG_DURATION_STATS" | jq '.count // 0')
+# v2.7.0 (#54, Part 1+2): this used to scan EVERY RunAction regardless of the
+# owning policy, so k10-disaster-recovery-policy and k10-system-reports-policy
+# runs sat in the same distribution as application backups -- on a real
+# cluster this produced "Avg 2h 26m, Min 2s, Max 14h 1m over 70 runs" where
+# Min was the reporting policy's 7s run and the actual 14h backup read as an
+# outlier against a mean it helped drag down. Fixed by resolving each
+# RunAction to its policy via .spec.subject.name and excluding names matching
+# SYSTEM_POLICY_PATTERNS -- the exact predicate APP_POLICIES_JSON already
+# applies, so this sample and policyAnalysis's cannot drift apart again.
+# A null/missing subject.name cannot be classified either way and is never
+# silently folded into the app sample: it is counted separately as
+# unknownAttributionCount (never treated as "app").
+#
+# Same computation also produces the Part 2 phase breakdown: for each
+# in-window, app-scoped, Complete RunAction, the snapshot and export phases
+# are resolved by matching BackupAction/ExportAction objects that (a) carry
+# the same k10.kasten.io/policyName label as the run's resolved policy and
+# (b) have their own startTime/endTime fall inside the run's
+# [startTime,endTime] window (the run's own total span already requires both
+# to be present). This is a heuristic, not an owner-reference join -- Kasten
+# does not expose one that KDL has found -- so it fails toward "unknown"
+# (never toward a wrong number) whenever a child action's timestamps do not
+# nest inside its run's window; document this if a real cluster ever shows
+# child timestamps escaping their run's own span.
+#
+# "The export phase of a run" is the WALL-CLOCK ENVELOPE of that run's export
+# action(s) (latest end minus earliest start), not their summed duration:
+# Kasten 9.0 additional-export lets one policy run two exports, and if they
+# run concurrently, summing would let the export phase read as longer than
+# the run itself. Never `first` the export actions (may silently drop the
+# second one) and never `// 0` an absent export into a fake zero-duration
+# measurement (has-vs-truthiness, #54) -- absent (not_configured / unknown)
+# and "measured, 0 seconds" are carried as distinct states throughout.
+#
+# Three-state export applicability, same shape as every other name-derived
+# classification in this file: "not_configured" only when the CURRENT policy
+# spec is readable and declares no export action (a normal, common case, not
+# a defect); "unknown" when an export is declared (or the policy has since
+# been deleted, so declaration cannot be confirmed) but no matching
+# ExportAction survives in the window -- actions are evicted on a busy
+# cluster, and that is unknown, never a silent zero; "measured" only when at
+# least one matching action was actually found. The snapshot phase is
+# two-state (measured/unknown): every RunAction implies an attempted backup,
+# so there is no "not configured" case for it.
+if [ -n "$FOURTEEN_DAYS_AGO" ]; then
+  POLICY_RUN_PHASE_STATS=$(_ep "$APP_POLICIES_JSON" | jq -c \
+    --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" \
+    --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
+    --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
+    --arg patterns "$SYSTEM_POLICY_PATTERNS" \
+    --arg cutoff "$FOURTEEN_DAYS_AGO" '
+    def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
+    def ts_epoch: (try (ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch null);
+
+    # app/system/unknown ownership of a RunAction, by its subject.name string
+    # -- deliberately independent of whether that policy object still
+    # exists, matching how APP_POLICIES_JSON itself is filtered.
+    def run_owner_scope($name; $patterns):
+      if $name == null then "unknown"
+      elif ($name | test($patterns)) then "system"
+      else "app"
+      end;
+
+    def duration_stats:
+      . as $arr | ($arr | length) as $n |
+      if $n == 0 then {count:0, avg:null, min:null, max:null}
+      else {count:$n, avg: (($arr|add)/$n | floor), min:($arr|min), max:($arr|max)}
+      end;
+
+    # Stats over one phase (snapshot or export) across a set of already
+    # per-run-resolved rows. $naState (e.g. "not_configured") is optional --
+    # pass null to omit that key entirely (the snapshot phase has no such
+    # state).
+    def agg_phase($rows; $field; $stateField; $naState):
+      ( [$rows[] | select(.[$stateField] == "measured") | .[$field]] ) as $m |
+      {
+        measuredCount: ($m | length),
+        avg: (if ($m|length) == 0 then null else ($m|add)/($m|length) | floor end),
+        min: (if ($m|length) == 0 then null else ($m|min) end),
+        max: (if ($m|length) == 0 then null else ($m|max) end),
+        unknownCount: ([$rows[] | select(.[$stateField] == "unknown")] | length)
+      } + ( if $naState != null then
+              { notConfiguredCount: ([$rows[] | select(.[$stateField] == $naState)] | length) }
+            else {} end);
+
+    ( $runsArr[0].items // [] ) as $allRuns |
+    ( $backupArr[0].items // [] ) as $allBackups |
+    ( $exportArr[0].items // [] ) as $allExports |
+
+    # name -> "does this app policy declare an export action" (never `first`:
+    # this only tests presence in the array, so a 2nd/3rd export action is
+    # never at risk of being dropped by this lookup).
+    ( [ .items[]? | { key: .metadata.name,
+                      value: ( [ .spec.actions[]? | select(.action == "export") ] | length > 0 ) } ]
+      | from_entries ) as $exportDeclaredByPolicy |
+    ( [ .items[]?.metadata.name ] ) as $appPolicyNames |
+
+    ( [
+        $allRuns[]
+        | select(.metadata.creationTimestamp >= $cutoff)
+        | select(.status.state == "Complete")
+        | select(.status.startTime and .status.endTime)
+        | . as $run
+        | ($run.spec.subject.name) as $pname
+        | (run_owner_scope($pname; $patterns)) as $scope
+        | {
+            policyName: $pname,
+            scope: $scope,
+            totalSeconds: ( ($run.status.endTime|ts_epoch) - ($run.status.startTime|ts_epoch) ),
+            runStart: ($run.status.startTime | ts_epoch),
+            runEnd:   ($run.status.endTime   | ts_epoch)
+          }
+      ] ) as $prepared |
+    # A run whose own span could not be parsed (ts_epoch -> null on either
+    # bound) cannot be measured at all; excluded here exactly as the old,
+    # unscoped AVG_DURATION_STATS already required both timestamps present.
+    ( [ $prepared[] | select(.totalSeconds != null and .runStart != null and .runEnd != null) ] ) as $usable |
+    ( [ $usable[] | select(.scope == "system") ] | length ) as $systemExcluded |
+    ( [ $usable[] | select(.scope == "unknown") ] | length ) as $unknownAttribution |
+    ( [ $usable[] | select(.scope == "app") ] ) as $appRuns |
+
+    ( [
+        $appRuns[] | . as $r |
+        ( [ $allBackups[]
+            | select( ((.metadata.labels // {})["k10.kasten.io/policyName"] // null) == $r.policyName )
+            | select(.status.startTime and .status.endTime)
+            | { s: (.status.startTime | ts_epoch), e: (.status.endTime | ts_epoch) }
+            | select(.s != null and .e != null)
+            | select(.s >= $r.runStart and .e <= $r.runEnd)
+          ] ) as $snapMatches |
+        ( [ $allExports[]
+            | select( ((.metadata.labels // {})["k10.kasten.io/policyName"] // null) == $r.policyName )
+            | select(.status.startTime and .status.endTime)
+            | { s: (.status.startTime | ts_epoch), e: (.status.endTime | ts_epoch) }
+            | select(.s != null and .e != null)
+            | select(.s >= $r.runStart and .e <= $r.runEnd)
+          ] ) as $expMatches |
+        ( $exportDeclaredByPolicy | has($r.policyName) ) as $policyKnown |
+        ( if $policyKnown then $exportDeclaredByPolicy[$r.policyName] else null end ) as $declaresExport |
+        $r + {
+          snapshotSeconds: ( if ($snapMatches|length) == 0 then null
+                             else ( ([$snapMatches[].e] | max) - ([$snapMatches[].s] | min) )
+                             end ),
+          snapshotState: ( if ($snapMatches|length) == 0 then "unknown" else "measured" end ),
+          exportSeconds: ( if ($expMatches|length) == 0 then null
+                           else ( ([$expMatches[].e] | max) - ([$expMatches[].s] | min) )
+                           end ),
+          exportState: ( if ($expMatches|length) > 0 then "measured"
+                         elif $declaresExport == false then "not_configured"
+                         else "unknown"
+                         end )
+        }
+      ] ) as $phased |
+
+    {
+      scope: "app-policies",
+      window: "14 days",
+      durationMethod: "envelope",
+      systemExcludedCount: $systemExcluded,
+      unknownAttributionCount: $unknownAttribution,
+      scopedPolicyCount: ($appPolicyNames | length),
+      overall: {
+        total: ([$phased[].totalSeconds] | duration_stats),
+        snapshot: (agg_phase($phased; "snapshotSeconds"; "snapshotState"; null)),
+        export: (agg_phase($phased; "exportSeconds"; "exportState"; "not_configured"))
+      },
+      byPolicy: [
+        $appPolicyNames[] as $pname |
+        ( [$phased[] | select(.policyName == $pname)] ) as $rows |
+        {
+          name: $pname,
+          runCount: ($rows | length),
+          total: ([$rows[].totalSeconds] | duration_stats),
+          snapshot: (agg_phase($rows; "snapshotSeconds"; "snapshotState"; null)),
+          export: (agg_phase($rows; "exportSeconds"; "exportState"; "not_configured"))
+        }
+      ]
+    }
+  ' 2>/dev/null || echo '')
+  if ! _ep "$POLICY_RUN_PHASE_STATS" | jq -e '.' >/dev/null 2>&1; then
+    _jq_fail "policyRunStats duration/phase breakdown"
+    POLICY_RUN_PHASE_STATS=""
+  fi
+fi
+if [ -z "${POLICY_RUN_PHASE_STATS:-}" ]; then
+  POLICY_RUN_PHASE_STATS='{"scope":"app-policies","window":"14 days","durationMethod":"envelope","systemExcludedCount":0,"unknownAttributionCount":0,"scopedPolicyCount":0,"overall":{"total":{"count":0,"avg":null,"min":null,"max":null},"snapshot":{"measuredCount":0,"avg":null,"min":null,"max":null,"unknownCount":0},"export":{"measuredCount":0,"avg":null,"min":null,"max":null,"unknownCount":0,"notConfiguredCount":0}},"byPolicy":[]}'
+fi
+printf '%s' "$POLICY_RUN_PHASE_STATS" > "$TEMP_DIR/policyRunPhaseStats.json"
+
+# Extract values with defaults -- same shell variable names as before v2.7.0,
+# now sourced from the app-policy-scoped computation above so the JSON
+# (averageDuration) and the terminal print exactly this value, not a
+# recomputation of their own (#54 three-chains-must-agree).
+AVG_DURATION=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.total.avg // 0')
+MIN_DURATION=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.total.min // 0')
+MAX_DURATION=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.total.max // 0')
+DURATION_SAMPLE_COUNT=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.total.count // 0')
+RUNSTATS_SYSTEM_EXCLUDED=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.systemExcludedCount // 0')
+RUNSTATS_UNKNOWN_ATTRIBUTION=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.unknownAttributionCount // 0')
+RUNSTATS_SCOPED_POLICY_COUNT=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.scopedPolicyCount // 0')
 
 # Sanitize values
 [ -z "$AVG_DURATION" ] && AVG_DURATION=0
 [ -z "$MIN_DURATION" ] && MIN_DURATION=0
 [ -z "$MAX_DURATION" ] && MAX_DURATION=0
 [ -z "$DURATION_SAMPLE_COUNT" ] && DURATION_SAMPLE_COUNT=0
+[ -z "$RUNSTATS_SYSTEM_EXCLUDED" ] && RUNSTATS_SYSTEM_EXCLUDED=0
+[ -z "$RUNSTATS_UNKNOWN_ATTRIBUTION" ] && RUNSTATS_UNKNOWN_ATTRIBUTION=0
+[ -z "$RUNSTATS_SCOPED_POLICY_COUNT" ] && RUNSTATS_SCOPED_POLICY_COUNT=0
 
-debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT runs)"
+debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT app-policy runs; excluded $RUNSTATS_SYSTEM_EXCLUDED system-policy runs, $RUNSTATS_UNKNOWN_ATTRIBUTION unresolved-owner runs)"
 
 ### -------------------------
 ### Effective RPO per policy (NEW v2.0 - patch 3/7) - A1
@@ -1993,9 +2197,12 @@ debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT ru
 #
 # samples == intervals count == max(0, completedRuns - 1). 0 samples → all
 # numeric fields null and drift null (cannot conclude).
-
+#
+# v2.7.0 (#54): source is APP_POLICIES_JSON, not POLICIES_JSON -- same app-only
+# scope as POLICY_LAST_RUN above and policyAnalysis, so the report cannot again
+# show two different definitions of "policy" in the same section.
 if [ -n "$FOURTEEN_DAYS_AGO" ]; then
-  EFFECTIVE_RPO=$(_ep "$POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" '
+  EFFECTIVE_RPO=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" '
     ($runsArr[0] // {"items":[]}) as $runs |
     # Map K10 frequency alias to theoretical interval in seconds.
     # 30-day month is the K10 documented convention for @monthly.
@@ -2015,6 +2222,15 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
       else (($s[$n/2 - 1] + $s[$n/2]) / 2)
       end;
 
+    # v2.7.0 (#54): same RFC3339Nano defence as POLICY_LAST_RUN above -- a raw
+    # fromdateiso8601 throws on a non-zero fractional second, which would
+    # abort this whole jq call (empty-array fallback) rather than cost one
+    # policy its interval sample. ts_epoch never throws; a run whose
+    # timestamp still fails to parse is dropped from $ts (one fewer sample),
+    # not allowed to turn the rest of the interval math into null/an error.
+    def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
+    def ts_epoch: (try (ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch null);
+
     [.items[]? | . as $policy |
       ($policy.spec.frequency // null) as $freq |
       freq_secs($freq) as $theoretical |
@@ -2026,7 +2242,7 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
             .metadata.creationTimestamp >= $cutoff
           ))
         | sort_by(.metadata.creationTimestamp)
-        | [.[] | .metadata.creationTimestamp | fromdateiso8601]
+        | [.[] | .metadata.creationTimestamp | ts_epoch] | map(select(. != null))
       ) as $ts |
       (
         if ($ts | length) < 2 then []
@@ -3190,11 +3406,10 @@ debug "Pods: $PODS (Running: $PODS_RUNNING, Ready: $PODS_READY)"
 ### -------------------------
 ### Backup/Export Actions
 ### -------------------------
-BACKUP_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/backupactions_raw.json" 2>/dev/null)")
-EXPORT_ACTIONS_JSON=$(safe_json "$(cat "$TEMP_DIR/exportactions_raw.json" 2>/dev/null)")
-printf '%s' "$BACKUP_ACTIONS_JSON" > "$TEMP_DIR/backupactions_clean.json"  # for jq --slurpfile (see runactions note)
-printf '%s' "$EXPORT_ACTIONS_JSON" > "$TEMP_DIR/exportactions_clean.json"  # for jq --slurpfile (see runactions note)
-
+# BACKUP_ACTIONS_JSON / EXPORT_ACTIONS_JSON are sanitised earlier now (v2.7.0,
+# #54, see the comment above RUNACTIONS_JSON in the Policy Run Statistics
+# section) so the phase-breakdown computation there can reach them too; the
+# shell variables and the _clean.json temp files are still valid here.
 BACKUP_ACTIONS_TOTAL=$(_ep "$BACKUP_ACTIONS_JSON" | jq '.items | length // 0')
 [ -z "$BACKUP_ACTIONS_TOTAL" ] && BACKUP_ACTIONS_TOTAL=0
 BACKUP_ACTIONS_COMPLETED=$(_ep "$BACKUP_ACTIONS_JSON" | jq '[.items[]? | select(.status.state == "Complete")] | length // 0')
@@ -8987,6 +9202,10 @@ if [ "$MODE" = "json" ]; then
     --argjson minDuration "$MIN_DURATION" \
     --argjson maxDuration "$MAX_DURATION" \
     --argjson durationSampleCount "$DURATION_SAMPLE_COUNT" \
+    --argjson runstatsSystemExcluded "$RUNSTATS_SYSTEM_EXCLUDED" \
+    --argjson runstatsUnknownAttribution "$RUNSTATS_UNKNOWN_ATTRIBUTION" \
+    --argjson runstatsScopedPolicyCount "$RUNSTATS_SCOPED_POLICY_COUNT" \
+    --slurpfile policyRunPhaseStats "$TEMP_DIR/policyRunPhaseStats.json" \
     --slurpfile unprotectedNs "$TEMP_DIR/unprotectedNs.json" \
     --argjson unprotectedCount "$UNPROTECTED_COUNT" \
     --slurpfile unprotectedBreakdown "$TEMP_DIR/unprotectedBreakdown.json" \
@@ -9287,6 +9506,7 @@ if [ "$MODE" = "json" ]; then
     ( $snapshotData[0] ) as $snapshotData |
     ( $licenseBlock[0] ) as $licenseBlock |
     ( $policyLastRun[0] ) as $policyLastRun |
+    ( $policyRunPhaseStats[0] ) as $policyRunPhaseStats |
     ( $unprotectedNs[0] ) as $unprotectedNs |
     ( $unprotectedBreakdown[0] ) as $unprotectedBreakdown |
     ( $protectionUnresolvedPolicies[0] // [] ) as $protectionUnresolvedPolicies |
@@ -9539,8 +9759,19 @@ if [ "$MODE" = "json" ]; then
           seconds: $avgDuration,
           min: $minDuration,
           max: $maxDuration,
-          sampleCount: $durationSampleCount
+          sampleCount: $durationSampleCount,
+          scope: "app-policies",
+          systemExcludedCount: $runstatsSystemExcluded,
+          unknownAttributionCount: $runstatsUnknownAttribution,
+          scopedPolicyCount: $runstatsScopedPolicyCount,
+          note: ("App policies only (system DR/reports policies excluded), same scope as policyAnalysis and lastRuns above. " + ($runstatsScopedPolicyCount | tostring) + " app polic" + (if $runstatsScopedPolicyCount == 1 then "y" else "ies" end) + " in scope over the last 14 days. " + ($runstatsSystemExcluded | tostring) + " system-policy run(s) and " + ($runstatsUnknownAttribution | tostring) + " run(s) with an unresolved policy owner were excluded from this sample, not folded into it.")
         },
+        phaseBreakdown: (
+          ($policyRunPhaseStats // {scope:"app-policies",window:"14 days",durationMethod:"envelope",systemExcludedCount:0,unknownAttributionCount:0,scopedPolicyCount:0,overall:{total:{count:0,avg:null,min:null,max:null},snapshot:{measuredCount:0,avg:null,min:null,max:null,unknownCount:0},export:{measuredCount:0,avg:null,min:null,max:null,unknownCount:0,notConfiguredCount:0}},byPolicy:[]})
+          | . + {
+              note: "Snapshot and export phase durations, same 14-day window and app-policy scope as averageDuration above. The export phase duration is the WALL-CLOCK ENVELOPE of a run export action set (latest end minus earliest start), not their sum -- a policy can carry more than one export action since Kasten 9.0 (additional export), and summing overlapping/parallel exports would let the reported export phase exceed the total duration of the run itself. snapshotSeconds/exportSeconds are only meaningful where the matching phase state is \"measured\": \"unknown\" means the phase action object could not be found in the window (evicted or otherwise unreadable), not a zero-duration measurement; \"not_configured\" (export only) means the current policy spec declares no export action at all. snapshotPhase plus exportPhase is NOT expected to equal the total duration of the run: queue time between phases belongs to neither and is not reported as a third phase."
+            }
+        ),
         effectiveRpo: {
           summary: {
             totalPolicies: $rpoTotal,
@@ -10615,6 +10846,7 @@ fi
 
 ### Policy Last Run Summary (NEW v1.5; v1.9: error message added)
 printf "\n${COLOR_BOLD}[TIME] Policy Last Run Status${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+printf "  ${COLOR_CYAN}App policies only ($RUNSTATS_SCOPED_POLICY_COUNT); system DR/reports policies excluded here too${COLOR_RESET}\n"
 _ep "$POLICY_LAST_RUN" | jq -r '.[]? |
   "  \(.name): " +
   (if .lastRun then
@@ -10626,14 +10858,76 @@ _ep "$POLICY_LAST_RUN" | jq -r '.[]? |
   else "Never" end)
 ' 2>/dev/null || printf "  ${COLOR_YELLOW}No run data available${COLOR_RESET}\n"
 
-### Average Policy Run Duration (NEW v1.5)
-printf "\n${COLOR_BOLD}[TIME] Policy Run Duration${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
+### Average Policy Run Duration (NEW v1.5; v2.7.0 #54: app-policy scope + phases)
+printf "\n${COLOR_BOLD}[TIME] Policy Run Duration${COLOR_RESET} ${COLOR_CYAN}(NEW, v2.7.0: app-policy scope)${COLOR_RESET}\n"
+printf "  ${COLOR_CYAN}App policies only ($RUNSTATS_SCOPED_POLICY_COUNT in scope); excluded $RUNSTATS_SYSTEM_EXCLUDED system-policy run(s) and $RUNSTATS_UNKNOWN_ATTRIBUTION run(s) with an unresolved policy owner from this sample${COLOR_RESET}\n"
 printf "  Sample size: $DURATION_SAMPLE_COUNT runs (last 14 days)\n"
 if [ "$DURATION_SAMPLE_COUNT" -gt 0 ]; then
   printf "  Average: ${COLOR_GREEN}${AVG_DURATION}s${COLOR_RESET}\n"
   printf "  Min: ${MIN_DURATION}s | Max: ${MAX_DURATION}s\n"
 else
   printf "  ${COLOR_YELLOW}[INFO]  No completed runs in the last 14 days${COLOR_RESET}\n"
+fi
+
+# Phase breakdown (snapshot vs export): read verbatim from
+# POLICY_RUN_PHASE_STATS, the single computation that also feeds the JSON
+# above and the HTML section -- no renderer here recomputes an average or
+# picks which duration to show (#54 three-chains-must-agree).
+RUNSTATS_SNAP_MEASURED=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.measuredCount // 0')
+RUNSTATS_SNAP_AVG=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.avg')
+RUNSTATS_SNAP_MIN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.min')
+RUNSTATS_SNAP_MAX=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.max')
+RUNSTATS_SNAP_UNKNOWN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.snapshot.unknownCount // 0')
+RUNSTATS_EXP_MEASURED=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.measuredCount // 0')
+RUNSTATS_EXP_AVG=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.avg')
+RUNSTATS_EXP_MIN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.min')
+RUNSTATS_EXP_MAX=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.max')
+RUNSTATS_EXP_UNKNOWN=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.unknownCount // 0')
+RUNSTATS_EXP_NA=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.overall.export.notConfiguredCount // 0')
+[ -z "$RUNSTATS_SNAP_MEASURED" ] && RUNSTATS_SNAP_MEASURED=0
+[ -z "$RUNSTATS_EXP_MEASURED" ] && RUNSTATS_EXP_MEASURED=0
+[ -z "$RUNSTATS_SNAP_UNKNOWN" ] && RUNSTATS_SNAP_UNKNOWN=0
+[ -z "$RUNSTATS_EXP_UNKNOWN" ] && RUNSTATS_EXP_UNKNOWN=0
+[ -z "$RUNSTATS_EXP_NA" ] && RUNSTATS_EXP_NA=0
+
+printf "\n  ${COLOR_BOLD}Phase breakdown${COLOR_RESET} ${COLOR_CYAN}(snapshot vs export, same window/scope)${COLOR_RESET}\n"
+if [ "$RUNSTATS_SNAP_MEASURED" -gt 0 ] 2>/dev/null; then
+  printf "    Snapshot: avg ${RUNSTATS_SNAP_AVG}s | min ${RUNSTATS_SNAP_MIN}s | max ${RUNSTATS_SNAP_MAX}s (measured on $RUNSTATS_SNAP_MEASURED/$DURATION_SAMPLE_COUNT runs"
+  [ "$RUNSTATS_SNAP_UNKNOWN" -gt 0 ] 2>/dev/null && printf ", $RUNSTATS_SNAP_UNKNOWN unknown -- action evicted or unreadable"
+  printf ")\n"
+else
+  printf "    Snapshot: ${COLOR_YELLOW}no measurable phase data in this sample${COLOR_RESET}\n"
+fi
+if [ "$RUNSTATS_EXP_MEASURED" -gt 0 ] 2>/dev/null; then
+  printf "    Export:   avg ${RUNSTATS_EXP_AVG}s | min ${RUNSTATS_EXP_MIN}s | max ${RUNSTATS_EXP_MAX}s (measured on $RUNSTATS_EXP_MEASURED/$DURATION_SAMPLE_COUNT runs"
+  [ "$RUNSTATS_EXP_UNKNOWN" -gt 0 ] 2>/dev/null && printf ", $RUNSTATS_EXP_UNKNOWN unknown"
+  [ "$RUNSTATS_EXP_NA" -gt 0 ] 2>/dev/null && printf ", $RUNSTATS_EXP_NA not configured"
+  printf ")\n"
+else
+  printf "    Export:   ${COLOR_YELLOW}no measurable export-phase data in this sample${COLOR_RESET} ($RUNSTATS_EXP_NA not configured, $RUNSTATS_EXP_UNKNOWN unknown)\n"
+fi
+printf "    ${COLOR_CYAN}(export phase = wall-clock envelope of a run export action(s), not their sum; snapshot+export is NOT expected to equal the total -- queue time belongs to neither)${COLOR_RESET}\n"
+
+RUNSTATS_BYPOLICY_COUNT=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.byPolicy | length // 0')
+[ -z "$RUNSTATS_BYPOLICY_COUNT" ] && RUNSTATS_BYPOLICY_COUNT=0
+if [ "$RUNSTATS_BYPOLICY_COUNT" -gt 0 ] 2>/dev/null; then
+  printf "\n  ${COLOR_BOLD}Per policy (14 days)${COLOR_RESET}\n"
+  _ep "$POLICY_RUN_PHASE_STATS" | jq -r '
+    def hms($s):
+      if $s == null then "n/a"
+      elif $s < 60 then "\($s|floor)s"
+      elif $s < 3600 then "\(($s/60)|floor)m\(($s%60)|floor)s"
+      else "\(($s/3600)|floor)h\((($s%3600)/60)|floor)m"
+      end;
+    .byPolicy[] |
+    "    " + .name + " | runs=\(.runCount)" +
+    " | total avg=" + hms(.total.avg) + " min=" + hms(.total.min) + " max=" + hms(.total.max) +
+    " | snapshot avg=" + hms(.snapshot.avg) + (if .snapshot.unknownCount > 0 then " (\(.snapshot.unknownCount) unknown)" else "" end) +
+    " | export avg=" + hms(.export.avg) +
+      (if .runCount > 0 and .export.notConfiguredCount == .runCount then " (not configured)"
+       elif .export.unknownCount > 0 then " (\(.export.unknownCount) unknown)"
+       else "" end)
+  ' 2>/dev/null
 fi
 
 ### Effective RPO (NEW v2.0 - patch 3/7)
