@@ -1886,8 +1886,13 @@ else
   KDR_MODE="Not Configured"
   KDR_FREQUENCY="N/A"
   KDR_PROFILE="N/A"
-  KDR_LOCAL_SNAPSHOT="false"
-  KDR_EXPORT_CATALOG="false"
+  # No DR policy exists, so there is nothing to have a catalog-snapshot
+  # setting. "false" would assert a measurement of a policy that is not there;
+  # these are three-state since #53, and the honest value is null. Not
+  # rendered (the DR card is gated on .enabled), but the JSON is consumed
+  # directly by kdl-diff.sh and by downstream readers.
+  KDR_LOCAL_SNAPSHOT="null"
+  KDR_EXPORT_CATALOG="null"
 fi
 
 debug "KDR enabled: $KDR_ENABLED, mode: $KDR_MODE, quickMode: $KDR_QUICK_MODE, local: $KDR_LOCAL_SNAPSHOT, export: $KDR_EXPORT_CATALOG"
@@ -8149,7 +8154,16 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
         | if ($eligible | not) or (.neverWritten == true) or ($drBlocked == true) or ($featPresent == false) then null
           elif ($candidate | not) then (if .inactive == false then "written" else "undated" end)
           elif .gateReason != null then null
-          elif (.retainer == true) and ((.snapshotCount // 0) > 0) then "retained"
+          # `(.snapshotCount // 0) > 0` collapsed "not counted" into "zero".
+          # snapshotCount is null until a storage scan populates storageUsage,
+          # which on a failing repository may never have happened -- so a
+          # repository a live policy IS still retiring restore points in fell
+          # through to "unverified", which this code defines as "the gate could
+          # not establish either way". The severity was right either way, but
+          # the row lost its only explanation while the best-practices line
+          # told the reader to check the reason under each status.
+          elif (.retainer == true) and (.snapshotCount != null) and (.snapshotCount > 0) then "retained"
+          elif (.retainer == true) and (.snapshotCount == null) then "retained-uncounted"
           else "unverified" end
       ),
       # A parked repository holding stranded content. null for any other
@@ -8263,6 +8277,12 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
              (if .maintenanceInfoCause == "scans-only" then null
               else "Background maintenance is disabled by configuration: the backgroundMaintenanceRun key is absent from ConfigMap k10-features, so K10 runs storage scans only. See the section note." end)
            else null end)
+        elif (.severityGate == "active") and (.activeReason == "retained-uncounted") then
+          (if .daysSinceLastWrite != null
+           then "No data written for " + (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + " days, but "
+           else "The last write cannot be dated, but " end)
+          + ((.retainerPolicies // []) | join(", "))
+          + " still retires restore points in it, and every retirement leaves space that only maintenance reclaims. How many restore points remain is not known: no storage scan has reported a snapshot count for this repository."
         elif (.severityGate == "active") and (.activeReason == "retained") then
           (if .daysSinceLastWrite != null
            then "No data written for " + (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + " days, but "
@@ -8449,6 +8469,7 @@ STORAGE_REPO_FAILSET=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '
       # verdict compares like with like.
       activeNeverRan:   ([ $active[] | select(.status == "NEVER_RAN") ] | length),
       activeRetained:   ([ $active[] | select(.activeReason == "retained") ] | length),
+      activeRetainedUncounted: ([ $active[] | select(.activeReason == "retained-uncounted") ] | length),
       activeUnverified: ([ $active[] | select(.activeReason == "unverified") ] | length),
       quiet:    ($quiet | length),
       quietNeverWritten:       ([ $quiet[] | select(.quietReason == "never-written") ] | length),

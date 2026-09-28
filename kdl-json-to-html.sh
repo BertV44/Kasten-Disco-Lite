@@ -203,18 +203,26 @@ def boolBadge(v):
 
 # Three-state sibling of boolBadge (#49): a plain Yes/No collapses "not
 # measured" into "measured and false", which asserts a finding that was never
-# established. boolBadge itself is NOT changed -- it has 9 other call sites
-# (verified by grep, not the "eleven" the issue quoted -- counts drift, per
-# this file's own history; grep it again before trusting either number).
-# Each of the 9 reaches this file as a plain JSON boolean: KDL.sh casts every
-# one of them with `($var == "true")` at the producer side (fipsMode,
-# networkPolicies, scc, vap, gvbSidecarInjection, monitoring.prometheus,
-# reportsPolicy.exists, VM .ready), never a raw passthrough, so none of them
-# can arrive here as `null` and boolBadge cannot misrender an unmeasured
-# state for any of them. Whether each of THOSE underlying shell reads itself
-# tells "false" apart from "could not read" is a separate question, one
-# level upstream of this renderer and outside what #49 reported -- not
-# re-audited here.
+# established. boolBadge itself is NOT changed.
+#
+# On the counts: the issue said boolBadge had "eleven call sites" and it was
+# RIGHT for the tree it was filed against -- main has 11. This tree has 9,
+# because two moved to triBadge (disasterRecovery.localCatalogSnapshot and
+# monitoring.prometheusRemoteWrite). Both numbers are correct; they describe
+# different trees. Re-count before trusting either.
+#
+# All 9 survivors were traced to their producer in KDL.sh and every one is
+# cast to a real boolean before it reaches this file, so none can arrive as
+# null and boolBadge cannot misrender an unmeasured state for them:
+# fipsMode, networkPolicies, scc, vap, gvbSidecarInjection,
+# monitoring.prometheus, reportsPolicy.exists, VM .ready, and
+# k10Configuration.security.auditLogging.enabled. (That last one was missing
+# from the first version of this list, which named eight producers for nine
+# sites -- an inventory that does not add up is not an audit.)
+#
+# Whether each of THOSE upstream shell reads itself tells "false" apart from
+# "could not read" is a separate question one level up, outside what #49
+# reported, and not re-audited here.
 def triBadge(v):
   if v == true then "<span class=\"badge ok\">\u2713 Yes</span>"
   elif v == false then "<span class=\"badge warn\">\u2717 No</span>"

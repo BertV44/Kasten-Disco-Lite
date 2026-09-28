@@ -290,6 +290,23 @@ unreclaimed space can still grow.
   exact trap the comment above that stage documents. `firstRunDue` is now
   computed once and bound before the constructor, so the published key and
   every reader of it cannot disagree.
+- **A critical repository no longer loses its only explanation when the
+  snapshot count has never been measured.** `activeReason` tested
+  `(.snapshotCount // 0) > 0`, and `snapshotCount` is `null` until a storage
+  scan populates `storageUsage` -- which on a failing repository may never
+  have happened. So a repository a live policy IS still retiring restore
+  points in fell through to `unverified`, which the code defines as "the gate
+  could not establish either way", and `gateNote` printed nothing. The
+  severity was correct either way, but the best-practices line tells the
+  reader to check the reason under each status and that row had none. New
+  state `retained-uncounted`, with a note that says the retainer is known and
+  the remaining count is not, plus its own section counter.
+- **`disasterRecovery.localCatalogSnapshot` / `.exportCatalogSnapshot` are
+  `null`, not `false`, when no DR policy exists.** There is no policy to have
+  a catalog-snapshot setting, so `false` asserted a measurement that was never
+  made -- inconsistent with the three-state contract #53 introduces. Not
+  rendered (the card is gated on `.enabled`), but the JSON is read directly by
+  `kdl-diff.sh` and by downstream consumers.
 - **Stranded content is keyed on the evidence that K10 parked the repository,
   not on the `IDLE` status.** `strandedSignal` and `strandedBytes` are read
   nowhere except `idleStranded` and `idleNote`, both of which were gated on
