@@ -3,6 +3,45 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+### Fixed
+- **Policy Run Statistics counted every RunAction, not just application
+  ones.** The summary cards (average/min/max duration) and the per-policy
+  table (`policyRunStats.lastRuns`, `policyRunStats.effectiveRpo`) mixed
+  `k10-disaster-recovery-policy` and `k10-system-reports-policy` into the same
+  distribution as application backups. On a live cluster this produced "Avg
+  2h 26m, Min 2s, Max 14h 1m over 70 runs": the reported Min belonged to the
+  7-second-per-run reporting policy, the average was dragged down by two
+  policies moving no application data, and the one number that mattered — a
+  14-hour application backup — read as an outlier against a mean it had
+  itself been used to compute. Fixed by resolving each RunAction's owning
+  policy from `.spec.subject.name` and excluding names matching
+  `SYSTEM_POLICY_PATTERNS` — the same predicate `policyAnalysis` already
+  applies, shared rather than duplicated, so the two sections cannot disagree
+  about what "policy" means again. A RunAction whose owner cannot be resolved
+  (`subject.name` absent) is counted separately as
+  `unknownAttributionCount`, never silently folded into the application
+  sample. `averageDuration` now also reports `scope`, `scopedPolicyCount` and
+  `systemExcludedCount` so the sample's population is stated, not implied,
+  and the terminal/HTML text say so in words, not just the JSON.
+- **A non-zero fractional second in a RunAction timestamp silently emptied
+  the entire "Policy Last Run Status" table and truncated `effectiveRpo`'s
+  interval samples**, found live while building the fixture this same fix
+  needed for RFC3339Nano coverage. `fromdateiso8601` throws on the fractional
+  second Kasten emits whenever it is non-zero; uncaught, that failure
+  propagated out of the whole `jq` call, and the shell-level empty-array
+  fallback swallowed it without a line on stderr — every policy's last-run
+  row disappeared whenever its most recent run had one such timestamp. Fixed
+  with the same tolerant `ts_clean`/`ts_epoch` pattern already used
+  elsewhere in `KDL.sh`; a single still-unparseable timestamp now costs one
+  data point, not the whole table.
+- `kdl-diff.sh`: new "Policy Run Statistics (scope & phases)" comparison
+  section reports the app-policy sample size as an informational delta. A
+  baseline predating this scope fix is detected and skipped rather than
+  misreported as a real trend (same handling as the v2.6.0
+  `amberCount` → `staleCount` rename).
+
 ## [2.6.0] - 2026-09-23
 
 ### Fixed

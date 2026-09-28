@@ -1009,18 +1009,19 @@ else "" end) + "
 <!-- Policy Run Stats -->
 <h2>\u23F1\uFE0F Policy Run Statistics</h2>"
 + (if .policyRunStats then
-    "<p class=\"section-description\">The summary cards describe the duration <strong>distribution over a sample of recent successful runs</strong> (sample size below). The table shows the <strong>most recent run per policy</strong>, which may fall outside that sample &mdash; so a long last run can legitimately exceed the sampled max.</p>
+    (.policyRunStats.averageDuration) as $avgD |
+    "<p class=\"section-description\">App policies only (" + ($avgD.scopedPolicyCount // 0 | tostring) + " in scope over the last 14 days); system DR/reports policies are excluded from every card and table below, the same scope policyAnalysis uses. " + ($avgD.systemExcludedCount // 0 | tostring) + " system-policy run(s) and " + ($avgD.unknownAttributionCount // 0 | tostring) + " run(s) with an unresolved policy owner were excluded from the sample, not folded into it. The summary cards describe the duration <strong>distribution over a sample of recent successful runs</strong> (sample size below). The \"last run per policy\" table shows the <strong>most recent run per policy</strong>, which may fall outside that sample &mdash; so a long last run can legitimately exceed the sampled max.</p>
     <div class=\"grid\">
       <div class=\"card new-feature\"><strong>Avg Duration <small>(sampled)</small></strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.seconds) + "</div></div>
       <div class=\"card\"><strong>Min <small>(sampled)</small></strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.min) + "</div></div>
       <div class=\"card\"><strong>Max <small>(sampled)</small></strong><div class=\"card-value\">" + formatDuration(.policyRunStats.averageDuration.max) + "</div></div>
       <div class=\"card new-feature\"><strong>Sample Size</strong><div class=\"card-value\">" + (.policyRunStats.averageDuration.sampleCount | tostring) + " runs</div></div>
-    </div>
-    <h3>Last run per policy</h3>
+    </div>" +
+    "<h3>Last run per policy</h3>
     <table>
     <thead><tr><th>Policy</th><th>Last Run</th><th>Status</th><th>Duration</th></tr></thead>
     <tbody>" +
-    ([.policyRunStats.lastRuns[]? | 
+    ([.policyRunStats.lastRuns[]? |
       "<tr>
         <td><strong>" + .name + "</strong></td>
         <td>" + (if .lastRun then (.lastRun.timestamp | split("T")[0]) else "Never" end) + "</td>

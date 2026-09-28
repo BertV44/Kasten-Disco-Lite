@@ -683,6 +683,44 @@ RPO_JSON=$(jq -c -n \
 add_section_json "effectiveRpo" "$RPO_JSON"
 
 ### -------------------------
+### Policy Run Statistics: scope & phase breakdown (v2.7.0, #54)
+### -------------------------
+# averageDuration.{seconds,min,max,sampleCount} are pre-existing keys, not
+# renamed: their MEANING changed (app-policy scope instead of every policy),
+# so a baseline taken before v2.7.0 and a current report taken after it will
+# show a population shift here that is not a real trend -- expected, same
+# discontinuity as the v2.6.0 amberCount -> staleCount rename. Only compare
+# them when both sides already report a scope (i.e. both are v2.7.0+).
+print_section "Policy Run Statistics (scope & phases)"
+B_RUNSTATS_SCOPE=$(get_baseline '.policyRunStats.averageDuration.scope')
+C_RUNSTATS_SCOPE=$(get_current '.policyRunStats.averageDuration.scope')
+B_SAMPLE=$(get_baseline '.policyRunStats.averageDuration.sampleCount')
+C_SAMPLE=$(get_current '.policyRunStats.averageDuration.sampleCount')
+
+RUNSTATS_CHANGED=false
+if [ "$B_RUNSTATS_SCOPE" != "app-policies" ] || [ "$C_RUNSTATS_SCOPE" = "null" ] || [ -z "$C_RUNSTATS_SCOPE" ]; then
+  print_change "[INFO]" "$COLOR_CYAN" "Baseline predates the v2.7.0 app-policy scope fix (#54) -- sample size/min/max/avg are not comparable across this boundary; not diffed."
+  RUNSTATS_CHANGED=true
+else
+  if [ -n "$B_SAMPLE" ] && [ -n "$C_SAMPLE" ] && [ "$B_SAMPLE" != "$C_SAMPLE" ] && [ "$B_SAMPLE" != "null" ] && [ "$C_SAMPLE" != "null" ]; then
+    print_change "[INFO]" "$COLOR_CYAN" "App-policy run sample size: ${B_SAMPLE} -> ${C_SAMPLE} runs (14d window; size alone is not a regression or an improvement)"
+    RUNSTATS_CHANGED=true
+  fi
+fi
+if [ "$RUNSTATS_CHANGED" = false ] && [ "$SUMMARY_ONLY" = false ] && [ "$MODE" = "human" ]; then
+  print_change "[OK]" "$COLOR_GREEN" "No change (sample size ${C_SAMPLE:-n/a})"
+fi
+
+RUNSTATS_JSON=$(jq -c -n \
+  --arg bSample "${B_SAMPLE:-null}" --arg cSample "${C_SAMPLE:-null}" '
+  def numOrNull: if . == "null" or . == "" then null else tonumber end;
+  {
+    baselineSampleCount: ($bSample | numOrNull), currentSampleCount: ($cSample | numOrNull)
+  }
+')
+add_section_json "policyRunStats" "$RUNSTATS_JSON"
+
+### -------------------------
 ### K10 RBAC (v2.0)
 ### -------------------------
 print_section "K10 RBAC"

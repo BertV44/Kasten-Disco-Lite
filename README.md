@@ -50,7 +50,7 @@ These join the existing v1.9 features:
 - **Catalog Size** with **Free Space** alerts
 - **K10 infrastructure volumes** — access mode and backend shape of the PVCs the Helm chart creates for K10 itself (catalog, jobs, logging, metering, Prometheus), scoped to exclude FileStore profile targets
 - **Orphaned RestorePoints** detection
-- **Average Policy Run Duration**
+- **Policy Run Statistics** — average/min/max run duration, scoped to **application policies only** *(scope fix NEW v2.7.0)*
 - **Location Profiles** with immutability detection (supports `Xh` and `Xd` formats)
 - **PolicyPresets** inventory
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
@@ -247,9 +247,13 @@ The "biggest gap" (largest unscored pillar) is identified as actionable advice. 
 
 > **Note**: the score is a synthesis indicator for executive / CISO communication — not a compliance assertion. Pillar weighting is empirical. See [Appendix A: Ransomware Readiness Score — Rationale](#appendix-a-ransomware-readiness-score--rationale) for the full justification of each pillar weight, evidence rules, and known limitations.
 
+### Policy Run Statistics: scope (v2.7.0)
+
+The duration cards and the per-policy table are scoped to **application policies only** — the same `SYSTEM_POLICY_PATTERNS` exclusion `policyAnalysis` already applies, so the two sections cannot disagree about what "policy" means. Before v2.7.0 the sample mixed in `k10-disaster-recovery-policy` and `k10-system-reports-policy`: on one real cluster this dragged a reporting policy's 7-second runs into the reported Min and a DR policy's 3m31s runs into the average, while the actual multi-hour application backup read as an outlier against a mean it had itself been used to compute. `averageDuration` now also reports `scopedPolicyCount`, `systemExcludedCount`, and `unknownAttributionCount` (RunActions whose `.spec.subject.name` could not be resolved to a policy at all — counted separately, never silently folded into the application sample).
+
 ### Effective RPO per Policy (patch 3/7)
 
-For each policy, KDL measures the **median interval** between consecutive `Complete` RunActions over the same 14-day window used by Average Run Duration. Median (not mean) is used because it is robust to outliers (a single 12h backup after a maintenance window doesn't blow up the metric).
+Application policies only, same scope as above (`k10-disaster-recovery-policy` / `k10-system-reports-policy` excluded since v2.7.0). For each policy, KDL measures the **median interval** between consecutive `Complete` RunActions over the same 14-day window used by Average Run Duration. Median (not mean) is used because it is robust to outliers (a single 12h backup after a maintenance window doesn't blow up the metric).
 
 Drift detection: `median > theoretical × 1.5` (50% retard). Only flagged for policies declared with a K10 frequency alias (`@hourly`, `@daily`, `@weekly`, `@monthly`=30 days, `@yearly`); custom cron expressions and manual policies report stats without drift judgement.
 
@@ -297,7 +301,7 @@ No new kubectl call, no new RBAC — the data is derived from `namespaces_raw.js
 
 ### `kdl-diff.sh` standalone JSON comparator (patch 6/7)
 
-Separate POSIX sh script that takes two KDL JSON outputs and reports changes across 16 sections: metadata, ransomware readiness (delta grade + per-pillar), licence, backup health, catalog, policies (added/removed), namespace coverage, policy analysis, effective RPO, K10 RBAC subjects, profiles, disaster recovery, virtualization, resource limits, best practices.
+Separate POSIX sh script that takes two KDL JSON outputs and reports changes across 17 sections: metadata, ransomware readiness (delta grade + per-pillar), licence, backup health, catalog, policies (added/removed), namespace coverage, policy analysis, effective RPO, policy run statistics (app-policy sample size) *(NEW v2.7.0)*, K10 RBAC subjects, profiles, disaster recovery, virtualization, resource limits, best practices.
 
 Classifies each change as improvement / regression / neutral. Exit code = number of regressions (capped at 99), 100 = usage error. Three output modes: `--human` (default), `--json` (structured), `--summary` (suppress no-change lines).
 
@@ -458,8 +462,8 @@ echo "Regressions: $?"   # exit code = number of regressions
 12. **Policy Presets** — Presets with frequency and retention, policies using presets
 13. **Kasten Policies** — Policies with frequency, schedule, actions, selectors, retention (snapshot + export)
 14. **Policy Last Run Status** — Timestamp, state, duration, deepest cause-chain error
-15. **Policy Run Duration** — Average, min, max over last 14 days
-16. **Effective RPO per Policy** *(NEW v2.0)* — Median interval between successful runs, drift vs theoretical
+15. **Policy Run Duration** — Average, min, max over last 14 days, **application policies only** (system DR/reports policies excluded from the sample and from the per-policy table) *(scope fix NEW v2.7.0)*
+16. **Effective RPO per Policy** *(NEW v2.0)* — Median interval between successful runs, drift vs theoretical, **application policies only** *(scope fix NEW v2.7.0)*
 17. **Policy Analysis: Empty + Redundant** *(NEW v2.0)* — Empty policies, redundant pairs (genuine vs catchall)
 18. **Per-Namespace Protection Status** — Last successful backup per namespace, stale detection
 19. **Namespace Protection** — Catch-all detection, unprotected namespaces
