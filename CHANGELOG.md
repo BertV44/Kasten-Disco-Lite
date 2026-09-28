@@ -284,6 +284,23 @@ unreclaimed space can still grow.
   has stopped scheduling it.** `NEVER RAN - first run not yet overdue` printed
   "K10 is not scheduling this repository" beside it. No timer on a new
   repository is what "too new" looks like, not what "given up on" looks like.
+  The first attempt at this guard was itself inert: it read `.firstRunDue` from
+  inside the same `. + {...}` constructor that adds it, where `.` is the INPUT,
+  so it saw `null`, never fired, and the sentence printed anyway. That is the
+  exact trap the comment above that stage documents. `firstRunDue` is now
+  computed once and bound before the constructor, so the published key and
+  every reader of it cannot disagree.
+- **Stranded content is keyed on the evidence that K10 parked the repository,
+  not on the `IDLE` status.** `strandedSignal` and `strandedBytes` are read
+  nowhere except `idleStranded` and `idleNote`, both of which were gated on
+  `status == "IDLE"`. Any cluster-wide rung that pre-empts the `parked`
+  scheduler state -- the DR ownership block, or background maintenance
+  switched off -- therefore deleted the entire finding: a parked repository
+  holding 5 GB of unreferenced blobs reported it as nothing, `idleStrandedCount`
+  read 0, and the row could render a green `OK` directly under a section note
+  saying unreferenced data is never reclaimed. Both are now keyed on
+  `k10Parked`, a repository holding stranded content is never green, and
+  "Not a fault" is reserved for a genuine `IDLE`.
 - **`OK` printed the wrong age.** The label used `daysSinceLastMaintenance`
   (the newest exit-0 record) while the verdict is decided by `successAgeDays`.
   They diverge whenever the newest exit-0 record is newer than the newest run

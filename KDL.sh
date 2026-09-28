@@ -7709,7 +7709,20 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   # out UNKNOWN. Staging the pass is the fix that cannot regress, where
   # hand-inlining each recomputation would drift.
   | map(
-    . + {
+    # firstRunDue is computed HERE, before the constructor, and bound. Inside
+    # `. + {...}` the `.` is the INPUT, so a sibling key added alongside is
+    # invisible -- the exact trap this stage exists to avoid, which caught the
+    # scheduler-note guard below once already (it read `.firstRunDue`, got
+    # null, and never fired). Both the published key and every reader inside
+    # the constructor now read $firstRunDue, so they cannot disagree.
+    (
+      (if .fullIntervalSeconds == null then 86400 else .fullIntervalSeconds end) as $iv
+      | if .ownerPodRunning == true then false
+        elif .daysSinceCreation == null then true
+        else (((.daysSinceCreation * 86400) > $iv) or ((.overdueSeconds // 0) > $iv))
+        end
+    ) as $firstRunDue
+    | . + {
       # Has the FIRST full maintenance fallen due? Only meaningful for a
       # repository with no run in its history, and it decides whether an empty
       # history is a finding or simply a new repository.
@@ -7748,13 +7761,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       #     so an unreadable pod list (null) does not suppress the finding;
       #   * one full interval of grace before lateness counts, the same
       #     allowance the OVERDUE branch gives.
-      firstRunDue: (
-        (if .fullIntervalSeconds == null then 86400 else .fullIntervalSeconds end) as $iv
-        | if .ownerPodRunning == true then false
-          elif .daysSinceCreation == null then true
-          else (((.daysSinceCreation * 86400) > $iv) or ((.overdueSeconds // 0) > $iv))
-          end
-      ),
+      firstRunDue: $firstRunDue,
       # THREE-STATE, and the third state is load-bearing. null means we could
       # not date the last write, and a repository we cannot date must never be
       # treated as inactive: inactivity downgrades severity, so defaulting the
@@ -7880,7 +7887,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
           # what "given up on" looks like. Saying K10 has stopped scheduling
           # it contradicted the status printed two columns over, which reads
           # "NEVER RAN - first run not yet overdue".
-          elif (.k10SchedulerState == "dropped") and (.firstRunDue == false) then null
+          elif (.k10SchedulerState == "dropped") and ($firstRunDue == false) then null
           elif .k10SchedulerState == "dropped" then
             "K10 is not scheduling this repository."
             + (if $profileGone then ""
@@ -8147,7 +8154,18 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       ),
       # A parked repository holding stranded content. null for any other
       # status, and for an IDLE whose storage usage could not be read.
-      idleStranded: (if .status != "IDLE" then null
+      # Keyed on k10Parked, the EVIDENCE that K10 parked this repository, not
+      # on status == "IDLE". A cluster-wide rung -- the DR ownership block, or
+      # background maintenance switched off -- pre-empts the "parked"
+      # scheduler state, which used to make IDLE unreachable and take the
+      # whole stranded-content finding with it: strandedSignal and
+      # strandedBytes are read NOWHERE else, so a parked repository holding
+      # 5 GB of unreferenced blobs reported that as nothing at all, and could
+      # render green OK under a section note saying unreferenced data is never
+      # reclaimed. Parking is what k10Parked measures; whether the service is
+      # currently scheduling is a separate fact, and only the first decides
+      # whether content is stranded.
+      idleStranded: (if .k10Parked != true then null
                      elif .strandedSignal == null then null
                      else (.strandedSignal != "none") end),
       # Stranded content is reported as STATE and a product limitation, never
@@ -8158,7 +8176,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                   elif . >= 1000000 then ((. / 1000000 * 10 | round) / 10 | tostring) + " MB"
                   else (((. / 1000) | round) | tostring) + " KB" end;
         (" Nothing will reclaim it until data is written to the repository again: K10 does not maintain a parked repository.") as $tail
-        | if .status != "IDLE" then null
+        | if .k10Parked != true then null
           elif .strandedSignal == "pure-garbage" then
             "Parked by K10 after five clean cycles since the last write. " + (.strandedBytes | size)
             + " of blobs remain and no snapshot references them." + $tail
@@ -8169,7 +8187,13 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
             "Parked by K10 after five clean cycles since the last write. " + (.strandedBytes | size)
             + " is marked unused and has not been reclaimed." + $tail
           elif .strandedSignal == "none" then
-            "Parked by K10 after five clean maintenance cycles since the last write. Not a fault."
+            # "Not a fault" only where the repository really is IDLE. Where a
+            # cluster-wide precondition pre-empted the parked state, the
+            # section note already says nothing is being maintained, and a row
+            # calling that healthy would contradict it.
+            (if .status == "IDLE"
+             then "Parked by K10 after five clean maintenance cycles since the last write. Not a fault."
+             else null end)
           else
             "Parked by K10 after five clean maintenance cycles since the last write. Not a fault. Stranded content was not assessed: its storage usage has not been measured."
           end
@@ -8328,13 +8352,17 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
             elif .status == "UNKNOWN" then "NOT ASSESSED"
             else (.status | tostring) end),
           statusLevel: (
-            if .status == "FAILING_STALE" then (if .severityGate == "quiet" then "warn" else "error" end)
+            # A repository holding stranded content is never green, whatever
+            # its status: where a cluster-wide rung pre-empts IDLE the status
+            # can fall through to OK, and an OK row would bury the finding.
+            (if .status == "FAILING_STALE" then (if .severityGate == "quiet" then "warn" else "error" end)
             elif .status == "NEVER_RAN" then
               (if .firstRunDue == false then "info" elif .severityGate == "quiet" then "warn" else "error" end)
             elif (.status == "FAILING") or (.status == "OVERDUE") or (.status == "STALE") or (.status == "DISABLED") then "warn"
             elif .status == "IDLE" then (if .idleStranded == true then "warn" else "info" end)
             elif .status == "OK" then "ok"
-            else "info" end)
+            else "info" end) as $lvl
+            | if (.idleStranded == true) and ($lvl == "ok") then "warn" else $lvl end)
         })
 ' 2>/dev/null) || { _jq_fail "storage repository maintenance"; STORAGE_REPO_MAINTENANCE='[]'; }
 
