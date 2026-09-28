@@ -1517,8 +1517,20 @@ else "" end) + "
 # repositories read as three. So the heading carries the repositories at each
 # level, from the statusLevel the rows print, and the sidebar prints those.
 + (if ([.storageRepositories.items[]? | has("statusLevel")] | any) then
-     " data-crit=\"" + ([.storageRepositories.items[] | select(.statusLevel == "error")] | length | tostring)
-     + "\" data-warn=\"" + ([.storageRepositories.items[] | select(.statusLevel == "warn")] | length | tostring) + "\""
+     # statusLevel counts each repository once, which is what the badge sweep
+     # got wrong. But it counts only the STATUS. profileMismatch deliberately
+     # does not feed status or severity, so an OK repository with a repointed
+     # profile renders warn badges in the section while the sidebar said the
+     # section had nothing amber. Cross-cutting warn-badged context rows have
+     # to be added back, without double-counting a repository whose status is
+     # already warn or error.
+     ([.storageRepositories.items[] | select(.statusLevel == "error")] | length) as $crit
+     | ([.storageRepositories.items[] | select(.statusLevel == "warn")] | length) as $warn
+     | ([.storageRepositories.items[]
+         | select((.profileMismatch == true)
+                  and (.statusLevel != "warn") and (.statusLevel != "error"))] | length) as $ctxWarn
+     | " data-crit=\"" + ($crit | tostring)
+     + "\" data-warn=\"" + (($warn + $ctxWarn) | tostring) + "\""
    else "" end)
 + ">\uD83D\uDCBE Repository Maintenance</h2>
      <p class=\"section-description\">Full maintenance reclaims the space held by deleted snapshots and compacts the indexes. <strong>Nothing here means a backup has been lost</strong> &mdash; what suffers is storage cost and the speed of exports, imports and restores.</p>

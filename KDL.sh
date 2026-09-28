@@ -7216,6 +7216,18 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
         if .readOnly == true then "read-only"
         elif $drBlocked == true then "blocked"
         elif (.repositoryPods != null) and ((.repositoryPods | length) > 0) then "running"
+        # Background maintenance switched off in k10-features. Below "running"
+        # and not above it, unlike the DR block: the block stops K10 touching
+        # the repository at all, while this leaves storage scans running, so a
+        # pod may legitimately be acting on it. Above the three rungs that
+        # follow, for the reason the block is: "scheduled", "parked" and
+        # "dropped" all describe a service that is deciding when to maintain
+        # this repository, and a service with maintenance switched off is not.
+        # Without this rung a parked repository read IDLE - "Not a fault" -
+        # under a section note saying no repository is maintained, and a
+        # dropped one promised a retry that no write and no crypto-svc restart
+        # can deliver.
+        elif $featPresent == false then "maintenance-off"
         elif .nextProcessTime != null then "scheduled"
         elif .k10Parked == true then "parked"
         elif (.detailsAvailable == true) and (.repositoryPods != null) and (.k10Parked == false) then "dropped"
@@ -7408,6 +7420,14 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                elif $drBlockDays == 1 then ", 1 day"
                else ", " + ($drBlockDays | tostring) + " days" end)
             + "). See the section note."
+          elif .k10SchedulerState == "maintenance-off" then
+            "K10 is not maintaining this repository: background maintenance is switched off in ConfigMap k10-features. Neither a new write nor a crypto-svc restart retries it. See the section note."
+          # A repository whose first maintenance is not due yet has nothing
+          # to have been dropped: no timer is what "too new" looks like, not
+          # what "given up on" looks like. Saying K10 has stopped scheduling
+          # it contradicted the status printed two columns over, which reads
+          # "NEVER RAN - first run not yet overdue".
+          elif (.k10SchedulerState == "dropped") and (.firstRunDue == false) then null
           elif .k10SchedulerState == "dropped" then
             "K10 is not scheduling this repository."
             + (if $profileGone then ""
@@ -7833,7 +7853,15 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
             elif .status == "OVERDUE" then "OVERDUE - " + ($cycles | tostring) + " cycle"
                  + (if $cycles == 1 then "" else "s" end) + " past due, no maintenance running"
             elif .status == "STALE" then "STALE - last success " + days($succ // $age // "an unknown number of") + " ago"
-            elif .status == "OK" then "OK" + (if $age == null then "" else " - maintained " + days($age) + " ago" end)
+            # The age printed must be the age that DECIDED the verdict. OK is
+            # reached from $successStale == false, which is computed from
+            # $succ (successAgeDays) -- never from $age
+            # (daysSinceLastMaintenance), which is the newest exit-0 record and
+            # can be newer than the newest run that counts as a success. STALE
+            # above already prefers $succ for exactly this reason; OK did not,
+            # so a verdict taken from a 6-day-old success could print
+            # "maintained 1 day ago".
+            elif .status == "OK" then "OK" + (if $succ == null then "" else " - maintained " + days($succ) + " ago" end)
             # Three renderings: firstRunDue is false both before the first run
             # comes round and while it is executing, and one red NEVER RAN for
             # all three called a repository a failure when the report said
@@ -8153,7 +8181,7 @@ case "$SR_DRBLOCK_AGE" in
   1)    _srv_age=", present for 1 day" ;;
   *)    _srv_age=", present for $SR_DRBLOCK_AGE days" ;;
 esac
-SR_BLOCK_SENTENCE="Kasten DR ownership block is in place: ConfigMap k10-dr-remove-to-get-ownership in $NAMESPACE$_srv_age. This cluster was restored from a Kasten DR backup and is deliberately not running repository maintenance or storage scans on any repository. Backups and exports continue, so the repositories grow unmaintained. Expected right after a DR restore or during a DR test. If the original Kasten instance, and any other instance restored from the same catalog, is permanently gone, hand ownership to this cluster: kubectl delete configmap -n $NAMESPACE k10-dr-remove-to-get-ownership (the dashboard exposes the same action). Maintenance resumes within an hour per repository, or immediately after a crypto-svc restart. Do not delete it while another instance may still maintain these repositories: two owners can corrupt backup data."
+SR_BLOCK_SENTENCE="Kasten DR ownership block is in place: ConfigMap k10-dr-remove-to-get-ownership in $NAMESPACE$_srv_age. This cluster was restored from a Kasten DR backup and is deliberately not running repository maintenance or storage scans on any repository. Backups and exports continue, so the repositories grow unmaintained. Expected right after a DR restore or during a DR test. If the original Kasten instance, and any other instance restored from the same catalog, is permanently gone, hand ownership to this cluster by removing that ConfigMap; the Kasten dashboard exposes the same action. Maintenance resumes within an hour per repository, or immediately after a crypto-svc restart. Do not delete it while another instance may still maintain these repositories: two owners can corrupt backup data."
 SR_FEAT_SENTENCE="Background maintenance is disabled by configuration: the backgroundMaintenanceRun key is absent from ConfigMap k10-features. Storage scans run; no repository is maintained and unreferenced data is never reclaimed. Re-enable with helm upgrade ... --set features.backgroundMaintenanceRun=true (any value enables it; only the absence of the key disables it)."
 SR_VERDICT_GLOSS=""
 SR_VERDICT_DETAIL=""
@@ -8460,13 +8488,24 @@ SR_SUMMARY_JSON=$(jq -cn \
   # k10-features that reads as off is called out because K10 does not read
   # it: the key alone enables maintenance.
   ([ (if $blk == true then {level: "warn", text: $blkSentence} else empty end),
-     (if $blk == null then {level: "info", text: ("DR ownership block not checked (" + $blkReason + ").")} else empty end),
+     (if $blk == null then {level: "info", text: ("DR ownership block not checked"
+        + (if ($blkReason | length) == 0 then "" else " (" + $blkReason + ")" end) + ".")} else empty end),
      (if $feat == false then {level: "warn", text: $featSentence} else empty end),
      (if ($feat == true) and ($featValue | test("^(false|0|no|off)$"; "i")) then
         {level: "info", text: ("k10-features carries backgroundMaintenanceRun set to " + $featValue + "; K10 reads whether the key is present, not its value, so background maintenance is enabled.")}
       else empty end),
      (if ($feat == null) and ($featCm != false) then
-        {level: "info", text: ("Background maintenance flag not checked (" + $featReason + ").")}
+        {level: "info", text: ("Background maintenance flag not checked"
+           + (if ($featReason | length) == 0 then "" else " (" + $featReason + ")" end) + ".")}
+      else empty end),
+     # ConfigMap k10-features genuinely absent. Until now no branch matched
+     # this at all: the JSON carried checked=false with a reason and BOTH
+     # rendered outputs printed nothing, so an unknown reached the data and
+     # neither reader. The verdict deliberately stays loud -- an absent
+     # ConfigMap is not read as "maintenance disabled" -- but the reader has
+     # to be told the flag could not be established.
+     (if ($feat == null) and ($featCm == false) then
+        {level: "info", text: "Background maintenance flag not checked: ConfigMap k10-features not found. Whether background maintenance is enabled could not be established, so it is not reported either way."}
       else empty end) ]) as $pre
   | ($thr | tostring) as $t
   | if ($total == 0) and ($listed > 0) then
@@ -9869,7 +9908,7 @@ if [ "$MODE" = "json" ]; then
         redactionNote: "procedureError and lastRunError are cluster-supplied text, published verbatim except that scheme://host, UUIDs and IPv4 addresses are masked and the string is truncated at 300 characters. Collected FIELDS carry names only - an object-store bucket or a FileStore claim - never an endpoint, region or path, because a repository path is k10/<cluster-uuid>/... .",
         severityGateNote: "An eligible failure (FAILING_STALE, or NEVER_RAN once due) is active - the section critical - while unreclaimed space can still grow: written inside inactiveThresholdDays, a last write that cannot be dated with no owner known to be gone, or quiet but kept by the gate. One thing outranks a recent write: a zero snapshot count taken after it (countZeroAfterWrite, from a storage scan ending at least an hour after modifiedTime), because nothing is left to retire and the next export moves the write past the scan. A quiet one (idle, or orphaned with no datable write) drops to a warning only when the record proves nothing more accumulates: every restore point has retired (snapshotCount 0, counted after the last write - an earlier count can miss snapshots written since), retirement cannot reach it (profile gone or profileMismatch), or no live policy retires restore points in it (retainer false: a deleted or paused policy retires nothing, since retirement is a phase of a policy run). For volumedata, no RestorePointContents referencing the namespace (restorePointRefs 0, read from a list that was readable and not empty) proves it directly and outranks an inferred retainer: the snapshot count is refreshed only by a successful scan, so on a failing repository it can be weeks old. A never-written repository is quiet, and so is every eligible failure while the Kasten DR ownership block is in place (dr-ownership-block) or background maintenance is switched off in k10-features (maintenance-feature-off): the cause is cluster-wide, and the section verdict names it. Anything unknown keeps the critical. severityGate, quietReason and activeReason carry the decision per repository; retainerPolicies names who still retires restore points in it - for volumedata a live policy exporting to the profile whose selector covers the namespace, or the labelled first writer.",
         idleStatusNote: "IDLE = K10 has parked the repository: five maintenance results scheduled since the last write, every task since succeeded, so the service stopped scheduling it until the next write (k10SchedulerState parked). Not a fault, and above STALE and OVERDUE because the lapsed schedule is what parking looks like. Stricter than the K10 rule: the newest procedure must not have failed. strandedSignal names what a parked repository still holds - pure-garbage (no snapshot left, blobs above the floor), mostly-garbage (stored above three times in use, the difference above the floor), index-garbage (the smaller of unused content and stored minus in use above the floor) - each bounded by physical bytes, because content can be marked unused after its blobs are deleted. strandedFloorBytes is 1 GB or a quarter of estateStoredBytes, whichever is smaller. A stranded IDLE (idleStranded) rolls up to PARTIAL; a plain one is not a finding.",
-        schedulerNote: "k10SchedulerState is what the K10 repositories service is doing with the repository, first match wins: read-only (status.readOnly; never processed here), blocked (the Kasten DR ownership block is in place; K10 processes no repository until ConfigMap k10-dr-remove-to-get-ownership is removed), running (an owner or repo-access pod is present, Pending included; k10SchedulerPodType names it, and a scan pod is never full maintenance), scheduled (the service holds a timer: status.details.nextProessTime, misspelled in Kasten, published as nextProcessTime), parked (no timer, and the service idle rule holds - five maintenance results scheduled since the last write and every task since succeeded; healthy by design), dropped (no timer, not parked, pod list readable), null (not determinable). k10TimerOverdueSeconds is set only when a held timer is more than 300 seconds in the past with no pod. k10RestartWontHelp is true when the ten retained process results are all failures started at or after the last write, so a crypto-svc restart skips the repository until it is next written to; null, never false, otherwise. ownerPodRunning (an owner pod of any kind running, upgrades included) is what excuses an overdue run; maintenanceRunning counts full-maintenance pods only. k10SchedulerNote, failureCauseNote and profileNote are row sentences; rowNotes collects every sentence for the row, and every output prints it verbatim.",
+        schedulerNote: "k10SchedulerState is what the K10 repositories service is doing with the repository, first match wins: read-only (status.readOnly; never processed here), blocked (the Kasten DR ownership block is in place; K10 processes no repository until ConfigMap k10-dr-remove-to-get-ownership is removed), running (an owner or repo-access pod is present, Pending included; k10SchedulerPodType names it, and a scan pod is never full maintenance), maintenance-off (background maintenance is switched off in k10-features; below running because scans still run, above the next three because none of them describes a service that is not maintaining at all), scheduled (the service holds a timer: status.details.nextProessTime, misspelled in Kasten, published as nextProcessTime), parked (no timer, and the service idle rule holds - five maintenance results scheduled since the last write and every task since succeeded; healthy by design), dropped (no timer, not parked, pod list readable), null (not determinable). k10TimerOverdueSeconds is set only when a held timer is more than 300 seconds in the past with no pod. k10RestartWontHelp is true when the ten retained process results are all failures started at or after the last write, so a crypto-svc restart skips the repository until it is next written to; null, never false, otherwise. ownerPodRunning (an owner pod of any kind running, upgrades included) is what excuses an overdue run; maintenanceRunning counts full-maintenance pods only. k10SchedulerNote, failureCauseNote and profileNote are row sentences; rowNotes collects every sentence for the row, and every output prints it verbatim.",
         maintenanceTypeNote: "recentResults holds only runs Kopia exited 0 on: Kasten appends an entry only after kopia maintenance run --full exits 0. The newest entry is chosen by completedTime, not by position; the list was observed newest-first on a live Kasten 9.0.5 cluster, but nothing in the payload states it. The entries carry no full/quick discriminator, but they are spaced one per day against a configured full interval of 24h and a quick interval of 1h (maintenanceInfo.full.interval / .quick.interval), and quick runs would produce roughly 24x more entries than observed - so recentResults holds full runs. runsTotal exceeds the number of entries kept, so the list is truncated to the most recent.",
         verdictNote: "verdictGloss, verdictDetail and verdictNotes are the best-practices line for this section: the gloss after the verdict, the detail in brackets, and one sentence per line beneath it. Written once, beside the verdict; the terminal and the HTML print them verbatim.",
         labelNote: "statusLabel is the status every output prints for a repository, and statusLevel its colour: error, warn, info or ok. summary holds the section counts as every output prints them: the total, the status rows (every repository counted once) and the context rows (already counted by status), or a message when there is nothing to count. Written once; the terminal and the HTML print them verbatim.",

@@ -150,6 +150,53 @@ unreclaimed space can still grow.
 - Every sentence published for a repository is also collected in `rowNotes`,
   and the terminal and the HTML print that list verbatim.
 
+### Fixed after review of the maintenance work
+- **Background maintenance switched off in `k10-features` is now a scheduler
+  state of its own** (`maintenance-off`). The state ladder had a rung for the
+  DR ownership block and none for this, so a parked repository still read
+  `IDLE` -- labelled "Not a fault", `statusLevel: info`, contributing nothing
+  -- directly under a section note saying no repository is maintained and
+  nothing is reclaimed. The new rung sits below `running`, because scans keep
+  running when only maintenance is off, and above `scheduled`/`parked`/
+  `dropped`, because none of those describes a service that is not
+  maintaining at all.
+- **A `dropped` repository no longer promises a retry that cannot happen.**
+  With maintenance switched off, the row said "It retries only when data is
+  next written to it or when crypto-svc restarts" — neither of which retries
+  anything while the key is absent — beside a note saying the opposite. The
+  sentence was already suppressed for the DR block and for a deleted profile;
+  it is now suppressed here too.
+- **A repository whose first maintenance is not yet due is no longer told K10
+  has stopped scheduling it.** `NEVER RAN - first run not yet overdue` printed
+  "K10 is not scheduling this repository" beside it. No timer on a new
+  repository is what "too new" looks like, not what "given up on" looks like.
+- **`OK` printed the wrong age.** The label used `daysSinceLastMaintenance`
+  (the newest exit-0 record) while the verdict is decided by `successAgeDays`.
+  They diverge whenever the newest exit-0 record is newer than the newest run
+  that counts as a success, so a verdict taken from a six-day-old success
+  could render "OK - maintained 1 day ago". `STALE` already preferred the
+  deciding age; `OK` now does too.
+- **`k10-features` missing entirely produced no rendered note at all.** The
+  JSON recorded `checked: false` with a reason and both outputs printed
+  nothing, so the unknown reached the data and neither reader. The verdict
+  deliberately stays loud — an absent ConfigMap is not read as "disabled" —
+  but the reader is now told the flag could not be established. A blank
+  server message no longer renders as "not checked ()".
+- **The sidebar counted no warnings for a section showing warning badges.**
+  The new `data-crit`/`data-warn` heading attributes counted only
+  `statusLevel`, and `profileMismatch` deliberately does not feed status, so
+  an `OK` repository with a repointed profile gave `data-warn="0"` beside two
+  amber badges. Cross-cutting warn-badged context rows are counted back in,
+  without double-counting a repository already warn or error.
+
+### Changed after review
+- **No remediation commands in the report.** The DR ownership block note
+  carried `kubectl delete configmap ...` in the terminal and the HTML. The
+  report names the ConfigMap and points at the dashboard action instead. A
+  wrong command in a support deliverable is worse than no command, and this
+  one is destructive: the same note warns that two owners can corrupt backup
+  data.
+
 ### Fixed
 - **`kdl-diff.sh` compared only 14 of the 19 best-practice checks.** `BP_LIST`
   had never been extended with `clusterScopedResources`,
