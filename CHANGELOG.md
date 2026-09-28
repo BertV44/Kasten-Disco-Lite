@@ -151,6 +151,18 @@ unreclaimed space can still grow.
   and the terminal and the HTML print that list verbatim.
 
 ### Fixed
+- **`kdl-diff.sh` compared only 14 of the 19 best-practice checks.** `BP_LIST`
+  had never been extended with `clusterScopedResources`,
+  `exportRetentionExplicit`, `policiesWithoutExport`, `snapshotRetentionHigh`
+  or `snapshotRetentionZero`, so a regression in any of those five was
+  invisible to the one tool whose job is catching drift between two
+  discoveries. Confirmed by flipping three checks in a real report: only
+  `monitoring`, the one in the list, was reported — `snapshotRetentionZero`
+  (`OK` -> `FOUND`) and `policiesWithoutExport` (`WARN` -> `FOUND`) passed
+  silently. `BP_LIST` and `bpSevMap` now hold the same 19 keys, and the comment
+  above the list says so, since the two drifting apart is what caused this.
+  Baselines predating a key are unaffected: the existing "both values present"
+  guard already skips them.
 
 - **A short run Kopia exited 0 on was reported `FAILING`** whenever the
   procedure record had been evicted. The same repository read `UNKNOWN` or
