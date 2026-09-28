@@ -34,7 +34,8 @@ These join the existing v1.9 features:
 - **License information** with **Consumption tracking**
 - **Health status** (pod health, backup success rates based on finished actions)
 - **Multi-Cluster detection** (primary/secondary/standalone)
-- **Disaster Recovery (KDR)** status and configuration
+- **Disaster Recovery (KDR)** status and configuration, including the Quick DR
+  catalog-snapshot mode read from the fields Kasten actually writes *(corrected v2.7.0)*
 - **Export Storage usage** with **Deduplication ratio**
 - **Policy Last Run Status** with duration + deepest cause-chain error message
 - **Failed Actions Top 5** with namespace, policy, and root-cause error
@@ -56,7 +57,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state unreleased)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0)*
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
@@ -64,7 +65,10 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 ---
 
-## What's New (unreleased)
+## What's New in v2.7
+
+v2.7.0 closes #49, #51, #53 and #54, and merges PR #52.
+
 
 - **What the K10 scheduler is doing with each repository.** The repositories
   service parks a healthy repository after five clean cycles since its last
@@ -72,7 +76,8 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   a trace KDL could see, so a parked repository aged into `STALE` and a
   given-up one read as though tonight's run would retry it. Each repository
   now carries `k10SchedulerState` — `read-only`, `blocked`, `running`,
-  `scheduled`, `parked` or `dropped` — from the service's own timer, the pods
+  `maintenance-off`, `scheduled`, `parked` or `dropped` — from the service's
+  own timer, the pods
   acting on the repository and the service's idle rule. A `dropped` repository
   says K10 is not scheduling it and what will retry it, including when a
   `crypto-svc` restart will not.
@@ -82,7 +87,8 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   every DR restore; while it exists K10 processes no repository, and policies
   keep running, so the repositories grow unmaintained. Every repository then
   reads `blocked` (a parked one is not `IDLE`: parking describes a service
-  that is processing), every eligible failure is quiet (`dr-ownership-block`),
+  that is processing — but it keeps its stranded-content finding, see below),
+  every eligible failure is quiet (`dr-ownership-block`),
   and the section verdict is `BLOCKED_DR_OWNERSHIP`, a warning, with the
   remedy and its condition: delete the ConfigMap only when no other instance
   restored from the same catalog may still maintain these repositories. The
@@ -99,6 +105,21 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   parked repository still holding stranded content — no snapshot left, most
   of the store unreferenced, or content marked unused — is `IDLE` with a
   warning, because nothing reclaims that space until the next write.
+  Stranded content is keyed on the evidence that K10 parked the repository,
+  not on the `IDLE` status itself: a cluster-wide precondition (the DR
+  ownership block, or background maintenance switched off) pre-empts the
+  `parked` scheduler state, and the finding has to survive that. It does —
+  the repository is never rendered green while it holds stranded content,
+  even where its status is not `IDLE`.
+
+- **Background maintenance switched off is its own scheduler state**
+  (`maintenance-off`). It sits below `running`, because storage scans keep
+  running when only maintenance is disabled, and above `scheduled`, `parked`
+  and `dropped`, because none of those describes a service that is not
+  maintaining at all. Without it a parked repository read `IDLE` — "not a
+  fault" — under a section note saying no repository is maintained, and a
+  dropped one promised a retry that neither a new write nor a `crypto-svc`
+  restart can deliver.
 
 - **Severity is earned by accumulation, not by writes.** An idle repository in
   which a live policy still retires restore points keeps its critical: each
@@ -152,6 +173,58 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
   the unread count printed beside it. A repository written to yesterday can
   be quietened after all: by a zero snapshot count taken after that write,
   since nothing is left to retire.
+
+- **Disaster Recovery mode was misreported on almost every Quick DR cluster**
+  (#53). KDL read `kdrSnapshotConfiguration.enabled` and `.exportData.enabled`
+  — two fields Kasten does not write — and `// false` turned each missing key
+  into a confident `false`, so every Quick DR cluster reported "No Catalog
+  Snapshot" whatever it was configured to do. The mode now comes from
+  `takeLocalCatalogSnapshot` and `exportCatalogSnapshot`, with local tested
+  before export (an export depends on a local snapshot), and Quick versus
+  Legacy DR is read from `quickDisasterRecoveryEnabled` in the `k10-config`
+  ConfigMap rather than inferred from whether the policy happens to carry a
+  `kdrSnapshotConfiguration`. Unreadable reports "Not determined", never a
+  guess; an unrecognised combination lists its settings rather than being
+  forced into one of the three real modes. New JSON key
+  `disasterRecovery.quickMode`, and both catalog-snapshot flags are genuinely
+  three-state. The HTML card gained the **Exported Catalog Snapshot** row the
+  JSON had always carried and the card never showed. The DR verdict and the
+  15-point ransomware credit are unchanged by any of this — they key on run
+  history, never on the mode.
+
+- **An unmeasured Prometheus remote-write state is no longer rendered as a
+  negative finding** (#49). `monitoring.prometheusRemoteWrite.enabled` is
+  documented three-state, and the Best Practices row said "not assessed"
+  while the Monitoring card, in the same document, said "✗ No" — asserting a
+  measurement that never happened. A three-state badge now renders `null` as
+  "Not assessed" in both places. `boolBadge` is unchanged; its remaining call
+  sites were each traced to their producer in `KDL.sh` and confirmed to be
+  genuine booleans cast before they reach the renderer.
+
+- **Policy Run Statistics is scoped to application policies, and splits each
+  run into its snapshot and export phases** (#54). The duration cards and the
+  per-policy table counted DR and reporting runs — which move no application
+  data — in a distribution readers take as being about their backups. See
+  [Policy Run Statistics: scope & phase breakdown](#policy-run-statistics-scope--phase-breakdown-v270).
+
+- **A switched-off policy no longer counts as protection** (#51). `spec.paused`
+  was never read, so a namespace covered only by a paused policy reported as
+  protected. Three states, with `unknown` keyed on whether the CRD declares
+  the field. A namespace with a real successful backup stays protected:
+  evidence still outranks inference. See
+  [Policy Paused/Enabled State](#policy-pausedenabled-state).
+
+- **`kdl-diff.sh` compared only 14 of the 19 best-practice checks.** `BP_LIST`
+  had never been extended with `clusterScopedResources`,
+  `exportRetentionExplicit`, `policiesWithoutExport`, `snapshotRetentionHigh`
+  or `snapshotRetentionZero`, so a regression in any of those five was
+  invisible to the one tool whose job is catching drift between two
+  discoveries. It now holds the same 19 keys as `bpSevMap`. Baselines
+  predating a key are unaffected.
+
+- **The run-duration summary and the per-policy rows use one formatter.** The
+  summary printed `Max: 87s` where the row beneath printed `max=1m27s` for the
+  same number.
 
 ## What's New in v2.6
 
@@ -304,7 +377,44 @@ The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII out
 
 See [CHANGELOG](CHANGELOG.md#210---2026-07-03) for details.
 
-## What's New in v2.0
+## What's New in v1.9 / v1.9.1
+
+### v1.9.1 — Bug fixes
+
+- **Locale-sensitive numeric formatting**: awk printf calls produced French-style output (`73,0%` instead of `73.0`) on systems with `LC_NUMERIC=fr_FR.UTF-8`. The decimal comma was being emitted into the JSON `successRate` and `dedupRatio` string fields and into the human-readable export storage display, breaking downstream consumers (HTML/PPTX generators, dashboards) that expect parseable numbers. Fix: prepend `LC_ALL=C` to all 5 affected awk invocations.
+- **Per-Namespace Protection Status excluded namespaces with hyphens**: the `appNamespaces` test was based on `test()` against a regex without anchors, causing namespaces like `my-app` to match a pattern fragment from `SYSTEM_NS_PATTERNS`. Fix: explicit array intersection instead of regex test.
+
+### v1.9 — Features
+
+- **BP-RET-HIGH threshold raised from `> 2` to `> 7`** — the old threshold flagged perfectly reasonable retention strategies as bad practice. New threshold aligns with the K10 documented `daily=7` default. Rationale documented inline.
+- **Disaster Recovery section** now surfaces the Quick DR catalog-snapshot variants (Local Snapshot, Exported Catalog, No Snapshot) as distinct modes. *(Corrected in a later release: the fields actually read are `kdrSnapshotConfiguration.takeLocalCatalogSnapshot` and `.exportCatalogSnapshot` — the field names originally shipped here, `.enabled` / `.exportData.enabled`, do not exist in that object and always read as absent; see the Disaster Recovery output section below and the CHANGELOG.)*
+- **Failed Actions Top 5** — dedicated section, recursive cause-chain unwrapping via `JQ_DEEPEST_MSG` helper (bounded recursion, 5 levels).
+- **Per-Namespace Protection Status** — last successful backup per namespace, stale detection (default threshold: 7 days, configurable via `STALE_DAYS_THRESHOLD`).
+- **Stuck Actions detection** — `state=Running` for more than `STUCK_HOURS_THRESHOLD` hours (default 24) flags hung Kanister jobs or kubectl exec calls that never returned.
+- **Profile validation status** — `.status.validation` / `.status.error` surfaced per profile to detect silent credential / connectivity issues.
+- **k10-system-reports-policy state** + last ReportAction — KDL silently depends on this policy for Export Storage / Dedup Ratio metrics. Now surfaced explicitly.
+- **RestorePoints distribution by namespace** (top 5) — uses already-collected `restorepoints_raw.json`.
+- **StorageClasses + VolumeSnapshotClasses inventory** with CSI/VSC cross-check — flags CSI drivers used by SCs that have NO matching VolumeSnapshotClass (Kanister/GVB required).
+- **Kubernetes server version + distribution detection** — heuristic chain: providerID (Azure/AWS/GCE) → vendor namespaces (cattle-system, k3s-upgrader) → version string suffix.
+- **Import policies tracking** — distinct from backup policies, relevant for multi-cluster import workflow (`MC_ROLE=secondary`).
+- **5 new Best Practices**: snapshot retention >7, snapshot retention zero, export retention explicit, cluster-scoped resources, policies without export.
+- **POLICY_LAST_RUN enriched with deepest cause-chain error** — `JQ_DEEPEST_MSG` helper unwraps K10's nested `cause` fields (each is a JSON-encoded string) up to 5 levels.
+- **`--no-helm` flag** — skip Helm release secret read for security-sensitive environments. The `k10-config` ConfigMap fallback is still used.
+
+---
+
+## What's New in v1.8.x (bug fixes, no schema changes)
+
+- **v1.8.3**: Fixed silent script exit on clusters where the catalog pod is not labelled `component=catalog`. Temp directory cascade (`$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`). New debug log entry.
+- **v1.8.2**: Fixed `_ep: command not found` on any run with `--output` (ordering bug in autodetect block introduced in v1.8.1).
+- **v1.8.1**: Fixed export retention display (was reading wrong JSON path). Deterministic retention key ordering. Added `--help`, `--version`, `--output FILE` flags. Execution timer. Parallel kubectl CRD fetches. Replaced `bc` dependency with `awk`. `safe_json()` / `safe_int()` helpers.
+
+---
+
+## Feature Reference — the analytical sections in detail
+
+Introduced in v2.0 unless a heading says otherwise; the `(patch n/7)` labels
+are from the v2.0 development series. Later additions carry their own version.
 
 ### Ransomware Readiness Score (patch 5/7)
 
@@ -449,40 +559,6 @@ This branch folds in all v1.9.2 fixes:
 
 ---
 
-## What's New in v1.9 / v1.9.1
-
-### v1.9.1 — Bug fixes
-
-- **Locale-sensitive numeric formatting**: awk printf calls produced French-style output (`73,0%` instead of `73.0`) on systems with `LC_NUMERIC=fr_FR.UTF-8`. The decimal comma was being emitted into the JSON `successRate` and `dedupRatio` string fields and into the human-readable export storage display, breaking downstream consumers (HTML/PPTX generators, dashboards) that expect parseable numbers. Fix: prepend `LC_ALL=C` to all 5 affected awk invocations.
-- **Per-Namespace Protection Status excluded namespaces with hyphens**: the `appNamespaces` test was based on `test()` against a regex without anchors, causing namespaces like `my-app` to match a pattern fragment from `SYSTEM_NS_PATTERNS`. Fix: explicit array intersection instead of regex test.
-
-### v1.9 — Features
-
-- **BP-RET-HIGH threshold raised from `> 2` to `> 7`** — the old threshold flagged perfectly reasonable retention strategies as bad practice. New threshold aligns with the K10 documented `daily=7` default. Rationale documented inline.
-- **Disaster Recovery section** now surfaces the Quick DR catalog-snapshot variants (Local Snapshot, Exported Catalog, No Snapshot) as distinct modes. *(Corrected in a later release: the fields actually read are `kdrSnapshotConfiguration.takeLocalCatalogSnapshot` and `.exportCatalogSnapshot` — the field names originally shipped here, `.enabled` / `.exportData.enabled`, do not exist in that object and always read as absent; see the Disaster Recovery output section below and the CHANGELOG.)*
-- **Failed Actions Top 5** — dedicated section, recursive cause-chain unwrapping via `JQ_DEEPEST_MSG` helper (bounded recursion, 5 levels).
-- **Per-Namespace Protection Status** — last successful backup per namespace, stale detection (default threshold: 7 days, configurable via `STALE_DAYS_THRESHOLD`).
-- **Stuck Actions detection** — `state=Running` for more than `STUCK_HOURS_THRESHOLD` hours (default 24) flags hung Kanister jobs or kubectl exec calls that never returned.
-- **Profile validation status** — `.status.validation` / `.status.error` surfaced per profile to detect silent credential / connectivity issues.
-- **k10-system-reports-policy state** + last ReportAction — KDL silently depends on this policy for Export Storage / Dedup Ratio metrics. Now surfaced explicitly.
-- **RestorePoints distribution by namespace** (top 5) — uses already-collected `restorepoints_raw.json`.
-- **StorageClasses + VolumeSnapshotClasses inventory** with CSI/VSC cross-check — flags CSI drivers used by SCs that have NO matching VolumeSnapshotClass (Kanister/GVB required).
-- **Kubernetes server version + distribution detection** — heuristic chain: providerID (Azure/AWS/GCE) → vendor namespaces (cattle-system, k3s-upgrader) → version string suffix.
-- **Import policies tracking** — distinct from backup policies, relevant for multi-cluster import workflow (`MC_ROLE=secondary`).
-- **5 new Best Practices**: snapshot retention >7, snapshot retention zero, export retention explicit, cluster-scoped resources, policies without export.
-- **POLICY_LAST_RUN enriched with deepest cause-chain error** — `JQ_DEEPEST_MSG` helper unwraps K10's nested `cause` fields (each is a JSON-encoded string) up to 5 levels.
-- **`--no-helm` flag** — skip Helm release secret read for security-sensitive environments. The `k10-config` ConfigMap fallback is still used.
-
----
-
-## What's New in v1.8.x (bug fixes, no schema changes)
-
-- **v1.8.3**: Fixed silent script exit on clusters where the catalog pod is not labelled `component=catalog`. Temp directory cascade (`$TMPDIR` → `/tmp` → `$HOME/.kdl-tmp` → `$PWD/.kdl-tmp`). New debug log entry.
-- **v1.8.2**: Fixed `_ep: command not found` on any run with `--output` (ordering bug in autodetect block introduced in v1.8.1).
-- **v1.8.1**: Fixed export retention display (was reading wrong JSON path). Deterministic retention key ordering. Added `--help`, `--version`, `--output FILE` flags. Execution timer. Parallel kubectl CRD fetches. Replaced `bc` dependency with `awk`. `safe_json()` / `safe_int()` helpers.
-
----
-
 ## Requirements
 
 - `kubectl` or `oc` configured and authenticated
@@ -572,40 +648,41 @@ echo "Regressions: $?"   # exit code = number of regressions
 6. **Stuck Actions** — `state=Running` > 24h (configurable)
 7. **Multi-Cluster** — Role (primary/secondary/none), cluster count
 8. **k10-system-reports-policy state** — Existence, frequency, last run state
-9. **Disaster Recovery (KDR)** — Status, mode (Quick DR/Legacy), frequency, profile
+9. **Disaster Recovery (KDR)** — Status, mode, frequency, profile. Quick DR vs Legacy comes from `quickDisasterRecoveryEnabled` in `k10-config`; within Quick DR the catalog-snapshot mode (No Catalog Snapshot / Local / Exported) is read from `takeLocalCatalogSnapshot` and `exportCatalogSnapshot`, three-state, with "Not determined" where the setting cannot be read *(corrected v2.7.0)*
 10. **Immutability Signal** — Detected protection periods, profile count
 11. **Location Profiles** — Backend, region, endpoint, protection period per profile, validation status
 12. **Policy Presets** — Presets with frequency and retention, policies using presets
-13. **Kasten Policies** — Policies with frequency, schedule, actions, selectors, retention (snapshot + export)
+13. **Kasten Policies** — Policies with frequency, schedule, actions, selectors, retention (snapshot + export), and paused/enabled state *(paused state NEW v2.7.0)*
 14. **Policy Last Run Status** — Timestamp, state, duration, deepest cause-chain error
 15. **Policy Run Duration** — Average, min, max over last 14 days, **application policies only** (system DR/reports policies excluded from the sample and from the per-policy table); plus a snapshot-vs-export phase breakdown per policy, over the same window and scope *(scope fix + phase breakdown NEW v2.7.0)*
 16. **Effective RPO per Policy** *(NEW v2.0)* — Median interval between successful runs, drift vs theoretical, **application policies only** *(scope fix NEW v2.7.0)*
-17. **Policy Analysis: Empty + Redundant** *(NEW v2.0)* — Empty policies, redundant pairs (genuine vs catchall)
+17. **Policy Analysis: Empty + Redundant** *(NEW v2.0)* — Empty policies, redundant pairs (genuine vs catchall), paused policies counted and excluded from both *(paused NEW v2.7.0)*
 18. **Per-Namespace Protection Status** — Last successful backup per namespace, stale detection
 19. **Namespace Protection** — Catch-all detection, unprotected namespaces
 20. **K10 Resource Limits** — Pod/container counts, limits, deployment replicas
 21. **Catalog** — PVC name, size, free space percentage with alerts
 22. **K10 Infrastructure Volumes** — Access mode, StorageClass, provisioner and backend shape of the Helm-created K10 PVCs, plus the namespace PVCs deliberately left out of scope (FileStore profile targets)
-23. **Orphaned RestorePoints** — Count and details
-24. **Residual Snapshots** *(NEW v2.5)* — Local Kasten snapshots (RestorePointContents) past a 7-day threshold, split into the subset no live policy retains (on demand, policy deleted, application gone) and the subset a GFS policy legitimately keeps
-25. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
-26. **Transform Sets** — Count and transform details
-27. **Monitoring** — Prometheus status
-28. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
-29. **K10 Configuration** — Security, dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
-30. **K10 RBAC Inventory** *(NEW v2.0)* — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, unique subjects (Users, Groups, ServiceAccounts), wildcard role flags
-31. **Policy Coverage Summary** — App policies targeting all namespaces
-32. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
-33. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
-34. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
-35. **Best Practices Compliance** — 19 checks with severity-coded indicators
-36. **Execution Time** — Elapsed time display
+23. **Storage Repository Maintenance** *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0)* — Per-repository maintenance status from evidence that a run *succeeded*, the K10 scheduler state (`read-only`, `blocked`, `running`, `maintenance-off`, `scheduled`, `parked`, `dropped`), the two cluster-wide preconditions (the Kasten DR ownership block and the `backgroundMaintenanceRun` feature flag), stranded content on parked repositories, and a severity gate that keeps a failure critical only while unreclaimed space can still grow
+24. **Orphaned RestorePoints** — Count and details
+25. **Residual Snapshots** *(NEW v2.5)* — Local Kasten snapshots (RestorePointContents) past a 7-day threshold, split into the subset no live policy retains (on demand, policy deleted, application gone) and the subset a GFS policy legitimately keeps
+26. **Kanister Blueprints** — Blueprints and bindings (cluster-wide)
+27. **Transform Sets** — Count and transform details
+28. **Monitoring** — Prometheus status
+29. **Virtualization** — VM platform, inventory, policies, protection, freeze config, concurrency
+30. **K10 Configuration** — Security, dashboard access, concurrency limiters, timeouts, datastore parallelism, persistence, excluded apps, features, non-default settings
+31. **K10 RBAC Inventory** *(NEW v2.0)* — ClusterRoles, ClusterRoleBindings, Roles, RoleBindings, unique subjects (Users, Groups, ServiceAccounts), wildcard role flags
+32. **Policy Coverage Summary** — App policies targeting all namespaces
+33. **Data Usage** — PVCs, capacity, snapshot data, export storage with dedup ratio
+34. **StorageClasses & VolumeSnapshotClasses** — Inventory + CSI/VSC cross-check
+35. **Ransomware Readiness Score** *(NEW v2.0)* — 8-pillar synthesis, grade A-F, biggest gap
+36. **Best Practices Compliance** — 19 checks with severity-coded indicators
+37. **Execution Time** — Elapsed time display
 
 ### JSON Output
 
-Top-level keys (v2.0):
+Top-level keys (current, v2.7.0):
 
-`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `cluster`, `rbacLimited`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `failedActionsTop5`, `stuckActions`, `namespaceProtectionStatus`, `restorePointsByNamespace`, `profileValidation`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `k10InfraVolumes`, `ransomwareReadiness`, `bestPractices`, `policiesWithoutExport`, `retentionAnalysis`, `collectionFlags`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
+`kdlVersion`, `platform`, `kastenVersion`, `kastenCompatibility`, `cluster`, `rbacLimited`, `license`, `health`, `multiCluster`, `reportsPolicy`, `disasterRecovery`, `policyPresets`, `kanister`, `transformSets`, `monitoring`, `virtualization`, `coverage`, `policyRunStats`, `policyAnalysis`, `k10Resources`, `catalog`, `orphanedRestorePoints`, `failedActionsTop5`, `stuckActions`, `namespaceProtectionStatus`, `restorePointsByNamespace`, `profileValidation`, `dataUsage`, `storageClasses`, `volumeSnapshotClasses`, `k10Configuration`, `k10Rbac`, `k10InfraVolumes`, `storageRepositories`, `residualSnapshots`, `ransomwareReadiness`, `bestPractices`, `policiesWithoutExport`, `retentionAnalysis`, `collectionFlags`, `immutabilitySignal`, `immutabilityDays`, `policies`, `profiles`, `importPolicies`
 
 Kubernetes version and distribution live under `cluster.kubernetesVersion` /
 `cluster.distribution`; restore-action counters under `health.backups.restoreActions`.
@@ -618,6 +695,29 @@ New in v2.0:
 - `k10Rbac` — accessibility flags, clusterRoles, clusterRoleBindings, roles, roleBindings, subjects
 - `ransomwareReadiness` — grade, score, pillars (with evidence), biggestGap, gradeThresholds
 
+Added since:
+
+- `storageRepositories` *(v2.4, rebuilt v2.6 and v2.7)* — per-repository maintenance
+  status and evidence, `k10SchedulerState` and its inputs, the severity gate
+  (`severityGate`, `quietReason`, `activeReason`, `retainerPolicies`), stranded
+  content, `rowNotes`, `statusLabel` / `statusLevel`, the section `summary`, and
+  `k10MaintenancePreconditions`
+- `residualSnapshots` *(v2.5)* — local snapshots past the threshold, split into
+  those no live policy retains and those a GFS policy legitimately keeps
+
+New in v2.7.0:
+
+- `disasterRecovery.quickMode` — `true` / `false` / `null`; with
+  `localCatalogSnapshot` and `exportCatalogSnapshot` now genuinely three-state
+- `policyRunStats.averageDuration` — gains `scope`, `scopedPolicyCount`,
+  `systemExcludedCount`, `unknownAttributionCount`
+- `policyRunStats.phaseBreakdown` — `overall` and `byPolicy[]` snapshot/export
+  durations, each with `measured` / `unknown` / `not_configured` counts
+- `policies.pausedCount`, `policies.pausedSchemaStatus`; `paused`,
+  `pausedState`, `pausedReason` on `policyAnalysis.resolved[]` and on
+  `policyRunStats.effectiveRpo` items; `pausedCount`, `enabledCount`,
+  `pausedStateUnknownCount`, `pausedSchemaStatus` on the summaries
+
 ---
 
 ## Best Practices Compliance (19 checks)
@@ -627,9 +727,9 @@ New in v2.0:
 | Disaster Recovery      | Critical | KDR policy enabled with export                    | Not configured                                     |
 | Authentication         | Critical | OIDC, LDAP, OpenShift OAuth, etc.                 | Dashboard unauthenticated                          |
 | Immutability           | Warning  | At least 1 profile with protection period         | No immutable profiles                              |
-| Monitoring             | Warning  | Prometheus detected (remote write reported apart) | No monitoring                                      |
+| Monitoring             | Info     | Prometheus detected (remote write reported apart) | No monitoring                                      |
 | VM Protection          | Warning  | All VMs covered by policies                       | Unprotected VMs                                    |
-| Snapshot retention high| Warning  | No policy with snapshot retention > 7             | Source SC I/O impact risk                          |
+| Snapshot retention high| Info     | No policy with snapshot retention > 7             | Source SC I/O impact risk                          |
 | Fast local recovery    | Warning  | All backup policies retain >= 1 snapshot          | Snapshot retention = 0 (no fast restore)           |
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
@@ -640,8 +740,8 @@ New in v2.0:
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
 | Audit Logging          | Info     | SIEM logging enabled                              | Optional                                           |
 | Resource Limits        | Info     | All K10 containers have limits                    | Partial coverage                                   |
-| Namespace Protection   | Info     | All app namespaces covered                        | Gaps detected                                      |
-| Kanister Blueprints    | Info     | Blueprints configured                             | Optional                                           |
+| Namespace Protection   | Warning  | All app namespaces covered (a paused policy protects nothing) | Gaps detected                          |
+| VM snapshot consistency| Warning  | VM policies quiesce/freeze before snapshot        | Crash-consistent VM snapshots only                 |
 | Cluster-scoped         | Info     | At least one policy with `includeClusterResources`| Optional                                           |
 
 ### Residual snapshots — why age alone is not the finding
