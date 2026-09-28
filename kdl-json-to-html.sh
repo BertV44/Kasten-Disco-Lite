@@ -195,6 +195,25 @@ def boolBadge(v):
   if v == true then "<span class=\"badge ok\">\u2713 Yes</span>"
   else "<span class=\"badge warn\">\u2717 No</span>" end;
 
+# Three-state sibling of boolBadge (#49): a plain Yes/No collapses "not
+# measured" into "measured and false", which asserts a finding that was never
+# established. boolBadge itself is NOT changed -- it has 9 other call sites
+# (verified by grep, not the "eleven" the issue quoted -- counts drift, per
+# this file's own history; grep it again before trusting either number).
+# Each of the 9 reaches this file as a plain JSON boolean: KDL.sh casts every
+# one of them with `($var == "true")` at the producer side (fipsMode,
+# networkPolicies, scc, vap, gvbSidecarInjection, monitoring.prometheus,
+# reportsPolicy.exists, VM .ready), never a raw passthrough, so none of them
+# can arrive here as `null` and boolBadge cannot misrender an unmeasured
+# state for any of them. Whether each of THOSE underlying shell reads itself
+# tells "false" apart from "could not read" is a separate question, one
+# level upstream of this renderer and outside what #49 reported -- not
+# re-audited here.
+def triBadge(v):
+  if v == true then "<span class=\"badge ok\">\u2713 Yes</span>"
+  elif v == false then "<span class=\"badge warn\">\u2717 No</span>"
+  else "<span class=\"badge info\">\u2139 Not assessed</span>" end;
+
 def severityBadge(sev; status):
   if status == "NOT_ASSESSED" then
     "<span class=\"badge info\">ℹ N/A</span>"
@@ -666,7 +685,7 @@ else "" end) + "
         <td><strong>Disaster Recovery</strong></td>
         <td class=\"sev-critical\">Critical</td>
         <td>" + severityBadge("critical"; .bestPractices.disasterRecovery) + "</td>
-        <td>" + badge(.bestPractices.disasterRecovery) + (if .disasterRecovery.enabled then " " + .disasterRecovery.mode else "" end) + "</td>
+        <td>" + badge(.bestPractices.disasterRecovery) + (if .disasterRecovery.enabled then " " + (.disasterRecovery.mode | @html) else "" end) + "</td>
       </tr>
       <tr>
         <td><strong>Authentication</strong></td>
@@ -978,10 +997,12 @@ else "" end) + "
     (if .disasterRecovery.enabled then
       "<div class=\"card dr-card\">
         <div class=\"stat-row\"><span class=\"stat-label\">Status</span><span class=\"stat-value\">" + badge(.disasterRecovery.status // "ENABLED") + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Mode</span><span class=\"stat-value\">" + .disasterRecovery.mode + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Mode</span><span class=\"stat-value\">" + (.disasterRecovery.mode | @html) + "</span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Frequency</span><span class=\"stat-value\"><code>" + .disasterRecovery.frequency + "</code></span></div>
         <div class=\"stat-row\"><span class=\"stat-label\">Profile</span><span class=\"stat-value\">" + .disasterRecovery.profile + "</span></div>
-        <div class=\"stat-row\"><span class=\"stat-label\">Local Catalog Snapshot</span><span class=\"stat-value\">" + boolBadge(.disasterRecovery.localCatalogSnapshot) + "</span></div>"
+        <div class=\"stat-row\"><span class=\"stat-label\">Quick DR Setting (k10-config)</span><span class=\"stat-value\">" + triBadge(.disasterRecovery.quickMode) + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Local Catalog Snapshot</span><span class=\"stat-value\">" + triBadge(.disasterRecovery.localCatalogSnapshot) + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Exported Catalog Snapshot</span><span class=\"stat-value\">" + triBadge(.disasterRecovery.exportCatalogSnapshot) + "</span></div>"
         + (if .disasterRecovery.lastRunState then "<div class=\"stat-row\"><span class=\"stat-label\">Last Run</span><span class=\"stat-value\">" + badge(.disasterRecovery.lastRunState) + "</span></div>" else "" end)
         + (if .disasterRecovery.lastSuccessfulRun then "<div class=\"stat-row\"><span class=\"stat-label\">Last Successful Run</span><span class=\"stat-value\"><code>" + .disasterRecovery.lastSuccessfulRun + "</code></span></div>" else "" end)
       + "</div>"
@@ -1914,7 +1935,7 @@ else "" end) + "
 <h2>\uD83D\uDCC8 Monitoring</h2>
 <div class=\"grid-2\">
   <div class=\"card\"><div class=\"stat-row\"><span class=\"stat-label\">Prometheus</span><span class=\"stat-value\">" + boolBadge(.monitoring.prometheus) + "</span></div></div>
-  <div class=\"card\"><div class=\"stat-row\"><span class=\"stat-label\">Remote Write</span><span class=\"stat-value\">" + boolBadge(.monitoring.prometheusRemoteWrite.enabled // false) + "</span></div></div>
+  <div class=\"card\"><div class=\"stat-row\"><span class=\"stat-label\">Remote Write</span><span class=\"stat-value\">" + triBadge(.monitoring.prometheusRemoteWrite.enabled) + "</span></div></div>
 </div>
 
 <!-- Data Usage -->
