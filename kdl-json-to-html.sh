@@ -2276,22 +2276,35 @@ else "" end) + "
   else
     "<div class=\"info-box\">Health metrics not available.</div>"
   end)
-+ (if (.failedActionsTop5.count // 0) > 0 then
-    "<h2>\u274C Failed Actions <small>(root cause)</small></h2>
-     <p class=\"section-description\">Most recent failed actions and the error message reported by K10. This is the first place to look when the success rate is low.</p>
+# Always rendered, so the sidebar always lists it: a section that appears only
+# when something failed cannot say "nothing failed". The heading carries the
+# uncapped total for the sidebar badge, since the table stops at five; JSON
+# older than the total falls back to the listed count.
++ ((.failedActionsTop5.total // .failedActionsTop5.count // 0)) as $faTotal
+| "<h2 data-crit=\"" + ($faTotal | tostring) + "\" data-warn=\"0\">\u274C Failed Actions <small>(root cause)</small></h2>"
++ (if .failedActionsTop5 == null then
+    "<div class=\"info-box\">Failed action data not available.</div>"
+  elif (.failedActionsTop5.count // 0) == 0 then
+    "<div class=\"success-box\">\u2713 <strong>No failed actions</strong> among the BackupActions, ExportActions and RestoreActions K10 still holds.</div>"
+  else
+    "<p class=\"section-description\">Most recent failed actions and the error message reported by K10. This is the first place to look when the success rate is low.</p>
      <table>
-       <thead><tr><th>Kind</th><th>Policy</th><th>Date</th><th>Root-cause message</th></tr></thead>
+       <thead><tr><th>Kind</th><th>Namespace</th><th>Policy</th><th>Date</th><th>Root-cause message</th></tr></thead>
        <tbody>" +
      ([.failedActionsTop5.items[]? |
        "<tr>
           <td>" + (.kind // "\u2014") + "</td>
+          <td>" + (if ((.namespace // "") == "") or (.namespace == "N/A") then "<em>\u2014</em>" else (.namespace | @html) end) + "</td>
           <td>" + (if (.policy // "") == "" then "<em>\u2014</em>" else (.policy | @html) end) + "</td>
           <td>" + (if (.timestamp // "") == "" then "\u2014" else (.timestamp | split("T")[0]) end) + "</td>
           <td><code>" + ((.message // "") | .[0:400] | @html) + (if ((.message // "") | length) > 400 then "\u2026" else "" end) + "</code></td>
         </tr>"
      ] | join("")) +
      "</tbody></table>"
-   else "" end)
+     + (if $faTotal > (.failedActionsTop5.count // 0) then
+         "<p class=\"section-description\">Showing the " + ((.failedActionsTop5.count) | tostring) + " most recent of " + ($faTotal | tostring) + " failed actions.</p>"
+       else "" end)
+  end)
 + "
 
 <h2>\uD83D\uDCC8 Monitoring</h2>
