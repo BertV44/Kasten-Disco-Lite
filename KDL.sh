@@ -3040,6 +3040,20 @@ if ! _ep "$POLICY_NAMES" | jq -e '.' >/dev/null 2>&1; then
   POLICY_NAMES='[]'
 fi
 
+# Imported RestorePoints are this cluster's view of another cluster's exports:
+# the source cluster's policy retires them, so neither the orphan check nor the
+# residual-snapshot check below can call them leftovers to clean up here. One
+# is recognised by either of two signals. The k10.kasten.io/importProfile label
+# is exact, but older Kasten imports do not carry it; a policyName naming a
+# live import policy covers those, since an import policy creates no snapshot
+# of its own. An unlabelled import whose policy has been deleted matches
+# neither and is still assessed -- nothing on the object tells it apart.
+IMPORT_POLICY_NAMES=$(_ep "$POLICIES_JSON" | jq -c '[.items[]? | select(any(.spec.actions[]?; .action == "import")) | .metadata.name] // []' 2>/dev/null || echo '[]')
+if ! _ep "$IMPORT_POLICY_NAMES" | jq -e '.' >/dev/null 2>&1; then
+  IMPORT_POLICY_NAMES='[]'
+fi
+printf '%s' "$IMPORT_POLICY_NAMES" > "$TEMP_DIR/import_policies.json"
+
 # Find RestorePoints where the source policy no longer exists.
 #
 # Three defects fixed in v2.2.0 (#orphan-rp), all observed on a 31k-RestorePoint
@@ -3070,10 +3084,17 @@ fi
 # (overstating).
 ORPHANED_RP_STATUS="OK"
 printf '%s' "${POLICY_NAMES:-[]}" > "$TEMP_DIR/orp_policies.json"
-ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR/orp_policies.json" '
+ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR/orp_policies.json" \
+    --slurpfile importPolicies "$TEMP_DIR/import_policies.json" '
   ( $policies[0] // [] ) as $policies |
+  ( $importPolicies[0] // [] ) as $importPolicies |
   [(.items // [])[]? |
     . as $rp |
+    # Imported: owned by the source cluster, never an orphan here.
+    select(
+      ((($rp.metadata.labels // {}) | has("k10.kasten.io/importProfile")) | not)
+      and (($importPolicies | index(($rp.metadata.labels // {})["k10.kasten.io/policyName"] // "")) == null)
+    ) |
     ((.spec.source.actionName // "") | tostring) as $action |
     # Kasten labels the owning policy on the RestorePoint. Prefer it: it is
     # exact, whereas deriving the policy from the action name cannot be.
@@ -3116,6 +3137,17 @@ fi
 ORPHANED_RP_COUNT=$(_ep "$ORPHANED_RP" | jq 'length // 0')
 [ -z "$ORPHANED_RP_COUNT" ] && ORPHANED_RP_COUNT=0
 
+# Imported RestorePoints the orphan check left out, counted so the report can
+# say so rather than shrink silently.
+RP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile importPolicies "$TEMP_DIR/import_policies.json" '
+  ( $importPolicies[0] // [] ) as $importPolicies |
+  [(.items // [])[]?
+   | (.metadata.labels // {}) as $l
+   | select(($l | has("k10.kasten.io/importProfile"))
+            or (($importPolicies | index($l["k10.kasten.io/policyName"] // "")) != null))]
+  | length // 0
+' 2>/dev/null || echo 0)")
+
 # RestorePoints that carry no actionName at all — not orphaned, not attributable.
 RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq '
   [(.items // [])[]?
@@ -3135,7 +3167,7 @@ if [ "${RESTORE_POINTS_COUNT:-0}" -gt 0 ] 2>/dev/null \
   warn "Orphan detection is not possible on this catalog; the count is reported as not assessed."
 fi
 
-debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT (status: $ORPHANED_RP_STATUS, unattributable: $RP_UNATTRIBUTABLE_COUNT)"
+debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT (status: $ORPHANED_RP_STATUS, unattributable: $RP_UNATTRIBUTABLE_COUNT, imported excluded: $RP_IMPORTED_COUNT)"
 
 ### -------------------------
 ### Residual Snapshots (NEW v2.5)
@@ -3192,6 +3224,7 @@ RESIDUAL_SNAP_STATUS="OK"
 RESIDUAL_SNAPSHOTS='[]'
 RESIDUAL_SNAP_LISTED=0
 RESIDUAL_SNAP_LOCAL_COUNT=0
+RESIDUAL_SNAP_IMPORTED_COUNT=0
 RESIDUAL_SNAP_COUNT=0
 RESIDUAL_SNAP_UNRETAINED_COUNT=0
 RESIDUAL_SNAP_ONDEMAND_COUNT=0
@@ -3243,6 +3276,7 @@ else
   RESIDUAL_SNAP_SUMMARY=$(cat "$TEMP_DIR/rpc_raw.json" 2>/dev/null | jq -c \
     --slurpfile policies "$TEMP_DIR/orp_policies.json" \
     --slurpfile retention "$TEMP_DIR/residual_retention.json" \
+    --slurpfile importPolicies "$TEMP_DIR/import_policies.json" \
     --argjson threshold "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" '
     def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else null end;
     # Strips fractional seconds before a Z and nothing else, so a numeric offset
@@ -3254,11 +3288,19 @@ else
 
     ( $policies[0] // [] ) as $policyNames |
     ( $retention[0] // {} ) as $retentionMap |
+    ( $importPolicies[0] // [] ) as $importPolicies |
     ( now ) as $now |
     ( .items // [] ) as $all |
+    # Imported content is not a local snapshot either: it carries no
+    # exportProfile label, but it sits in the repository of the source cluster,
+    # which retires it. Same two signals as the orphan check.
+    def imported: ((.metadata.labels // {})) as $l
+      | ($l | has("k10.kasten.io/importProfile"))
+        or (($importPolicies | index($l["k10.kasten.io/policyName"] // "")) != null);
     [ $all[]?
       | ((.metadata.labels // {})) as $l
       | select(($l | has("k10.kasten.io/exportProfile")) | not)
+      | select(imported | not)
       | ( .status.actionTime // .status.scheduledTime // .metadata.creationTimestamp ) as $refTime
       | ( $refTime | ts_epoch ) as $refEpoch
       | ( ($l["k10.kasten.io/policyName"] // "") | tostring ) as $policyName
@@ -3347,6 +3389,7 @@ else
     {
       listed: ($all | length),
       localSnapshots: ($snaps | length),
+      imported: ([ $all[]? | select(((.metadata.labels // {}) | has("k10.kasten.io/exportProfile")) | not) | select(imported) ] | length),
       residual: ($residual | length),
       unretained: ($unretained | length),
       onDemand: ([ $residual[] | select(.reason == "on-demand") ] | length),
@@ -3387,6 +3430,7 @@ else
   if [ -n "$RESIDUAL_SNAP_SUMMARY" ] && _ep "$RESIDUAL_SNAP_SUMMARY" | jq -e '.' >/dev/null 2>&1; then
     RESIDUAL_SNAP_LISTED=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.listed // 0')")
     RESIDUAL_SNAP_LOCAL_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.localSnapshots // 0')")
+    RESIDUAL_SNAP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.imported // 0')")
     RESIDUAL_SNAP_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.residual // 0')")
     RESIDUAL_SNAP_UNRETAINED_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.unretained // 0')")
     RESIDUAL_SNAP_ONDEMAND_COUNT=$(safe_int "$(_ep "$RESIDUAL_SNAP_SUMMARY" | jq '.onDemand // 0')")
@@ -9458,11 +9502,13 @@ if [ "$MODE" = "json" ]; then
     --argjson orphanedRpCount "$ORPHANED_RP_COUNT" \
     --arg orphanedRpStatus "$ORPHANED_RP_STATUS" \
     --argjson rpUnattributableCount "$RP_UNATTRIBUTABLE_COUNT" \
+    --argjson rpImportedCount "$RP_IMPORTED_COUNT" \
     --slurpfile residualSnapshots "$TEMP_DIR/residualSnapshots.json" \
     --argjson residualThresholdDays "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" \
     --arg residualSnapStatus "$RESIDUAL_SNAP_STATUS" \
     --argjson residualSnapListed "$RESIDUAL_SNAP_LISTED" \
     --argjson residualSnapLocal "$RESIDUAL_SNAP_LOCAL_COUNT" \
+    --argjson residualSnapImported "$RESIDUAL_SNAP_IMPORTED_COUNT" \
     --argjson residualSnapCount "$RESIDUAL_SNAP_COUNT" \
     --argjson residualSnapUnretained "$RESIDUAL_SNAP_UNRETAINED_COUNT" \
     --argjson residualSnapOnDemand "$RESIDUAL_SNAP_ONDEMAND_COUNT" \
@@ -10004,7 +10050,10 @@ if [ "$MODE" = "json" ]; then
         status: $orphanedRpStatus,
         # RestorePoints with no spec.source.actionName: cannot be attributed to
         # any policy, so neither orphaned nor confirmed-attached.
-        unattributable: $rpUnattributableCount
+        unattributable: $rpUnattributableCount,
+        # Imported RestorePoints, left out of the check: the policy of the
+        # source cluster retires them.
+        importedExcluded: $rpImportedCount
       },
 
       # Local Kasten snapshots (RestorePointContents with NO exportProfile
@@ -10017,9 +10066,12 @@ if [ "$MODE" = "json" ]; then
         # every count below MUST NOT be read as a verified zero.
         status: $residualSnapStatus,
         # RestorePointContents the cluster returned, exports included. The gap
-        # with localSnapshots is how many were exports.
+        # with localSnapshots is how many were exports or imports.
         listed: $residualSnapListed,
         localSnapshots: $residualSnapLocal,
+        # Imported content left out of localSnapshots: it lives in the
+        # repository of the source cluster, which retires it.
+        imported: $residualSnapImported,
         # Past the threshold. Not a finding on its own: a GFS policy
         # legitimately retains monthly and yearly points.
         beyondThreshold: $residualSnapCount,
@@ -11614,6 +11666,9 @@ fi
 if [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
   printf "  ${COLOR_CYAN}    $RP_UNATTRIBUTABLE_COUNT RestorePoint(s) have no source action name (not attributable)${COLOR_RESET}\n"
 fi
+if [ "${RP_IMPORTED_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_CYAN}    $RP_IMPORTED_COUNT imported RestorePoint(s) not assessed (retired by the source cluster)${COLOR_RESET}\n"
+fi
 
 ### Residual Snapshots (NEW v2.5)
 printf "\n${COLOR_BOLD}[SNAP] Residual Snapshots${COLOR_RESET} ${COLOR_CYAN}(NEW v2.5)${COLOR_RESET}\n"
@@ -11622,6 +11677,9 @@ if [ "$RESIDUAL_SNAP_STATUS" = "NOT_ASSESSED" ]; then
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} Not assessed - RestorePointContents could not be listed or parsed; this is NOT a verified zero\n"
 else
   printf "  RestorePointContents listed: $RESIDUAL_SNAP_LISTED ($RESIDUAL_SNAP_LOCAL_COUNT local snapshot(s))\n"
+  if [ "$RESIDUAL_SNAP_IMPORTED_COUNT" -gt 0 ]; then
+    printf "  ${COLOR_CYAN}    $RESIDUAL_SNAP_IMPORTED_COUNT imported restore point(s) not assessed (retired by the source cluster)${COLOR_RESET}\n"
+  fi
   if [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}[WARN]  $RESIDUAL_SNAP_UNRETAINED_COUNT residual snapshot(s) no live policy retains${COLOR_RESET}\n"
     printf "  ${COLOR_CYAN}    on demand: $RESIDUAL_SNAP_ONDEMAND_COUNT | policy deleted: $RESIDUAL_SNAP_POLICY_DELETED_COUNT | application gone: $RESIDUAL_SNAP_UNBOUND_COUNT | past declared retention: $RESIDUAL_SNAP_OVER_RETENTION_COUNT${COLOR_RESET}\n"
