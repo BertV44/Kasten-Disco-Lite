@@ -1825,7 +1825,15 @@ else "" end) + "
       <table>
         <thead><tr><th>Repository Name</th><th>Application</th><th>Type</th><th>Profile</th><th>Policy</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Last Data Write</th><th>Duration</th></tr></thead>
         <tbody>" +
-      ([.storageRepositories.items[]? |
+      # Errors first, then warnings, then the rest: what an auditor reads this
+      # table for is what is failing, and on a cluster with dozens of idle or
+      # read-only repositories it sat on page two. A warn-badged profile
+      # mismatch ranks with the warnings, as the sidebar counts it. sort_by is
+      # stable, so the collection order holds within each level.
+      ([.storageRepositories.items // [] | sort_by(
+          if .statusLevel == "error" then 0
+          elif .statusLevel == "warn" or .profileMismatch == true then 1
+          else 2 end)[] |
         "<tr><td><code>" + (.name | @html) + "</code></td>" +
         # The repository name is a generated suffix and identifies nothing a
         # reader can act on. The application and the policy do: "this failing
