@@ -27,3 +27,6 @@ CLAUDE.md
 kdl-dr-mode-test.sh
 kdl-runstats-test.sh
 kdl-policy-state-test.sh
+kdl-repo-maint-test.sh
+kdl-policy-ns-test.sh
+kdl-expiry-test.sh
