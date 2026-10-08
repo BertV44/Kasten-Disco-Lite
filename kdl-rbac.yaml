@@ -133,6 +133,13 @@ rules:
     verbs: ["get", "list"]
 
   # --- Kasten K10 custom resources (read-only) ---
+  # `policies` here covers the cluster-wide read (`get policies -A`, #58):
+  # Kasten policies live in the K10 namespace AND in application namespaces
+  # (non-admin users manage the policies of their own namespaces), and KDL
+  # reads them all in one call when this ClusterRole is bound. Without it KDL
+  # falls back to reading policies namespace by namespace and reports only
+  # what the caller can read -- see the optional per-namespace Role at the end
+  # of this file.
   - apiGroups: ["config.kio.kasten.io"]
     resources:
       - profiles
@@ -268,3 +275,51 @@ subjects:
   - kind: ServiceAccount
     name: kdl
     namespace: kasten-io
+# ---------------------------------------------------------------------------
+# OPTIONAL -- restricted users who cannot be given Part A (#58)
+#
+# Kasten policies also live in APPLICATION namespaces. Without the cluster-wide
+# `policies` read of Part A, KDL lists the namespaces the caller can see
+# (`get namespaces`, or `get projects` on OpenShift) and reads
+# `policies.config.kio.kasten.io` in each one. It then reports exactly which
+# namespaces it read and which it could not (policyCollection in the JSON, and
+# a notice in the terminal and HTML report), and verdicts that an unseen policy
+# could change are reported as NOT ASSESSED rather than clean.
+#
+# To let such a user see the policies of an application namespace, the admin of
+# THAT namespace applies a Role like the one below (one per application
+# namespace; template it with your tool of choice) plus a RoleBinding to the
+# user. Nothing here is needed for the K10 namespace itself: Part B and the K10
+# admin role already cover it.
+#
+# Uncomment, set the namespace and the subject, and apply.
+#
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: Role
+# metadata:
+#   name: kasten-discovery-reader-policies
+#   namespace: my-app-namespace   # <-- the APPLICATION namespace
+#   labels:
+#     app.kubernetes.io/name: kasten-discovery-lite
+#     app.kubernetes.io/component: rbac
+# rules:
+#   - apiGroups: ["config.kio.kasten.io"]
+#     resources:
+#       - policies
+#       - policypresets        # optional
+#       - blueprintbindings    # optional
+#     verbs: ["get", "list"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: RoleBinding
+# metadata:
+#   name: kasten-discovery-reader-policies
+#   namespace: my-app-namespace   # <-- must match the Role namespace
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: Role
+#   name: kasten-discovery-reader-policies
+# subjects:
+#   - kind: User
+#     name: alice@example.com
+#     apiGroup: rbac.authorization.k8s.io

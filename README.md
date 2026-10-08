@@ -952,6 +952,40 @@ the `Role` and `RoleBinding` (Part B) in `kdl-rbac.yaml` before applying.
 Edit the binding subjects in both Bindings to point at your principal
 (ServiceAccount, User, or Group).
 
+### Policies outside the K10 namespace: partial reporting
+
+Kasten policies live in the K10 namespace **and** in application namespaces
+(non-admin users manage the policies of their own namespaces). KDL reads them
+cluster-wide with a single `get policies.config.kio.kasten.io -A`, which the
+Part A ClusterRole covers. The exit status of that list decides, not the
+`auth can-i` probe (a probe can be wrong).
+
+When that read is refused (a restricted, namespace-scoped user), KDL does not
+silently report on the K10 namespace alone:
+
+- It adds `list policies --all-namespaces` to the RBAC warning and reads
+  policies **namespace by namespace** over the namespaces the user can see
+  (`get namespaces`, or `get projects` on OpenShift when listing namespaces is
+  denied), recording the exit status of each read. At most 500 namespaces are
+  attempted (`KDL_POLICY_NS_MAX`); the rest are counted as not attempted.
+- It publishes `policyCollection` in the JSON (`mode`: `cluster`,
+  `per-namespace` or `k10-only`; `namespacesAttempted`, `namespacesRead`,
+  `namespacesDenied`), and the terminal and HTML reports print the same scope
+  in the policies section, with a visible warning when it is partial.
+- When the set is partial, the verdicts that an unseen policy could flip in
+  the dangerous direction are **not assessed** instead of clean: namespace
+  protection gaps, VM protection gaps, orphaned RestorePoints and residual
+  snapshots whose policy "is gone" (when the policy namespace was not read),
+  and the best-practice checks that assert something about every policy (the
+  clean result of the snapshot-retention, export-retention and export-coverage
+  checks, and a "not configured" cluster-scoped check). A finding on a policy
+  that *was* read stays a finding.
+
+To let a restricted user see the policies of an application namespace, that
+namespace's admin applies the optional namespaced `Role` documented at the end
+of [`kdl-rbac.yaml`](kdl-rbac.yaml) (`get`, `list` on `policies`). Without it,
+KDL reports only what the user can read, and says so.
+
 ### Pre-flight check
 
 On startup KDL runs `kubectl auth can-i` for its key cluster-scoped reads

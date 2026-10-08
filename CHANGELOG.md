@@ -3,6 +3,36 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+- **Policies outside the K10 namespace are now collected** (#58): KDL read
+  `policies.config.kio.kasten.io` from the K10 namespace only, so every
+  policy-derived section was computed on an incomplete set and presented as
+  complete. Policies are now read cluster-wide (`-A`) when permitted; when that
+  list is refused, KDL falls back to per-namespace reads (`get namespaces`, or
+  `get projects` on OpenShift) with the exit status of each read, merges what it
+  could read and publishes `policyCollection` (mode, namespaces attempted, read
+  and denied). Terminal and HTML print the same scope, with a visible warning
+  when it is partial.
+- **A partial policy set no longer yields a clean verdict.** Namespace
+  protection gaps, VM protection, orphaned RestorePoints, residual snapshots
+  whose policy is "gone", and the clean result of the retention, export and
+  cluster-scoped checks go to NOT_ASSESSED (orphans: PARTIAL) when a policy
+  could be hiding in a namespace that was not read.
+- **Policies are keyed by (namespace, name), never by bare name.** The orphan
+  check, the residual-snapshot retention lookup, the imported-RestorePoint
+  recognition, the run, RPO and phase statistics and the storage-repository
+  owner lookup use the `k10.kasten.io/policyNamespace` label (and the run
+  subject's namespace) where it exists. Two policies of the same name in two
+  namespaces no longer share runs, retention or an orphan verdict. The DR and
+  reporting "system policy" exclusions apply to the K10 namespace only. Policies
+  show their namespace in the inventory (terminal and HTML).
+- `kdl-rbac.yaml` documents that Part A covers `-A` and adds an optional
+  namespaced Role for restricted users; the README explains partial reporting.
+- Fixed: the HTML notice "cluster-wide namespace listing was denied" matched any
+  RBAC entry containing the word "namespace" (for example `list ... --all-namespaces`).
+- Test: `kdl-policy-ns-test.sh` (replay harness).
+
 ## [2.7.0] - 2026-09-28
 
 Four reported defects, one pull request, and the fixes that came out of
