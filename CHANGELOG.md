@@ -25,6 +25,32 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   pager and column sort; print shows every row and names the filter. Terminal
   output is unchanged. New harness `kdl-repo-maint-test.sh`.
 
+Manual runs and snapshot expiry (issue #63).
+
+- **Residual Snapshots ranked manual runs among their policy's scheduled
+  snapshots.** `k10.kasten.io/isRunNow` was read nowhere, so a manual run was
+  wrong both ways: one with no expiry, which nothing ever retires, could be
+  called `policy-retained`, and it pushed every scheduled snapshot behind it one
+  slot closer to `policy-over-retention`. On the validation lab a manual run of
+  the DR policy made its newest scheduled snapshot read as over-retention. Manual
+  runs are now left out of the rank groups and judged on their
+  `k10.kasten.io/expiresAt` label: none -> `manual-no-expiry` (finding); a date
+  ahead, or past by no more than a 2-day retirement grace -> `manual-expires`
+  (context); past by more -> `manual-expired` (finding); unparsable ->
+  `manual-expiry-unknown` (`NOT_ASSESSED`, never a pass). Kasten's own
+  `k10-disaster-recovery-policy` is exempt from the **no-expiry** anomaly only
+  (`k10-dr`: a DR manual run without `expiresAt`). A DR manual run past its
+  expiry is `manual-expired` like any other: on the lab Kasten removed the
+  RestorePoint at expiry yet left the content Unbound for 8 days, a real
+  leftover that an exemption would have hidden.
+- **New `residualSnapshots.expiry` overview** (terminal, JSON, HTML "Snapshots
+  with no expiry"): over every non-imported RestorePointContent, local and
+  exported, how many are scheduled `N/A`, manual "No expiration", manual with an
+  expiry date, expired or unparsable, with the oldest no-expiration runs listed.
+  Information only: exports with no expiration are not residual snapshots and do
+  not move the `residualSnapshots` best practice. Label semantics were verified
+  on Kasten 9.0.x only.
+
 ## [2.7.0] - 2026-09-28
 
 Four reported defects, one pull request, and the fixes that came out of
