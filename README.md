@@ -1,8 +1,8 @@
-# Kasten Discovery Lite v2.7.0
+# Kasten Discovery Lite v2.7.1
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
-**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2 / 9.0.5). On a newer
+**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2 / 9.0.5 / 9.0.6). On a newer
 cluster the report prints a warning and sets `kastenCompatibility.newerThanValidated`,
 rather than silently analysing an unknown CRD schema.
 
@@ -38,7 +38,7 @@ These join the existing v1.9 features:
   catalog-snapshot mode read from the fields Kasten actually writes *(corrected v2.7.0)*
 - **Export Storage usage** with **Deduplication ratio**
 - **Policy Last Run Status** with duration + deepest cause-chain error message
-- **Failed Actions Top 5** with namespace, policy, and root-cause error
+- **Failed Actions Top 5** with namespace, policy, and root-cause error, always listed with the uncapped total *(v2.7.1)*
 - **Stuck Actions detection** (state=Running > 24h)
 - **Per-Namespace Protection Status** (last successful backup, stale detection)
 - **Profile validation status** (`.status.validation` / `.status.error`)
@@ -58,7 +58,7 @@ These join the existing v1.9 features:
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
 - **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0)*
-- **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
+- **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*; manual runs judged on their expiry, imported restore points left out, and an overview of snapshots with no expiry *(v2.7.1)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.
@@ -787,6 +787,22 @@ The verdict keys on the subset that nothing retains —
 | `policy-retained` | Past the threshold and still within what the policy retains — reported as context, never as a finding |
 | `policy-unverifiable` | Names a policy that could not be checked because the policy list was empty or unreadable — never reported as deleted |
 | `policy-retention-unknown` | Live policy declaring no snapshot retention at all — the window is unknown, so neither retained nor residual |
+| `manual-no-expiry` | Manual run (`k10.kasten.io/isRunNow=true`) with no `k10.kasten.io/expiresAt` label — the Kasten UI's "No expiration": nothing ever retires it. A finding |
+| `manual-expired` | Manual run whose `expiresAt` is past by more than the 2-day retirement grace: Kasten should already have retired it. A finding |
+| `manual-expires` | Manual run still inside its `expiresAt` date (or the grace) — Kasten retires it; context, never a finding |
+| `manual-expiry-unknown` | Manual run whose `expiresAt` could not be parsed — gates the verdict to `NOT_ASSESSED` |
+| `k10-dr` | Manual run of Kasten's own `k10-disaster-recovery-policy` with **no** `expiresAt` — managed by Kasten, not reported. A DR manual run with an expiry is judged like any other (past it: `manual-expired`; the RestorePoint is typically already removed and the content left `Unbound`, observed on 9.0.6) |
+
+Manual runs are **never ranked** against their policy's retention (the policy
+name they carry does not retire them); they are judged on their `expiresAt`
+label alone. `residualSnapshots.expiry` is an information-only overview over
+every non-imported RestorePointContent, local **and exported**: scheduled
+`N/A`, manual "No expiration" (with the oldest ones listed, flagged local or
+exported), manual with an expiry date, expired, unparsable, and Kasten DR
+snapshots counted apart. An export with no expiration sits in the export
+repository, not in the cluster, so it is not a residual snapshot and never
+changes the best-practice verdict. The label semantics (`expiresAt` with the
+time colons replaced by hyphens, `isRunNow`) were verified on Kasten 9.0.x only.
 
 Reported sizes come from `status.physicalSizeBytes`, which is absent on plenty
 of clusters. Absent, non-numeric and negative all count as **unknown**, never as
@@ -951,6 +967,40 @@ the `Role` and `RoleBinding` (Part B) in `kdl-rbac.yaml` before applying.
 
 Edit the binding subjects in both Bindings to point at your principal
 (ServiceAccount, User, or Group).
+
+### Policies outside the K10 namespace: partial reporting
+
+Kasten policies live in the K10 namespace **and** in application namespaces
+(non-admin users manage the policies of their own namespaces). KDL reads them
+cluster-wide with a single `get policies.config.kio.kasten.io -A`, which the
+Part A ClusterRole covers. The exit status of that list decides, not the
+`auth can-i` probe (a probe can be wrong).
+
+When that read is refused (a restricted, namespace-scoped user), KDL does not
+silently report on the K10 namespace alone:
+
+- It adds `list policies --all-namespaces` to the RBAC warning and reads
+  policies **namespace by namespace** over the namespaces the user can see
+  (`get namespaces`, or `get projects` on OpenShift when listing namespaces is
+  denied), recording the exit status of each read. At most 500 namespaces are
+  attempted (`KDL_POLICY_NS_MAX`); the rest are counted as not attempted.
+- It publishes `policyCollection` in the JSON (`mode`: `cluster`,
+  `per-namespace` or `k10-only`; `namespacesAttempted`, `namespacesRead`,
+  `namespacesDenied`), and the terminal and HTML reports print the same scope
+  in the policies section, with a visible warning when it is partial.
+- When the set is partial, the verdicts that an unseen policy could flip in
+  the dangerous direction are **not assessed** instead of clean: namespace
+  protection gaps, VM protection gaps, orphaned RestorePoints and residual
+  snapshots whose policy "is gone" (when the policy namespace was not read),
+  and the best-practice checks that assert something about every policy (the
+  clean result of the snapshot-retention, export-retention and export-coverage
+  checks, and a "not configured" cluster-scoped check). A finding on a policy
+  that *was* read stays a finding.
+
+To let a restricted user see the policies of an application namespace, that
+namespace's admin applies the optional namespaced `Role` documented at the end
+of [`kdl-rbac.yaml`](kdl-rbac.yaml) (`get`, `list` on `policies`). Without it,
+KDL reports only what the user can read, and says so.
 
 ### Pre-flight check
 

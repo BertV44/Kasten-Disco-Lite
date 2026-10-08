@@ -3,6 +3,133 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [2.7.1] - 2026-10-08
+
+Four contributed pull requests (#59-#62, Michael Courcy) and four issues
+(#56, #57, #58, #63). The largest change is #58: policies are now read from
+every namespace, not only the K10 one. That is also where the independent
+audit found the defects that no section test had seen: once application
+namespaces are read, an app-scoped policy is no longer a K10-wide one, and
+every selector consumer that assumed otherwise reported protection the cluster
+does not have. They are fixed, and each has a replay scenario.
+
+- **Failed Actions is always listed** (#59): a success box when nothing
+  failed, a red sidebar badge with the uncapped total
+  (`failedActionsTop5.total`), "Showing the 5 most recent of N", and a
+  Namespace column read from the application (`appNamespace` label or
+  subject), never from the action's own namespace, so a metadata export of a
+  multi-namespace policy is no longer reported as a `kasten-io` failure.
+- **Repository Maintenance lists failing repositories first** (#60), by the
+  published `statusLevel`, stable within each level.
+- **Imported restore points are left out of the cleanup checks** (#61): they
+  are another cluster's exports, retired by the source cluster. Recognised by
+  the `k10.kasten.io/importProfile` label or by a live import policy;
+  published as `orphanedRestorePoints.importedExcluded` and
+  `residualSnapshots.imported`, and printed as a context line.
+- **Residual Snapshots explains its Rank / retained column** (#62) in a header
+  tooltip.
+- **Repository Maintenance verdict called a retained-uncounted repository
+  "still being written to"** (#57): the `retained-uncounted` active reason was
+  counted inside KDL.sh and never published, and both renderers derived the
+  "written" group by subtraction, so such a repository fell into the first
+  clause, contradicting its own row. KDL.sh now publishes
+  `activeWrittenCount` (counted, not subtracted) and
+  `activeRetainedUncountedCount`; written + retained + retainedUncounted +
+  unverified equals `activeFailingCount` by construction. The verdict folds
+  retained-uncounted into the retained clause, with the same wording in the
+  terminal and the HTML.
+- **Repository Maintenance summary is clickable** (#56, HTML): every summary
+  row and part carries a stable category key, published per repository as
+  `storageRepositories.items[].categories` (and as `key` on each summary row).
+  The summary counts are now counted from those same keys, so a count and the
+  rows behind it cannot drift. Clicking a row filters the repository table
+  (the parent "Lost their owner" is the union of its parts), shows a removable
+  "Filtered: ..." chip, and composes with the search box, issues-only, the
+  pager and column sort; print shows every row and names the filter. Terminal
+  output is unchanged. New harness `kdl-repo-maint-test.sh`.
+
+Manual runs and snapshot expiry (issue #63).
+
+- **Residual Snapshots ranked manual runs among their policy's scheduled
+  snapshots.** `k10.kasten.io/isRunNow` was read nowhere, so a manual run was
+  wrong both ways: one with no expiry, which nothing ever retires, could be
+  called `policy-retained`, and it pushed every scheduled snapshot behind it one
+  slot closer to `policy-over-retention`. On the validation lab a manual run of
+  the DR policy made its newest scheduled snapshot read as over-retention. Manual
+  runs are now left out of the rank groups and judged on their
+  `k10.kasten.io/expiresAt` label: none -> `manual-no-expiry` (finding); a date
+  ahead, or past by no more than a 2-day retirement grace -> `manual-expires`
+  (context); past by more -> `manual-expired` (finding); unparsable ->
+  `manual-expiry-unknown` (`NOT_ASSESSED`, never a pass). Kasten's own
+  `k10-disaster-recovery-policy` is exempt from the **no-expiry** anomaly only
+  (`k10-dr`: a DR manual run without `expiresAt`). A DR manual run past its
+  expiry is `manual-expired` like any other: on the lab Kasten removed the
+  RestorePoint at expiry yet left the content Unbound for 8 days, a real
+  leftover that an exemption would have hidden.
+- **New `residualSnapshots.expiry` overview** (terminal, JSON, HTML "Snapshots
+  with no expiry"): over every non-imported RestorePointContent, local and
+  exported, how many are scheduled `N/A`, manual "No expiration", manual with an
+  expiry date, expired or unparsable, with the oldest no-expiration runs listed.
+  Information only: exports with no expiration are not residual snapshots and do
+  not move the `residualSnapshots` best practice. Label semantics were verified
+  on Kasten 9.0.x only.
+
+- **Policies outside the K10 namespace are now collected** (#58): KDL read
+  `policies.config.kio.kasten.io` from the K10 namespace only, so every
+  policy-derived section was computed on an incomplete set and presented as
+  complete. Policies are now read cluster-wide (`-A`) when permitted; when that
+  list is refused, KDL falls back to per-namespace reads (`get namespaces`, or
+  `get projects` on OpenShift) with the exit status of each read, merges what it
+  could read and publishes `policyCollection` (mode, namespaces attempted, read
+  and denied). Terminal and HTML print the same scope, with a visible warning
+  when it is partial.
+- **A partial policy set no longer yields a clean verdict.** Namespace
+  protection gaps, VM protection, orphaned RestorePoints, residual snapshots
+  whose policy is "gone", and the clean result of the retention, export and
+  cluster-scoped checks go to NOT_ASSESSED (orphans: PARTIAL) when a policy
+  could be hiding in a namespace that was not read.
+- **Policies are keyed by (namespace, name), never by bare name.** The orphan
+  check, the residual-snapshot retention lookup, the imported-RestorePoint
+  recognition, the run, RPO and phase statistics and the storage-repository
+  owner lookup use the `k10.kasten.io/policyNamespace` label (and the run
+  subject's namespace) where it exists. Two policies of the same name in two
+  namespaces no longer share runs, retention or an orphan verdict. The DR and
+  reporting "system policy" exclusions apply to the K10 namespace only. Policies
+  show their namespace in the inventory (terminal and HTML).
+- `kdl-rbac.yaml` documents that Part A covers `-A` and adds an optional
+  namespaced Role for restricted users; the README explains partial reporting.
+- Fixed: the HTML notice "cluster-wide namespace listing was denied" matched any
+  RBAC entry containing the word "namespace" (for example `list ... --all-namespaces`).
+- Test: `kdl-policy-ns-test.sh` (replay harness).
+- **#58 follow-up (audit of the junction with older code):**
+  - A policy living outside the K10 namespace is app-scoped and protects ONLY
+    its own namespace (docs.kasten.io, usage/app_scoped_policies): an empty
+    selector is no longer a cluster-wide catch-all, and a selector naming other
+    namespaces credits none of them. Applied once (`kdlAppScoped`) in the
+    selector resolver, the catch-all counters, VM coverage, repository
+    `covers` and overlap detection. This had made namespace protection read
+    COMPLETE beside namespaces that were never backed up.
+  - Residual-snapshot rank groups include the policy namespace: two same-named
+    policies protecting one application no longer rank each other's snapshots.
+  - `failedActionsTop5.status` (OK / NOT_ASSESSED): an empty list beside a
+    non-zero total, or a failed jq pass, renders as an info box, never as
+    "No failed actions". A string `.status.error` no longer empties the list.
+    The terminal also prints "showing N most recent of TOTAL".
+  - Ransomware readiness: the Off-cluster export pillar is not assessed (no
+    points claimed lost, not the biggest gap, score flagged as a lower bound)
+    when the policy set is partial and no exporting policy is visible.
+  - Policy names carry their namespace outside the K10 namespace in every
+    HTML table too (`displayName`, published once, read by both renderers).
+  - Terminal redundant-pair separator is ASCII (`<->`).
+  - Second audit round: an app-scoped policy's `NotIn` no longer counts as a
+    K10-wide "deliberate exclusion" (it hid real gaps behind COMPLETE); app-scoped
+    VM policies that can reach no VM are not counted as VM policies (verdict
+    NOT_CONFIGURED, not PARTIAL; explicit refs and wildcards filtered the same
+    way); app-scoped policies no longer count toward the cluster-scoped-resources
+    check; a numeric `status.error.message` is coerced to a string (it made the
+    HTML renderer exit empty); the terminal grade line says "lower bound" like
+    the HTML; a duplicated jq `--arg` is removed.
+
 ## [2.7.0] - 2026-09-28
 
 Four reported defects, one pull request, and the fixes that came out of

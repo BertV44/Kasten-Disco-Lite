@@ -239,6 +239,40 @@ def pausedBadge:
     "<br><span class=\"badge info\">paused state unknown</span>"
   else "" end;
 
+# #58: which policies this report could see, from policyCollection (the same
+# object the terminal reads). Complete cluster-wide reads get one quiet line;
+# anything partial gets a visible warning naming what was not read.
+def policyCollectionNotice:
+  (.policyCollection // null) as $pc |
+  if $pc == null then ""
+  elif ($pc.mode // "cluster") == "cluster" then
+    "<p class=\"section-description\">Policy scope: cluster-wide read (all namespaces).</p>"
+  else
+    "<p class=\"section-description\">Policy scope: "
+    + (if $pc.mode == "per-namespace"
+       then "per-namespace read &mdash; " + (($pc.namespacesRead // 0) | tostring) + " of " + (($pc.namespacesAttempted // 0) | tostring) + " namespace(s) read, " + (($pc.namespacesDenied // []) | length | tostring) + " denied."
+       else "K10 namespace only &mdash; the cluster-wide read was refused and no namespace list was available."
+       end)
+    + "</p>"
+    + (if ($pc.partial // true) then
+        "<div class=\"warning-box\">\u26a0 <strong>Partial policy set.</strong> Policies in namespaces that could not be read are <em>not</em> in this report. Verdicts that an unseen policy could change (namespace protection gaps, orphaned RestorePoints, residual snapshots whose policy is gone, and the best-practice checks that assert something about every policy) are reported as not assessed, not as clean."
+        + (if (($pc.namespacesDenied // []) | length) > 0 then
+            "<br><small>Not readable (" + (($pc.namespacesDenied | length) | tostring) + "): "
+            + ([($pc.namespacesDenied // [])[:10][] | "<code>" + (. | @html) + "</code>"] | join(", "))
+            + (if (($pc.namespacesDenied | length) > 10) then ", and " + ((($pc.namespacesDenied | length) - 10) | tostring) + " more (see <code>policyCollection</code> in the JSON)" else "" end)
+            + "</small>"
+          else "" end)
+        + (if (($pc.namespacesNotAttempted // 0) > 0) then "<br><small>" + (($pc.namespacesNotAttempted) | tostring) + " namespace(s) were not attempted (read cap reached).</small>" else "" end)
+        + "</div>"
+      else "" end)
+  end;
+
+# A policy name with its namespace when it lives outside the K10 namespace.
+def polNs($k10):
+  if ((.namespace // null) != null) and (.namespace != ($k10 // "kasten-io")) then
+    "<br><small>namespace: <code>" + (.namespace | @html) + "</code></small>"
+  else "" end;
+
 def severityBadge(sev; status):
   if status == "NOT_ASSESSED" then
     "<span class=\"badge info\">ℹ N/A</span>"
@@ -478,6 +512,8 @@ h3 { font-size:1rem; margin:1.5rem 0 0.5rem; color:var(--text-muted); }
 
 /* ===== badges (new + legacy names) ===== */
 .new-badge, .tuned-badge { background:var(--brand-dim); color:var(--brand); font-size:0.65rem; padding:0.15rem 0.45rem; border-radius:6px; margin-left:0.5rem; font-weight:600; letter-spacing:0.3px; }
+/* a header that explains itself on hover (native title tooltip) */
+.hint { text-decoration:underline dotted; text-underline-offset:3px; cursor:help; }
 .badge { display:inline-flex; align-items:center; gap:0.3rem; padding:0.16rem 0.55rem; border-radius:999px; font-size:0.74rem; font-weight:600; white-space:nowrap; border:1px solid; }
 .badge.ok, .ok { background:var(--ok-bg); color:var(--ok-fg); border-color:var(--ok-bd); }
 .badge.warn, .warn { background:var(--warn-bg); color:var(--warn-fg); border-color:var(--warn-bd); }
@@ -606,7 +642,11 @@ details.wl-item > summary::-webkit-details-marker { display:none; }
      query adds none -- so without it the later declaration won and printing
      still dropped every row past page 1 of a 162-row table, under a
      changelog entry saying printing is never paginated. */
-  tbody tr.tbl-hide-p { display:table-row !important; }
+  tbody tr.tbl-hide-p, tbody tr.tbl-hide-c { display:table-row !important; }
+  /* The category filter never drops rows from a printout; the chip stays and
+     says so, so the page names the filter that was on screen. */
+  .cat-chip button { display:none; }
+  .cat-print { display:inline; }
   .tbl-tools, .tbl-pager { display:none; }
 }
 @media (max-width:820px) {
@@ -626,7 +666,17 @@ th[data-sortable] { cursor:pointer; user-select:none; }
    pagination. They have to COMPOSE -- the filter used to set style.display
    directly, which pagination would then stomp (and vice versa), so both now
    use classes and only-issues stays pure CSS. */
-tbody tr.tbl-hide-f, tbody tr.tbl-hide-p { display:none; }
+tbody tr.tbl-hide-f, tbody tr.tbl-hide-p, tbody tr.tbl-hide-c { display:none; }
+/* A third class, for the category filter a click on a summary row sets
+   (issue #56): it composes with the search box (tbl-hide-f), issues-only and
+   pagination (tbl-hide-p) because each owns its own class. */
+.stat-click { cursor:pointer; border-radius:6px; }
+.stat-click:hover, .stat-click:focus-visible { background:var(--brand-dim); outline:none; }
+.stat-click.cat-active { background:var(--brand-dim); box-shadow:inset 3px 0 0 var(--brand); }
+.cat-bar { margin:0.5rem 0 0.25rem; }
+.cat-chip { display:inline-flex; align-items:center; gap:0.4rem; background:var(--brand-dim); border:1px solid var(--brand); color:var(--text); border-radius:999px; padding:0.15rem 0.3rem 0.15rem 0.7rem; font-size:0.78rem; }
+.cat-chip button { background:transparent; border:none; color:inherit; cursor:pointer; font:inherit; line-height:1; padding:0 0.3rem; }
+.cat-print { display:none; }
 .tbl-pager { display:flex; align-items:center; gap:0.4rem; margin-left:auto; font-size:0.75rem; color:var(--text-muted); }
 .tbl-page-btn { background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:0.2rem 0.5rem; font:inherit; font-size:0.75rem; cursor:pointer; }
 .tbl-page-btn:hover:not(:disabled) { border-color:var(--brand); }
@@ -1035,9 +1085,14 @@ else "" end) + "
                   # not settle it -- so "still being written to" is no longer
                   # the whole of this count. Same three wordings as the
                   # terminal.
-                  | ((.storageRepositories.activeRetainedCount // 0)) as $ret
+                  | ((.storageRepositories.activeRetainedCount // 0)
+                     + (.storageRepositories.activeRetainedUncountedCount // 0)) as $ret
                   | ((.storageRepositories.activeUnverifiedCount // 0)) as $unv
-                  | ($af - $ret - $unv) as $wr
+                  # Published, not subtracted (issue #57). A JSON from before
+                  # activeWrittenCount existed falls back to the remainder.
+                  | (if (.storageRepositories | has("activeWrittenCount"))
+                     then .storageRepositories.activeWrittenCount
+                     else ($af - $ret - $unv) end) as $wr
                   | if $af > 0 then
                       # The count includes repositories whose write date could
                       # not be read -- they stay active so an unknown cannot
@@ -1102,8 +1157,8 @@ else "" end) + "
           (if (.residualSnapshots.unretained // 0) > 0 then
             " (" + ((.residualSnapshots.unretained) | tostring) + " unretained past "
                  + ((.residualSnapshots.thresholdDays // 7) | tostring) + "d)"
-          elif ((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) > 0 then
-            " (" + (((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) | tostring)
+          elif ((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) > 0 then
+            " (" + (((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) | tostring)
                  + " snapshot(s) could not be assessed)"
           else "" end) + "</td>
       </tr>"
@@ -1199,7 +1254,7 @@ else "" end) + "
       <tbody>" +
       ([$pb.byPolicy[]? |
         "<tr>
-          <td><strong>" + .name + "</strong></td>
+          <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
           <td>" + (.runCount | tostring) + "</td>
           <td>" + formatDuration(.total.avg) + " / " + formatDuration(.total.min) + " / " + formatDuration(.total.max) + "</td>
           <td>" + formatDuration(.snapshot.avg) + (if .snapshot.unknownCount > 0 then " <small>(" + (.snapshot.unknownCount|tostring) + " unknown)</small>" else "" end) + "</td>
@@ -1216,7 +1271,7 @@ else "" end) + "
     <tbody>" +
     ([.policyRunStats.lastRuns[]? |
       "<tr>
-        <td><strong>" + .name + "</strong></td>
+        <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
         <td>" + (if .lastRun then (.lastRun.timestamp | split("T")[0]) else "Never" end) + "</td>
         <td>" + badge(if .lastRun then .lastRun.state else "N/A" end) + "</td>
         <td>" + (if .lastRun.duration then formatDuration(.lastRun.duration) else "N/A" end) + "</td>
@@ -1235,8 +1290,11 @@ else "" end) + "
     (if .coverage.hasCatchallPolicy then
       "<div class=\"success-box\">\u2713 <strong>Catch-all policy detected</strong> - All namespaces are protected.</div>"
     elif ((.bestPractices.namespaceProtection // "N/A") == "NOT_ASSESSED"
-          and (([(.rbacLimited.denied // [])[] | select(test("namespace"; "i"))] | length) > 0)) then
+          and (([(.rbacLimited.denied // [])[] | select(test("^list namespaces"; "i"))] | length) > 0)) then
       "<div class=\"info-box\">\u2139 <strong>Not assessed (RBAC).</strong> Cluster-wide namespace listing was denied, so namespace coverage could not be evaluated &mdash; this is <em>not</em> the same as \"all namespaces protected\". See the RBAC notice near the top of this report.</div>"
+    elif ((.coverage.protection.policySetPartial // false) == true) then
+      # #58: not a gap -- the policy set is partial.
+      "<div class=\"info-box\">\u2139 <strong>Not assessed (partial policy set).</strong> " + (.coverage.unprotectedNamespaces.count | tostring) + " namespace(s) are matched by no policy that was <em>read</em>, but policies in namespaces this run could not read may protect them &mdash; this is <em>not</em> a verified gap and <em>not</em> a verified all-clear. See the policy scope notice under Backup Policies. The evidence-based view below reports " + ((.namespaceProtectionStatus.neverBackedUp // 0) | tostring) + " namespace(s) with no successful backup at all, out of " + ((.namespaceProtectionStatus.total // 0) | tostring) + " analysed.</div>"
     elif ((.coverage.protection.status // "OK") == "NOT_ASSESSED") then
       # The selector analysis contradicted itself or hit a selector it does not
       # implement. Publishing a gap list here would be worse than publishing
@@ -1651,14 +1709,21 @@ else "" end) + "
           # terminal prints, in the same order. The cards after the else are
           # kept for reports that predate it.
           (.storageRepositories.summary) as $sm
-          | def srow: "<div class=\"stat-row\"><span class=\"stat-label\">" + (.label | @html)
+          | # A row or part that carries a category key (KDL.sh publishes one per
+            # row, the same key each repository row is tagged with) filters the
+            # repository table when clicked. A report without keys renders as before.
+            def catattr: if (.key // null) != null
+                then " data-cat=\"" + (.key | @html) + "\" role=\"button\" tabindex=\"0\" title=\"Click to filter the table to these repositories\""
+                else "" end;
+            def catcls: if (.key // null) != null then " stat-click" else "" end;
+            def srow: "<div class=\"stat-row" + catcls + "\"" + catattr + "><span class=\"stat-label\">" + (.label | @html)
                 + "</span><span class=\"stat-value\"><span class=\"badge "
                 + ((.level // "info") | if IN("error", "warn", "info", "ok") then . else "info" end)
                 + "\">" + (.count | tostring) + "</span></span></div>";
             # A part is a breakdown of the row above it and the parts sum to
             # that row, so an informational part carries no badge. Any other
             # level keeps its badge: a part never loses its level.
-            def prow: "<div class=\"stat-row stat-part\"><span class=\"stat-label\">" + (.label | @html)
+            def prow: "<div class=\"stat-row stat-part" + catcls + "\"" + catattr + "><span class=\"stat-label\">" + (.label | @html)
                 + "</span><span class=\"stat-value\">"
                 + (if (.level // "info") == "info" then (.count | tostring)
                    else "<span class=\"badge " + (.level | if IN("error", "warn", "ok") then . else "info" end)
@@ -1822,11 +1887,19 @@ else "" end) + "
         end)
 
       + "</div>
-      <table>
+      <table data-cat-table=\"1\">
         <thead><tr><th>Repository Name</th><th>Application</th><th>Type</th><th>Profile</th><th>Policy</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Last Data Write</th><th>Duration</th></tr></thead>
         <tbody>" +
-      ([.storageRepositories.items[]? |
-        "<tr><td><code>" + (.name | @html) + "</code></td>" +
+      # Errors first, then warnings, then the rest: what an auditor reads this
+      # table for is what is failing, and on a cluster with dozens of idle or
+      # read-only repositories it sat on page two. A warn-badged profile
+      # mismatch ranks with the warnings, as the sidebar counts it. sort_by is
+      # stable, so the collection order holds within each level.
+      ([.storageRepositories.items // [] | sort_by(
+          if .statusLevel == "error" then 0
+          elif .statusLevel == "warn" or .profileMismatch == true then 1
+          else 2 end)[] |
+        "<tr data-cats=\"" + ((.categories // []) | join(" ") | @html) + "\"><td><code>" + (.name | @html) + "</code></td>" +
         # The repository name is a generated suffix and identifies nothing a
         # reader can act on. The application and the policy do: "this failing
         # repository belongs to the mysql backup policy" is the sentence that
@@ -2078,6 +2151,8 @@ else "" end) + "
     # count is a fallback 0 and carries no information.
     (if .orphanedRestorePoints.status == "NOT_ASSESSED" then
       "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The orphaned-RestorePoint computation failed, so this section could not be evaluated &mdash; this is <em>not</em> the same as \"no orphans\". Re-run with <code>--debug</code> to surface the underlying error.</div>"
+    elif (.orphanedRestorePoints.status == "PARTIAL") and (.orphanedRestorePoints.count == 0) then
+      "<div class=\"info-box\">\u2139 <strong>No orphan confirmed &mdash; not a clean verdict.</strong> The policy set is partial (see the policy scope notice under Backup Policies), so " + ((.orphanedRestorePoints.unverifiable // 0) | tostring) + " RestorePoint(s) naming a policy in an unreadable namespace could not be checked.</div>"
     elif .orphanedRestorePoints.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>No orphaned RestorePoints detected</strong></div>"
     else
@@ -2094,8 +2169,14 @@ else "" end) + "
       ] | join("")) +
       "</tbody></table>"
     end)
+    + (if ((.orphanedRestorePoints.unverifiable // 0) > 0) and (.orphanedRestorePoints.count > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unverifiable) | tostring) + " more RestorePoint(s) name a policy in a namespace that could not be read: their orphan status is unknown (partial policy set), so the list above may be incomplete.</div>"
+      else "" end)
     + (if ((.orphanedRestorePoints.unattributable // 0) > 0) then
         "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unattributable) | tostring) + " RestorePoint(s) carry no source action name and cannot be attributed to a policy &mdash; they are counted neither as orphaned nor as attached.</div>"
+      else "" end)
+    + (if ((.orphanedRestorePoints.importedExcluded // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.importedExcluded) | tostring) + " imported RestorePoint(s) are not assessed: they are another cluster&rsquo;s exports, retired by the source cluster&rsquo;s policy, not something to clean up here.</div>"
       else "" end)
   else
     "<div class=\"info-box\">Orphaned RestorePoints data not available.</div>"
@@ -2107,7 +2188,7 @@ else "" end) + "
 + (if .residualSnapshots then
     "<p class=\"section-description\">Local Kasten snapshots &mdash; <code>RestorePointContent</code> objects with no <code>k10.kasten.io/exportProfile</code> label &mdash; still present past "
       + ((.residualSnapshots.thresholdDays // 7) | tostring)
-      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold.</p>"
+      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. So are imported ones: they sit in another cluster&rsquo;s repository, and that cluster retires them. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold. <strong>Manual runs</strong> (<code>k10.kasten.io/isRunNow</code>) are never ranked: policy retention does not retire them, so they are judged on their <code>k10.kasten.io/expiresAt</code> label instead &mdash; none means nothing retires them, a date in the past (beyond a " + ((.residualSnapshots.expiry.graceDays // 2) | tostring) + "-day retirement grace) means Kasten should already have. Kasten&rsquo;s own disaster-recovery snapshots are exempt from the no-expiry finding only.</p>"
     + (if .residualSnapshots.status == "NOT_ASSESSED" then
         "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The <code>RestorePointContent</code> list could not be read (RBAC on <code>restorepointcontents</code>, or the aggregated API is unavailable) or the computation failed. This is <em>not</em> the same as \"no residual snapshots\". Grant <code>list</code> on <code>restorepointcontents.apps.kio.kasten.io</code> (see <code>kdl-rbac.yaml</code>) and re-run with <code>--debug</code>.</div>"
       elif ((.residualSnapshots.localSnapshots // 0) == 0) then
@@ -2116,7 +2197,7 @@ else "" end) + "
       elif ((.residualSnapshots.unretained // 0) == 0)
            and (((.residualSnapshots.unknownAge // 0)
                  + (.residualSnapshots.breakdown.policyUnverifiable // 0)
-                 + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) > 0) then
+                 + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) > 0) then
         # No finding identified, but not a clean pass either. The green box used
         # to claim "every one past the threshold is retained by a live policy"
         # here - a positive statement the data did not support, rendered one
@@ -2124,7 +2205,7 @@ else "" end) + "
         "<div class=\"info-box\">\u2139 <strong>No residual snapshot identified, but this is not a clean pass.</strong> "
           + (((.residualSnapshots.unknownAge // 0)
               + (.residualSnapshots.breakdown.policyUnverifiable // 0)
-              + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) | tostring)
+              + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) | tostring)
           + " of the " + ((.residualSnapshots.localSnapshots // 0) | tostring)
           + " local snapshot(s) could not be assessed &mdash; see the details below. The best-practice check reports <em>not assessed</em> for this reason.</div>"
       elif ((.residualSnapshots.unretained // 0) == 0) and ((.residualSnapshots.beyondThreshold // 0) == 0) then
@@ -2134,7 +2215,7 @@ else "" end) + "
       elif ((.residualSnapshots.unretained // 0) == 0) then
         "<div class=\"success-box\">\u2713 <strong>No residual snapshots</strong> &mdash; all "
           + ((.residualSnapshots.beyondThreshold // 0) | tostring)
-          + " snapshot(s) past the threshold are within what their policy retains</div>"
+          + " snapshot(s) past the threshold are accounted for &mdash; retained by a live policy or an unexpired expiry date, or managed by Kasten</div>"
       else
         "<div class=\"warning-box\">\u26a0 <strong>" + ((.residualSnapshots.unretained) | tostring)
           + " residual snapshot(s)</strong> that no live policy retains, out of "
@@ -2144,11 +2225,13 @@ else "" end) + "
               (if (.residualSnapshots.breakdown.onDemand // 0) > 0 then (.residualSnapshots.breakdown.onDemand | tostring) + " taken on demand (no policy)" else empty end),
               (if (.residualSnapshots.breakdown.policyDeleted // 0) > 0 then (.residualSnapshots.breakdown.policyDeleted | tostring) + " whose policy was deleted" else empty end),
               (if (.residualSnapshots.breakdown.unbound // 0) > 0 then (.residualSnapshots.breakdown.unbound | tostring) + " whose application is gone (Unbound)" else empty end),
-              (if (.residualSnapshots.breakdown.policyOverRetention // 0) > 0 then (.residualSnapshots.breakdown.policyOverRetention | tostring) + " ranked past everything their policy retention can hold" else empty end)
+              (if (.residualSnapshots.breakdown.policyOverRetention // 0) > 0 then (.residualSnapshots.breakdown.policyOverRetention | tostring) + " ranked past everything their policy retention can hold" else empty end),
+              (if (.residualSnapshots.breakdown.manualNoExpiry // 0) > 0 then (.residualSnapshots.breakdown.manualNoExpiry | tostring) + " manual run(s) with no expiration (nothing retires them)" else empty end),
+              (if (.residualSnapshots.breakdown.manualExpired // 0) > 0 then (.residualSnapshots.breakdown.manualExpired | tostring) + " manual run(s) past their expiry date" else empty end)
             ] | join(" &middot; "))
           + "</div>
       <table>
-      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th>Rank / retained</th><th>Physical size</th></tr></thead>
+      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th><span class=\"hint\" title=\"Rank: where this snapshot sits among the local snapshots of the same application and policy, newest first (1 = newest).&#10;Retained: how many snapshots the declared retention of that policy can hold at most, the sum of its counts (hourly 24 + daily 7 = 31). That overstates what is kept, since one snapshot can fill a daily and a weekly slot, so a rank past it is residual for certain.&#10;&#10;A dash is the usual case: the row is residual for a reason that does not depend on retention, so rank decides nothing. Either the snapshot was taken on demand (no policy), its policy was deleted, or it is Unbound: its RestorePoint is gone, typically with the namespace, and only the content is left. A manual run (isRunNow) is never ranked either: policy retention does not retire it, so its row is residual because it has no expiration (manual-no-expiry) or because its expiry date has passed (manual-expired). Only a past-retention row (policy-over-retention) shows a rank. The Why residual column gives the reason.\">Rank / retained</span></th><th>Physical size</th></tr></thead>
       <tbody>" +
         ([.residualSnapshots.items[:10][]? |
           "<tr>
@@ -2159,7 +2242,10 @@ else "" end) + "
                      else ((.ageDays * 10 | floor) / 10) as $a
                           | (if ($a | floor) == $a then ($a | floor | tostring) else ($a | tostring) end) + "d"
                      end) + "</td>
-            <td>" + (.reason // "unknown") + "</td>
+            <td>" + (.reason // "unknown")
+              + (if .reason == "manual-no-expiry" then " &mdash; manual run with no <code>expiresAt</code>: nothing retires it"
+                 elif .reason == "manual-expired" then " &mdash; manual run past its expiry date (" + (.expiresAt // "?") + "): Kasten should have retired it" + (if .state == "Unbound" then ". Kasten has already removed the RestorePoint (state Unbound: only the content is left behind, as observed on 9.0.6)" else "" end)
+                 else "" end) + "</td>
             <td>" + (if .reason == "policy-over-retention" and .rank != null
                      then ((.rank + 1) | tostring) + " of " + ((.retentionTotal // 0) | tostring) + " retained"
                      else "\u2014" end) + "</td>
@@ -2173,13 +2259,29 @@ else "" end) + "
           else "" end)
       end)
     # Context lines, each printed only when the data says so.
+    + (if ((.residualSnapshots.imported // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.imported) | tostring)
+          + " imported restore point(s) are not counted as local snapshots: they are another cluster&rsquo;s exports, retired by the source cluster.</div>"
+      else "" end)
     + (if ((.residualSnapshots.breakdown.policyRetained // 0) > 0) then
         "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.breakdown.policyRetained) | tostring)
           + " snapshot(s) are past the threshold but retained by a live policy &mdash; expected with GFS retention, and not counted as residual.</div>"
       else "" end)
+    + (if ((.residualSnapshots.breakdown.manualExpires // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.breakdown.manualExpires) | tostring)
+          + " manual run(s) are past the threshold but still inside their <code>expiresAt</code> date (or within the retirement grace) &mdash; Kasten retires them, so they are not counted as residual.</div>"
+      else "" end)
+    + (if ((.residualSnapshots.breakdown.k10Dr // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.breakdown.k10Dr) | tostring)
+          + " manual run(s) of Kasten&rsquo;s own disaster-recovery policy with no expiry are not assessed: they are managed by Kasten. A DR manual run with an expiry date is judged like any other.</div>"
+      else "" end)
+    + (if ((.residualSnapshots.breakdown.manualExpiryUnknown // 0) > 0) then
+        "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.manualExpiryUnknown) | tostring)
+          + " manual run(s) carry an <code>expiresAt</code> label that could not be parsed. Their expiry is unknown, so they are reported as neither retained nor residual.</div>"
+      else "" end)
     + (if ((.residualSnapshots.breakdown.policyUnverifiable // 0) > 0) then
         "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.policyUnverifiable) | tostring)
-          + " snapshot(s) name a policy that could not be checked, because the policy list came back empty or unreadable. They are reported as unverifiable, never as orphaned.</div>"
+          + " snapshot(s) name a policy that could not be checked, because the policy list came back empty or unreadable, or the policy may live in a namespace that could not be read (partial policy set). They are reported as unverifiable, never as orphaned.</div>"
       else "" end)
     + (if ((.residualSnapshots.breakdown.policyRetentionUnknown // 0) > 0) then
         "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.policyRetentionUnknown) | tostring)
@@ -2193,6 +2295,43 @@ else "" end) + "
         "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.sizeUnknownCount) | tostring)
           + " of the snapshots past the threshold report no <code>status.physicalSizeBytes</code> &mdash; unknown, not zero. Even a complete total would not be a promise of reclaimable space: what the storage layer reports back varies by CSI driver.</div>"
       else "" end)
+    # Snapshots with no expiry (issue #63): information, never a finding.
+    + (if (.residualSnapshots.expiry // null) == null or (.residualSnapshots.expiry.status // "NOT_ASSESSED") != "OK" then
+        ""
+      else
+        .residualSnapshots.expiry as $x
+        | "<h3>Snapshots with no expiry</h3>
+      <p class=\"section-description\">Over every <code>RestorePointContent</code>, local and exported (imports excluded), the <code>k10.kasten.io/expiresAt</code> and <code>k10.kasten.io/isRunNow</code> labels give the three states of the Kasten &ldquo;Expires at&rdquo; column: <strong>N/A</strong> (scheduled, retention carried by the policy), <strong>No expiration</strong> (manual run that nothing ever retires) or a date. This is information, not a finding: an exported restore point with no expiration sits in the export repository, not in the cluster, so it is not a residual snapshot and does not change the best-practice verdict. Label semantics were verified on Kasten 9.0.x only.</p>
+      <div class=\"card\">
+        <div class=\"stat-row\"><span class=\"stat-label\">Scheduled, N/A</span><span class=\"stat-value\">" + (($x.scheduledNA // 0) | tostring) + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Manual runs, no expiration</span><span class=\"stat-value\">" + (($x.manualNoExpiration // 0) | tostring) + " (" + (($x.manualNoExpirationLocal // 0) | tostring) + " local, " + (($x.manualNoExpirationExported // 0) | tostring) + " exported)</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Manual runs, with an expiry date</span><span class=\"stat-value\">" + (($x.manualWithExpiry // 0) | tostring) + " (" + (($x.manualExpiryPassed // 0) | tostring) + " past it by more than " + (($x.graceDays // 2) | tostring) + " days, " + (($x.unparseable // 0) | tostring) + " unparsable)</span></div>"
+        + (if ($x.drPolicy // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Kasten DR snapshots (excluded above)</span><span class=\"stat-value\">" + (($x.drPolicy) | tostring) + "</span></div>"
+          else "" end)
+        + "</div>"
+        + (if ($x.items | length) > 0 then
+            "<table>
+      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Policy</th><th>Age</th><th>Where</th></tr></thead>
+      <tbody>" +
+            ([$x.items[:10][]? |
+              "<tr>
+            <td><code>" + (.name // "unknown") + "</code></td>
+            <td>" + (if (.appNamespace // "") == "" then "\u2014" else .appNamespace end) + "</td>
+            <td>" + (if (.appName // "") == "" then "\u2014" else .appName end) + "</td>
+            <td>" + (if (.policy // "") == "" then "\u2014" else .policy end) + "</td>
+            <td>" + (if .ageDays == null then "unknown"
+                     else ((.ageDays * 10 | floor) / 10) as $a
+                          | (if ($a | floor) == $a then ($a | floor | tostring) else ($a | tostring) end) + "d"
+                     end) + "</td>
+            <td>" + (if .exported then "exported (export repository)" else "local (in the cluster)" end) + "</td>
+          </tr>"
+            ] | join("")) + "</tbody></table>"
+            + (if ($x.manualNoExpiration // 0) > 10 then
+                "<p class=\"section-description\">Showing the 10 oldest of " + (($x.manualNoExpiration) | tostring) + "; the counts above are exact.</p>"
+              else "" end)
+          else "" end)
+      end)
   else
     "<div class=\"info-box\">Residual snapshot data not available.</div>"
   end)
@@ -2276,22 +2415,37 @@ else "" end) + "
   else
     "<div class=\"info-box\">Health metrics not available.</div>"
   end)
-+ (if (.failedActionsTop5.count // 0) > 0 then
-    "<h2>\u274C Failed Actions <small>(root cause)</small></h2>
-     <p class=\"section-description\">Most recent failed actions and the error message reported by K10. This is the first place to look when the success rate is low.</p>
+# Always rendered, so the sidebar always lists it: a section that appears only
+# when something failed cannot say "nothing failed". The heading carries the
+# uncapped total for the sidebar badge, since the table stops at five; JSON
+# older than the total falls back to the listed count.
++ ((.failedActionsTop5.total // .failedActionsTop5.count // 0)) as $faTotal
+| "<h2 data-crit=\"" + ($faTotal | tostring) + "\" data-warn=\"0\">\u274C Failed Actions <small>(root cause)</small></h2>"
++ (if .failedActionsTop5 == null then
+    "<div class=\"info-box\">Failed action data not available.</div>"
+  elif (.failedActionsTop5.status // "OK") == "NOT_ASSESSED" then
+    "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The failed-action list could not be built (" + ($faTotal | tostring) + " failed action(s) were counted). This is <em>not</em> the same as \"no failed actions\".</div>"
+  elif (.failedActionsTop5.count // 0) == 0 then
+    "<div class=\"success-box\">\u2713 <strong>No failed actions</strong> among the BackupActions, ExportActions and RestoreActions K10 still holds.</div>"
+  else
+    "<p class=\"section-description\">Most recent failed actions and the error message reported by K10. This is the first place to look when the success rate is low.</p>
      <table>
-       <thead><tr><th>Kind</th><th>Policy</th><th>Date</th><th>Root-cause message</th></tr></thead>
+       <thead><tr><th>Kind</th><th>Namespace</th><th>Policy</th><th>Date</th><th>Root-cause message</th></tr></thead>
        <tbody>" +
      ([.failedActionsTop5.items[]? |
        "<tr>
           <td>" + (.kind // "\u2014") + "</td>
+          <td>" + (if ((.namespace // "") == "") or (.namespace == "N/A") then "<em>\u2014</em>" else (.namespace | @html) end) + "</td>
           <td>" + (if (.policy // "") == "" then "<em>\u2014</em>" else (.policy | @html) end) + "</td>
           <td>" + (if (.timestamp // "") == "" then "\u2014" else (.timestamp | split("T")[0]) end) + "</td>
           <td><code>" + ((.message // "") | .[0:400] | @html) + (if ((.message // "") | length) > 400 then "\u2026" else "" end) + "</code></td>
         </tr>"
      ] | join("")) +
      "</tbody></table>"
-   else "" end)
+     + (if $faTotal > (.failedActionsTop5.count // 0) then
+         "<p class=\"section-description\">Showing the " + ((.failedActionsTop5.count) | tostring) + " most recent of " + ($faTotal | tostring) + " failed actions.</p>"
+       else "" end)
+  end)
 + "
 
 <h2>\uD83D\uDCC8 Monitoring</h2>
@@ -2373,6 +2527,7 @@ else "" end) + "
   else "" end)
 + "
 <h2>\uD83D\uDCDC Backup Policies</h2>"
++ policyCollectionNotice
 + (if ((.policies.pausedSchemaStatus // "") != "schema_confirmed") then
     "<div class=\"info-box\">\u2139 Paused/enabled state could not be verified on this cluster (" + (.policies.pausedSchemaStatus // "unknown") + "). None of the policies below could be confirmed enabled or paused; coverage and redundant-pair checks treat them as active, exactly as they did before this was tracked.</div>"
   elif ((.policies.pausedCount // 0) > 0) then
@@ -2383,7 +2538,8 @@ else "" end) + "
 <thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Export destinations</th><th>Retention</th></tr></thead>
 <tbody>"
 + (if (.policies.items | length) > 0 then
-    ([.policies.items[]? |
+    ((.policyCollection.k10Namespace // "kasten-io") as $pck |
+     [.policies.items[]? |
       # `exports` is emitted by KDL v2.2.0+; older reports only carry the single
       # `exportRetention`. Absent (null) and empty ([]) must NOT be conflated:
       # on a legacy report `null` means "not collected", and rendering that as
@@ -2392,7 +2548,7 @@ else "" end) + "
       (.exports == null) as $exportsUnknown |
       ((.actions // []) | index("export")) as $hasExportAction |
       "<tr>
-        <td><strong>" + .name + "</strong>" + (if .presetRef then "<br><small>\uD83D\uDCCB " + .presetRef + "</small>" else "" end) +
+        <td><strong>" + .name + "</strong>" + polNs($pck) + (if .presetRef then "<br><small>\uD83D\uDCCB " + .presetRef + "</small>" else "" end) +
           (if (.scope // "namespace") == "virtualMachine" then "<br><span class=\"badge info\">VM policy</span>" else "" end) +
           pausedBadge + "</td>
         <td><code>" + .frequency + "</code></td>
@@ -2638,7 +2794,8 @@ else "" end) + "
         .value as $v |
         ($v.score) as $s |
         ($v.max) as $m |
-        (if $s >= $m then "<span class=\"pillar-ok\">[OK]</span>"
+        (if ($v.assessed == false) then "<span class=\"pillar-partial\">[NOT ASSESSED]</span>"
+         elif $s >= $m then "<span class=\"pillar-ok\">[OK]</span>"
          elif $s > 0 then "<span class=\"pillar-partial\">[PARTIAL]</span>"
          else "<span class=\"pillar-fail\">[FAIL]</span>" end) as $status |
         ({
@@ -2655,10 +2812,14 @@ else "" end) + "
            " + $status + "
            <span><strong>" + $pillarLabel + "</strong></span>
            <span class=\"pillar-score\">" + ($s | tostring) + "/" + ($m | tostring) + "</span>
-           <span class=\"pillar-evidence\">" + (if $v.evidence then "detected" else "not detected" end) + "</span>
+           <span class=\"pillar-evidence\">" + (if ($v.assessed == false) then "not assessed: partial policy set, an exporting policy may be unseen" elif $v.evidence then "detected" else "not detected" end) + "</span>
          </div>"
      ] | join("")) +
      "</div>" +
+
+     (if (.ransomwareReadiness.scoreIsLowerBound // false) then
+       "<div class=\"info-box\">\u2139 <strong>Score is a lower bound.</strong> The policy set is partial (see the policy scope notice under Backup Policies), so the Off-cluster export pillar could not be assessed: no points are counted as lost for it and it is not named as the biggest gap.</div>"
+     else "" end) +
 
      (if .ransomwareReadiness.biggestGap then
        "<div class=\"biggest-gap\"><strong>\u26a0 Biggest gap:</strong> " +
@@ -2704,7 +2865,7 @@ else "" end) + "
        <tbody>" +
      ([$rpo[] |
        "<tr>
-          <td><strong>" + .name + "</strong>" + pausedBadge + "</td>
+          <td><strong>" + ((.displayName // .name) | @html) + "</strong>" + pausedBadge + "</td>
           <td>" + (.frequencyDeclared // "<em>manual</em>") + "</td>
           <td>" + (if .frequencyTheoreticalSeconds then formatDuration(.frequencyTheoreticalSeconds) else "<em>n/a</em>" end) + "</td>
           <td>" + (.samples | tostring) + "</td>
@@ -2753,7 +2914,7 @@ else "" end) + "
          <tbody>" +
        ([.policyAnalysis.resolved[]? | select(.pausedState == "paused") |
          "<tr>
-            <td><strong>" + .name + "</strong></td>
+            <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
             <td><code>" + .selectorKind + "</code></td>
             <td>" + (.targetedCount | tostring) + "</td>
           </tr>"
@@ -2769,7 +2930,7 @@ else "" end) + "
          <tbody>" +
        ([.policyAnalysis.empty[]? |
          "<tr>
-            <td><strong>" + .name + "</strong></td>
+            <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
             <td><code>" + .selectorKind + "</code></td>
             <td>" + (.targetedCount | tostring) + "</td>
             <td>" + (.effectiveCount | tostring) + "</td>
@@ -2786,8 +2947,8 @@ else "" end) + "
          <tbody>" +
        ([.policyAnalysis.redundantPairs[]? | select(.involvesCatchall | not) |
          "<tr>
-            <td><strong>" + .policies[0] + "</strong></td>
-            <td><strong>" + .policies[1] + "</strong></td>
+            <td><strong>" + ((.policyDisplayNames[0] // .policies[0]) | @html) + "</strong></td>
+            <td><strong>" + ((.policyDisplayNames[1] // .policies[1]) | @html) + "</strong></td>
             <td>" + (.sharedNamespaces | join(", ")) + "</td>
             <td>" + (.sharedActions | join(", ")) + "</td>
             <td>" + (if .sameFrequency then "<span class=\"badge warn\">\u26a0 yes</span>" else "<span class=\"badge info\">no</span>" end) + "</td>
@@ -3036,8 +3197,8 @@ else "" end) + "
     <table>
     <thead><tr><th>Policy</th><th>Frequency</th><th>Profile</th></tr></thead>
     <tbody>" +
-    ([.importPolicies.items[]? | "<tr>
-      <td><code>" + .name + "</code></td>
+    ((.policyCollection.k10Namespace // "kasten-io") as $pck | [.importPolicies.items[]? | "<tr>
+      <td><code>" + .name + "</code>" + polNs($pck) + "</td>
       <td>" + (.frequency // "manual") + "</td>
       <td>" + (if .profile != "" then "<code>" + .profile + "</code>" else "<em>—</em>" end) + "</td>
     </tr>"] | join("")) +
@@ -3178,6 +3339,7 @@ else "" end) + "
     // Assigned below only for tables that get a pager; the sort handler calls
     // it unconditionally, so it must always be callable.
     var repage = function(){};
+    table.kdlRepage = function(r){ repage(r); };
     var ths = Array.prototype.slice.call(table.querySelectorAll(`thead th`));
     ths.forEach(function(th, idx){
       th.setAttribute(`data-sortable`, `1`);
@@ -3242,7 +3404,7 @@ else "" end) + "
         var eligible = function(){
           var oi = body.classList.contains(`only-issues`);
           return Array.prototype.slice.call(tbody.querySelectorAll(`tr`)).filter(function(tr){
-            if(tr.classList.contains(`tbl-hide-f`)){ return false; }
+            if(tr.classList.contains(`tbl-hide-f`) || tr.classList.contains(`tbl-hide-c`)){ return false; }
             if(oi && !tr.classList.contains(`has-issue`)){ return false; }
             return true;
           });
@@ -3271,6 +3433,54 @@ else "" end) + "
       }
     }
   });
+
+  // ---------- 5b. category filter (Repository Maintenance summary) ----------
+  // A click on a summary row or part (data-cat) hides, with its own class, every
+  // row of the repository table whose data-cats does not carry the key. The
+  // search box, issues-only and the pager keep their own classes and the pager
+  // counts only rows no mechanism hides. Click the row again or the chip x to clear.
+  var catTable = content.querySelector(`table[data-cat-table]`), catKey = null, catBar = null;
+  if(catTable){
+    catBar = el(`div`, `cat-bar`); catBar.style.display = `none`;
+    catTable.parentNode.insertBefore(catBar, catTable.previousElementSibling && catTable.previousElementSibling.classList.contains(`tbl-tools`) ? catTable.previousElementSibling : catTable);
+  }
+  function setCat(key, label){
+    catKey = key;
+    var shown = 0;
+    Array.prototype.slice.call(catTable.querySelectorAll(`tbody tr`)).forEach(function(tr){
+      var hit = !key || (` ` + (tr.getAttribute(`data-cats`) || ``) + ` `).indexOf(` ` + key + ` `) > -1;
+      tr.classList.toggle(`tbl-hide-c`, !hit);
+      if(hit){ shown++; }
+    });
+    Array.prototype.slice.call(content.querySelectorAll(`[data-cat]`)).forEach(function(n){
+      n.classList.toggle(`cat-active`, n.getAttribute(`data-cat`) === key);
+    });
+    catBar.textContent = ``;
+    catBar.style.display = key ? `block` : `none`;
+    if(key){
+      var chip = el(`span`, `cat-chip`);
+      chip.appendChild(document.createTextNode(`Filtered: ` + label + ` (` + shown + `)`));
+      var pn = el(`span`, `cat-print`); pn.textContent = ` - printing shows every repository`; chip.appendChild(pn);
+      var x = el(`button`, ``); x.type = `button`; x.setAttribute(`aria-label`, `Clear filter`); x.textContent = `\u00d7`;
+      x.addEventListener(`click`, function(){ setCat(null); });
+      chip.appendChild(x); catBar.appendChild(chip);
+    }
+    if(catTable.kdlRepage){ catTable.kdlRepage(true); }
+  }
+  function catClick(n){
+    var key = n.getAttribute(`data-cat`);
+    if(catKey === key){ setCat(null); return; }
+    var lab = n.querySelector(`.stat-label`);
+    setCat(key, lab ? lab.textContent.trim() : key);
+  }
+  if(catTable){
+    content.addEventListener(`click`, function(e){ var n = e.target.closest(`[data-cat]`); if(n){ catClick(n); } });
+    content.addEventListener(`keydown`, function(e){
+      if(e.key !== `Enter` && e.key !== ` `){ return; }
+      var n = e.target.closest ? e.target.closest(`[data-cat]`) : null;
+      if(n){ e.preventDefault(); catClick(n); }
+    });
+  }
 
   // ---------- 6. remediation worklist (findings only, no commands) ----------
   var bp = content.querySelector(`.bp-table`) || content.querySelector(`table`);
