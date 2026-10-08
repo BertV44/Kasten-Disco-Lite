@@ -450,9 +450,9 @@ def deepest_msg($depth):
   # A string (or other odd) .status.error must not abort the whole list: only an
   # object has a .message to read.
   if (type == "string") then .
-  elif $depth <= 0 or (type != "object") then (if type == "object" then (.message // "") else "" end)
+  elif $depth <= 0 or (type != "object") then (if type == "object" then ((.message // "") | tostring) else "" end)
   else
-    (.message // "") as $m |
+    ((.message // "") | tostring) as $m |
     (.cause // null) as $c |
     if ($c == null) or ($c == "") then $m
     else
@@ -2676,6 +2676,10 @@ printf '%s' "${ALL_NAMESPACES:-[]}" > "$TEMP_DIR/pe_nslist.json"
 POLICY_EXCLUSIONS_JSON=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsList "$TEMP_DIR/pe_nslist.json" '
   ( $nsList[0] ) as $nsList |
   [ .items[]?
+    # An app-scoped policy (outside the K10 namespace) protects only its own
+    # namespace and cannot "deliberately exclude" any other one: its NotIn is
+    # not a K10-wide exception (docs.kasten.io usage/app_scoped_policies).
+    | select(.kdlAppScoped != true)
     | { policy: .metadata.name,
         namespace: (.metadata.namespace // null),
         patterns: [ .spec.selector.matchExpressions[]?
@@ -3625,7 +3629,6 @@ else
     --arg drPolicy "$K10_DR_POLICY_NAME" \
     --arg k10ns "$NAMESPACE" \
     --slurpfile scope "$TEMP_DIR/pc_scope.json" \
-    --arg k10ns "$NAMESPACE" \
     --argjson threshold "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" "$JQ_POLICY_KEY_LIB"'
     def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else null end;
     # Strips fractional seconds before a Z and nothing else, so a numeric offset
@@ -4663,8 +4666,19 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
   #   - k10.kasten.io/virtualMachineRef        (Kasten 8.5+)  values "ns/vmName"
   #   - k10.kasten.io/virtualMachineNamespace  (Kasten 9.0+)  values are
   #     namespaces, and spec.selector.matchLabels filters on VM labels
+  # An app-scoped VM policy (outside the K10 namespace) reaches only VMs in its
+  # own namespace (docs.kasten.io usage/app_scoped_policies): one whose selector
+  # names no VM there can reach none, and is not counted as a VM policy.
   VM_POLICIES_JSON="$(_ep "$POLICIES_JSON" | jq -c "$JQ_SELECTOR_LIB"'
-    [.items[]? | select(policy_scope == "virtualMachine")]
+    def vm_reach:
+      if (.kdlAppScoped != true) then true
+      else (.metadata.namespace // "") as $own
+        | any((.spec.selector.matchExpressions // [])[]?;
+              ((.operator // "In") == "In") and
+              ( (.key == vm_ref_key and any((.values // [])[]?; . as $v | ($v | tostring | split("/")[0]) as $n | ($own | glob_match($n))))
+                or (.key == vm_ns_key and ($own | glob_any(.values // []))) ))
+      end;
+    [.items[]? | select(policy_scope == "virtualMachine") | select(vm_reach)]
   ' 2>/dev/null || echo '[]')"
   VM_POLICY_COUNT=$(safe_int "$(_ep "$VM_POLICIES_JSON" | jq 'length // 0')")
 
@@ -4680,8 +4694,11 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
 
   # Extract explicitly protected VM references from VM policies
   PROTECTED_VM_REFS="$(_ep "$VM_POLICIES_JSON" | jq -c "$JQ_SELECTOR_LIB"'
-    [.[] | (.spec.selector.matchExpressions // [])[]? |
-     select(.key == vm_ref_key) | (.values // [])[]?] | unique
+    [.[] | . as $p | (.metadata.namespace // "") as $own | (.spec.selector.matchExpressions // [])[]? |
+     select(.key == vm_ref_key) | (.values // [])[]?
+     | . as $v | ($v | tostring | split("/")[0]) as $n
+     | select(($p.kdlAppScoped != true) or ($own | glob_match($n)))
+     | $v] | unique
   ' 2>/dev/null || echo '[]')"
 
   # Count explicitly protected VMs (via virtualMachineRef)
@@ -5870,6 +5887,9 @@ fi
 # BP-CLUSTER-SCOPED: at least one policy backing up cluster-scoped resources
 HAS_CLUSTER_SCOPED_POLICY=$(_ep "$APP_POLICIES_JSON" | jq -r '
   [.items[]?
+    # App-scoped policies (outside the K10 namespace) protect their own
+    # namespace only, never cluster-scoped resources.
+    | select(.kdlAppScoped != true)
     | select(
         (.spec.selector.matchLabels["k10.kasten.io/appType"] // "") == "cluster"
         or
@@ -12908,7 +12928,7 @@ case "$RANSOM_GRADE" in
 esac
 
 printf "\n${COLOR_BOLD}[RANSOMWARE-READINESS] Ransomware Readiness Score${COLOR_RESET} ${COLOR_CYAN}(NEW v2.0)${COLOR_RESET}\n"
-printf "  ${COLOR_BOLD}Grade: ${_grade_color}${RANSOM_GRADE}${COLOR_RESET}${COLOR_BOLD} (${RANSOM_TOTAL}/${RANSOM_MAX_TOTAL})${COLOR_RESET}\n"
+printf "  ${COLOR_BOLD}Grade: ${_grade_color}${RANSOM_GRADE}${COLOR_RESET}${COLOR_BOLD} (${RANSOM_TOTAL}/${RANSOM_MAX_TOTAL}$([ "$RANSOM_EXPORT_ASSESSED" = "true" ] || printf ', lower bound'))${COLOR_RESET}\n"
 printf "\n"
 
 # Show each pillar with check/cross
