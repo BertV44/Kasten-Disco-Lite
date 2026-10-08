@@ -52,6 +52,10 @@ assert_eq() {
 assert_has() {
   if grep -F -q -- "$3" "$2" 2>/dev/null; then ok "$1"; else bad "$1 (missing: $3)"; fi
 }
+# assert_has_any <description> <file> <fixed string 1> <fixed string 2>
+assert_has_any() {
+  if grep -F -q -- "$3" "$2" 2>/dev/null || grep -F -q -- "$4" "$2" 2>/dev/null; then ok "$1"; else bad "$1 (missing: $3 | $4)"; fi
+}
 assert_lacks() {
   if grep -F -q -- "$3" "$2" 2>/dev/null; then bad "$1 (unexpected: $3)"; else ok "$1"; fi
 }
@@ -292,7 +296,8 @@ put "$D" 0 "$WORK/d-ns.json" "" get namespaces -o json
 add_items "$POLICIES_K10" \
   "$(pol tenant-a daily '{"daily":2}' tenant-a)" \
   "$(pol tenant-b daily '{"daily":30}' tenant-b)" \
-  "$(pol tenant-a k10-disaster-recovery-policy '{"daily":1}' tenant-a)" > "$WORK/d-all.json"
+  "$(pol tenant-a k10-disaster-recovery-policy '{"daily":1}' tenant-a)" \
+  "$(pol kasten-io daily '{"daily":5}' tenant-a)" > "$WORK/d-all.json"
 put "$D" 0 "$WORK/d-all.json" "" get "$POLKEY" -A -o json
 # RestorePoints: ok-a and ok-b have their policy; orphan-c names daily in tenant-c, where there is none.
 add_items "$RP_FILE" \
@@ -313,9 +318,19 @@ add_items "$RPC_FILE" "$@" > "$WORK/d-rpc.json"
 put "$D" 0 "$WORK/d-rpc.json" "" get restorepointcontents.apps.kio.kasten.io -o json
 run d "$D"
 assert_eq "d: mode cluster, complete" "$(jf "$WORK/d.json" '.policyCollection.mode + "/" + (.policyCollection.partial | tostring)')" "cluster/false"
-assert_eq "d: both same-named policies kept, each with its namespace" "$(jf "$WORK/d.json" '[.policies.items[] | select(.name == "daily") | .namespace] | sort | join(",")')" "tenant-a,tenant-b"
-assert_eq "d: policyAnalysis keeps both" "$(jf "$WORK/d.json" '[.policyAnalysis.resolved[] | select(.name == "daily") | .namespace] | sort | join(",")')" "tenant-a,tenant-b"
-assert_eq "d: effective RPO keeps both" "$(jf "$WORK/d.json" '[.policyRunStats.effectiveRpo.items[]? | select(.name == "daily") | .namespace] | sort | join(",")')" "tenant-a,tenant-b"
+assert_eq "d: all same-named policies kept, each with its namespace" "$(jf "$WORK/d.json" '[.policies.items[] | select(.name == "daily") | .namespace] | sort | join(",")')" "kasten-io,tenant-a,tenant-b"
+assert_eq "d: policyAnalysis keeps all" "$(jf "$WORK/d.json" '[.policyAnalysis.resolved[] | select(.name == "daily") | .namespace] | sort | join(",")')" "kasten-io,tenant-a,tenant-b"
+assert_eq "d: effective RPO keeps all" "$(jf "$WORK/d.json" '[.policyRunStats.effectiveRpo.items[]? | select(.name == "daily") | .namespace] | sort | join(",")')" "kasten-io,tenant-a,tenant-b"
+# One rule everywhere (#5): the namespace is shown only outside the K10 namespace,
+# published once as displayName and printed by terminal AND html.
+assert_eq "d: displayName published: K10 bare, others with namespace" "$(jf "$WORK/d.json" '[.policyRunStats.effectiveRpo.items[] | select(.name == "daily") | .displayName] | sort | join("|")')" "daily|daily (ns: tenant-a)|daily (ns: tenant-b)"
+assert_has "d: html Effective RPO row shows the namespace (tenant-a)" "$WORK/d.html" "<strong>daily (ns: tenant-a)</strong>"
+assert_has "d: html Effective RPO row shows the namespace (tenant-b)" "$WORK/d.html" "<strong>daily (ns: tenant-b)</strong>"
+assert_has "d: terminal RPO/last-run rows show the namespace" "$WORK/d.txt" "daily (ns: tenant-a)"
+assert_eq "d: a K10 policy and a same-named app-scoped policy form a genuine overlap pair" "$(jf "$WORK/d.json" '[.policyAnalysis.redundantPairs[] | select((.involvesCatchall | not) and (.policies == ["daily","daily"])) | .policyDisplayNames | sort | join("|")] | first')" "daily|daily (ns: tenant-a)"
+assert_has_any "d: terminal pair line disambiguates" "$WORK/d.txt" "[daily <-> daily (ns: tenant-a)]" "[daily (ns: tenant-a) <-> daily]"
+assert_has_any "d: html pair row disambiguates" "$WORK/d.html" "<td><strong>daily (ns: tenant-a)</strong></td>" "<td><strong>daily (ns: tenant-a)</strong></td>"
+assert_lacks "d: terminal is ASCII (no arrow glyph)" "$WORK/d.txt" "↔"
 assert_eq "d: orphan = only the RestorePoint whose (namespace, policy) is gone" "$(jf "$WORK/d.json" '[.orphanedRestorePoints.items[].name] | join(",")')" "rp-orphan-c"
 assert_eq "d: orphan status OK on a complete set" "$(jf "$WORK/d.json" '.orphanedRestorePoints.status + "/" + (.orphanedRestorePoints.unverifiable | tostring)')" "OK/0"
 assert_eq "d: retention looked up by (namespace, name): tenant-a over-retention only" "$(jf "$WORK/d.json" '[.residualSnapshots.items[] | select(.reason == "policy-over-retention") | .appNamespace | select(startswith("tenant-"))] | unique | join(",")')" "tenant-a"
@@ -368,6 +383,89 @@ assert_lacks "dp: html does not say no orphans" "$WORK/dp.html" "No orphaned Res
 assert_eq "dp: storage repository policy-owner checks degrade to unknown, not deleted" "$(jf "$WORK/dp.json" '[.storageRepositories.items[]? | select(.policyMissing == true)] | length')" "0"
 
 # ============================================================================
+
+# ============================================================================
+echo "== (f1) app-scoped policy with an EMPTY selector is not a catch-all"
+# docs.kasten.io usage/app_scoped_policies: a policy living in an application
+# namespace protects ONLY that namespace, whatever its selector says.
+F1="$WORK/ov-f1"; mkdir -p "$F1"
+add_items "$NS_FILE" "$(ns_item tenant-a)" "$(ns_item tenant-b)" > "$WORK/f1-ns.json"
+put "$F1" 0 "$WORK/f1-ns.json" "" get namespaces -o json
+jq -n -c '{apiVersion:"config.kio.kasten.io/v1alpha1", kind:"Policy", metadata:{name:"empty-selector", namespace:"tenant-a"},
+           spec:{frequency:"@daily", retention:{daily:7}, actions:[{action:"backup"}], selector:{}}}' > "$WORK/f1-p1.json"
+jq -n -c --arg g "$_gap" '{apiVersion:"config.kio.kasten.io/v1alpha1", kind:"Policy", metadata:{name:"names-others", namespace:"tenant-b"},
+           spec:{frequency:"@daily", retention:{daily:7}, actions:[{action:"backup"}], selector:{matchNames:[$g]}}}' > "$WORK/f1-p2.json"
+add_items "$POLICIES_K10" "$(cat "$WORK/f1-p1.json")" "$(cat "$WORK/f1-p2.json")" > "$WORK/f1-all.json"
+put "$F1" 0 "$WORK/f1-all.json" "" get "$POLKEY" -A -o json
+run f1 "$F1"
+assert_eq "f1: no catch-all" "$(jf "$WORK/f1.json" '.coverage.hasCatchallPolicy')" "false"
+assert_eq "f1: policies counted as targeting all namespaces" "$(jf "$WORK/f1.json" '.coverage.policiesTargetingAllNamespaces')" "$(jf "$WORK/a.json" '.coverage.policiesTargetingAllNamespaces')"
+assert_eq "f1: namespace protection is not COMPLETE" "$(jf "$WORK/f1.json" '.bestPractices.namespaceProtection')" "$(jf "$WORK/a.json" '.bestPractices.namespaceProtection')"
+assert_eq "f1: the baseline gap is still a gap (a selector naming it credits nothing)" "$(jf "$WORK/f1.json" "[.coverage.unprotectedNamespaces.items[] | select(. == \"$_gap\")] | length")" "1"
+assert_eq "f1: tenant-a (own namespace of the empty-selector policy) is not a gap" "$(jf "$WORK/f1.json" '[.coverage.unprotectedNamespaces.items[] | select(. == "tenant-a")] | length')" "0"
+assert_eq "f1: tenant-b (policy names other namespaces) is not credited by it, and has no policy of its own coverage but itself" "$(jf "$WORK/f1.json" '[.policyAnalysis.resolved[] | select(.name == "names-others") | .existingNamespaces // .targetedNamespaces] | first | join(",")')" "tenant-b"
+assert_eq "f1: policyAnalysis kind is appScoped, never catchall" "$(jf "$WORK/f1.json" '[.policyAnalysis.resolved[] | select(.namespace == "tenant-a" or .namespace == "tenant-b") | .selectorKind] | unique | join(",")')" "appScoped"
+assert_lacks "f1: terminal does not claim a catch-all" "$WORK/f1.txt" "Catch-all policy detected"
+assert_lacks "f1: terminal does not claim all namespaces protected" "$WORK/f1.txt" "All application namespaces are protected"
+assert_lacks "f1: html does not claim a catch-all" "$WORK/f1.html" "Catch-all policy detected"
+
+# ============================================================================
+echo "== (f2) residual rank groups include the policy namespace"
+F2="$WORK/ov-f2"; mkdir -p "$F2"
+add_items "$NS_FILE" "$(ns_item tenant-x)" "$(ns_item tenant-a)" "$(ns_item tenant-b)" > "$WORK/f2-ns.json"
+put "$F2" 0 "$WORK/f2-ns.json" "" get namespaces -o json
+add_items "$POLICIES_K10" "$(pol tenant-a daily '{"daily":2}' tenant-x)" "$(pol tenant-b daily '{"daily":30}' tenant-x)" > "$WORK/f2-all.json"
+put "$F2" 0 "$WORK/f2-all.json" "" get "$POLKEY" -A -o json
+# same application (tenant-x), two policies of the same name: interleaved ages
+set --
+for _i in 1 2 3 4; do
+  set -- "$@" "$(rpc "x-a$_i" tenant-x daily tenant-a $((_i * 10)))" "$(rpc "x-b$_i" tenant-x daily tenant-b $((_i * 10 + 1)))"
+done
+add_items "$RPC_FILE" "$@" > "$WORK/f2-rpc.json"
+put "$F2" 0 "$WORK/f2-rpc.json" "" get restorepointcontents.apps.kio.kasten.io -o json
+run f2 "$F2"
+assert_eq "f2: only the policy that retains 2 has snapshots ranked past it, and exactly 2 (ranks 2,3 of ITS group)" "$(jf "$WORK/f2.json" '[.residualSnapshots.items[] | select(.appNamespace == "tenant-x" and .reason == "policy-over-retention") | .policyNamespace + ":" + (.rank | tostring)] | sort | join(",")')" "tenant-a:2,tenant-a:3"
+
+# ============================================================================
+echo "== (f3) failed actions: an odd error object does not empty the list; NOT_ASSESSED is never green"
+F3="$WORK/ov-f3"; mkdir -p "$F3"
+BA_FILE="$CORPUS/get_backupactions.actions.kio.kasten.io_-A_-o_json.out"
+_tnow=$(ISO_NOW_MINUS 0)
+fa() { jq -n -c --arg n "$1" --arg t "$_tnow" --argjson e "$2" '{apiVersion:"actions.kio.kasten.io/v1alpha1", kind:"BackupAction", metadata:{name:$n, namespace:"kdrill-demo", creationTimestamp:$t, labels:{"k10.kasten.io/appNamespace":"kdrill-demo","k10.kasten.io/policyName":"p"}}, spec:{subject:{namespace:"kdrill-demo"}}, status:{state:"Failed", error:$e}}'; }
+add_items "$BA_FILE" "$(fa fa-string '"plain string error"')" "$(fa fa-object '{"message":"object error"}')" > "$WORK/f3-ba.json"
+put "$F3" 0 "$WORK/f3-ba.json" "" get backupactions.actions.kio.kasten.io -A -o json
+run f3 "$F3"
+assert_eq "f3: status OK" "$(jf "$WORK/f3.json" '.failedActionsTop5.status')" "OK"
+assert_eq "f3: the string-error action is listed with its message" "$(jf "$WORK/f3.json" '[.failedActionsTop5.items[] | select(.name == "fa-string") | .message] | first')" "plain string error"
+assert_eq "f3: the object-error action is listed too" "$(jf "$WORK/f3.json" '[.failedActionsTop5.items[] | select(.name == "fa-object") | .message] | first')" "object error"
+assert_has "f3: html lists the string error" "$WORK/f3.html" "plain string error"
+# a list that cannot be built (labels is a string -> jq error) beside a non-zero total
+jq -n -c --arg t "$_tnow" '{apiVersion:"actions.kio.kasten.io/v1alpha1", kind:"BackupAction", metadata:{name:"fa-broken", namespace:"kdrill-demo", creationTimestamp:$t, labels:"oops"}, status:{state:"Failed"}}' > "$WORK/f3-broken.json"
+add_items "$BA_FILE" "$(cat "$WORK/f3-broken.json")" > "$WORK/f3b-ba.json"
+F3B="$WORK/ov-f3b"; mkdir -p "$F3B"
+put "$F3B" 0 "$WORK/f3b-ba.json" "" get backupactions.actions.kio.kasten.io -A -o json
+run f3b "$F3B"
+assert_eq "f3b: status NOT_ASSESSED, never an empty OK" "$(jf "$WORK/f3b.json" '.failedActionsTop5.status')" "NOT_ASSESSED"
+assert_has "f3b: terminal says not assessed" "$WORK/f3b.txt" "Not assessed - the failed-action list could not be built"
+assert_lacks "f3b: terminal is not green" "$WORK/f3b.txt" "[OK] No failed actions found"
+assert_has "f3b: html info box" "$WORK/f3b.html" "The failed-action list could not be built"
+assert_lacks "f3b: html is not green" "$WORK/f3b.html" "No failed actions</strong>"
+# the "showing N of TOTAL" line, terminal as in the html
+if [ "$(jf "$WORK/f3.json" '.failedActionsTop5.total > .failedActionsTop5.count')" = "true" ]; then
+  assert_has "f3: terminal says showing N of TOTAL" "$WORK/f3.txt" "most recent of $(jf "$WORK/f3.json" '.failedActionsTop5.total') failed actions"
+  assert_has "f3: html says showing N of TOTAL" "$WORK/f3.html" "most recent of $(jf "$WORK/f3.json" '.failedActionsTop5.total') failed actions"
+fi
+
+# ============================================================================
+echo "== (f4) ransomware readiness: off-cluster export is not assessed on a partial set"
+assert_eq "f4: c5 (nothing readable): pillar not assessed" "$(jf "$WORK/c5.json" '.ransomwareReadiness.pillars.offClusterExport.assessed')" "false"
+assert_eq "f4: ... score flagged as a lower bound" "$(jf "$WORK/c5.json" '.ransomwareReadiness.scoreIsLowerBound')" "true"
+assert_eq "f4: ... and not named the biggest gap" "$(jf "$WORK/c5.json" '.ransomwareReadiness.biggestGap.pillar // "none"' | grep -c 'Off-cluster export')" "0"
+assert_has "f4: terminal says why" "$WORK/c5.txt" "the policy set is partial, so an exporting policy may be unseen"
+assert_has "f4: html says why" "$WORK/c5.html" "Score is a lower bound."
+assert_eq "f4: complete set keeps the pillar assessed" "$(jf "$WORK/a.json" '.ransomwareReadiness.pillars.offClusterExport.assessed')" "true"
+assert_eq "f4: partial set WITH a visible export policy stays assessed" "$(jf "$WORK/c1.json" '.ransomwareReadiness.pillars.offClusterExport.assessed')" "true"
+
 echo "== (e) gate-style empty run: fake kubectl answers {\"items\":[]} to everything"
 E="$WORK/ebin"; mkdir -p "$E"
 ln -s "$(command -v jq)" "$E/jq"

@@ -78,6 +78,26 @@ Manual runs and snapshot expiry (issue #63).
 - Fixed: the HTML notice "cluster-wide namespace listing was denied" matched any
   RBAC entry containing the word "namespace" (for example `list ... --all-namespaces`).
 - Test: `kdl-policy-ns-test.sh` (replay harness).
+- **#58 follow-up (audit of the junction with older code):**
+  - A policy living outside the K10 namespace is app-scoped and protects ONLY
+    its own namespace (docs.kasten.io, usage/app_scoped_policies): an empty
+    selector is no longer a cluster-wide catch-all, and a selector naming other
+    namespaces credits none of them. Applied once (`kdlAppScoped`) in the
+    selector resolver, the catch-all counters, VM coverage, repository
+    `covers` and overlap detection. This had made namespace protection read
+    COMPLETE beside namespaces that were never backed up.
+  - Residual-snapshot rank groups include the policy namespace: two same-named
+    policies protecting one application no longer rank each other's snapshots.
+  - `failedActionsTop5.status` (OK / NOT_ASSESSED): an empty list beside a
+    non-zero total, or a failed jq pass, renders as an info box, never as
+    "No failed actions". A string `.status.error` no longer empties the list.
+    The terminal also prints "showing N most recent of TOTAL".
+  - Ransomware readiness: the Off-cluster export pillar is not assessed (no
+    points claimed lost, not the biggest gap, score flagged as a lower bound)
+    when the policy set is partial and no exporting policy is visible.
+  - Policy names carry their namespace outside the K10 namespace in every
+    HTML table too (`displayName`, published once, read by both renderers).
+  - Terminal redundant-pair separator is ASCII (`<->`).
 
 ## [2.7.0] - 2026-09-28
 
