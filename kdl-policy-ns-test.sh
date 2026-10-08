@@ -25,8 +25,12 @@ set -eu
 
 HARNESS="${KDL_HARNESS:-/private/tmp/claude-502/-Users-bertrand-castagnet-Kasten-Disco-Lite/e02d74d7-3eac-4533-bb00-787b69de5098/scratchpad/harness}"
 HERE=$(cd "$(dirname "$0")" && pwd)
-# The pre-change script: the commit this work branched from, not a moving branch.
-BASELINE_REF="${KDL_BASELINE_REF:-$(git -C "$HERE" merge-base HEAD dev-2.7.1 2>/dev/null || echo dev-2.7.1)}"
+# The pre-change script: dev-2.7.1 just before #58 was merged (c758ca6 = PRs
+# #59-#62, #56/#57 and #63 already in), so scenario (a) isolates what #58
+# changed. A merge-base against the moving branch resolves to HEAD itself once
+# #58 is merged, and an older base would count #63's intended changes as
+# regressions.
+BASELINE_REF="${KDL_BASELINE_REF:-c758ca6}"
 CORPUS="$HARNESS/corpus"
 [ -d "$CORPUS" ] || { echo "harness corpus not found: $CORPUS (set KDL_HARNESS)" >&2; exit 2; }
 # shellcheck disable=SC1091
