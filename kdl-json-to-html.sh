@@ -2105,6 +2105,9 @@ else "" end) + "
     + (if ((.orphanedRestorePoints.unattributable // 0) > 0) then
         "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unattributable) | tostring) + " RestorePoint(s) carry no source action name and cannot be attributed to a policy &mdash; they are counted neither as orphaned nor as attached.</div>"
       else "" end)
+    + (if ((.orphanedRestorePoints.importedExcluded // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.importedExcluded) | tostring) + " imported RestorePoint(s) are not assessed: they are another cluster&rsquo;s exports, retired by the source cluster&rsquo;s policy, not something to clean up here.</div>"
+      else "" end)
   else
     "<div class=\"info-box\">Orphaned RestorePoints data not available.</div>"
   end)
@@ -2115,7 +2118,7 @@ else "" end) + "
 + (if .residualSnapshots then
     "<p class=\"section-description\">Local Kasten snapshots &mdash; <code>RestorePointContent</code> objects with no <code>k10.kasten.io/exportProfile</code> label &mdash; still present past "
       + ((.residualSnapshots.thresholdDays // 7) | tostring)
-      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold.</p>"
+      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. So are imported ones: they sit in another cluster&rsquo;s repository, and that cluster retires them. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold.</p>"
     + (if .residualSnapshots.status == "NOT_ASSESSED" then
         "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The <code>RestorePointContent</code> list could not be read (RBAC on <code>restorepointcontents</code>, or the aggregated API is unavailable) or the computation failed. This is <em>not</em> the same as \"no residual snapshots\". Grant <code>list</code> on <code>restorepointcontents.apps.kio.kasten.io</code> (see <code>kdl-rbac.yaml</code>) and re-run with <code>--debug</code>.</div>"
       elif ((.residualSnapshots.localSnapshots // 0) == 0) then
@@ -2181,6 +2184,10 @@ else "" end) + "
           else "" end)
       end)
     # Context lines, each printed only when the data says so.
+    + (if ((.residualSnapshots.imported // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.imported) | tostring)
+          + " imported restore point(s) are not counted as local snapshots: they are another cluster&rsquo;s exports, retired by the source cluster.</div>"
+      else "" end)
     + (if ((.residualSnapshots.breakdown.policyRetained // 0) > 0) then
         "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.breakdown.policyRetained) | tostring)
           + " snapshot(s) are past the threshold but retained by a live policy &mdash; expected with GFS retention, and not counted as residual.</div>"
