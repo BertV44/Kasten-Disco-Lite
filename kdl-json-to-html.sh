@@ -239,6 +239,40 @@ def pausedBadge:
     "<br><span class=\"badge info\">paused state unknown</span>"
   else "" end;
 
+# #58: which policies this report could see, from policyCollection (the same
+# object the terminal reads). Complete cluster-wide reads get one quiet line;
+# anything partial gets a visible warning naming what was not read.
+def policyCollectionNotice:
+  (.policyCollection // null) as $pc |
+  if $pc == null then ""
+  elif ($pc.mode // "cluster") == "cluster" then
+    "<p class=\"section-description\">Policy scope: cluster-wide read (all namespaces).</p>"
+  else
+    "<p class=\"section-description\">Policy scope: "
+    + (if $pc.mode == "per-namespace"
+       then "per-namespace read &mdash; " + (($pc.namespacesRead // 0) | tostring) + " of " + (($pc.namespacesAttempted // 0) | tostring) + " namespace(s) read, " + (($pc.namespacesDenied // []) | length | tostring) + " denied."
+       else "K10 namespace only &mdash; the cluster-wide read was refused and no namespace list was available."
+       end)
+    + "</p>"
+    + (if ($pc.partial // true) then
+        "<div class=\"warning-box\">\u26a0 <strong>Partial policy set.</strong> Policies in namespaces that could not be read are <em>not</em> in this report. Verdicts that an unseen policy could change (namespace protection gaps, orphaned RestorePoints, residual snapshots whose policy is gone, and the best-practice checks that assert something about every policy) are reported as not assessed, not as clean."
+        + (if (($pc.namespacesDenied // []) | length) > 0 then
+            "<br><small>Not readable (" + (($pc.namespacesDenied | length) | tostring) + "): "
+            + ([($pc.namespacesDenied // [])[:10][] | "<code>" + (. | @html) + "</code>"] | join(", "))
+            + (if (($pc.namespacesDenied | length) > 10) then ", and " + ((($pc.namespacesDenied | length) - 10) | tostring) + " more (see <code>policyCollection</code> in the JSON)" else "" end)
+            + "</small>"
+          else "" end)
+        + (if (($pc.namespacesNotAttempted // 0) > 0) then "<br><small>" + (($pc.namespacesNotAttempted) | tostring) + " namespace(s) were not attempted (read cap reached).</small>" else "" end)
+        + "</div>"
+      else "" end)
+  end;
+
+# A policy name with its namespace when it lives outside the K10 namespace.
+def polNs($k10):
+  if ((.namespace // null) != null) and (.namespace != ($k10 // "kasten-io")) then
+    "<br><small>namespace: <code>" + (.namespace | @html) + "</code></small>"
+  else "" end;
+
 def severityBadge(sev; status):
   if status == "NOT_ASSESSED" then
     "<span class=\"badge info\">ℹ N/A</span>"
@@ -1256,8 +1290,11 @@ else "" end) + "
     (if .coverage.hasCatchallPolicy then
       "<div class=\"success-box\">\u2713 <strong>Catch-all policy detected</strong> - All namespaces are protected.</div>"
     elif ((.bestPractices.namespaceProtection // "N/A") == "NOT_ASSESSED"
-          and (([(.rbacLimited.denied // [])[] | select(test("namespace"; "i"))] | length) > 0)) then
+          and (([(.rbacLimited.denied // [])[] | select(test("^list namespaces"; "i"))] | length) > 0)) then
       "<div class=\"info-box\">\u2139 <strong>Not assessed (RBAC).</strong> Cluster-wide namespace listing was denied, so namespace coverage could not be evaluated &mdash; this is <em>not</em> the same as \"all namespaces protected\". See the RBAC notice near the top of this report.</div>"
+    elif ((.coverage.protection.policySetPartial // false) == true) then
+      # #58: not a gap -- the policy set is partial.
+      "<div class=\"info-box\">\u2139 <strong>Not assessed (partial policy set).</strong> " + (.coverage.unprotectedNamespaces.count | tostring) + " namespace(s) are matched by no policy that was <em>read</em>, but policies in namespaces this run could not read may protect them &mdash; this is <em>not</em> a verified gap and <em>not</em> a verified all-clear. See the policy scope notice under Backup Policies. The evidence-based view below reports " + ((.namespaceProtectionStatus.neverBackedUp // 0) | tostring) + " namespace(s) with no successful backup at all, out of " + ((.namespaceProtectionStatus.total // 0) | tostring) + " analysed.</div>"
     elif ((.coverage.protection.status // "OK") == "NOT_ASSESSED") then
       # The selector analysis contradicted itself or hit a selector it does not
       # implement. Publishing a gap list here would be worse than publishing
@@ -2114,6 +2151,8 @@ else "" end) + "
     # count is a fallback 0 and carries no information.
     (if .orphanedRestorePoints.status == "NOT_ASSESSED" then
       "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The orphaned-RestorePoint computation failed, so this section could not be evaluated &mdash; this is <em>not</em> the same as \"no orphans\". Re-run with <code>--debug</code> to surface the underlying error.</div>"
+    elif (.orphanedRestorePoints.status == "PARTIAL") and (.orphanedRestorePoints.count == 0) then
+      "<div class=\"info-box\">\u2139 <strong>No orphan confirmed &mdash; not a clean verdict.</strong> The policy set is partial (see the policy scope notice under Backup Policies), so " + ((.orphanedRestorePoints.unverifiable // 0) | tostring) + " RestorePoint(s) naming a policy in an unreadable namespace could not be checked.</div>"
     elif .orphanedRestorePoints.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>No orphaned RestorePoints detected</strong></div>"
     else
@@ -2130,6 +2169,9 @@ else "" end) + "
       ] | join("")) +
       "</tbody></table>"
     end)
+    + (if ((.orphanedRestorePoints.unverifiable // 0) > 0) and (.orphanedRestorePoints.count > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unverifiable) | tostring) + " more RestorePoint(s) name a policy in a namespace that could not be read: their orphan status is unknown (partial policy set), so the list above may be incomplete.</div>"
+      else "" end)
     + (if ((.orphanedRestorePoints.unattributable // 0) > 0) then
         "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unattributable) | tostring) + " RestorePoint(s) carry no source action name and cannot be attributed to a policy &mdash; they are counted neither as orphaned nor as attached.</div>"
       else "" end)
@@ -2239,7 +2281,7 @@ else "" end) + "
       else "" end)
     + (if ((.residualSnapshots.breakdown.policyUnverifiable // 0) > 0) then
         "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.policyUnverifiable) | tostring)
-          + " snapshot(s) name a policy that could not be checked, because the policy list came back empty or unreadable. They are reported as unverifiable, never as orphaned.</div>"
+          + " snapshot(s) name a policy that could not be checked, because the policy list came back empty or unreadable, or the policy may live in a namespace that could not be read (partial policy set). They are reported as unverifiable, never as orphaned.</div>"
       else "" end)
     + (if ((.residualSnapshots.breakdown.policyRetentionUnknown // 0) > 0) then
         "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.policyRetentionUnknown) | tostring)
@@ -2483,6 +2525,7 @@ else "" end) + "
   else "" end)
 + "
 <h2>\uD83D\uDCDC Backup Policies</h2>"
++ policyCollectionNotice
 + (if ((.policies.pausedSchemaStatus // "") != "schema_confirmed") then
     "<div class=\"info-box\">\u2139 Paused/enabled state could not be verified on this cluster (" + (.policies.pausedSchemaStatus // "unknown") + "). None of the policies below could be confirmed enabled or paused; coverage and redundant-pair checks treat them as active, exactly as they did before this was tracked.</div>"
   elif ((.policies.pausedCount // 0) > 0) then
@@ -2493,7 +2536,8 @@ else "" end) + "
 <thead><tr><th>Name</th><th>Frequency</th><th>Actions</th><th>Selector</th><th>Export destinations</th><th>Retention</th></tr></thead>
 <tbody>"
 + (if (.policies.items | length) > 0 then
-    ([.policies.items[]? |
+    ((.policyCollection.k10Namespace // "kasten-io") as $pck |
+     [.policies.items[]? |
       # `exports` is emitted by KDL v2.2.0+; older reports only carry the single
       # `exportRetention`. Absent (null) and empty ([]) must NOT be conflated:
       # on a legacy report `null` means "not collected", and rendering that as
@@ -2502,7 +2546,7 @@ else "" end) + "
       (.exports == null) as $exportsUnknown |
       ((.actions // []) | index("export")) as $hasExportAction |
       "<tr>
-        <td><strong>" + .name + "</strong>" + (if .presetRef then "<br><small>\uD83D\uDCCB " + .presetRef + "</small>" else "" end) +
+        <td><strong>" + .name + "</strong>" + polNs($pck) + (if .presetRef then "<br><small>\uD83D\uDCCB " + .presetRef + "</small>" else "" end) +
           (if (.scope // "namespace") == "virtualMachine" then "<br><span class=\"badge info\">VM policy</span>" else "" end) +
           pausedBadge + "</td>
         <td><code>" + .frequency + "</code></td>
@@ -3146,8 +3190,8 @@ else "" end) + "
     <table>
     <thead><tr><th>Policy</th><th>Frequency</th><th>Profile</th></tr></thead>
     <tbody>" +
-    ([.importPolicies.items[]? | "<tr>
-      <td><code>" + .name + "</code></td>
+    ((.policyCollection.k10Namespace // "kasten-io") as $pck | [.importPolicies.items[]? | "<tr>
+      <td><code>" + .name + "</code>" + polNs($pck) + "</td>
       <td>" + (.frequency // "manual") + "</td>
       <td>" + (if .profile != "" then "<code>" + .profile + "</code>" else "<em>—</em>" end) + "</td>
     </tr>"] | join("")) +
