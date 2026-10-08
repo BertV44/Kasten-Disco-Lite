@@ -3588,6 +3588,11 @@ debug "Actions - Total: $TOTAL_ACTIONS, Finished: $FINISHED_ACTIONS, Completed: 
 # JSON-encoded string) up to 5 levels.
 #
 # All sources already loaded above — no extra kubectl calls.
+#
+# The namespace of a Backup/ExportAction is the application's, from the label or
+# the subject. Never the action's own metadata.namespace: a metadata export of a
+# multi-namespace policy is created in the K10 namespace with a Manifest as its
+# subject, and reporting it as "kasten-io" names a namespace that did not fail.
 
 FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
   ($backupArr[0] // {"items":[]}) as $backup |
@@ -3597,7 +3602,7 @@ FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
     ($backup.items // []) | .[] | select((.status.state // "") == "Failed") | {
       kind: "BackupAction",
       name: (.metadata.name // ""),
-      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "N/A"),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .spec.subject.namespace // "N/A"),
       policy: (.metadata.labels["k10.kasten.io/policyName"] // ""),
       timestamp: (.metadata.creationTimestamp // ""),
       message: ((.status.error // {}) | deepest_msg)
@@ -3607,7 +3612,7 @@ FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
     ($export.items // []) | .[] | select((.status.state // "") == "Failed") | {
       kind: "ExportAction",
       name: (.metadata.name // ""),
-      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .metadata.namespace // "N/A"),
+      namespace: (.metadata.labels["k10.kasten.io/appNamespace"] // .spec.subject.namespace // "N/A"),
       policy: (.metadata.labels["k10.kasten.io/policyName"] // ""),
       timestamp: (.metadata.creationTimestamp // ""),
       message: ((.status.error // {}) | deepest_msg)
@@ -3636,6 +3641,9 @@ if ! _ep "$FAILED_ACTIONS_TOP5" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 FAILED_ACTIONS_TOP5_COUNT=$(safe_int "$(_ep "$FAILED_ACTIONS_TOP5" | jq 'length // 0')")
+# The same population as the list above, uncapped: the list stops at five, and
+# a sidebar badge reading "5" on a cluster with forty failures understates it.
+FAILED_ACTIONS_ALL_COUNT=$(safe_int "$((FAILED_ACTIONS + RESTORE_ACTIONS_FAILED))")
 
 debug "Failed actions top 5 collected: $FAILED_ACTIONS_TOP5_COUNT entries"
 
@@ -9571,6 +9579,7 @@ if [ "$MODE" = "json" ]; then
     --arg k8sDistribution "$K8S_DISTRIBUTION" \
     --slurpfile failedActionsTop5 "$TEMP_DIR/failedActionsTop5.json" \
     --argjson failedActionsTop5Count "$FAILED_ACTIONS_TOP5_COUNT" \
+    --argjson failedActionsTotal "$FAILED_ACTIONS_ALL_COUNT" \
     --slurpfile stuckActions "$TEMP_DIR/stuckActions.json" \
     --argjson stuckActionsCount "$STUCK_ACTIONS_COUNT" \
     --argjson stuckHoursThreshold "$STUCK_HOURS_THRESHOLD" \
@@ -10259,6 +10268,7 @@ if [ "$MODE" = "json" ]; then
 
       failedActionsTop5: {
         count: $failedActionsTop5Count,
+        total: $failedActionsTotal,
         items: $failedActionsTop5
       },
 
