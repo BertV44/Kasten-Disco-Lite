@@ -1254,7 +1254,7 @@ else "" end) + "
       <tbody>" +
       ([$pb.byPolicy[]? |
         "<tr>
-          <td><strong>" + .name + "</strong></td>
+          <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
           <td>" + (.runCount | tostring) + "</td>
           <td>" + formatDuration(.total.avg) + " / " + formatDuration(.total.min) + " / " + formatDuration(.total.max) + "</td>
           <td>" + formatDuration(.snapshot.avg) + (if .snapshot.unknownCount > 0 then " <small>(" + (.snapshot.unknownCount|tostring) + " unknown)</small>" else "" end) + "</td>
@@ -1271,7 +1271,7 @@ else "" end) + "
     <tbody>" +
     ([.policyRunStats.lastRuns[]? |
       "<tr>
-        <td><strong>" + .name + "</strong></td>
+        <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
         <td>" + (if .lastRun then (.lastRun.timestamp | split("T")[0]) else "Never" end) + "</td>
         <td>" + badge(if .lastRun then .lastRun.state else "N/A" end) + "</td>
         <td>" + (if .lastRun.duration then formatDuration(.lastRun.duration) else "N/A" end) + "</td>
@@ -2423,6 +2423,8 @@ else "" end) + "
 | "<h2 data-crit=\"" + ($faTotal | tostring) + "\" data-warn=\"0\">\u274C Failed Actions <small>(root cause)</small></h2>"
 + (if .failedActionsTop5 == null then
     "<div class=\"info-box\">Failed action data not available.</div>"
+  elif (.failedActionsTop5.status // "OK") == "NOT_ASSESSED" then
+    "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The failed-action list could not be built (" + ($faTotal | tostring) + " failed action(s) were counted). This is <em>not</em> the same as \"no failed actions\".</div>"
   elif (.failedActionsTop5.count // 0) == 0 then
     "<div class=\"success-box\">\u2713 <strong>No failed actions</strong> among the BackupActions, ExportActions and RestoreActions K10 still holds.</div>"
   else
@@ -2792,7 +2794,8 @@ else "" end) + "
         .value as $v |
         ($v.score) as $s |
         ($v.max) as $m |
-        (if $s >= $m then "<span class=\"pillar-ok\">[OK]</span>"
+        (if ($v.assessed == false) then "<span class=\"pillar-partial\">[NOT ASSESSED]</span>"
+         elif $s >= $m then "<span class=\"pillar-ok\">[OK]</span>"
          elif $s > 0 then "<span class=\"pillar-partial\">[PARTIAL]</span>"
          else "<span class=\"pillar-fail\">[FAIL]</span>" end) as $status |
         ({
@@ -2809,10 +2812,14 @@ else "" end) + "
            " + $status + "
            <span><strong>" + $pillarLabel + "</strong></span>
            <span class=\"pillar-score\">" + ($s | tostring) + "/" + ($m | tostring) + "</span>
-           <span class=\"pillar-evidence\">" + (if $v.evidence then "detected" else "not detected" end) + "</span>
+           <span class=\"pillar-evidence\">" + (if ($v.assessed == false) then "not assessed: partial policy set, an exporting policy may be unseen" elif $v.evidence then "detected" else "not detected" end) + "</span>
          </div>"
      ] | join("")) +
      "</div>" +
+
+     (if (.ransomwareReadiness.scoreIsLowerBound // false) then
+       "<div class=\"info-box\">\u2139 <strong>Score is a lower bound.</strong> The policy set is partial (see the policy scope notice under Backup Policies), so the Off-cluster export pillar could not be assessed: no points are counted as lost for it and it is not named as the biggest gap.</div>"
+     else "" end) +
 
      (if .ransomwareReadiness.biggestGap then
        "<div class=\"biggest-gap\"><strong>\u26a0 Biggest gap:</strong> " +
@@ -2858,7 +2865,7 @@ else "" end) + "
        <tbody>" +
      ([$rpo[] |
        "<tr>
-          <td><strong>" + .name + "</strong>" + pausedBadge + "</td>
+          <td><strong>" + ((.displayName // .name) | @html) + "</strong>" + pausedBadge + "</td>
           <td>" + (.frequencyDeclared // "<em>manual</em>") + "</td>
           <td>" + (if .frequencyTheoreticalSeconds then formatDuration(.frequencyTheoreticalSeconds) else "<em>n/a</em>" end) + "</td>
           <td>" + (.samples | tostring) + "</td>
@@ -2907,7 +2914,7 @@ else "" end) + "
          <tbody>" +
        ([.policyAnalysis.resolved[]? | select(.pausedState == "paused") |
          "<tr>
-            <td><strong>" + .name + "</strong></td>
+            <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
             <td><code>" + .selectorKind + "</code></td>
             <td>" + (.targetedCount | tostring) + "</td>
           </tr>"
@@ -2923,7 +2930,7 @@ else "" end) + "
          <tbody>" +
        ([.policyAnalysis.empty[]? |
          "<tr>
-            <td><strong>" + .name + "</strong></td>
+            <td><strong>" + ((.displayName // .name) | @html) + "</strong></td>
             <td><code>" + .selectorKind + "</code></td>
             <td>" + (.targetedCount | tostring) + "</td>
             <td>" + (.effectiveCount | tostring) + "</td>
@@ -2940,8 +2947,8 @@ else "" end) + "
          <tbody>" +
        ([.policyAnalysis.redundantPairs[]? | select(.involvesCatchall | not) |
          "<tr>
-            <td><strong>" + .policies[0] + "</strong></td>
-            <td><strong>" + .policies[1] + "</strong></td>
+            <td><strong>" + ((.policyDisplayNames[0] // .policies[0]) | @html) + "</strong></td>
+            <td><strong>" + ((.policyDisplayNames[1] // .policies[1]) | @html) + "</strong></td>
             <td>" + (.sharedNamespaces | join(", ")) + "</td>
             <td>" + (.sharedActions | join(", ")) + "</td>
             <td>" + (if .sameFrequency then "<span class=\"badge warn\">\u26a0 yes</span>" else "<span class=\"badge info\">no</span>" end) + "</td>

@@ -447,7 +447,10 @@ num_gt() {
 # - Returns "" (never null) so callers can chain string ops safely
 JQ_DEEPEST_MSG='
 def deepest_msg($depth):
-  if $depth <= 0 or (type != "object") then (.message // "")
+  # A string (or other odd) .status.error must not abort the whole list: only an
+  # object has a .message to read.
+  if (type == "string") then .
+  elif $depth <= 0 or (type != "object") then (if type == "object" then (.message // "") else "" end)
   else
     (.message // "") as $m |
     (.cause // null) as $c |
@@ -722,7 +725,13 @@ def policy_target_ns($allNs):
   ( [ $exprs[]? | (.operator // "") ]
     | map(select(. as $o | (["In","NotIn","Exists","DoesNotExist"] | index($o)) == null))
     | length ) as $badOps |
-  if ($sel == null) or ($sel == {})
+  if (.kdlAppScoped == true) then
+    # App-scoped policy (lives outside the K10 namespace): it protects ONLY its
+    # own namespace, never a catch-all, never another namespace its selector
+    # names (docs.kasten.io usage/app_scoped_policies).
+    (.metadata.namespace // "") as $own |
+    { namespaces: [ $allNs[]? | select((.name // "") == $own) | .name ], resolvable: true, kind: "appScoped", nonStandardPatterns: [] }
+  elif ($sel == null) or ($sel == {})
      or (($sel | keys | length) == 0) then
     # Genuinely empty selector: catch-all over non-system namespaces.
     { namespaces: [ $allNs[]? | select(.isSystem | not) | .name ], resolvable: true, kind: "catchall", nonStandardPatterns: [] }
@@ -815,7 +824,11 @@ def lbl_of($p):
   and ( (lbl_pns) as $r | ($r == null) or (($p.metadata.namespace // null) == null) or ($r == $p.metadata.namespace) );
 # How a policy is NAMED in a report line: bare in the K10 namespace, with its
 # namespace elsewhere. Takes an object carrying .name and .namespace.
-def pdisp($k10ns): .name + (if ((.namespace // $k10ns) != $k10ns) then " (ns: " + .namespace + ")" else "" end);
+# pdn is THE rule (published once as displayName by the producers below; the
+# terminal and the HTML both print it): the namespace is shown only outside the
+# K10 namespace.
+def pdn($k10ns; $ns; $name): $name + (if (($ns // $k10ns) != $k10ns) then " (ns: " + $ns + ")" else "" end);
+def pdisp($k10ns): pdn($k10ns; .namespace; .name);
 # $pols is [{ns,name}]; $scope is {complete, read:[ns]} (policyCollection).
 def pol_exists($pols; $ns; $name):
   any($pols[]?; .name == $name and ((($ns // "") == "") or .ns == $ns));
@@ -1818,8 +1831,16 @@ debug "Profiles with TLS verification skipped: $PROFILE_TLS_SKIPPED_COUNT"
 ### -------------------------
 progress "policies"
 # Sanitize: strip control chars and remove sensitive fields from export params
-POLICIES_JSON=$(cat "$TEMP_DIR/policies_raw.json" 2>/dev/null | tr -d '\000-\011\013-\037' | jq -c '
+# kdlAppScoped: a policy that lives OUTSIDE the K10 namespace is an app-scoped
+# policy. Kasten documents (docs.kasten.io, usage/app_scoped_policies) that such
+# a policy protects ONLY the namespace it lives in, whatever its selector says:
+# an empty selector is NOT a cluster-wide catch-all and a selector naming other
+# namespaces credits none of them. Every selector consumer reads this marker
+# (policy_target_ns, the catch-all counters, the VM coverage matcher), so the
+# rule is stated once, here.
+POLICIES_JSON=$(cat "$TEMP_DIR/policies_raw.json" 2>/dev/null | tr -d '\000-\011\013-\037' | jq -c --arg k10ns "$NAMESPACE" '
   .items |= (. // [] | map(
+    (. + {kdlAppScoped: ((.metadata.namespace // $k10ns) != $k10ns)}) |
     .spec.actions |= (. // [] | map(
       if .exportParameters then
         .exportParameters |= (del(.receiveString) | del(.migrationToken))
@@ -1867,6 +1888,8 @@ ALL_NS_POLICIES="$(_ep "$APP_POLICIES_JSON" | jq '[
        (.spec.selector.matchLabels == {} or .spec.selector.matchLabels == null))
     )
     and ([.spec.actions[]?.action] | index("backup"))
+    # An app-scoped policy (outside the K10 namespace) is never a catch-all.
+    and (.kdlAppScoped != true)
     # #51: a PAUSED catch-all confers no protection. `!= true` (not `//`) so
     # `false` and absent both still count as active, only a confirmed pause
     # is excluded.
@@ -2152,7 +2175,7 @@ printf '%s' "$EXPORT_ACTIONS_JSON" > "$TEMP_DIR/exportactions_clean.json"  # for
 # policies excluded)"). k10-disaster-recovery-policy and
 # k10-system-reports-policy have their own dedicated status elsewhere
 # (KDR_STATUS / REPORTS_POLICY_LAST_RUN_STATE below), so nothing is lost.
-POLICY_LAST_RUN=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG""$JQ_POLICY_KEY_LIB"'
+POLICY_LAST_RUN=$(_ep "$APP_POLICIES_JSON" | jq -c --arg k10ns "$NAMESPACE" --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG""$JQ_POLICY_KEY_LIB"'
   # v2.7.0 (#54): found via the runstats RFC3339Nano test fixture -- a raw
   # fromdateiso8601 on a timestamp with a non-zero fractional second throws,
   # which is uncaught here, so the WHOLE jq call fails and the shell-level
@@ -2165,6 +2188,7 @@ POLICY_LAST_RUN=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DI
   [.items[]? | . as $policy | {
     name: .metadata.name,
     namespace: (.metadata.namespace // null),
+    displayName: pdn($k10ns; .metadata.namespace; .metadata.name),
     lastRun: (
       ($runs.items // [])
       | map(select(run_of($policy)))
@@ -2465,6 +2489,7 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
         {
           name: $pol.name,
           namespace: $pol.ns,
+          displayName: pdn($k10ns; $pol.ns; $pol.name),
           runCount: ($rows | length),
           total: ([$rows[].totalSeconds] | duration_stats),
           snapshot: (agg_phase($rows; "snapshotSeconds"; "snapshotState"; null)),
@@ -2531,7 +2556,7 @@ debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT ap
 # scope as POLICY_LAST_RUN above and policyAnalysis, so the report cannot again
 # show two different definitions of "policy" in the same section.
 if [ -n "$FOURTEEN_DAYS_AGO" ]; then
-  EFFECTIVE_RPO=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB""$JQ_POLICY_KEY_LIB"'
+  EFFECTIVE_RPO=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" --arg k10ns "$NAMESPACE" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB""$JQ_POLICY_KEY_LIB"'
     ($runsArr[0] // {"items":[]}) as $runs |
     # Map K10 frequency alias to theoretical interval in seconds.
     # 30-day month is the K10 documented convention for @monthly.
@@ -2581,6 +2606,7 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
       {
         name: $policy.metadata.name,
         namespace: ($policy.metadata.namespace // null),
+        displayName: pdn($k10ns; $policy.metadata.namespace; $policy.metadata.name),
         frequencyDeclared: $freq,
         frequencyTheoreticalSeconds: $theoretical,
         samples: ($intervals | length),
@@ -2723,6 +2749,7 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
         (.spec.selector | keys | length == 0)
       )
       and ([.spec.actions[]?.action] | index("backup"))
+      and (.kdlAppScoped != true)
       and (.spec.paused != true)
     ) | .metadata.name] | join(", ")
   ')
@@ -2735,6 +2762,7 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
         (.spec.selector | keys | length == 0)
       )
       and ([.spec.actions[]?.action] | index("backup"))
+      and (.kdlAppScoped != true)
       and (.spec.paused != true)
     )] | length
   ')
@@ -2755,6 +2783,7 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
       .spec.selector != null and
       (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0) and
       (policy_scope == "namespace") and
+      (.kdlAppScoped != true) and
       (.spec.paused != true)
     ) | .metadata.name] | join(", ")
   ' 2>/dev/null || echo "")
@@ -2763,6 +2792,7 @@ if [ "$APP_POLICY_COUNT" -gt 0 ]; then
       .spec.selector != null and
       (.spec.selector.matchLabels != null and (.spec.selector.matchLabels | length) > 0) and
       (policy_scope == "namespace") and
+      (.kdlAppScoped != true) and
       (.spec.paused != true)
     )] | length
   ' 2>/dev/null || echo "0")
@@ -2977,7 +3007,7 @@ debug "Unprotected list: $UNPROTECTED_NS_JSON"
 # matchLabels resolution returns []; matchNames still flag empty correctly.
 
 printf '%s' "${ALL_NAMESPACES_LABELED:-[]}" > "$TEMP_DIR/pa_nslabeled.json"
-POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB"'
+POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --arg k10ns "$NAMESPACE" --slurpfile nsLabeled "$TEMP_DIR/pa_nslabeled.json" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB""$JQ_POLICY_KEY_LIB"'
   # Resolve targeted namespaces for a single policy.
   # Returns {namespaces: [...], resolvable: bool, kind: "catchall"|"matchNames"|...}
   # v2.2.0 (#one-resolver): this used to be a second, independent selector
@@ -3013,6 +3043,7 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
     {
       name: $p.metadata.name,
       namespace: ($p.metadata.namespace // null),
+      displayName: pdn($k10ns; $p.metadata.namespace; $p.metadata.name),
       actions: ([$p.spec.actions[]?.action] | unique),
       frequency: ($p.spec.frequency // null),
       # scope distinguishes namespace-scoped from VM-scoped policies (Kasten
@@ -3056,6 +3087,7 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
         policies: [$p1.name, $p2.name],
         # #58: same-named policies in two namespaces are different policies.
         policyNamespaces: [$p1.namespace, $p2.namespace],
+        policyDisplayNames: [$p1.displayName, $p2.displayName],
         scope: $p1.scope,
         sharedNamespaces: $sharedNs,
         sharedActions: $sharedActions,
@@ -3593,6 +3625,7 @@ else
     --arg drPolicy "$K10_DR_POLICY_NAME" \
     --arg k10ns "$NAMESPACE" \
     --slurpfile scope "$TEMP_DIR/pc_scope.json" \
+    --arg k10ns "$NAMESPACE" \
     --argjson threshold "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" "$JQ_POLICY_KEY_LIB"'
     def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else null end;
     # Strips fractional seconds before a Z and nothing else, so a numeric offset
@@ -3735,7 +3768,7 @@ else
     # retention it does not have and push every scheduled snapshot behind it one
     # slot closer to "over retention". They keep rank -1.
     ( [ $snaps0[] | select(.refEpoch != null and (.manual | not)) ]
-      | group_by([.appNamespace, .appName, .policyName])
+      | group_by([.appNamespace, .appName, .policyName, (.policyNamespace // $k10ns)])
       | map( sort_by(.refEpoch) | reverse | to_entries | map(.value + {rank: .key}) )
       | flatten
       | map({key: .name, value: .rank})
@@ -4077,6 +4110,7 @@ debug "Actions - Total: $TOTAL_ACTIONS, Finished: $FINISHED_ACTIONS, Completed: 
 # multi-namespace policy is created in the K10 namespace with a Manifest as its
 # subject, and reporting it as "kasten-io" names a namespace that did not fail.
 
+FAILED_ACTIONS_TOP5_STATUS="OK"
 FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
   ($backupArr[0] // {"items":[]}) as $backup |
   ($exportArr[0] // {"items":[]}) as $export |
@@ -4117,16 +4151,22 @@ FAILED_ACTIONS_TOP5=$(jq -cn "$JQ_DEEPEST_MSG"'
   --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
   --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
   --slurpfile restoreArr "$TEMP_DIR/restoreactions_clean.json" \
-  2>/dev/null || echo '[]')
+  2>/dev/null) || { _jq_fail "failed actions"; FAILED_ACTIONS_TOP5='[]'; FAILED_ACTIONS_TOP5_STATUS="NOT_ASSESSED"; }
 
-if ! _ep "$FAILED_ACTIONS_TOP5" | jq -e '.' >/dev/null 2>&1; then
+if ! _ep "$FAILED_ACTIONS_TOP5" | jq -e 'type == "array"' >/dev/null 2>&1; then
   FAILED_ACTIONS_TOP5='[]'
+  FAILED_ACTIONS_TOP5_STATUS="NOT_ASSESSED"
 fi
 
 FAILED_ACTIONS_TOP5_COUNT=$(safe_int "$(_ep "$FAILED_ACTIONS_TOP5" | jq 'length // 0')")
 # The same population as the list above, uncapped: the list stops at five, and
 # a sidebar badge reading "5" on a cluster with forty failures understates it.
 FAILED_ACTIONS_ALL_COUNT=$(safe_int "$((FAILED_ACTIONS + RESTORE_ACTIONS_FAILED))")
+# An empty list beside a non-zero total is a failed computation, not "no failed
+# actions": never render it as a green all-clear.
+if [ "$FAILED_ACTIONS_TOP5_COUNT" -eq 0 ] && [ "$FAILED_ACTIONS_ALL_COUNT" -gt 0 ]; then
+  FAILED_ACTIONS_TOP5_STATUS="NOT_ASSESSED"
+fi
 
 debug "Failed actions top 5 collected: $FAILED_ACTIONS_TOP5_COUNT entries"
 
@@ -4688,7 +4728,10 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
     def ns_policy_covers($ns):
       (.spec.selector // null) as $sel |
       (ns_exclusions) as $excl |
-      if ($ns | glob_any($excl)) then false
+      # App-scoped policy (outside the K10 namespace): its own namespace only
+      # (docs.kasten.io usage/app_scoped_policies).
+      if (.kdlAppScoped == true) then ($ns == (.metadata.namespace // ""))
+      elif ($ns | glob_any($excl)) then false
       elif $sel == null or $sel == {} or
            ($sel.matchNames == null and $sel.matchExpressions == null and $sel.matchLabels == null)
         then true
@@ -4707,6 +4750,7 @@ if [ "$VM_CRD_EXISTS" = "true" ]; then
          | (.values // [])[]? ]) as $refPats |
       ([ ($sel.matchExpressions // [])[]? | select(.key == vm_ns_key and .operator == "In")
          | (.values // [])[]? ]) as $nsPats |
+      ( (.kdlAppScoped != true) or ($ns == (.metadata.namespace // "")) ) and
       (
         (($refPats | length) > 0 and (($ns + "/" + $name) | glob_any($refPats)))
         or
@@ -9692,8 +9736,17 @@ fi
 
 RANSOM_EXPORT=0
 RANSOM_EXPORT_MAX=15
+RANSOM_EXPORT_ASSESSED=true
 if [ "$POLICIES_WITH_EXPORT" -gt 0 ] 2>/dev/null; then
   RANSOM_EXPORT=$RANSOM_EXPORT_MAX
+elif [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+  # #58: "no policy exports" is a claim about EVERY policy. On a partial set
+  # the exporting policy may live in a namespace that was not read, so the
+  # pillar is not assessed: no points are claimed lost and it is never named
+  # the biggest gap. The score is then a lower bound, and says so. (The other
+  # pillars read the K10 configuration, profiles and DR policy of the K10
+  # namespace, not the application policy set.)
+  RANSOM_EXPORT_ASSESSED=false
 fi
 
 RANSOM_AUTH=0
@@ -9765,7 +9818,9 @@ _track_gap() {
   fi
 }
 _track_gap "$RANSOM_IMMUT" "$RANSOM_IMMUT_MAX" "Immutability"
-_track_gap "$RANSOM_EXPORT" "$RANSOM_EXPORT_MAX" "Off-cluster export"
+if [ "$RANSOM_EXPORT_ASSESSED" = "true" ]; then
+  _track_gap "$RANSOM_EXPORT" "$RANSOM_EXPORT_MAX" "Off-cluster export"
+fi
 _track_gap "$RANSOM_AUTH" "$RANSOM_AUTH_MAX" "Authentication"
 _track_gap "$RANSOM_DR" "$RANSOM_DR_MAX" "Disaster Recovery"
 _track_gap "$RANSOM_AUDIT" "$RANSOM_AUDIT_MAX" "Audit logging"
@@ -10033,6 +10088,7 @@ if [ "$MODE" = "json" ]; then
     --argjson ransomImmutMax "$RANSOM_IMMUT_MAX" \
     --argjson ransomExport "$RANSOM_EXPORT" \
     --argjson ransomExportMax "$RANSOM_EXPORT_MAX" \
+    --argjson ransomExportAssessed "$RANSOM_EXPORT_ASSESSED" \
     --argjson ransomAuth "$RANSOM_AUTH" \
     --argjson ransomAuthMax "$RANSOM_AUTH_MAX" \
     --argjson ransomDr "$RANSOM_DR" \
@@ -10189,6 +10245,7 @@ if [ "$MODE" = "json" ]; then
     --arg k8sDistribution "$K8S_DISTRIBUTION" \
     --slurpfile failedActionsTop5 "$TEMP_DIR/failedActionsTop5.json" \
     --argjson failedActionsTop5Count "$FAILED_ACTIONS_TOP5_COUNT" \
+    --arg failedActionsStatus "$FAILED_ACTIONS_TOP5_STATUS" \
     --argjson failedActionsTotal "$FAILED_ACTIONS_ALL_COUNT" \
     --slurpfile stuckActions "$TEMP_DIR/stuckActions.json" \
     --argjson stuckActionsCount "$STUCK_ACTIONS_COUNT" \
@@ -10868,10 +10925,13 @@ if [ "$MODE" = "json" ]; then
         grade: $ransomGrade,
         score: $ransomTotal,
         maxScore: $ransomMaxTotal,
+        scoreIsLowerBound: ($ransomExportAssessed | not),
         biggestGap: (if $ransomBiggestGap != "" then {pillar: $ransomBiggestGap, pointsLost: $ransomBiggestGapPoints} else null end),
         pillars: {
           immutability:     {score: $ransomImmut,   max: $ransomImmutMax,   evidence: ($immutability == "true" and $immutableProfiles > 0)},
-          offClusterExport: {score: $ransomExport,  max: $ransomExportMax,  evidence: ($policiesWithExport > 0)},
+          # assessed:false = the policy set was partial and no exporting policy
+          # was visible: score 0 here means "not seen", not "absent" (#58).
+          offClusterExport: {score: $ransomExport,  max: $ransomExportMax,  evidence: ($policiesWithExport > 0), assessed: $ransomExportAssessed},
           authentication:   {score: $ransomAuth,    max: $ransomAuthMax,    evidence: ($authMethod != "none" and $authMethod != "")},
           disasterRecovery: {score: $ransomDr,      max: $ransomDrMax,      evidence: ($kdrStatus == "ENABLED")},
           auditLogging:     {score: $ransomAudit,   max: $ransomAuditMax,   evidence: ($auditEnabled == "true")},
@@ -10918,6 +10978,9 @@ if [ "$MODE" = "json" ]; then
       },
 
       failedActionsTop5: {
+        # OK | NOT_ASSESSED. NOT_ASSESSED: the list could not be built (or came
+        # back empty beside a non-zero total), so count 0 is NOT "no failures".
+        status: $failedActionsStatus,
         count: $failedActionsTop5Count,
         total: $failedActionsTotal,
         items: $failedActionsTop5
@@ -11409,10 +11472,15 @@ fi
 
 ### Failed Actions Top 5 (NEW v1.9)
 printf "\n${COLOR_BOLD}[FAIL] Failed Actions - Top 5${COLOR_RESET} ${COLOR_CYAN}(NEW v1.9)${COLOR_RESET}\n"
-if [ "$FAILED_ACTIONS_TOP5_COUNT" -eq 0 ]; then
+if [ "$FAILED_ACTIONS_TOP5_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} Not assessed - the failed-action list could not be built ($FAILED_ACTIONS_ALL_COUNT failed action(s) counted); this is NOT 'no failed actions'\n"
+elif [ "$FAILED_ACTIONS_TOP5_COUNT" -eq 0 ]; then
   printf "  ${COLOR_GREEN}[OK] No failed actions found${COLOR_RESET}\n"
 else
   printf "  ${COLOR_RED}$FAILED_ACTIONS_TOP5_COUNT recent failure(s)${COLOR_RESET} (most recent first):\n"
+  if [ "$FAILED_ACTIONS_ALL_COUNT" -gt "$FAILED_ACTIONS_TOP5_COUNT" ]; then
+    printf "  Showing the $FAILED_ACTIONS_TOP5_COUNT most recent of $FAILED_ACTIONS_ALL_COUNT failed actions.\n"
+  fi
   _ep "$FAILED_ACTIONS_TOP5" | jq -r '.[] |
     "  - [\(.kind)] \(.timestamp | split("T")[0])  ns=\(.namespace)" +
     (if .policy != "" then "  policy=\(.policy)" else "" end) +
@@ -12030,7 +12098,7 @@ else
   if [ "$POLICY_REDUNDANT_GENUINE" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Redundant policy pairs: $POLICY_REDUNDANT_GENUINE genuine (two non-catchall policies overlap)\n"
     _ep "$POLICY_ANALYSIS" | jq -r --arg k10ns "$NAMESPACE" '.redundantPairs[]? | select(.involvesCatchall | not) |
-      "    - [" + ([range(0; (.policies | length)) as $i | .policies[$i] + (if ((.policyNamespaces[$i] // $k10ns) != $k10ns) then " (ns: " + .policyNamespaces[$i] + ")" else "" end)] | join(" ↔ ")) + "]" +
+      "    - [" + ([range(0; (.policies | length)) as $i | .policies[$i] + (if ((.policyNamespaces[$i] // $k10ns) != $k10ns) then " (ns: " + .policyNamespaces[$i] + ")" else "" end)] | join(" <-> ")) + "]" +
       " | shared NS: " + (.sharedNamespaces | join(", ")) +
       " | shared actions: " + (.sharedActions | join(", ")) +
       (if .sameFrequency then " | same frequency" else " | different frequencies" end)
@@ -12856,7 +12924,11 @@ _pillar_line() {
 }
 
 _pillar_line "Immutability"        "$RANSOM_IMMUT"   "$RANSOM_IMMUT_MAX"   "$([ "$IMMUTABILITY" = "true" ] && [ "$IMMUTABLE_PROFILES" -gt 0 ] && echo "$IMMUTABLE_PROFILES profile(s) with retention lock" || echo "no immutable profile configured")"
-_pillar_line "Off-cluster export"  "$RANSOM_EXPORT"  "$RANSOM_EXPORT_MAX"  "$([ "$POLICIES_WITH_EXPORT" -gt 0 ] && echo "$POLICIES_WITH_EXPORT policy/policies export to remote location" || echo "no policy with export action")"
+if [ "$RANSOM_EXPORT_ASSESSED" = "true" ]; then
+  _pillar_line "Off-cluster export"  "$RANSOM_EXPORT"  "$RANSOM_EXPORT_MAX"  "$([ "$POLICIES_WITH_EXPORT" -gt 0 ] && echo "$POLICIES_WITH_EXPORT policy/policies export to remote location" || echo "no policy with export action")"
+else
+  printf "    ${COLOR_CYAN}[NOT ASSESSED]${COLOR_RESET} %-22s %2d/%-2d  %s\n" "Off-cluster export" "$RANSOM_EXPORT" "$RANSOM_EXPORT_MAX" "no exporting policy among the policies READ; the policy set is partial, so an exporting policy may be unseen (score is a lower bound)"
+fi
 _pillar_line "Authentication"      "$RANSOM_AUTH"    "$RANSOM_AUTH_MAX"    "$([ "$AUTH_METHOD" != "none" ] && [ -n "$AUTH_METHOD" ] && echo "$AUTH_METHOD" || echo "dashboard may be unauthenticated")"
 _pillar_line "Disaster Recovery"   "$RANSOM_DR"     "$RANSOM_DR_MAX"      "$([ "$KDR_STATUS" = "ENABLED" ] && echo "KDR healthy ($KDR_MODE)" || { [ "$KDR_ENABLED" = "true" ] && echo "KDR present but $KDR_STATUS — no credit" || echo "KDR not configured"; })"
 _pillar_line "Audit logging"       "$RANSOM_AUDIT"  "$RANSOM_AUDIT_MAX"   "$([ "$AUDIT_ENABLED" = "true" ] && echo "SIEM targets: $AUDIT_TARGETS" || echo "no audit/SIEM configured")"
