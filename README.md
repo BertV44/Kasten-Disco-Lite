@@ -1,8 +1,8 @@
-# Kasten Discovery Lite v2.7.0
+# Kasten Discovery Lite v2.7.1
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
-**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2 / 9.0.5). On a newer
+**Validated against Veeam Kasten up to 9.0** (9.0.0 / 9.0.1 / 9.0.2 / 9.0.5 / 9.0.6). On a newer
 cluster the report prints a warning and sets `kastenCompatibility.newerThanValidated`,
 rather than silently analysing an unknown CRD schema.
 
@@ -38,7 +38,7 @@ These join the existing v1.9 features:
   catalog-snapshot mode read from the fields Kasten actually writes *(corrected v2.7.0)*
 - **Export Storage usage** with **Deduplication ratio**
 - **Policy Last Run Status** with duration + deepest cause-chain error message
-- **Failed Actions Top 5** with namespace, policy, and root-cause error
+- **Failed Actions Top 5** with namespace, policy, and root-cause error, always listed with the uncapped total *(v2.7.1)*
 - **Stuck Actions detection** (state=Running > 24h)
 - **Per-Namespace Protection Status** (last successful backup, stale detection)
 - **Profile validation status** (`.status.validation` / `.status.error`)
@@ -58,7 +58,7 @@ These join the existing v1.9 features:
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
 - **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0)*
-- **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*
+- **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*; manual runs judged on their expiry, imported restore points left out, and an overview of snapshots with no expiry *(v2.7.1)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
 The script is designed to be **portable**, **POSIX-compliant**, **pure ASCII output**, and **support-grade**.

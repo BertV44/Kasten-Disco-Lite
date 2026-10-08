@@ -3,8 +3,31 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.7.1] - 2026-10-08
 
+Four contributed pull requests (#59-#62, Michael Courcy) and four issues
+(#56, #57, #58, #63). The largest change is #58: policies are now read from
+every namespace, not only the K10 one. That is also where the independent
+audit found the defects that no section test had seen: once application
+namespaces are read, an app-scoped policy is no longer a K10-wide one, and
+every selector consumer that assumed otherwise reported protection the cluster
+does not have. They are fixed, and each has a replay scenario.
+
+- **Failed Actions is always listed** (#59): a success box when nothing
+  failed, a red sidebar badge with the uncapped total
+  (`failedActionsTop5.total`), "Showing the 5 most recent of N", and a
+  Namespace column read from the application (`appNamespace` label or
+  subject), never from the action's own namespace, so a metadata export of a
+  multi-namespace policy is no longer reported as a `kasten-io` failure.
+- **Repository Maintenance lists failing repositories first** (#60), by the
+  published `statusLevel`, stable within each level.
+- **Imported restore points are left out of the cleanup checks** (#61): they
+  are another cluster's exports, retired by the source cluster. Recognised by
+  the `k10.kasten.io/importProfile` label or by a live import policy;
+  published as `orphanedRestorePoints.importedExcluded` and
+  `residualSnapshots.imported`, and printed as a context line.
+- **Residual Snapshots explains its Rank / retained column** (#62) in a header
+  tooltip.
 - **Repository Maintenance verdict called a retained-uncounted repository
   "still being written to"** (#57): the `retained-uncounted` active reason was
   counted inside KDL.sh and never published, and both renderers derived the
