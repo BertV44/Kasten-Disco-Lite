@@ -1104,8 +1104,8 @@ else "" end) + "
           (if (.residualSnapshots.unretained // 0) > 0 then
             " (" + ((.residualSnapshots.unretained) | tostring) + " unretained past "
                  + ((.residualSnapshots.thresholdDays // 7) | tostring) + "d)"
-          elif ((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) > 0 then
-            " (" + (((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) | tostring)
+          elif ((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) > 0 then
+            " (" + (((.residualSnapshots.unknownAge // 0) + (.residualSnapshots.breakdown.policyUnverifiable // 0) + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) | tostring)
                  + " snapshot(s) could not be assessed)"
           else "" end) + "</td>
       </tr>"
@@ -2120,7 +2120,7 @@ else "" end) + "
 + (if .residualSnapshots then
     "<p class=\"section-description\">Local Kasten snapshots &mdash; <code>RestorePointContent</code> objects with no <code>k10.kasten.io/exportProfile</code> label &mdash; still present past "
       + ((.residualSnapshots.thresholdDays // 7) | tostring)
-      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. So are imported ones: they sit in another cluster&rsquo;s repository, and that cluster retires them. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold.</p>"
+      + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. So are imported ones: they sit in another cluster&rsquo;s repository, and that cluster retires them. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold. <strong>Manual runs</strong> (<code>k10.kasten.io/isRunNow</code>) are never ranked: policy retention does not retire them, so they are judged on their <code>k10.kasten.io/expiresAt</code> label instead &mdash; none means nothing retires them, a date in the past (beyond a " + ((.residualSnapshots.expiry.graceDays // 2) | tostring) + "-day retirement grace) means Kasten should already have. Kasten&rsquo;s own disaster-recovery snapshots are not assessed.</p>"
     + (if .residualSnapshots.status == "NOT_ASSESSED" then
         "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The <code>RestorePointContent</code> list could not be read (RBAC on <code>restorepointcontents</code>, or the aggregated API is unavailable) or the computation failed. This is <em>not</em> the same as \"no residual snapshots\". Grant <code>list</code> on <code>restorepointcontents.apps.kio.kasten.io</code> (see <code>kdl-rbac.yaml</code>) and re-run with <code>--debug</code>.</div>"
       elif ((.residualSnapshots.localSnapshots // 0) == 0) then
@@ -2129,7 +2129,7 @@ else "" end) + "
       elif ((.residualSnapshots.unretained // 0) == 0)
            and (((.residualSnapshots.unknownAge // 0)
                  + (.residualSnapshots.breakdown.policyUnverifiable // 0)
-                 + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) > 0) then
+                 + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) > 0) then
         # No finding identified, but not a clean pass either. The green box used
         # to claim "every one past the threshold is retained by a live policy"
         # here - a positive statement the data did not support, rendered one
@@ -2137,7 +2137,7 @@ else "" end) + "
         "<div class=\"info-box\">\u2139 <strong>No residual snapshot identified, but this is not a clean pass.</strong> "
           + (((.residualSnapshots.unknownAge // 0)
               + (.residualSnapshots.breakdown.policyUnverifiable // 0)
-              + (.residualSnapshots.breakdown.policyRetentionUnknown // 0)) | tostring)
+              + (.residualSnapshots.breakdown.policyRetentionUnknown // 0) + (.residualSnapshots.breakdown.manualExpiryUnknown // 0)) | tostring)
           + " of the " + ((.residualSnapshots.localSnapshots // 0) | tostring)
           + " local snapshot(s) could not be assessed &mdash; see the details below. The best-practice check reports <em>not assessed</em> for this reason.</div>"
       elif ((.residualSnapshots.unretained // 0) == 0) and ((.residualSnapshots.beyondThreshold // 0) == 0) then
@@ -2147,7 +2147,7 @@ else "" end) + "
       elif ((.residualSnapshots.unretained // 0) == 0) then
         "<div class=\"success-box\">\u2713 <strong>No residual snapshots</strong> &mdash; all "
           + ((.residualSnapshots.beyondThreshold // 0) | tostring)
-          + " snapshot(s) past the threshold are within what their policy retains</div>"
+          + " snapshot(s) past the threshold are accounted for &mdash; retained by a live policy or an unexpired expiry date, or managed by Kasten</div>"
       else
         "<div class=\"warning-box\">\u26a0 <strong>" + ((.residualSnapshots.unretained) | tostring)
           + " residual snapshot(s)</strong> that no live policy retains, out of "
@@ -2157,11 +2157,13 @@ else "" end) + "
               (if (.residualSnapshots.breakdown.onDemand // 0) > 0 then (.residualSnapshots.breakdown.onDemand | tostring) + " taken on demand (no policy)" else empty end),
               (if (.residualSnapshots.breakdown.policyDeleted // 0) > 0 then (.residualSnapshots.breakdown.policyDeleted | tostring) + " whose policy was deleted" else empty end),
               (if (.residualSnapshots.breakdown.unbound // 0) > 0 then (.residualSnapshots.breakdown.unbound | tostring) + " whose application is gone (Unbound)" else empty end),
-              (if (.residualSnapshots.breakdown.policyOverRetention // 0) > 0 then (.residualSnapshots.breakdown.policyOverRetention | tostring) + " ranked past everything their policy retention can hold" else empty end)
+              (if (.residualSnapshots.breakdown.policyOverRetention // 0) > 0 then (.residualSnapshots.breakdown.policyOverRetention | tostring) + " ranked past everything their policy retention can hold" else empty end),
+              (if (.residualSnapshots.breakdown.manualNoExpiry // 0) > 0 then (.residualSnapshots.breakdown.manualNoExpiry | tostring) + " manual run(s) with no expiration (nothing retires them)" else empty end),
+              (if (.residualSnapshots.breakdown.manualExpired // 0) > 0 then (.residualSnapshots.breakdown.manualExpired | tostring) + " manual run(s) past their expiry date" else empty end)
             ] | join(" &middot; "))
           + "</div>
       <table>
-      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th><span class=\"hint\" title=\"Rank: where this snapshot sits among the local snapshots of the same application and policy, newest first (1 = newest).&#10;Retained: how many snapshots the declared retention of that policy can hold at most, the sum of its counts (hourly 24 + daily 7 = 31). That overstates what is kept, since one snapshot can fill a daily and a weekly slot, so a rank past it is residual for certain.&#10;&#10;A dash is the usual case: the row is residual for a reason that does not depend on retention, so rank decides nothing. Either the snapshot was taken on demand (no policy), its policy was deleted, or it is Unbound: its RestorePoint is gone, typically with the namespace, and only the content is left. Only a past-retention row (policy-over-retention) shows a rank. The Why residual column gives the reason.\">Rank / retained</span></th><th>Physical size</th></tr></thead>
+      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th><span class=\"hint\" title=\"Rank: where this snapshot sits among the local snapshots of the same application and policy, newest first (1 = newest).&#10;Retained: how many snapshots the declared retention of that policy can hold at most, the sum of its counts (hourly 24 + daily 7 = 31). That overstates what is kept, since one snapshot can fill a daily and a weekly slot, so a rank past it is residual for certain.&#10;&#10;A dash is the usual case: the row is residual for a reason that does not depend on retention, so rank decides nothing. Either the snapshot was taken on demand (no policy), its policy was deleted, or it is Unbound: its RestorePoint is gone, typically with the namespace, and only the content is left. A manual run (isRunNow) is never ranked either: policy retention does not retire it, so its row is residual because it has no expiration (manual-no-expiry) or because its expiry date has passed (manual-expired). Only a past-retention row (policy-over-retention) shows a rank. The Why residual column gives the reason.\">Rank / retained</span></th><th>Physical size</th></tr></thead>
       <tbody>" +
         ([.residualSnapshots.items[:10][]? |
           "<tr>
@@ -2172,7 +2174,10 @@ else "" end) + "
                      else ((.ageDays * 10 | floor) / 10) as $a
                           | (if ($a | floor) == $a then ($a | floor | tostring) else ($a | tostring) end) + "d"
                      end) + "</td>
-            <td>" + (.reason // "unknown") + "</td>
+            <td>" + (.reason // "unknown")
+              + (if .reason == "manual-no-expiry" then " &mdash; manual run with no <code>expiresAt</code>: nothing retires it"
+                 elif .reason == "manual-expired" then " &mdash; manual run past its expiry date (" + (.expiresAt // "?") + "): Kasten should have retired it"
+                 else "" end) + "</td>
             <td>" + (if .reason == "policy-over-retention" and .rank != null
                      then ((.rank + 1) | tostring) + " of " + ((.retentionTotal // 0) | tostring) + " retained"
                      else "\u2014" end) + "</td>
@@ -2194,6 +2199,18 @@ else "" end) + "
         "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.breakdown.policyRetained) | tostring)
           + " snapshot(s) are past the threshold but retained by a live policy &mdash; expected with GFS retention, and not counted as residual.</div>"
       else "" end)
+    + (if ((.residualSnapshots.breakdown.manualExpires // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.breakdown.manualExpires) | tostring)
+          + " manual run(s) are past the threshold but still inside their <code>expiresAt</code> date (or within the retirement grace) &mdash; Kasten retires them, so they are not counted as residual.</div>"
+      else "" end)
+    + (if ((.residualSnapshots.breakdown.k10Dr // 0) > 0) then
+        "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.breakdown.k10Dr) | tostring)
+          + " manual run(s) of Kasten&rsquo;s own disaster-recovery policy are not assessed: they are managed by Kasten and are never reported as anomalies.</div>"
+      else "" end)
+    + (if ((.residualSnapshots.breakdown.manualExpiryUnknown // 0) > 0) then
+        "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.manualExpiryUnknown) | tostring)
+          + " manual run(s) carry an <code>expiresAt</code> label that could not be parsed. Their expiry is unknown, so they are reported as neither retained nor residual.</div>"
+      else "" end)
     + (if ((.residualSnapshots.breakdown.policyUnverifiable // 0) > 0) then
         "<div class=\"warning-box\">\u26a0 " + ((.residualSnapshots.breakdown.policyUnverifiable) | tostring)
           + " snapshot(s) name a policy that could not be checked, because the policy list came back empty or unreadable. They are reported as unverifiable, never as orphaned.</div>"
@@ -2210,6 +2227,43 @@ else "" end) + "
         "<div class=\"info-box\">\u2139 " + ((.residualSnapshots.sizeUnknownCount) | tostring)
           + " of the snapshots past the threshold report no <code>status.physicalSizeBytes</code> &mdash; unknown, not zero. Even a complete total would not be a promise of reclaimable space: what the storage layer reports back varies by CSI driver.</div>"
       else "" end)
+    # Snapshots with no expiry (issue #63): information, never a finding.
+    + (if (.residualSnapshots.expiry // null) == null or (.residualSnapshots.expiry.status // "NOT_ASSESSED") != "OK" then
+        ""
+      else
+        .residualSnapshots.expiry as $x
+        | "<h3>Snapshots with no expiry</h3>
+      <p class=\"section-description\">Over every <code>RestorePointContent</code>, local and exported (imports excluded), the <code>k10.kasten.io/expiresAt</code> and <code>k10.kasten.io/isRunNow</code> labels give the three states of the Kasten &ldquo;Expires at&rdquo; column: <strong>N/A</strong> (scheduled, retention carried by the policy), <strong>No expiration</strong> (manual run that nothing ever retires) or a date. This is information, not a finding: an exported restore point with no expiration sits in the export repository, not in the cluster, so it is not a residual snapshot and does not change the best-practice verdict. Label semantics were verified on Kasten 9.0.x only.</p>
+      <div class=\"card\">
+        <div class=\"stat-row\"><span class=\"stat-label\">Scheduled, N/A</span><span class=\"stat-value\">" + (($x.scheduledNA // 0) | tostring) + "</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Manual runs, no expiration</span><span class=\"stat-value\">" + (($x.manualNoExpiration // 0) | tostring) + " (" + (($x.manualNoExpirationLocal // 0) | tostring) + " local, " + (($x.manualNoExpirationExported // 0) | tostring) + " exported)</span></div>
+        <div class=\"stat-row\"><span class=\"stat-label\">Manual runs, with an expiry date</span><span class=\"stat-value\">" + (($x.manualWithExpiry // 0) | tostring) + " (" + (($x.manualExpiryPassed // 0) | tostring) + " past it by more than " + (($x.graceDays // 2) | tostring) + " days, " + (($x.unparseable // 0) | tostring) + " unparsable)</span></div>"
+        + (if ($x.drPolicy // 0) > 0 then
+            "<div class=\"stat-row\"><span class=\"stat-label\">Kasten DR snapshots (excluded above)</span><span class=\"stat-value\">" + (($x.drPolicy) | tostring) + "</span></div>"
+          else "" end)
+        + "</div>"
+        + (if ($x.items | length) > 0 then
+            "<table>
+      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Policy</th><th>Age</th><th>Where</th></tr></thead>
+      <tbody>" +
+            ([$x.items[:10][]? |
+              "<tr>
+            <td><code>" + (.name // "unknown") + "</code></td>
+            <td>" + (if (.appNamespace // "") == "" then "\u2014" else .appNamespace end) + "</td>
+            <td>" + (if (.appName // "") == "" then "\u2014" else .appName end) + "</td>
+            <td>" + (if (.policy // "") == "" then "\u2014" else .policy end) + "</td>
+            <td>" + (if .ageDays == null then "unknown"
+                     else ((.ageDays * 10 | floor) / 10) as $a
+                          | (if ($a | floor) == $a then ($a | floor | tostring) else ($a | tostring) end) + "d"
+                     end) + "</td>
+            <td>" + (if .exported then "exported (export repository)" else "local (in the cluster)" end) + "</td>
+          </tr>"
+            ] | join("")) + "</tbody></table>"
+            + (if ($x.manualNoExpiration // 0) > 10 then
+                "<p class=\"section-description\">Showing the 10 oldest of " + (($x.manualNoExpiration) | tostring) + "; the counts above are exact.</p>"
+              else "" end)
+          else "" end)
+      end)
   else
     "<div class=\"info-box\">Residual snapshot data not available.</div>"
   end)
