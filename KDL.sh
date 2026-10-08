@@ -779,6 +779,56 @@ def profile_kind:
   else "undetermined" end;
 '
 
+# ----------------------------------------------------------------------------
+# Policy identity (#58)
+#
+# A Kasten policy is identified by (namespace, name), not by name: policies live
+# in the K10 namespace AND in application namespaces, and two namespaces may
+# each hold a policy called "daily". Keying by bare name collapsed them -- one
+# took the other's runs, retention and orphan verdicts. RunActions carry the
+# owner in spec.subject.{name,namespace}; RestorePoints, RestorePointContents,
+# BackupActions, ExportActions and StorageRepositories carry
+# k10.kasten.io/policyName AND k10.kasten.io/policyNamespace. The namespace is
+# used where the object carries it and ignored only where it is absent (older
+# catalogs), so a name-only object still attributes rather than vanishing.
+JQ_POLICY_KEY_LIB='
+def pkey($ns; $n): (($ns // "") | tostring) + "/" + (($n // "") | tostring);
+def pol_key: pkey(.metadata.namespace; .metadata.name);
+# The DR and reporting policies are SYSTEM policies only in the K10 namespace.
+# A user policy that happens to carry one of those names in an application
+# namespace is an application policy.
+def is_system_policy($k10ns; $patterns):
+  ((.metadata.namespace // $k10ns) == $k10ns) and ((.metadata.name // "") | test($patterns));
+def lbl_pns: ((.metadata.labels // {})["k10.kasten.io/policyNamespace"] // null);
+def lbl_pname: ((.metadata.labels // {})["k10.kasten.io/policyName"] // null);
+# Owner namespace of a RunAction (the subject, then the label, then its own).
+def run_pns: (.spec.subject.namespace // lbl_pns // .metadata.namespace // null);
+# Is this RunAction a run of policy $p? Namespace compared when both sides
+# carry one.
+def run_of($p):
+  (.spec.subject.name == $p.metadata.name)
+  and ( (run_pns) as $r | ($r == null) or (($p.metadata.namespace // null) == null) or ($r == $p.metadata.namespace) );
+# Is this object (Backup/Export action, RestorePoint, ...) labelled as owned by
+# policy $p?
+def lbl_of($p):
+  (lbl_pname == $p.metadata.name)
+  and ( (lbl_pns) as $r | ($r == null) or (($p.metadata.namespace // null) == null) or ($r == $p.metadata.namespace) );
+# How a policy is NAMED in a report line: bare in the K10 namespace, with its
+# namespace elsewhere. Takes an object carrying .name and .namespace.
+def pdisp($k10ns): .name + (if ((.namespace // $k10ns) != $k10ns) then " (ns: " + .namespace + ")" else "" end);
+# $pols is [{ns,name}]; $scope is {complete, read:[ns]} (policyCollection).
+def pol_exists($pols; $ns; $name):
+  any($pols[]?; .name == $name and ((($ns // "") == "") or .ns == $ns));
+# Three states, never two: a policy that is not in the set is only DELETED when
+# the set provably contains every policy of that namespace. Otherwise it may
+# live in a namespace that could not be read, which is unknown.
+def pol_state($pols; $scope; $ns; $name):
+  if pol_exists($pols; $ns; $name) then "active"
+  elif ($scope.complete == true) then "deleted"
+  elif (($ns // "") != "") and ((($scope.read // []) | index($ns)) != null) then "deleted"
+  else "unknown" end;
+';
+
 ### -------------------------
 ### Temp file management
 ### -------------------------
@@ -883,6 +933,15 @@ $CLI auth can-i list nodes                                        >/dev/null 2>&
 $CLI auth can-i list storageclasses.storage.k8s.io                >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list storageclasses"
 $CLI auth can-i list volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list volumesnapshotclasses"
 $CLI auth can-i list restorepointcontents.apps.kio.kasten.io    >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list restorepointcontents (residual snapshots)"
+# Policies live in the K10 namespace AND in application namespaces (#58). The
+# probe is advisory only: it can lie (aggregated RBAC, impersonation, a custom
+# authorizer), so the verdict -- and the RBAC_MISSING entry -- comes from the
+# exit status of the cluster-wide list itself, after the parallel fetch below.
+if $CLI auth can-i list policies.config.kio.kasten.io --all-namespaces >/dev/null 2>&1; then
+  POLICY_LIST_PROBE="allowed"
+else
+  POLICY_LIST_PROBE="denied"
+fi
 
 # Bounded (max 5 entries) RBAC-limitation summary, safe to pass via --argjson.
 RBAC_LIMITED_JSON=$(printf '%s' "$RBAC_MISSING" | jq -R -c 'split(";") | map(select(length>0)) | {any: (length>0), denied: .}' 2>/dev/null) || RBAC_LIMITED_JSON='{"any":false,"denied":[]}'
@@ -1046,7 +1105,12 @@ jq -e '.items' "$TEMP_DIR/deploys.json" >/dev/null 2>&1 || echo '{"items":[]}' >
 progress "K10 resources"
 
 $CLI -n "$NAMESPACE" get profiles.config.kio.kasten.io -o json > "$TEMP_DIR/profiles_raw.json" 2>/dev/null &
-$CLI -n "$NAMESPACE" get policies.config.kio.kasten.io -o json > "$TEMP_DIR/policies_raw.json" 2>/dev/null &
+# Policies (#58): cluster-wide first. The exit status is recorded in a marker
+# file because a refused list and an empty one are otherwise both an empty
+# file. When the list is refused, the per-namespace fallback below rebuilds
+# policies_raw.json from the namespaces the caller can read.
+( $CLI get policies.config.kio.kasten.io -A -o json > "$TEMP_DIR/policies_all_raw.json" 2>/dev/null \
+    && : > "$TEMP_DIR/policies_all.ok" ) &
 # Action CRs and RestorePoints are cluster-wide (#10/#15): on K10 8.x,
 # policy-driven actions and RP CRs live in the source application namespace,
 # not the K10 namespace. Fetch with -A. Downstream jq resolves the namespace
@@ -1095,6 +1159,163 @@ $CLI get storagerepositories.repositories.kio.kasten.io -n "$NAMESPACE" -o json 
 wait
 
 debug "Parallel fetch complete"
+
+### -------------------------
+### Policy collection scope (#58)
+### -------------------------
+# Kasten policies live in the K10 namespace AND in application namespaces
+# (non-admin users manage the policies of their own namespaces). Reading only
+# $NAMESPACE silently computed every policy-derived verdict on an incomplete
+# set. Three modes, published as policyCollection and read by all three
+# renderers:
+#   cluster          the cluster-wide list succeeded: the set is complete.
+#   per-namespace    refused; each namespace the caller can enumerate was read
+#                    on its own, with its OWN exit status.
+#   k10-only         refused and no namespace list is available (neither
+#                    `get namespaces` nor, on OpenShift, `get projects`): only
+#                    the K10 namespace could be read.
+# The exit status of the list is the truth, not `auth can-i` (a probe can lie).
+# POLICY_COLLECTION_PARTIAL is true unless every policy that exists was
+# necessarily seen; the policy-derived verdicts that an unseen policy could
+# flip in the dangerous direction (a gap or an orphan that is not one) go to
+# NOT_ASSESSED when it is.
+POLICY_COLLECTION_DIR="$TEMP_DIR/pcoll"
+mkdir -p "$POLICY_COLLECTION_DIR"
+POLICY_COLLECTION_MODE="cluster"
+POLICY_COLLECTION_PARTIAL=false
+POLICY_COLLECTION_SOURCE="all-namespaces"
+POLICY_COLLECTION_ATTEMPTED=0
+POLICY_COLLECTION_READ=0
+POLICY_COLLECTION_DENIED_COUNT=0
+POLICY_COLLECTION_NOT_ATTEMPTED=0
+: > "$POLICY_COLLECTION_DIR/read.txt"
+: > "$POLICY_COLLECTION_DIR/denied.txt"
+
+if [ -f "$TEMP_DIR/policies_all.ok" ] && jq -e '(.items | type) == "array"' "$TEMP_DIR/policies_all_raw.json" >/dev/null 2>&1; then
+  cp "$TEMP_DIR/policies_all_raw.json" "$TEMP_DIR/policies_raw.json"
+  if [ "$POLICY_LIST_PROBE" = "denied" ]; then
+    debug "Policies: auth can-i said denied but the cluster-wide list succeeded; the list is the truth"
+  fi
+else
+  # The list is the truth: record the denial now (the pre-flight above only
+  # probed). The leading ';' is the documented RBAC_MISSING format.
+  RBAC_MISSING="$RBAC_MISSING;list policies --all-namespaces (policies outside the K10 namespace)"
+  RBAC_LIMITED_JSON=$(printf '%s' "$RBAC_MISSING" | jq -R -c 'split(";") | map(select(length>0)) | {any: (length>0), denied: .}' 2>/dev/null) || RBAC_LIMITED_JSON='{"any":false,"denied":[]}'
+  [ -n "$RBAC_LIMITED_JSON" ] || RBAC_LIMITED_JSON='{"any":false,"denied":[]}'
+  warn "Policies: the cluster-wide list was refused (probe: $POLICY_LIST_PROBE). Reading policies namespace by namespace; policies in namespaces this user cannot read are missing from the report."
+
+  # Candidate namespaces: the K10 namespace first, then whatever the caller can
+  # enumerate -- `get namespaces`, or on OpenShift `get projects` (a restricted
+  # user usually cannot list namespaces but can list their projects).
+  POLICY_COLLECTION_SOURCE="none"
+  printf '%s\n' "$NAMESPACE" > "$POLICY_COLLECTION_DIR/cand.txt"
+  if jq -e '(.items | type) == "array"' "$TEMP_DIR/namespaces_raw.json" >/dev/null 2>&1; then
+    POLICY_COLLECTION_SOURCE="namespaces"
+    jq -r '.items[]?.metadata.name | select(type == "string" and length > 0)' "$TEMP_DIR/namespaces_raw.json" >> "$POLICY_COLLECTION_DIR/cand.txt" 2>/dev/null || true
+  elif [ "$PLATFORM" = "OpenShift" ]; then
+    if $CLI get projects -o json > "$POLICY_COLLECTION_DIR/projects.json" 2>/dev/null \
+       && jq -e '(.items | type) == "array"' "$POLICY_COLLECTION_DIR/projects.json" >/dev/null 2>&1; then
+      POLICY_COLLECTION_SOURCE="projects"
+      jq -r '.items[]?.metadata.name | select(type == "string" and length > 0)' "$POLICY_COLLECTION_DIR/projects.json" >> "$POLICY_COLLECTION_DIR/cand.txt" 2>/dev/null || true
+    fi
+  fi
+  awk '!seen[$0]++' "$POLICY_COLLECTION_DIR/cand.txt" > "$POLICY_COLLECTION_DIR/cand_all.txt"
+  # Cap the fan-out. Anything past the cap is NOT attempted, counted, and keeps
+  # the collection partial: unattempted is not the same as read.
+  POLICY_COLLECTION_MAX="${KDL_POLICY_NS_MAX:-500}"
+  case "$POLICY_COLLECTION_MAX" in ''|*[!0-9]*|??????????*) POLICY_COLLECTION_MAX=500 ;; esac
+  if [ "$POLICY_COLLECTION_MAX" -lt 1 ]; then POLICY_COLLECTION_MAX=1; fi
+  POLICY_COLLECTION_TOTAL_CAND=$(wc -l < "$POLICY_COLLECTION_DIR/cand_all.txt" | tr -d ' ')
+  head -n "$POLICY_COLLECTION_MAX" "$POLICY_COLLECTION_DIR/cand_all.txt" > "$POLICY_COLLECTION_DIR/ns.txt"
+  POLICY_COLLECTION_ATTEMPTED=$(wc -l < "$POLICY_COLLECTION_DIR/ns.txt" | tr -d ' ')
+  POLICY_COLLECTION_NOT_ATTEMPTED=$((POLICY_COLLECTION_TOTAL_CAND - POLICY_COLLECTION_ATTEMPTED))
+  if [ "$POLICY_COLLECTION_NOT_ATTEMPTED" -lt 0 ]; then POLICY_COLLECTION_NOT_ATTEMPTED=0; fi
+
+  # Same batch-barrier fan-out as the storage repositories (`wait -n` is not
+  # POSIX). One marker file per namespace, named by index, carries that
+  # namespace's OWN exit status: a refused read must not look like an empty one.
+  POLICY_COLLECTION_PARALLEL=10
+  _pc_i=0
+  while IFS= read -r _pc_ns; do
+    if [ -n "$_pc_ns" ]; then
+      _pc_i=$((_pc_i + 1))
+      ( $CLI -n "$_pc_ns" get policies.config.kio.kasten.io -o json > "$POLICY_COLLECTION_DIR/$_pc_i.json" 2>/dev/null \
+          && : > "$POLICY_COLLECTION_DIR/$_pc_i.ok" ) &
+      if [ $((_pc_i % POLICY_COLLECTION_PARALLEL)) -eq 0 ]; then wait; fi
+    fi
+  done < "$POLICY_COLLECTION_DIR/ns.txt"
+  wait
+
+  : > "$POLICY_COLLECTION_DIR/merged.stream"
+  _pc_i=0
+  while IFS= read -r _pc_ns; do
+    if [ -n "$_pc_ns" ]; then
+      _pc_i=$((_pc_i + 1))
+      if [ -f "$POLICY_COLLECTION_DIR/$_pc_i.ok" ] \
+         && jq -e '(.items | type) == "array"' "$POLICY_COLLECTION_DIR/$_pc_i.json" >/dev/null 2>&1; then
+        printf '%s\n' "$_pc_ns" >> "$POLICY_COLLECTION_DIR/read.txt"
+        cat "$POLICY_COLLECTION_DIR/$_pc_i.json" >> "$POLICY_COLLECTION_DIR/merged.stream"
+      else
+        printf '%s\n' "$_pc_ns" >> "$POLICY_COLLECTION_DIR/denied.txt"
+      fi
+    fi
+  done < "$POLICY_COLLECTION_DIR/ns.txt"
+  POLICY_COLLECTION_READ=$(wc -l < "$POLICY_COLLECTION_DIR/read.txt" | tr -d ' ')
+  POLICY_COLLECTION_DENIED_COUNT=$(wc -l < "$POLICY_COLLECTION_DIR/denied.txt" | tr -d ' ')
+  if [ "$POLICY_COLLECTION_READ" -gt 0 ]; then
+    jq -c -s '{items: (map(.items // []) | add // [])}' "$POLICY_COLLECTION_DIR/merged.stream" > "$TEMP_DIR/policies_raw.json" 2>/dev/null \
+      || printf '%s\n' '{"items":[]}' > "$TEMP_DIR/policies_raw.json"
+  else
+    printf '%s\n' '{"items":[]}' > "$TEMP_DIR/policies_raw.json"
+  fi
+
+  if [ "$POLICY_COLLECTION_SOURCE" = "none" ]; then
+    POLICY_COLLECTION_MODE="k10-only"
+  else
+    POLICY_COLLECTION_MODE="per-namespace"
+  fi
+  # Complete only when the namespace list is the real cluster inventory
+  # (`get namespaces`, not the caller's own projects: a restricted user cannot
+  # see namespaces that hold policies they cannot read), every namespace was
+  # attempted and every attempt succeeded.
+  if [ "$POLICY_COLLECTION_SOURCE" = "namespaces" ] \
+     && [ "$POLICY_COLLECTION_DENIED_COUNT" -eq 0 ] \
+     && [ "$POLICY_COLLECTION_NOT_ATTEMPTED" -eq 0 ] \
+     && [ "$POLICY_COLLECTION_READ" -gt 0 ]; then
+    POLICY_COLLECTION_PARTIAL=false
+  else
+    POLICY_COLLECTION_PARTIAL=true
+  fi
+fi
+
+if [ "$POLICY_COLLECTION_MODE" = "cluster" ]; then
+  POLICY_COLLECTION_JSON='{"mode":"cluster","partial":false,"namespaceSource":"all-namespaces","namespacesAttempted":null,"namespacesRead":null,"namespacesDenied":[],"namespacesNotAttempted":0}'
+  printf '%s\n' '{"complete":true,"read":[]}' > "$TEMP_DIR/pc_scope.json"
+else
+  jq -R -s -c 'split("\n") | map(select(length > 0))' "$POLICY_COLLECTION_DIR/denied.txt" > "$POLICY_COLLECTION_DIR/denied.json" 2>/dev/null || printf '[]\n' > "$POLICY_COLLECTION_DIR/denied.json"
+  jq -R -s -c 'split("\n") | map(select(length > 0))' "$POLICY_COLLECTION_DIR/read.txt" > "$POLICY_COLLECTION_DIR/read.json" 2>/dev/null || printf '[]\n' > "$POLICY_COLLECTION_DIR/read.json"
+  POLICY_COLLECTION_JSON=$(jq -c -n \
+    --arg mode "$POLICY_COLLECTION_MODE" --arg src "$POLICY_COLLECTION_SOURCE" \
+    --argjson partial "$POLICY_COLLECTION_PARTIAL" \
+    --argjson att "$POLICY_COLLECTION_ATTEMPTED" --argjson rd "$POLICY_COLLECTION_READ" \
+    --argjson na "$POLICY_COLLECTION_NOT_ATTEMPTED" \
+    --slurpfile den "$POLICY_COLLECTION_DIR/denied.json" '
+    {mode: $mode, partial: $partial, namespaceSource: $src, namespacesAttempted: $att, namespacesRead: $rd,
+     namespacesDenied: ($den[0] // []), namespacesNotAttempted: $na}' 2>/dev/null) \
+    || POLICY_COLLECTION_JSON='{"mode":"k10-only","partial":true,"namespaceSource":"none","namespacesAttempted":1,"namespacesRead":0,"namespacesDenied":[],"namespacesNotAttempted":0}'
+  # The scope file the policy lookups read: `complete` says whether a policy
+  # that is not in the set provably does not exist; `read` says which
+  # namespaces' policy lists were seen in full.
+  jq -c -n --argjson complete "$POLICY_COLLECTION_PARTIAL" --slurpfile rd "$POLICY_COLLECTION_DIR/read.json" \
+    '{complete: ($complete | not), read: ($rd[0] // [])}' > "$TEMP_DIR/pc_scope.json" 2>/dev/null \
+    || printf '%s\n' '{"complete":false,"read":[]}' > "$TEMP_DIR/pc_scope.json"
+  if [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+    warn "Policy collection is PARTIAL (mode: $POLICY_COLLECTION_MODE, read $POLICY_COLLECTION_READ of $POLICY_COLLECTION_ATTEMPTED namespace(s)); policy-derived verdicts that depend on unseen policies are reported as not assessed."
+  fi
+fi
+POLICY_COLLECTION_JSON=$(printf '%s' "$POLICY_COLLECTION_JSON" | jq -c --arg k "$NAMESPACE" '. + {k10Namespace: $k}' 2>/dev/null) \
+  || POLICY_COLLECTION_JSON='{"mode":"k10-only","partial":true,"namespaceSource":"none","namespacesAttempted":1,"namespacesRead":0,"namespacesDenied":[],"namespacesNotAttempted":0}'
+debug "Policy collection: mode=$POLICY_COLLECTION_MODE partial=$POLICY_COLLECTION_PARTIAL source=$POLICY_COLLECTION_SOURCE attempted=$POLICY_COLLECTION_ATTEMPTED read=$POLICY_COLLECTION_READ"
 
 # k10-config ConfigMap: read ONCE here and shared by the Helm release-name
 # lookup below, the Disaster Recovery quickDisasterRecoveryEnabled tri-state
@@ -1618,8 +1839,9 @@ POLICY_COUNT=$(safe_int "$POLICY_COUNT")
 # Filter out system policies (DR and reporting) for app coverage analysis
 # Be specific to avoid excluding user policies with "report" in name
 SYSTEM_POLICY_PATTERNS="^k10-disaster-recovery-policy$|^k10-system-reports-policy$|^k10-system-reports$"
-APP_POLICIES_JSON="$(_ep "$POLICIES_JSON" | jq -c --arg patterns "$SYSTEM_POLICY_PATTERNS" '
-  .items |= (. // [] | map(select(.metadata.name | test($patterns) | not)))
+# #58: system only in the K10 namespace; a same-named policy elsewhere is an app policy.
+APP_POLICIES_JSON="$(_ep "$POLICIES_JSON" | jq -c --arg patterns "$SYSTEM_POLICY_PATTERNS" --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'
+  .items |= (. // [] | map(select(is_system_policy($k10ns; $patterns) | not)))
 ' 2>/dev/null || echo '{"items":[]}')"
 APP_POLICY_COUNT=$(_ep "$APP_POLICIES_JSON" | jq '.items | length // 0')
 [ -z "$APP_POLICY_COUNT" ] && APP_POLICY_COUNT=0
@@ -1707,6 +1929,7 @@ IMPORT_POLICY_COUNT=$(safe_int "$(_ep "$POLICIES_JSON" | jq '
 IMPORT_POLICIES_JSON=$(_ep "$POLICIES_JSON" | jq -c '
   [.items[]? | select([.spec.actions[]?.action] | index("import")) | {
     name: .metadata.name,
+    namespace: (.metadata.namespace // null),
     frequency: (.spec.frequency // "manual"),
     profile: (
       [.spec.actions[]? | select(.action == "import") | .importParameters.profile.name // empty] | first // ""
@@ -1773,8 +1996,8 @@ REPORTS_POLICY_LAST_RUN_STATE="N/A"
 REPORTS_POLICY_LAST_RUN_TS="N/A"
 
 # Look up the policy from the already-loaded POLICIES_JSON (no extra call)
-REPORTS_POLICY=$(_ep "$POLICIES_JSON" | jq -c '
-  [.items[]? | select(.metadata.name == "k10-system-reports-policy")] | first // null
+REPORTS_POLICY=$(_ep "$POLICIES_JSON" | jq -c --arg k10ns "$NAMESPACE" '
+  [.items[]? | select(.metadata.name == "k10-system-reports-policy" and (.metadata.namespace // $k10ns) == $k10ns)] | first // null
 ' 2>/dev/null || echo 'null')
 
 if [ "$REPORTS_POLICY" != "null" ] && [ -n "$REPORTS_POLICY" ]; then
@@ -1803,7 +2026,7 @@ debug "Reports policy: exists=$REPORTS_POLICY_EXISTS state=$REPORTS_POLICY_LAST_
 ### -------------------------
 # Read the KDR policy from the already-fetched POLICIES_JSON instead of an extra
 # `kubectl get policy` call (#13).
-KDR_POLICY_JSON=$(_ep "$POLICIES_JSON" | jq -c 'first(.items[]? | select(.metadata.name == "k10-disaster-recovery-policy")) // {}' 2>/dev/null || echo '{}')
+KDR_POLICY_JSON=$(_ep "$POLICIES_JSON" | jq -c --arg k10ns "$NAMESPACE" 'first(.items[]? | select(.metadata.name == "k10-disaster-recovery-policy" and (.metadata.namespace // $k10ns) == $k10ns)) // {}' 2>/dev/null || echo '{}')
 [ -z "$KDR_POLICY_JSON" ] && KDR_POLICY_JSON='{}'
 if _ep "$KDR_POLICY_JSON" | jq -e '.metadata.name' >/dev/null 2>&1; then
   KDR_ENABLED=true
@@ -1929,7 +2152,7 @@ printf '%s' "$EXPORT_ACTIONS_JSON" > "$TEMP_DIR/exportactions_clean.json"  # for
 # policies excluded)"). k10-disaster-recovery-policy and
 # k10-system-reports-policy have their own dedicated status elsewhere
 # (KDR_STATUS / REPORTS_POLICY_LAST_RUN_STATE below), so nothing is lost.
-POLICY_LAST_RUN=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG"'
+POLICY_LAST_RUN=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" "$JQ_DEEPEST_MSG""$JQ_POLICY_KEY_LIB"'
   # v2.7.0 (#54): found via the runstats RFC3339Nano test fixture -- a raw
   # fromdateiso8601 on a timestamp with a non-zero fractional second throws,
   # which is uncaught here, so the WHOLE jq call fails and the shell-level
@@ -1941,9 +2164,10 @@ POLICY_LAST_RUN=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DI
   ($runsArr[0] // {"items":[]}) as $runs |
   [.items[]? | . as $policy | {
     name: .metadata.name,
+    namespace: (.metadata.namespace // null),
     lastRun: (
       ($runs.items // [])
-      | map(select(.spec.subject.name == $policy.metadata.name))
+      | map(select(run_of($policy)))
       | sort_by(.metadata.creationTimestamp)
       | last
       | if . then {
@@ -2004,8 +2228,10 @@ if [ "$KDR_ENABLED" = true ]; then
 
   KDR_RUN_FACTS=$(_ep "$RUNACTIONS_JSON" | jq -c \
     --arg pol "k10-disaster-recovery-policy" \
-    --argjson thr "$STALE_DAYS_THRESHOLD" '
-    ([.items[]? | select(.spec.subject.name == $pol)]) as $r |
+    --arg k10ns "$NAMESPACE" \
+    --argjson thr "$STALE_DAYS_THRESHOLD" "$JQ_POLICY_KEY_LIB"'
+    # #58: the DR policy is the one in the K10 namespace.
+    ([.items[]? | select(.spec.subject.name == $pol and ((run_pns // $k10ns) == $k10ns))]) as $r |
     ($r | sort_by(.metadata.creationTimestamp) | last) as $last |
     ($r | map(select((.status.state // "") == "Complete"))
        | sort_by(.metadata.creationTimestamp) | last) as $ok |
@@ -2107,16 +2333,19 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
     --slurpfile backupArr "$TEMP_DIR/backupactions_clean.json" \
     --slurpfile exportArr "$TEMP_DIR/exportactions_clean.json" \
     --arg patterns "$SYSTEM_POLICY_PATTERNS" \
-    --arg cutoff "$FOURTEEN_DAYS_AGO" '
+    --arg k10ns "$NAMESPACE" \
+    --arg cutoff "$FOURTEEN_DAYS_AGO" "$JQ_POLICY_KEY_LIB"'
     def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else . end;
     def ts_epoch: (try (ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch null);
 
     # app/system/unknown ownership of a RunAction, by its subject.name string
     # -- deliberately independent of whether that policy object still
     # exists, matching how APP_POLICIES_JSON itself is filtered.
-    def run_owner_scope($name; $patterns):
+    # #58: a system policy is one in the K10 namespace -- a same-named policy
+    # in an application namespace is an app policy.
+    def run_owner_scope($name; $pns; $patterns):
       if $name == null then "unknown"
-      elif ($name | test($patterns)) then "system"
+      elif (($name | test($patterns)) and (($pns // $k10ns) == $k10ns)) then "system"
       else "app"
       end;
 
@@ -2149,10 +2378,10 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
     # name -> "does this app policy declare an export action" (never `first`:
     # this only tests presence in the array, so a 2nd/3rd export action is
     # never at risk of being dropped by this lookup).
-    ( [ .items[]? | { key: .metadata.name,
+    ( [ .items[]? | { key: pol_key,
                       value: ( [ .spec.actions[]? | select(.action == "export") ] | length > 0 ) } ]
       | from_entries ) as $exportDeclaredByPolicy |
-    ( [ .items[]?.metadata.name ] ) as $appPolicyNames |
+    ( [ .items[]? | {ns: (.metadata.namespace // null), name: .metadata.name} ] ) as $appPolicyNames |
 
     ( [
         $allRuns[]
@@ -2161,9 +2390,11 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
         | select(.status.startTime and .status.endTime)
         | . as $run
         | ($run.spec.subject.name) as $pname
-        | (run_owner_scope($pname; $patterns)) as $scope
+        | ($run | run_pns) as $pns
+        | (run_owner_scope($pname; $pns; $patterns)) as $scope
         | {
             policyName: $pname,
+            policyNs: $pns,
             scope: $scope,
             totalSeconds: ( ($run.status.endTime|ts_epoch) - ($run.status.startTime|ts_epoch) ),
             runStart: ($run.status.startTime | ts_epoch),
@@ -2181,21 +2412,26 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
     ( [
         $appRuns[] | . as $r |
         ( [ $allBackups[]
-            | select( ((.metadata.labels // {})["k10.kasten.io/policyName"] // null) == $r.policyName )
+            | select( lbl_pname == $r.policyName )
+            | select( (lbl_pns == null) or ($r.policyNs == null) or (lbl_pns == $r.policyNs) )
             | select(.status.startTime and .status.endTime)
             | { s: (.status.startTime | ts_epoch), e: (.status.endTime | ts_epoch) }
             | select(.s != null and .e != null)
             | select(.s >= $r.runStart and .e <= $r.runEnd)
           ] ) as $snapMatches |
         ( [ $allExports[]
-            | select( ((.metadata.labels // {})["k10.kasten.io/policyName"] // null) == $r.policyName )
+            | select( lbl_pname == $r.policyName )
+            | select( (lbl_pns == null) or ($r.policyNs == null) or (lbl_pns == $r.policyNs) )
             | select(.status.startTime and .status.endTime)
             | { s: (.status.startTime | ts_epoch), e: (.status.endTime | ts_epoch) }
             | select(.s != null and .e != null)
             | select(.s >= $r.runStart and .e <= $r.runEnd)
           ] ) as $expMatches |
-        ( $exportDeclaredByPolicy | has($r.policyName) ) as $policyKnown |
-        ( if $policyKnown then $exportDeclaredByPolicy[$r.policyName] else null end ) as $declaresExport |
+        # A policy object with no namespace (older fixtures) keys as "/name".
+        ( if ($exportDeclaredByPolicy | has(pkey($r.policyNs; $r.policyName))) then pkey($r.policyNs; $r.policyName)
+          else pkey(null; $r.policyName) end ) as $rkey |
+        ( $exportDeclaredByPolicy | has($rkey) ) as $policyKnown |
+        ( if $policyKnown then $exportDeclaredByPolicy[$rkey] else null end ) as $declaresExport |
         $r + {
           snapshotSeconds: ( if ($snapMatches|length) == 0 then null
                              else ( ([$snapMatches[].e] | max) - ([$snapMatches[].s] | min) )
@@ -2224,10 +2460,11 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
         export: (agg_phase($phased; "exportSeconds"; "exportState"; "not_configured"))
       },
       byPolicy: [
-        $appPolicyNames[] as $pname |
-        ( [$phased[] | select(.policyName == $pname)] ) as $rows |
+        $appPolicyNames[] as $pol |
+        ( [$phased[] | select(.policyName == $pol.name and ((.policyNs == null) or ($pol.ns == null) or (.policyNs == $pol.ns)))] ) as $rows |
         {
-          name: $pname,
+          name: $pol.name,
+          namespace: $pol.ns,
           runCount: ($rows | length),
           total: ([$rows[].totalSeconds] | duration_stats),
           snapshot: (agg_phase($rows; "snapshotSeconds"; "snapshotState"; null)),
@@ -2294,7 +2531,7 @@ debug "Average policy duration: ${AVG_DURATION}s (from $DURATION_SAMPLE_COUNT ap
 # scope as POLICY_LAST_RUN above and policyAnalysis, so the report cannot again
 # show two different definitions of "policy" in the same section.
 if [ -n "$FOURTEEN_DAYS_AGO" ]; then
-  EFFECTIVE_RPO=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB"'
+  EFFECTIVE_RPO=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile runsArr "$TEMP_DIR/runactions_clean.json" --arg cutoff "$FOURTEEN_DAYS_AGO" --arg schemaStatus "$POLICY_PAUSED_SCHEMA_STATUS" "$JQ_SELECTOR_LIB""$JQ_POLICY_KEY_LIB"'
     ($runsArr[0] // {"items":[]}) as $runs |
     # Map K10 frequency alias to theoretical interval in seconds.
     # 30-day month is the K10 documented convention for @monthly.
@@ -2329,7 +2566,7 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
       (
         ($runs.items // [])
         | map(select(
-            .spec.subject.name == $policy.metadata.name and
+            run_of($policy) and
             .status.state == "Complete" and
             .metadata.creationTimestamp >= $cutoff
           ))
@@ -2343,6 +2580,7 @@ if [ -n "$FOURTEEN_DAYS_AGO" ]; then
       ) as $intervals |
       {
         name: $policy.metadata.name,
+        namespace: ($policy.metadata.namespace // null),
         frequencyDeclared: $freq,
         frequencyTheoreticalSeconds: $theoretical,
         samples: ($intervals | length),
@@ -2413,6 +2651,7 @@ POLICY_EXCLUSIONS_JSON=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsList "$T
   ( $nsList[0] ) as $nsList |
   [ .items[]?
     | { policy: .metadata.name,
+        namespace: (.metadata.namespace // null),
         patterns: [ .spec.selector.matchExpressions[]?
                     | select(.key == "k10.kasten.io/appNamespace" and .operator == "NotIn")
                     | .values[]? ] }
@@ -2773,6 +3012,7 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
     ([$r.namespaces[]? | select(. as $n | $existingNs | index($n) | not)] | unique) as $nonExisting |
     {
       name: $p.metadata.name,
+      namespace: ($p.metadata.namespace // null),
       actions: ([$p.spec.actions[]?.action] | unique),
       frequency: ($p.spec.frequency // null),
       # scope distinguishes namespace-scoped from VM-scoped policies (Kasten
@@ -2814,6 +3054,8 @@ POLICY_ANALYSIS=$(_ep "$APP_POLICIES_JSON" | jq -c --slurpfile nsLabeled "$TEMP_
        and ($p1.pausedState != "paused") and ($p2.pausedState != "paused") then
       {
         policies: [$p1.name, $p2.name],
+        # #58: same-named policies in two namespaces are different policies.
+        policyNamespaces: [$p1.namespace, $p2.namespace],
         scope: $p1.scope,
         sharedNamespaces: $sharedNs,
         sharedActions: $sharedActions,
@@ -3034,8 +3276,10 @@ RESTORE_POINTS_JSON=$(safe_json "$(cat "$TEMP_DIR/restorepoints_raw.json" 2>/dev
 
 RESTORE_POINTS_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq '.items | length // 0')")
 
-# Get policy names for comparison
-POLICY_NAMES=$(_ep "$POLICIES_JSON" | jq '[.items[]?.metadata.name] // []' 2>/dev/null || echo '[]')
+# Policy identities for comparison (#58): [{ns,name}], never bare names. Two
+# namespaces may each hold a policy of the same name, and a RestorePoint says
+# which one it belongs to through k10.kasten.io/policyNamespace.
+POLICY_NAMES=$(_ep "$POLICIES_JSON" | jq -c '[.items[]? | {ns: (.metadata.namespace // ""), name: .metadata.name}] // []' 2>/dev/null || echo '[]')
 if ! _ep "$POLICY_NAMES" | jq -e '.' >/dev/null 2>&1; then
   POLICY_NAMES='[]'
 fi
@@ -3048,7 +3292,7 @@ fi
 # live import policy covers those, since an import policy creates no snapshot
 # of its own. An unlabelled import whose policy has been deleted matches
 # neither and is still assessed -- nothing on the object tells it apart.
-IMPORT_POLICY_NAMES=$(_ep "$POLICIES_JSON" | jq -c '[.items[]? | select(any(.spec.actions[]?; .action == "import")) | .metadata.name] // []' 2>/dev/null || echo '[]')
+IMPORT_POLICY_NAMES=$(_ep "$POLICIES_JSON" | jq -c '[.items[]? | select(any(.spec.actions[]?; .action == "import")) | {ns: (.metadata.namespace // ""), name: .metadata.name}] // []' 2>/dev/null || echo '[]')
 if ! _ep "$IMPORT_POLICY_NAMES" | jq -e '.' >/dev/null 2>&1; then
   IMPORT_POLICY_NAMES='[]'
 fi
@@ -3084,25 +3328,36 @@ printf '%s' "$IMPORT_POLICY_NAMES" > "$TEMP_DIR/import_policies.json"
 # (overstating).
 ORPHANED_RP_STATUS="OK"
 printf '%s' "${POLICY_NAMES:-[]}" > "$TEMP_DIR/orp_policies.json"
-ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR/orp_policies.json" \
-    --slurpfile importPolicies "$TEMP_DIR/import_policies.json" '
+#
+# #58 -- (namespace, name), and three states. A RestorePoint names its policy
+# AND the policy namespace. It is an orphan only when that policy is PROVABLY
+# gone: the policy set is complete, or the policy namespace was read in full
+# and holds no such policy. When the set is partial and the policy could live in
+# a namespace nobody read, the RestorePoint is UNVERIFIABLE -- counted apart,
+# never called an orphan (a false alarm) and never called attached.
+ORPHANED_RP_UNVERIFIABLE_COUNT=0
+ORPHANED_RP_RESULT=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR/orp_policies.json" \
+    --slurpfile importPolicies "$TEMP_DIR/import_policies.json" \
+    --slurpfile scope "$TEMP_DIR/pc_scope.json" "$JQ_POLICY_KEY_LIB"'
   ( $policies[0] // [] ) as $policies |
   ( $importPolicies[0] // [] ) as $importPolicies |
+  ( $scope[0] // {complete: true, read: []} ) as $scope |
   [(.items // [])[]? |
     . as $rp |
     # Imported: owned by the source cluster, never an orphan here.
     select(
       ((($rp.metadata.labels // {}) | has("k10.kasten.io/importProfile")) | not)
-      and (($importPolicies | index(($rp.metadata.labels // {})["k10.kasten.io/policyName"] // "")) == null)
+      and ((pol_exists($importPolicies; ($rp | lbl_pns); (($rp | lbl_pname) // ""))) | not)
     ) |
     ((.spec.source.actionName // "") | tostring) as $action |
     # Kasten labels the owning policy on the RestorePoint. Prefer it: it is
     # exact, whereas deriving the policy from the action name cannot be.
     (($rp.metadata.labels // {})["k10.kasten.io/policyName"] // "" | tostring) as $labelPolicy |
     select($action != "" or $labelPolicy != "") |
-    select(
+    (
       if $labelPolicy != "" then
-        (($policies | index($labelPolicy)) == null)
+        # "deleted" -> orphan, "unknown" -> unverifiable, "active" -> neither.
+        pol_state($policies; $scope; ($rp | lbl_pns); $labelPolicy)
       else
         # Fallback: longest existing policy name that prefixes the action name.
         # RESIDUAL AMBIGUITY, unavoidable without the label: if a live policy is
@@ -3110,23 +3365,38 @@ ORPHANED_RP=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR
         # the deleted policy RestorePoints read as belonging to the live one and
         # their orphan status is missed. Longest-match narrows this but cannot
         # remove it — the action name simply does not carry the distinction.
-        ([ $policies[]?
-           | select(type == "string" and . != "")
-           | . as $p
-           | select($action == $p or ($action | startswith($p + "-")))
-         ] | length == 0)
+        # No namespace on the action name: with a partial set, no match proves
+        # nothing.
+        ( [ $policies[]?
+            | select((.name | type) == "string" and .name != "")
+            | . as $p
+            | select($action == $p.name or ($action | startswith($p.name + "-")))
+          ] | length ) as $m
+        | if $m > 0 then "active"
+          elif ($scope.complete == true) then "deleted"
+          else "unknown" end
       end
-    ) |
+    ) as $state |
+    select($state != "active") |
     {
       name: ($rp.metadata.name // "unknown"),
       namespace: (($rp.metadata.labels // {})["k10.kasten.io/appNamespace"] // $rp.metadata.namespace // "unknown"),
       created: ($rp.metadata.creationTimestamp // null),
       actions: [$action],
       # "label" is exact; "actionName" is the heuristic fallback above.
-      attributedBy: (if $labelPolicy != "" then "label" else "actionName" end)
+      attributedBy: (if $labelPolicy != "" then "label" else "actionName" end),
+      state: $state
     }
-  ] | unique_by(.name) // []
-' 2>/dev/null) || { _jq_fail "orphaned restore points"; ORPHANED_RP='[]'; ORPHANED_RP_STATUS="NOT_ASSESSED"; }
+  ] as $cand |
+  { orphans: ([ $cand[] | select(.state == "deleted") | del(.state) ] | unique_by(.name)),
+    unverifiable: ([ $cand[] | select(.state == "unknown") ] | unique_by(.name) | length) }
+' 2>/dev/null) || { _jq_fail "orphaned restore points"; ORPHANED_RP_RESULT=""; ORPHANED_RP_STATUS="NOT_ASSESSED"; }
+if [ -n "$ORPHANED_RP_RESULT" ] && _ep "$ORPHANED_RP_RESULT" | jq -e '.orphans' >/dev/null 2>&1; then
+  ORPHANED_RP=$(_ep "$ORPHANED_RP_RESULT" | jq -c '.orphans // []')
+  ORPHANED_RP_UNVERIFIABLE_COUNT=$(safe_int "$(_ep "$ORPHANED_RP_RESULT" | jq '.unverifiable // 0')")
+else
+  ORPHANED_RP='[]'
+fi
 
 # Validate result
 if ! _ep "$ORPHANED_RP" | jq -e '.' >/dev/null 2>&1; then
@@ -3139,12 +3409,13 @@ ORPHANED_RP_COUNT=$(_ep "$ORPHANED_RP" | jq 'length // 0')
 
 # Imported RestorePoints the orphan check left out, counted so the report can
 # say so rather than shrink silently.
-RP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile importPolicies "$TEMP_DIR/import_policies.json" '
+RP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile importPolicies "$TEMP_DIR/import_policies.json" "$JQ_POLICY_KEY_LIB"'
   ( $importPolicies[0] // [] ) as $importPolicies |
   [(.items // [])[]?
+   | . as $rp
    | (.metadata.labels // {}) as $l
    | select(($l | has("k10.kasten.io/importProfile"))
-            or (($importPolicies | index($l["k10.kasten.io/policyName"] // "")) != null))]
+            or pol_exists($importPolicies; ($rp | lbl_pns); ($l["k10.kasten.io/policyName"] // "")))]
   | length // 0
 ' 2>/dev/null || echo 0)")
 
@@ -3167,7 +3438,14 @@ if [ "${RESTORE_POINTS_COUNT:-0}" -gt 0 ] 2>/dev/null \
   warn "Orphan detection is not possible on this catalog; the count is reported as not assessed."
 fi
 
-debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT (status: $ORPHANED_RP_STATUS, unattributable: $RP_UNATTRIBUTABLE_COUNT, imported excluded: $RP_IMPORTED_COUNT)"
+# #58: unverifiable RestorePoints make the "no orphans" answer unknowable. PARTIAL
+# is the middle state: the confirmed orphans stay listed, but a zero or a short
+# list must not read as a clean verdict.
+if [ "$ORPHANED_RP_STATUS" = "OK" ] && [ "$ORPHANED_RP_UNVERIFIABLE_COUNT" -gt 0 ] 2>/dev/null; then
+  ORPHANED_RP_STATUS="PARTIAL"
+fi
+
+debug "Orphaned RestorePoints: $ORPHANED_RP_COUNT (status: $ORPHANED_RP_STATUS, unverifiable: $ORPHANED_RP_UNVERIFIABLE_COUNT, unattributable: $RP_UNATTRIBUTABLE_COUNT, imported excluded: $RP_IMPORTED_COUNT)"
 
 ### -------------------------
 ### Residual Snapshots (NEW v2.5)
@@ -3259,17 +3537,19 @@ else
             | (.snapshotRetention // {}) | to_entries | map(.value) | map(select(type == "number"))
             | select(length > 0) | add ] ) as $actionSums
       | {
-          key: (($p.metadata.name // "") | tostring),
-          value: (
+          # #58: keyed by (namespace, name) -- a list, not an object keyed by
+          # bare name, so two same-named policies keep their own retention.
+          ns: (($p.metadata.namespace // "") | tostring),
+          name: (($p.metadata.name // "") | tostring)
+        } + (
             if ($top | length) > 0 then { declared: true, total: ($top | add) }
             elif ($actionSums | length) > 0 then { declared: true, total: ($actionSums | max) }
             else { declared: false, total: 0 }
             end
           )
-        }
-    ] | from_entries
-  ' > "$TEMP_DIR/residual_retention.json" 2>/dev/null || printf '%s' '{}' > "$TEMP_DIR/residual_retention.json"
-  [ -s "$TEMP_DIR/residual_retention.json" ] || printf '%s' '{}' > "$TEMP_DIR/residual_retention.json"
+    ]
+  ' > "$TEMP_DIR/residual_retention.json" 2>/dev/null || printf '%s' '[]' > "$TEMP_DIR/residual_retention.json"
+  [ -s "$TEMP_DIR/residual_retention.json" ] || printf '%s' '[]' > "$TEMP_DIR/residual_retention.json"
 
   # One pass over the inventory: it can hold tens of thousands of objects, so
   # every counter comes out of a single jq run and `items` is capped below.
@@ -3277,7 +3557,8 @@ else
     --slurpfile policies "$TEMP_DIR/orp_policies.json" \
     --slurpfile retention "$TEMP_DIR/residual_retention.json" \
     --slurpfile importPolicies "$TEMP_DIR/import_policies.json" \
-    --argjson threshold "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" '
+    --slurpfile scope "$TEMP_DIR/pc_scope.json" \
+    --argjson threshold "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" "$JQ_POLICY_KEY_LIB"'
     def ts_clean: if type == "string" then sub("\\.[0-9]+Z$"; "Z") else null end;
     # Strips fractional seconds before a Z and nothing else, so a numeric offset
     # (+02:00) stays unparsable and lands in "unknown age" instead of being
@@ -3287,8 +3568,18 @@ else
     def ts_epoch: (try (ts_clean | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch null);
 
     ( $policies[0] // [] ) as $policyNames |
-    ( $retention[0] // {} ) as $retentionMap |
+    ( $retention[0] // [] ) as $retentionList |
     ( $importPolicies[0] // [] ) as $importPolicies |
+    ( $scope[0] // {complete: true, read: []} ) as $scope |
+    # Retention of the policy a snapshot belongs to: (namespace, name) where the
+    # snapshot carries the namespace label, name only where it does not. A name
+    # that two namespaces share and the snapshot cannot disambiguate is
+    # undeclared when either is -- the window is unknown, never a guess.
+    def ret_of($ns; $name):
+      [ $retentionList[] | select(.name == $name and ((($ns // "") == "") or .ns == $ns)) ] as $m
+      | if ($m | length) == 0 then null
+        elif any($m[]; .declared | not) then {declared: false, total: 0}
+        else {declared: true, total: ([ $m[].total ] | max)} end;
     ( now ) as $now |
     ( .items // [] ) as $all |
     # Imported content is not a local snapshot either: it carries no
@@ -3296,7 +3587,7 @@ else
     # which retires it. Same two signals as the orphan check.
     def imported: ((.metadata.labels // {})) as $l
       | ($l | has("k10.kasten.io/importProfile"))
-        or (($importPolicies | index($l["k10.kasten.io/policyName"] // "")) != null);
+        or pol_exists($importPolicies; lbl_pns; ($l["k10.kasten.io/policyName"] // ""));
     [ $all[]?
       | ((.metadata.labels // {})) as $l
       | select(($l | has("k10.kasten.io/exportProfile")) | not)
@@ -3304,6 +3595,7 @@ else
       | ( .status.actionTime // .status.scheduledTime // .metadata.creationTimestamp ) as $refTime
       | ( $refTime | ts_epoch ) as $refEpoch
       | ( ($l["k10.kasten.io/policyName"] // "") | tostring ) as $policyName
+      | ( lbl_pns ) as $policyNs
       | ( .status.physicalSizeBytes ) as $sz
       | {
           name: (.metadata.name // "unknown"),
@@ -3312,6 +3604,7 @@ else
           appNamespace: (($l["k10.kasten.io/appNamespace"] // .status.restorePointRef.namespace // "") | tostring),
           appType: (($l["k10.kasten.io/appType"] // "namespace") | tostring),
           policyName: $policyName,
+          policyNamespace: $policyNs,
           refTime: ($refTime | ts_clean),
           # Kept for the per-application ranking below, stripped from `items`.
           refEpoch: $refEpoch,
@@ -3329,22 +3622,25 @@ else
           # Three states, not two. "" = taken on demand; a name absent from a
           # NON-EMPTY policy list = deleted policy; an empty/unreadable policy
           # list = cannot tell, which must never render as "deleted".
+          # #58: "deleted" additionally requires that the policy set provably
+          # holds every policy of the snapshot namespace; a policy that may live
+          # in a namespace that could not be read is "unknown", which is the
+          # existing policy-unverifiable path, not a deletion.
           policyState: (
             if $policyName == "" then "none"
             elif ($policyNames | length) == 0 then "unknown"
-            elif ($policyNames | index($policyName)) != null then "active"
-            else "deleted"
+            else pol_state($policyNames; $scope; $policyNs; $policyName)
             end
           ),
           # Bound explicitly rather than with `//`: `declared` is a BOOLEAN, and
           # `a // b` fires on false exactly as it does on null, so `// false`
           # would make "declared: false" and "policy absent" indistinguishable.
           retentionDeclared: (
-            ( if $policyName == "" then null else $retentionMap[$policyName] end ) as $ret |
+            ( if $policyName == "" then null else ret_of($policyNs; $policyName) end ) as $ret |
             if $ret == null then false else $ret.declared end
           ),
           retentionTotal: (
-            ( if $policyName == "" then null else $retentionMap[$policyName] end ) as $ret |
+            ( if $policyName == "" then null else ret_of($policyNs; $policyName) end ) as $ret |
             if $ret == null then 0 else $ret.total end
           )
         }
@@ -5226,6 +5522,16 @@ fi
 # here is backed by positive evidence (every unmatched namespace is either
 # deliberately excluded or has a completed backup), which no unresolved
 # selector can contradict.
+# #58: with a PARTIAL policy set, a gap may be a namespace that a policy we
+# could not read protects. GAPS_DETECTED is the dangerous direction (a false
+# alarm), so it goes to NOT_ASSESSED. COMPLETE stays: it rests on the policies
+# and backups that WERE seen, and an unseen policy can only add protection.
+PROTECTION_POLICY_SET_PARTIAL=false
+if [ "$POLICY_COLLECTION_PARTIAL" = "true" ] && [ "$HAS_CATCHALL_POLICY" != "true" ] \
+   && [ "${UNPROTECTED_ACTIONABLE_COUNT:-$UNPROTECTED_COUNT}" -gt 0 ] 2>/dev/null; then
+  PROTECTION_POLICY_SET_PARTIAL=true
+  PROTECTION_STATUS="NOT_ASSESSED"
+fi
 if [ "$RBAC_NS_DENIED" = "true" ]; then
   BP_COVERAGE_STATUS="NOT_ASSESSED"
 elif [ "$HAS_CATCHALL_POLICY" = "true" ] || [ "${UNPROTECTED_ACTIONABLE_COUNT:-$UNPROTECTED_COUNT}" -eq 0 ]; then
@@ -5247,6 +5553,12 @@ if [ "$TOTAL_VMS" -gt 0 ]; then
   fi
 else
   BP_VM_PROTECTION_STATUS="N/A"
+fi
+# #58: PARTIAL / NOT_CONFIGURED claim that VMs lack a policy; with a partial
+# policy set the policy may be one we could not read.
+if [ "$POLICY_COLLECTION_PARTIAL" = "true" ] \
+   && { [ "$BP_VM_PROTECTION_STATUS" = "PARTIAL" ] || [ "$BP_VM_PROTECTION_STATUS" = "NOT_CONFIGURED" ]; }; then
+  BP_VM_PROTECTION_STATUS="NOT_ASSESSED"
 fi
 
 # BP-VM-CONSISTENCY (NEW v2.2.0, #kasten-v9): VM RestorePoints captured
@@ -5340,20 +5652,30 @@ EXPORT_NO_RETENTION_POLICIES=$(_ep "$APP_POLICIES_JSON" | jq -c '
 ' 2>/dev/null || echo '[]')
 EXPORT_NO_RETENTION_COUNT=$(safe_int "$(_ep "$EXPORT_NO_RETENTION_POLICIES" | jq 'length // 0')")
 
+# #58: for the four "no policy does X" checks, a finding on the policies that
+# were read stays a finding; a clean OK, though, claims something about every
+# policy and is only true on a complete set -- so with a partial set it is
+# NOT_ASSESSED, never OK.
 if [ "$HIGH_SNAP_COUNT" -gt 0 ]; then
   BP_SNAP_RETENTION_HIGH_STATUS="WARN"
+elif [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+  BP_SNAP_RETENTION_HIGH_STATUS="NOT_ASSESSED"
 else
   BP_SNAP_RETENTION_HIGH_STATUS="OK"
 fi
 
 if [ "$ZERO_SNAP_COUNT" -gt 0 ]; then
   BP_SNAP_RETENTION_ZERO_STATUS="WARN"
+elif [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+  BP_SNAP_RETENTION_ZERO_STATUS="NOT_ASSESSED"
 else
   BP_SNAP_RETENTION_ZERO_STATUS="OK"
 fi
 
 if [ "$EXPORT_NO_RETENTION_COUNT" -gt 0 ]; then
   BP_EXPORT_RETENTION_STATUS="WARN"
+elif [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+  BP_EXPORT_RETENTION_STATUS="NOT_ASSESSED"
 else
   BP_EXPORT_RETENTION_STATUS="OK"
 fi
@@ -5372,6 +5694,10 @@ HAS_CLUSTER_SCOPED_POLICY=$(_ep "$APP_POLICIES_JSON" | jq -r '
 
 if [ "$HAS_CLUSTER_SCOPED_POLICY" = "true" ]; then
   BP_CLUSTER_SCOPED_STATUS="CONFIGURED"
+elif [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+  # #58: "no policy backs up cluster-scoped resources" is unknowable on a
+  # partial set.
+  BP_CLUSTER_SCOPED_STATUS="NOT_ASSESSED"
 else
   BP_CLUSTER_SCOPED_STATUS="NOT_CONFIGURED"
 fi
@@ -5379,6 +5705,8 @@ fi
 # BP-NO-EXPORT-LIST: status reflects presence of policies-without-export
 if [ "$POLICIES_NO_EXPORT_COUNT" -gt 0 ]; then
   BP_NO_EXPORT_STATUS="WARN"
+elif [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+  BP_NO_EXPORT_STATUS="NOT_ASSESSED"
 else
   BP_NO_EXPORT_STATUS="OK"
 fi
@@ -6995,14 +7323,17 @@ if _sr_list_readable "$TEMP_DIR/policies_raw.json"; then
     --slurpfile allNsF "$TEMP_DIR/sr_nslabeled.json" \
     --slurpfile vdAppsF "$TEMP_DIR/sr_vd_apps.json" \
     --argjson nsReadable "$_sr_ns_ok" \
-    --arg sysPat "$SYSTEM_POLICY_PATTERNS" "$JQ_SELECTOR_LIB"'
+    --arg k10ns "$NAMESPACE" \
+    --arg sysPat "$SYSTEM_POLICY_PATTERNS" "$JQ_SELECTOR_LIB""$JQ_POLICY_KEY_LIB"'
     (if ($allNsF | length) > 0 then $allNsF[0] else [] end) as $allNs |
     (if ($vdAppsF | length) > 0 then $vdAppsF[0] else [] end) as $vd |
     [ .items[]? | select((.metadata.name | type) == "string")
-      | (.metadata.name | test($sysPat)) as $sys
+      | is_system_policy($k10ns; $sysPat) as $sys
       | (if $sys then {namespaces: [], resolvable: true} else policy_target_ns($allNs) end) as $t
-      | { key: .metadata.name,
+      # #58: keyed by (namespace, name); the name is carried in the value.
+      | { key: pol_key,
           value: {
+            name: .metadata.name,
             paused: (if (.spec.paused == true) then true
                      elif (.spec.paused == false) then false
                      elif (((.spec // {}) | has("paused")) | not) then false
@@ -7155,11 +7486,12 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   --argjson maintPods "$STORAGE_REPO_MAINT_PODS" \
   --argjson podsReadable "$STORAGE_REPO_PODS_READABLE" \
   --slurpfile ownersF "$TEMP_DIR/sr_policy_owners.json" \
+  --slurpfile pcScopeF "$TEMP_DIR/pc_scope.json" \
   --slurpfile rpcIndexF "$TEMP_DIR/sr_rpc_index.json" \
   --argjson strandedFloor "$STORAGE_REPO_STRANDED_FLOOR" \
   --arg threshold "$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS" \
   --arg inactiveThreshold "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS" \
-  --arg now "$STORAGE_REPO_NOW" '
+  --arg now "$STORAGE_REPO_NOW" "$JQ_POLICY_KEY_LIB"'
   # Same RFC3339Nano tolerance as the per-repo filter, and wrapped in try so a
   # single unparseable timestamp degrades that one repo to "unknown age"
   # instead of erroring out and emptying the entire array.
@@ -7195,6 +7527,29 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
 
   (if ($ownersF | length) > 0 then $ownersF[0] else null end) as $owners |
   (if ($rpcIndexF | length) > 0 then $rpcIndexF[0] else null end) as $rpcIndex |
+  (if ($pcScopeF | length) > 0 then $pcScopeF[0] else {complete: true, read: []} end) as $pcScope |
+
+  # #58: find the policy a repository names. Owners are keyed (namespace/name)
+  # and the repository carries policyName AND policyNamespace. found = the
+  # policy is in the set; missing = it provably is not (the set is complete, or
+  # that namespace was read in full); unknown = it may live in a namespace that
+  # could not be read, or the bare name matches several namespaces. Unknown
+  # never reads as deleted: a deleted-owner verdict is the loud one.
+  def owner_find($lp; $lns):
+    if $owners == null or $lp == null then {st: "none"}
+    elif $lns != null then
+      (pkey($lns; $lp)) as $k
+      | if ($owners | has($k)) then {st: "found", k: $k}
+        elif ($owners | has(pkey(null; $lp))) then {st: "found", k: pkey(null; $lp)}
+        elif ($pcScope.complete == true) or ((($pcScope.read // []) | index($lns)) != null) then {st: "missing"}
+        else {st: "unknown"} end
+    else
+      [ $owners | keys[] | select(endswith("/" + $lp)) ] as $c
+      | if ($c | length) == 1 then {st: "found", k: $c[0]}
+        elif ($c | length) > 1 then {st: "unknown"}
+        elif ($pcScope.complete == true) then {st: "missing"}
+        else {st: "unknown"} end
+    end;
 
   # WHO STILL RETIRES RESTORE POINTS INTO A REPOSITORY. Retirement is a phase
   # of a policy run (retire_policy.go:78-140): the policy retires its OWN
@@ -7230,9 +7585,11 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
     | ($r.policyName // null) as $lp
     | if $owners == null then {state: null, live: [], paused: [], stopped: null}
       elif ($r.contentType == "metadata") or ($r.contentType == "dr") then
-        (if ($lp == null) or ($prof == null) then {state: null, live: [], paused: [], stopped: null}
-         elif (($owners | has($lp)) | not) then {state: false, live: [], paused: [], stopped: "deleted"}
-         else ($owners[$lp]) as $o
+        (owner_find($lp; $r.policyNamespace)) as $f
+        | (if ($lp == null) or ($prof == null) then {state: null, live: [], paused: [], stopped: null}
+         elif $f.st == "missing" then {state: false, live: [], paused: [], stopped: "deleted"}
+         elif $f.st != "found" then {state: null, live: [], paused: [], stopped: null}
+         else ($owners[$f.k]) as $o
               | (if $r.contentType == "dr" then (($o.exportProfiles // []) + ($o.backupProfiles // []))
                  else ($o.exportProfiles // []) end) as $ps
               | (($o.actionsReadable == true) and ($o.exportProfilesComplete == true)
@@ -7246,15 +7603,20 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       elif $r.contentType == "volumedata" then
         (if ($prof == null) or ($r.appName == null) then {state: null, live: [], paused: [], stopped: null}
          else [ $owners | to_entries[] | select(((.value.exportProfiles // []) | index($prof)) != null) ] as $exp
+              | (owner_find($lp; $r.policyNamespace)) as $f
+              | ($f.k // null) as $lk
               # The first writer counts whatever its selector says now: retirement
               # acts on past runs. A former exporter would too, and is NOT SEEN (above).
-              | [ $exp[] | select((((.value.covers // []) | index($r.appName)) != null) or (.key == $lp)) ] as $cov
-              | [ $cov[] | select(.value.paused == false) | .key ] as $live
-              | [ $cov[] | select(.value.paused == true) | .key ] as $pz
+              | [ $exp[] | select((((.value.covers // []) | index($r.appName)) != null) or (.key == $lk)) ] as $cov
+              | [ $cov[] | select(.value.paused == false) | .value.name ] as $live
+              | [ $cov[] | select(.value.paused == true) | .value.name ] as $pz
               | if ($live | length) > 0 then {state: true, live: $live, paused: $pz, stopped: null}
                 elif ([ $cov[] | select(.value.paused == null) ] | length) > 0 then {state: null, live: [], paused: $pz, stopped: null}
-                elif ([ $exp[] | select((.value.coverageResolvable != true) and (.key != $lp)) ] | length) > 0
+                elif ([ $exp[] | select((.value.coverageResolvable != true) and (.key != $lk)) ] | length) > 0
                   then {state: null, live: [], paused: $pz, stopped: null}
+                # #58: the policy set is partial, so a retainer may live in a
+                # namespace that was not read -- no retainer cannot be claimed.
+                elif ($pcScope.complete != true) then {state: null, live: [], paused: $pz, stopped: null}
                 # A policy whose export profiles could not be read in full
                 # might export here, so no retainer cannot be claimed past it
                 # -- but only past one that could cover this namespace: its
@@ -7267,7 +7629,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                 elif ([ $owners | to_entries[]
                         | select((.value.actionsReadable != true) or (.value.exportProfilesComplete != true))
                         | select((((.value.covers // []) | index($r.appName)) != null)
-                                 or (.value.coverageResolvable != true) or (.key == $lp)) ] | length) > 0
+                                 or (.value.coverageResolvable != true) or (.key == $lk)) ] | length) > 0
                   then {state: null, live: [], paused: $pz, stopped: null}
                 else {state: false, live: [], paused: $pz, stopped: null} end
          end)
@@ -7332,7 +7694,10 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       policyMissing: (
         (.policyName) as $p
         | if ($policyNames == null) or ($p == null) then null
-          else (($policyNames | index($p)) == null)
+          else (owner_find($p; .policyNamespace)) as $f
+               | if $f.st == "missing" then true
+                 elif $f.st == "found" then false
+                 else null end
           end
       ),
       # spec.paused of the policy that owns this repository. null when the
@@ -7395,8 +7760,8 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       ownerPolicyPaused: (
         (.policyName) as $p
         | if ($owners == null) or ($p == null) then null
-          elif (($owners | has($p)) | not) then null
-          else $owners[$p].paused
+          else (owner_find($p; .policyNamespace)) as $f
+               | if $f.st != "found" then null else $owners[$f.k].paused end
           end
       ),
       # true when a maintenance time exists but its age could not be computed.
@@ -9511,6 +9876,9 @@ if [ "$MODE" = "json" ]; then
     --arg orphanedRpStatus "$ORPHANED_RP_STATUS" \
     --argjson rpUnattributableCount "$RP_UNATTRIBUTABLE_COUNT" \
     --argjson rpImportedCount "$RP_IMPORTED_COUNT" \
+    --argjson rpUnverifiableCount "$ORPHANED_RP_UNVERIFIABLE_COUNT" \
+    --argjson policyCollection "$(_safe_arg "$POLICY_COLLECTION_JSON" '{"mode":"k10-only","partial":true,"namespaceSource":"none","namespacesAttempted":1,"namespacesRead":0,"namespacesDenied":[],"namespacesNotAttempted":0}')" \
+    --argjson protectionPolicySetPartial "$PROTECTION_POLICY_SET_PARTIAL" \
     --slurpfile residualSnapshots "$TEMP_DIR/residualSnapshots.json" \
     --argjson residualThresholdDays "$RESIDUAL_SNAPSHOT_THRESHOLD_DAYS" \
     --arg residualSnapStatus "$RESIDUAL_SNAP_STATUS" \
@@ -9812,6 +10180,12 @@ if [ "$MODE" = "json" ]; then
       },
       rbacLimited: $rbacLimited,
 
+      # #58: which policies this report could see. mode cluster = the
+      # cluster-wide list worked and the set is complete; per-namespace /
+      # k10-only = it was refused and `partial` says whether anything may be
+      # missing. Terminal and HTML read this same object.
+      policyCollection: $policyCollection,
+
       license: $licenseBlock,
 
       health: {
@@ -9965,6 +10339,9 @@ if [ "$MODE" = "json" ]; then
         # of the cluster itself. The gap counts must not be read as verified.
         protection: {
           status: $protectionStatus,
+          # #58: true when NOT_ASSESSED is because policies outside the read
+          # set could be protecting the namespaces reported as gaps.
+          policySetPartial: $protectionPolicySetPartial,
           unresolvedPolicyCount: $protectionUnresolvedCount,
           unresolvedPolicies: $protectionUnresolvedPolicies,
           # Selectors placing a wildcard where Kasten documents none
@@ -10062,7 +10439,12 @@ if [ "$MODE" = "json" ]; then
         unattributable: $rpUnattributableCount,
         # Imported RestorePoints, left out of the check: the policy of the
         # source cluster retires them.
-        importedExcluded: $rpImportedCount
+        importedExcluded: $rpImportedCount,
+        # #58: RestorePoints naming a policy that may live in a namespace this
+        # run could not read: neither orphaned nor confirmed attached. status
+        # is PARTIAL when this is non-zero (a zero count is then not a clean
+        # verdict).
+        unverifiable: $rpUnverifiableCount
       },
 
       # Local Kasten snapshots (RestorePointContents with NO exportProfile
@@ -10537,6 +10919,8 @@ if [ "$MODE" = "json" ]; then
         ($policies.items | map(
           {
             name: .metadata.name,
+            # #58: policies live in application namespaces too.
+            namespace: (.metadata.namespace // null),
             frequency: .spec.frequency,
             subFrequency: .spec.subFrequency,
             actions: [.spec.actions[].action],
@@ -10986,6 +11370,33 @@ fi
 printf "\n${COLOR_BOLD}[LICENSE] Kasten Policies${COLOR_RESET}\n"
 printf "  Total: $POLICY_COUNT (App: $APP_POLICY_COUNT, System: $SYSTEM_POLICY_COUNT)\n"
 printf "  With export: $POLICIES_WITH_EXPORT | Using presets: $POLICIES_WITH_PRESETS\n"
+# #58: which policies this report could see. Read from the same object the JSON
+# publishes (policyCollection), not from the shell variables that built it.
+_pc_mode=$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.mode')
+if [ "$_pc_mode" = "cluster" ]; then
+  printf "  Policy scope: cluster-wide (all namespaces)\n"
+elif [ "$_pc_mode" = "per-namespace" ]; then
+  printf "  Policy scope: per-namespace read, %s of %s namespace(s) read, %s denied\n" \
+    "$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.namespacesRead')" \
+    "$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.namespacesAttempted')" \
+    "$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.namespacesDenied | length')"
+else
+  printf "  Policy scope: K10 namespace only (cluster-wide read refused and no namespace list available)\n"
+fi
+if [ "$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.partial')" = "true" ]; then
+  printf "  ${COLOR_YELLOW}[WARN] Partial policy set: policies in namespaces that could not be read are NOT in this report.${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}       Verdicts that an unseen policy could change are reported as not assessed, not as clean.${COLOR_RESET}\n"
+  _pc_den=$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.namespacesDenied | length')
+  if [ "$_pc_den" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}       Not readable (%s): %s%s${COLOR_RESET}\n" "$_pc_den" \
+      "$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.namespacesDenied[:8] | join(", ")')" \
+      "$(_ep "$POLICY_COLLECTION_JSON" | jq -r 'if (.namespacesDenied | length) > 8 then ", and \((.namespacesDenied | length) - 8) more (see policyCollection in the JSON)" else "" end')"
+  fi
+  _pc_na=$(_ep "$POLICY_COLLECTION_JSON" | jq -r '.namespacesNotAttempted // 0')
+  if [ "$_pc_na" -gt 0 ] 2>/dev/null; then
+    printf "  ${COLOR_YELLOW}       %s namespace(s) were not attempted (read cap reached)${COLOR_RESET}\n" "$_pc_na"
+  fi
+fi
 if [ "$MULTI_EXPORT_COUNT" -gt 0 ] 2>/dev/null; then
   printf "  Additional export (Kasten 9.0): ${COLOR_GREEN}$MULTI_EXPORT_COUNT policy(ies) with 2 export destinations${COLOR_RESET}\n"
   if [ "$MULTI_EXPORT_SAME_PROFILE_COUNT" -gt 0 ] 2>/dev/null; then
@@ -10995,9 +11406,9 @@ if [ "$MULTI_EXPORT_COUNT" -gt 0 ] 2>/dev/null; then
 fi
 
 if [ "$POLICY_COUNT" -gt 0 ]; then
-  _ep "$POLICIES_JSON" | jq -r "$JQ_SELECTOR_LIB"'
+  _ep "$POLICIES_JSON" | jq -r --arg k10ns "$NAMESPACE" "$JQ_SELECTOR_LIB"'
 .items[]? |
-"  - \(.metadata.name)\n" +
+"  - \(.metadata.name)" + (if ((.metadata.namespace // $k10ns) != $k10ns) then " (namespace: \(.metadata.namespace))" else "" end) + "\n" +
 "    Frequency: \(.spec.frequency // "manual")\n" +
 (if .spec.presetRef then "    Preset: \(.spec.presetRef.name)\n" else "" end) +
 (if .spec.subFrequency then
@@ -11101,14 +11512,14 @@ if [ "$IMPORT_POLICY_COUNT" -eq 0 ]; then
   fi
 else
   printf "  Import policies: ${COLOR_GREEN}$IMPORT_POLICY_COUNT${COLOR_RESET}\n"
-  _ep "$IMPORT_POLICIES_JSON" | jq -r '.[] | "  - \(.name) [\(.frequency)]" + (if .profile != "" then " profile=\(.profile)" else "" end)' 2>/dev/null
+  _ep "$IMPORT_POLICIES_JSON" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'.[] | "  - \(pdisp($k10ns)) [\(.frequency)]" + (if .profile != "" then " profile=\(.profile)" else "" end)' 2>/dev/null
 fi
 
 ### Policy Last Run Summary (NEW v1.5; v1.9: error message added)
 printf "\n${COLOR_BOLD}[TIME] Policy Last Run Status${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 printf "  ${COLOR_CYAN}App policies only ($RUNSTATS_SCOPED_POLICY_COUNT); system DR/reports policies excluded here too${COLOR_RESET}\n"
-_ep "$POLICY_LAST_RUN" | jq -r '.[]? |
-  "  \(.name): " +
+_ep "$POLICY_LAST_RUN" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'.[]? |
+  "  \(pdisp($k10ns)): " +
   (if .lastRun then
     .lastRun.timestamp + " | " + .lastRun.state +
     (if .lastRun.duration then " | " + (.lastRun.duration | tostring) + "s" else "" end) +
@@ -11184,7 +11595,7 @@ RUNSTATS_BYPOLICY_COUNT=$(_ep "$POLICY_RUN_PHASE_STATS" | jq '.byPolicy | length
 [ -z "$RUNSTATS_BYPOLICY_COUNT" ] && RUNSTATS_BYPOLICY_COUNT=0
 if [ "$RUNSTATS_BYPOLICY_COUNT" -gt 0 ] 2>/dev/null; then
   printf "\n  ${COLOR_BOLD}Per policy (14 days)${COLOR_RESET}\n"
-  _ep "$POLICY_RUN_PHASE_STATS" | jq -r '
+  _ep "$POLICY_RUN_PHASE_STATS" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'
     def hms($s):
       if $s == null then "n/a"
       elif $s < 60 then "\($s|floor)s"
@@ -11192,7 +11603,7 @@ if [ "$RUNSTATS_BYPOLICY_COUNT" -gt 0 ] 2>/dev/null; then
       else "\(($s/3600)|floor)h\((($s%3600)/60)|floor)m"
       end;
     .byPolicy[] |
-    "    " + .name + " | runs=\(.runCount)" +
+    "    " + pdisp($k10ns) + " | runs=\(.runCount)" +
     " | total avg=" + hms(.total.avg) + " min=" + hms(.total.min) + " max=" + hms(.total.max) +
     " | snapshot avg=" + hms(.snapshot.avg) + (if .snapshot.unknownCount > 0 then " (\(.snapshot.unknownCount) unknown)" else "" end) +
     " | export avg=" + hms(.export.avg) +
@@ -11226,7 +11637,7 @@ fi
 if [ "$RPO_WITH_SAMPLES" -gt 0 ] 2>/dev/null; then
   printf "\n  Per-policy:\n"
   # Format duration as human-readable (s -> Hh Mm Ss when >= 60s)
-  _ep "$EFFECTIVE_RPO" | jq -r '
+  _ep "$EFFECTIVE_RPO" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'
     def hms($s):
       if $s == null then "N/A"
       elif $s < 60 then "\($s|floor)s"
@@ -11237,7 +11648,7 @@ if [ "$RPO_WITH_SAMPLES" -gt 0 ] 2>/dev/null; then
     .[] | select(.samples > 0) |
     "    " +
     (if .drift == true then "[DRIFT] " elif .drift == false then "[OK]    " else "[INFO]  " end) +
-    .name +
+    pdisp($k10ns) +
     " | freq=" + (.frequencyDeclared // "n/a") +
     " | median=" + hms(.median) +
     " | max=" + hms(.max) +
@@ -11253,9 +11664,9 @@ if [ "$RPO_NOT_ANALYSED" -gt 0 ] 2>/dev/null; then
   # #51: "samples=0" alone used to look identical whether a policy is off or
   # broken -- opposite verdicts. pausedState (published once, see
   # paused_state() in JQ_SELECTOR_LIB) is what tells them apart here.
-  _ep "$EFFECTIVE_RPO" | jq -r '
+  _ep "$EFFECTIVE_RPO" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'
     .[] | select(.samples == 0) |
-    "    - " + .name + " (freq=" + (.frequencyDeclared // "manual") + ", samples=0" +
+    "    - " + pdisp($k10ns) + " (freq=" + (.frequencyDeclared // "manual") + ", samples=0" +
     (if .pausedState == "paused" then ", PAUSED -- expected, not an incident"
      elif .pausedState == "unknown" then ", paused-state unknown"
      else "" end) + ")"
@@ -11280,7 +11691,10 @@ elif [ "$POLICY_PAUSED_COUNT" -gt 0 ] 2>/dev/null; then
   printf "  ${COLOR_CYAN}Paused (excluded from coverage): $POLICY_PAUSED_COUNT${COLOR_RESET}\n"
 fi
 
-if [ "$APP_POLICY_COUNT" -eq 0 ]; then
+if [ "$APP_POLICY_COUNT" -eq 0 ] && [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
+  printf "  ${COLOR_YELLOW}[INFO]  No application backup policy in the policy set that could be read (partial)${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    Policies in namespaces that were not readable are unseen: this is NOT a verified absence.${COLOR_RESET}\n"
+elif [ "$APP_POLICY_COUNT" -eq 0 ]; then
   printf "  ${COLOR_RED}[WARN]  No application backup policies found!${COLOR_RESET}\n"
   printf "  ${COLOR_YELLOW}    Only system policies (DR/report) detected.${COLOR_RESET}\n"
 elif [ "$HAS_CATCHALL_POLICY" = "true" ]; then
@@ -11304,6 +11718,14 @@ elif [ "$UNPROTECTED_COUNT" -eq 0 ]; then
   printf "  ${COLOR_GREEN}[OK] All application namespaces are protected${COLOR_RESET}\n"
   if [ "$PROTECTED_NS_COUNT" -gt 0 ]; then
     printf "  ${COLOR_CYAN}    Targeted: $(_ep "$PROTECTED_NAMESPACES" | jq -r 'join(", ")')${COLOR_RESET}\n"
+  fi
+elif [ "$PROTECTION_POLICY_SET_PARTIAL" = "true" ]; then
+  # #58: not a gap -- possibly a namespace that a policy we could not read protects.
+  printf "  ${COLOR_YELLOW}[INFO]  $UNPROTECTED_COUNT namespace(s) are matched by no policy that was READ - NOT ASSESSED${COLOR_RESET}\n"
+  printf "  ${COLOR_YELLOW}    The policy set is partial (see Kasten Policies above): a policy in an unreadable namespace may protect them.${COLOR_RESET}\n"
+  _ep "$UNPROTECTED_NS_JSON" | jq -r '.[:10][] | "    - \(.)"' 2>/dev/null
+  if [ "$UNPROTECTED_COUNT" -gt 10 ]; then
+    printf "    ... and $((UNPROTECTED_COUNT - 10)) more\n"
   fi
 else
   printf "  ${COLOR_RED}[WARN]  $UNPROTECTED_COUNT unprotected namespace(s) detected:${COLOR_RESET}\n"
@@ -11339,8 +11761,8 @@ if [ "$POLICY_PAUSED_SCHEMA_STATUS" != "schema_confirmed" ]; then
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Paused/enabled state:  could not be read (%s)\n" "$POLICY_PAUSED_SCHEMA_STATUS"
 elif [ "$POLICY_PAUSED_COUNT" -gt 0 ] 2>/dev/null; then
   printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Paused policies:       $POLICY_PAUSED_COUNT (excluded from coverage and redundant-pair checks)\n"
-  _ep "$POLICY_ANALYSIS" | jq -r '.resolved[]? | select(.pausedState == "paused") |
-    "    - " + .name + " | selector=" + .selectorKind + " | targeted namespaces=" + (.targetedCount | tostring)
+  _ep "$POLICY_ANALYSIS" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'.resolved[]? | select(.pausedState == "paused") |
+    "    - " + pdisp($k10ns) + " | selector=" + .selectorKind + " | targeted namespaces=" + (.targetedCount | tostring)
   ' 2>/dev/null | head -10
   if [ "$POLICY_PAUSED_COUNT" -gt 10 ] 2>/dev/null; then
     printf "    ... and $((POLICY_PAUSED_COUNT - 10)) more\n"
@@ -11354,8 +11776,8 @@ if [ "$POLICY_EMPTY_COUNT" -eq 0 ] 2>/dev/null; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Empty policies:        0 (all selectors match at least one existing namespace)\n"
 else
   printf "  ${COLOR_RED}[WARN]${COLOR_RESET} Empty policies:        $POLICY_EMPTY_COUNT (selector matches no existing namespace)\n"
-  _ep "$POLICY_ANALYSIS" | jq -r '.empty[]? |
-    "    - " + .name +
+  _ep "$POLICY_ANALYSIS" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'.empty[]? |
+    "    - " + pdisp($k10ns) +
     " | selector=" + .selectorKind +
     (if (.nonExistingReferences | length) > 0 then " | references non-existing: " + (.nonExistingReferences | join(", ")) else "" end)
   ' 2>/dev/null | head -10
@@ -11370,7 +11792,7 @@ fi
 # Unresolvable policies (informational - operator NotIn etc.)
 if [ "$POLICY_UNRESOLVABLE_COUNT" -gt 0 ] 2>/dev/null; then
   printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Unresolvable selectors:$POLICY_UNRESOLVABLE_COUNT (complex matchExpressions — NotIn/Exists/etc. — not statically resolved)\n"
-  _ep "$POLICY_ANALYSIS" | jq -r '.unresolvable[]? | "    - " + .name + " (" + .selectorKind + ")"' 2>/dev/null | head -5
+  _ep "$POLICY_ANALYSIS" | jq -r --arg k10ns "$NAMESPACE" "$JQ_POLICY_KEY_LIB"'.unresolvable[]? | "    - " + pdisp($k10ns) + " (" + .selectorKind + ")"' 2>/dev/null | head -5
 fi
 
 # Redundant pairs (B2)
@@ -11380,8 +11802,8 @@ if [ "$TOTAL_REDUNDANT" -eq 0 ] 2>/dev/null; then
 else
   if [ "$POLICY_REDUNDANT_GENUINE" -gt 0 ] 2>/dev/null; then
     printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET} Redundant policy pairs: $POLICY_REDUNDANT_GENUINE genuine (two non-catchall policies overlap)\n"
-    _ep "$POLICY_ANALYSIS" | jq -r '.redundantPairs[]? | select(.involvesCatchall | not) |
-      "    - [" + (.policies | join(" ↔ ")) + "]" +
+    _ep "$POLICY_ANALYSIS" | jq -r --arg k10ns "$NAMESPACE" '.redundantPairs[]? | select(.involvesCatchall | not) |
+      "    - [" + ([range(0; (.policies | length)) as $i | .policies[$i] + (if ((.policyNamespaces[$i] // $k10ns) != $k10ns) then " (ns: " + .policyNamespaces[$i] + ")" else "" end)] | join(" ↔ ")) + "]" +
       " | shared NS: " + (.sharedNamespaces | join(", ")) +
       " | shared actions: " + (.sharedActions | join(", ")) +
       (if .sameFrequency then " | same frequency" else " | different frequencies" end)
@@ -11667,11 +12089,16 @@ fi
 printf "\n${COLOR_BOLD}[TRASH] Orphaned RestorePoints${COLOR_RESET} ${COLOR_CYAN}(NEW)${COLOR_RESET}\n"
 if [ "$ORPHANED_RP_STATUS" = "NOT_ASSESSED" ]; then
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} Not assessed - the computation failed; this is NOT a verified zero\n"
+elif [ "$ORPHANED_RP_COUNT" -eq 0 ] && [ "$ORPHANED_RP_STATUS" = "PARTIAL" ]; then
+  printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} No orphan confirmed, but this is NOT a clean verdict (see below)\n"
 elif [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
   printf "  ${COLOR_GREEN}[OK] No orphaned RestorePoints detected${COLOR_RESET}\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
   _ep "$ORPHANED_RP" | jq -r '.[:5][] | "    - \(.name) [\(.namespace)]"' 2>/dev/null
+fi
+if [ "${ORPHANED_RP_UNVERIFIABLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
+  printf "  ${COLOR_YELLOW}    $ORPHANED_RP_UNVERIFIABLE_COUNT RestorePoint(s) name a policy in a namespace that could not be read: orphan status unknown (partial policy set)${COLOR_RESET}\n"
 fi
 if [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
   printf "  ${COLOR_CYAN}    $RP_UNATTRIBUTABLE_COUNT RestorePoint(s) have no source action name (not attributable)${COLOR_RESET}\n"
@@ -11713,7 +12140,7 @@ else
     printf "  ${COLOR_CYAN}    $RESIDUAL_SNAP_RETAINED_COUNT past the threshold but retained by a live policy (expected with GFS retention)${COLOR_RESET}\n"
   fi
   if [ "$RESIDUAL_SNAP_UNVERIFIABLE_COUNT" -gt 0 ]; then
-    printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_UNVERIFIABLE_COUNT carry a policy name that could not be checked (policy list empty or unreadable)${COLOR_RESET}\n"
+    printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_UNVERIFIABLE_COUNT carry a policy name that could not be checked (policy list empty, unreadable or partial)${COLOR_RESET}\n"
   fi
   if [ "$RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT belong to a policy declaring no snapshot retention (window unknown)${COLOR_RESET}\n"
@@ -12251,7 +12678,9 @@ fi
 if [ "$BP_COVERAGE_STATUS" = "COMPLETE" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Namespace Protection: ${COLOR_GREEN}COMPLETE${COLOR_RESET}\n"
 elif [ "$BP_COVERAGE_STATUS" = "NOT_ASSESSED" ]; then
-  if [ "$RBAC_NS_DENIED" = "true" ]; then
+  if [ "$PROTECTION_POLICY_SET_PARTIAL" = "true" ] && [ "$RBAC_NS_DENIED" != "true" ]; then
+    printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED (partial policy set - policies in unreadable namespaces may protect the namespaces reported unmatched)\n"
+  elif [ "$RBAC_NS_DENIED" = "true" ]; then
     printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED (RBAC-limited - cluster-wide namespace listing was denied)\n"
   else
     printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Namespace Protection: NOT ASSESSED ($PROTECTION_UNRESOLVED_COUNT policy selector(s) use an operator KDL does not evaluate)\n"
@@ -12270,6 +12699,8 @@ elif [ "$BP_VM_PROTECTION_STATUS" = "PARTIAL" ]; then
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  VM Protection:        ${COLOR_YELLOW}PARTIAL${COLOR_RESET} ($PROTECTED_VM_COUNT/$TOTAL_VMS VMs protected)\n"
 elif [ "$BP_VM_PROTECTION_STATUS" = "NOT_CONFIGURED" ]; then
   printf "  ${COLOR_RED}[FAIL]${COLOR_RESET} VM Protection:        ${COLOR_RED}NOT CONFIGURED${COLOR_RESET} ($TOTAL_VMS VMs unprotected)\n"
+elif [ "$BP_VM_PROTECTION_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  VM Protection:        NOT ASSESSED (partial policy set - a policy in an unreadable namespace may protect VMs listed as unprotected)\n"
 fi
 
 # Authentication (NEW v1.8)
@@ -12296,6 +12727,8 @@ fi
 # Snapshot retention high (NEW v1.9)
 if [ "$BP_SNAP_RETENTION_HIGH_STATUS" = "OK" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Snapshot retention:   ${COLOR_GREEN}WITHIN LIMITS${COLOR_RESET} (no policy with snapshot retention >7)\n"
+elif [ "$BP_SNAP_RETENTION_HIGH_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Snapshot retention:   NOT ASSESSED (partial policy set - policies in unreadable namespaces were not checked)\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Snapshot retention:   ${COLOR_YELLOW}HIGH${COLOR_RESET} ($HIGH_SNAP_COUNT policy/policies with snapshot retention >7 — source SC I/O impact)\n"
   _ep "$HIGH_SNAP_POLICIES" | jq -r '.[:5][] | "      - " + .name + " (max=" + (.max|tostring) + ")"' 2>/dev/null
@@ -12304,6 +12737,8 @@ fi
 # Snapshot retention zero (NEW v1.9)
 if [ "$BP_SNAP_RETENTION_ZERO_STATUS" = "OK" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Fast local recovery:  ${COLOR_GREEN}AVAILABLE${COLOR_RESET} (all backup policies retain at least 1 snapshot)\n"
+elif [ "$BP_SNAP_RETENTION_ZERO_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Fast local recovery:  NOT ASSESSED (partial policy set - policies in unreadable namespaces were not checked)\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Fast local recovery:  ${COLOR_YELLOW}LIMITED${COLOR_RESET} ($ZERO_SNAP_COUNT policy/policies with zero snapshot retention)\n"
   _ep "$ZERO_SNAP_POLICIES" | jq -r '.[:5][] | "      - " + .' 2>/dev/null
@@ -12312,6 +12747,8 @@ fi
 # Export retention explicit (NEW v1.9)
 if [ "$BP_EXPORT_RETENTION_STATUS" = "OK" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Export retention:     ${COLOR_GREEN}EXPLICIT${COLOR_RESET}\n"
+elif [ "$BP_EXPORT_RETENTION_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Export retention:     NOT ASSESSED (partial policy set - policies in unreadable namespaces were not checked)\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Export retention:     ${COLOR_YELLOW}IMPLICIT${COLOR_RESET} ($EXPORT_NO_RETENTION_COUNT policy/policies with export but no explicit .retention)\n"
   _ep "$EXPORT_NO_RETENTION_POLICIES" | jq -r '.[:5][] | "      - " + .' 2>/dev/null
@@ -12320,6 +12757,8 @@ fi
 # Cluster-scoped resources (NEW v1.9)
 if [ "$BP_CLUSTER_SCOPED_STATUS" = "CONFIGURED" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Cluster-scoped:       ${COLOR_GREEN}CONFIGURED${COLOR_RESET} (CRDs/ClusterRoles backed up)\n"
+elif [ "$BP_CLUSTER_SCOPED_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Cluster-scoped:       NOT ASSESSED (partial policy set - policies in unreadable namespaces were not checked)\n"
 else
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET}  Cluster-scoped:       Not configured (no policy with includeClusterResources or appType=cluster)\n"
 fi
@@ -12339,6 +12778,8 @@ fi
 # Policies without export (NEW v1.9)
 if [ "$BP_NO_EXPORT_STATUS" = "OK" ]; then
   printf "  ${COLOR_GREEN}[OK]${COLOR_RESET} Export coverage:      ${COLOR_GREEN}ALL POLICIES EXPORT${COLOR_RESET}\n"
+elif [ "$BP_NO_EXPORT_STATUS" = "NOT_ASSESSED" ]; then
+  printf "  ${COLOR_CYAN}[INFO]${COLOR_RESET}  Export coverage:      NOT ASSESSED (partial policy set - policies in unreadable namespaces were not checked)\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]${COLOR_RESET}  Export coverage:      ${COLOR_YELLOW}$POLICIES_NO_EXPORT_COUNT policy/policies snapshot-only (no export)${COLOR_RESET}\n"
   _ep "$POLICIES_NO_EXPORT_LIST" | jq -r '.[:5][] | "      - " + .' 2>/dev/null
