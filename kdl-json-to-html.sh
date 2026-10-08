@@ -608,7 +608,11 @@ details.wl-item > summary::-webkit-details-marker { display:none; }
      query adds none -- so without it the later declaration won and printing
      still dropped every row past page 1 of a 162-row table, under a
      changelog entry saying printing is never paginated. */
-  tbody tr.tbl-hide-p { display:table-row !important; }
+  tbody tr.tbl-hide-p, tbody tr.tbl-hide-c { display:table-row !important; }
+  /* The category filter never drops rows from a printout; the chip stays and
+     says so, so the page names the filter that was on screen. */
+  .cat-chip button { display:none; }
+  .cat-print { display:inline; }
   .tbl-tools, .tbl-pager { display:none; }
 }
 @media (max-width:820px) {
@@ -628,7 +632,17 @@ th[data-sortable] { cursor:pointer; user-select:none; }
    pagination. They have to COMPOSE -- the filter used to set style.display
    directly, which pagination would then stomp (and vice versa), so both now
    use classes and only-issues stays pure CSS. */
-tbody tr.tbl-hide-f, tbody tr.tbl-hide-p { display:none; }
+tbody tr.tbl-hide-f, tbody tr.tbl-hide-p, tbody tr.tbl-hide-c { display:none; }
+/* A third class, for the category filter a click on a summary row sets
+   (issue #56): it composes with the search box (tbl-hide-f), issues-only and
+   pagination (tbl-hide-p) because each owns its own class. */
+.stat-click { cursor:pointer; border-radius:6px; }
+.stat-click:hover, .stat-click:focus-visible { background:var(--brand-dim); outline:none; }
+.stat-click.cat-active { background:var(--brand-dim); box-shadow:inset 3px 0 0 var(--brand); }
+.cat-bar { margin:0.5rem 0 0.25rem; }
+.cat-chip { display:inline-flex; align-items:center; gap:0.4rem; background:var(--brand-dim); border:1px solid var(--brand); color:var(--text); border-radius:999px; padding:0.15rem 0.3rem 0.15rem 0.7rem; font-size:0.78rem; }
+.cat-chip button { background:transparent; border:none; color:inherit; cursor:pointer; font:inherit; line-height:1; padding:0 0.3rem; }
+.cat-print { display:none; }
 .tbl-pager { display:flex; align-items:center; gap:0.4rem; margin-left:auto; font-size:0.75rem; color:var(--text-muted); }
 .tbl-page-btn { background:var(--surface); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:0.2rem 0.5rem; font:inherit; font-size:0.75rem; cursor:pointer; }
 .tbl-page-btn:hover:not(:disabled) { border-color:var(--brand); }
@@ -1037,9 +1051,14 @@ else "" end) + "
                   # not settle it -- so "still being written to" is no longer
                   # the whole of this count. Same three wordings as the
                   # terminal.
-                  | ((.storageRepositories.activeRetainedCount // 0)) as $ret
+                  | ((.storageRepositories.activeRetainedCount // 0)
+                     + (.storageRepositories.activeRetainedUncountedCount // 0)) as $ret
                   | ((.storageRepositories.activeUnverifiedCount // 0)) as $unv
-                  | ($af - $ret - $unv) as $wr
+                  # Published, not subtracted (issue #57). A JSON from before
+                  # activeWrittenCount existed falls back to the remainder.
+                  | (if (.storageRepositories | has("activeWrittenCount"))
+                     then .storageRepositories.activeWrittenCount
+                     else ($af - $ret - $unv) end) as $wr
                   | if $af > 0 then
                       # The count includes repositories whose write date could
                       # not be read -- they stay active so an unknown cannot
@@ -1653,14 +1672,21 @@ else "" end) + "
           # terminal prints, in the same order. The cards after the else are
           # kept for reports that predate it.
           (.storageRepositories.summary) as $sm
-          | def srow: "<div class=\"stat-row\"><span class=\"stat-label\">" + (.label | @html)
+          | # A row or part that carries a category key (KDL.sh publishes one per
+            # row, the same key each repository row is tagged with) filters the
+            # repository table when clicked. A report without keys renders as before.
+            def catattr: if (.key // null) != null
+                then " data-cat=\"" + (.key | @html) + "\" role=\"button\" tabindex=\"0\" title=\"Click to filter the table to these repositories\""
+                else "" end;
+            def catcls: if (.key // null) != null then " stat-click" else "" end;
+            def srow: "<div class=\"stat-row" + catcls + "\"" + catattr + "><span class=\"stat-label\">" + (.label | @html)
                 + "</span><span class=\"stat-value\"><span class=\"badge "
                 + ((.level // "info") | if IN("error", "warn", "info", "ok") then . else "info" end)
                 + "\">" + (.count | tostring) + "</span></span></div>";
             # A part is a breakdown of the row above it and the parts sum to
             # that row, so an informational part carries no badge. Any other
             # level keeps its badge: a part never loses its level.
-            def prow: "<div class=\"stat-row stat-part\"><span class=\"stat-label\">" + (.label | @html)
+            def prow: "<div class=\"stat-row stat-part" + catcls + "\"" + catattr + "><span class=\"stat-label\">" + (.label | @html)
                 + "</span><span class=\"stat-value\">"
                 + (if (.level // "info") == "info" then (.count | tostring)
                    else "<span class=\"badge " + (.level | if IN("error", "warn", "ok") then . else "info" end)
@@ -1824,7 +1850,7 @@ else "" end) + "
         end)
 
       + "</div>
-      <table>
+      <table data-cat-table=\"1\">
         <thead><tr><th>Repository Name</th><th>Application</th><th>Type</th><th>Profile</th><th>Policy</th><th>Bucket/Share</th><th>Status</th><th>Last Full Maintenance</th><th>Last Data Write</th><th>Duration</th></tr></thead>
         <tbody>" +
       # Errors first, then warnings, then the rest: what an auditor reads this
@@ -1836,7 +1862,7 @@ else "" end) + "
           if .statusLevel == "error" then 0
           elif .statusLevel == "warn" or .profileMismatch == true then 1
           else 2 end)[] |
-        "<tr><td><code>" + (.name | @html) + "</code></td>" +
+        "<tr data-cats=\"" + ((.categories // []) | join(" ") | @html) + "\"><td><code>" + (.name | @html) + "</code></td>" +
         # The repository name is a generated suffix and identifies nothing a
         # reader can act on. The application and the policy do: "this failing
         # repository belongs to the mysql backup policy" is the sentence that
@@ -3208,6 +3234,7 @@ else "" end) + "
     // Assigned below only for tables that get a pager; the sort handler calls
     // it unconditionally, so it must always be callable.
     var repage = function(){};
+    table.kdlRepage = function(r){ repage(r); };
     var ths = Array.prototype.slice.call(table.querySelectorAll(`thead th`));
     ths.forEach(function(th, idx){
       th.setAttribute(`data-sortable`, `1`);
@@ -3272,7 +3299,7 @@ else "" end) + "
         var eligible = function(){
           var oi = body.classList.contains(`only-issues`);
           return Array.prototype.slice.call(tbody.querySelectorAll(`tr`)).filter(function(tr){
-            if(tr.classList.contains(`tbl-hide-f`)){ return false; }
+            if(tr.classList.contains(`tbl-hide-f`) || tr.classList.contains(`tbl-hide-c`)){ return false; }
             if(oi && !tr.classList.contains(`has-issue`)){ return false; }
             return true;
           });
@@ -3301,6 +3328,54 @@ else "" end) + "
       }
     }
   });
+
+  // ---------- 5b. category filter (Repository Maintenance summary) ----------
+  // A click on a summary row or part (data-cat) hides, with its own class, every
+  // row of the repository table whose data-cats does not carry the key. The
+  // search box, issues-only and the pager keep their own classes and the pager
+  // counts only rows no mechanism hides. Click the row again or the chip x to clear.
+  var catTable = content.querySelector(`table[data-cat-table]`), catKey = null, catBar = null;
+  if(catTable){
+    catBar = el(`div`, `cat-bar`); catBar.style.display = `none`;
+    catTable.parentNode.insertBefore(catBar, catTable.previousElementSibling && catTable.previousElementSibling.classList.contains(`tbl-tools`) ? catTable.previousElementSibling : catTable);
+  }
+  function setCat(key, label){
+    catKey = key;
+    var shown = 0;
+    Array.prototype.slice.call(catTable.querySelectorAll(`tbody tr`)).forEach(function(tr){
+      var hit = !key || (` ` + (tr.getAttribute(`data-cats`) || ``) + ` `).indexOf(` ` + key + ` `) > -1;
+      tr.classList.toggle(`tbl-hide-c`, !hit);
+      if(hit){ shown++; }
+    });
+    Array.prototype.slice.call(content.querySelectorAll(`[data-cat]`)).forEach(function(n){
+      n.classList.toggle(`cat-active`, n.getAttribute(`data-cat`) === key);
+    });
+    catBar.textContent = ``;
+    catBar.style.display = key ? `block` : `none`;
+    if(key){
+      var chip = el(`span`, `cat-chip`);
+      chip.appendChild(document.createTextNode(`Filtered: ` + label + ` (` + shown + `)`));
+      var pn = el(`span`, `cat-print`); pn.textContent = ` - printing shows every repository`; chip.appendChild(pn);
+      var x = el(`button`, ``); x.type = `button`; x.setAttribute(`aria-label`, `Clear filter`); x.textContent = `\u00d7`;
+      x.addEventListener(`click`, function(){ setCat(null); });
+      chip.appendChild(x); catBar.appendChild(chip);
+    }
+    if(catTable.kdlRepage){ catTable.kdlRepage(true); }
+  }
+  function catClick(n){
+    var key = n.getAttribute(`data-cat`);
+    if(catKey === key){ setCat(null); return; }
+    var lab = n.querySelector(`.stat-label`);
+    setCat(key, lab ? lab.textContent.trim() : key);
+  }
+  if(catTable){
+    content.addEventListener(`click`, function(e){ var n = e.target.closest(`[data-cat]`); if(n){ catClick(n); } });
+    content.addEventListener(`keydown`, function(e){
+      if(e.key !== `Enter` && e.key !== ` `){ return; }
+      var n = e.target.closest ? e.target.closest(`[data-cat]`) : null;
+      if(n){ e.preventDefault(); catClick(n); }
+    });
+  }
 
   // ---------- 6. remediation worklist (findings only, no commands) ----------
   var bp = content.querySelector(`.bp-table`) || content.querySelector(`table`);

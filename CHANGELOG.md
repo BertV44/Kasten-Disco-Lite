@@ -3,6 +3,28 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+- **Repository Maintenance verdict called a retained-uncounted repository
+  "still being written to"** (#57): the `retained-uncounted` active reason was
+  counted inside KDL.sh and never published, and both renderers derived the
+  "written" group by subtraction, so such a repository fell into the first
+  clause, contradicting its own row. KDL.sh now publishes
+  `activeWrittenCount` (counted, not subtracted) and
+  `activeRetainedUncountedCount`; written + retained + retainedUncounted +
+  unverified equals `activeFailingCount` by construction. The verdict folds
+  retained-uncounted into the retained clause, with the same wording in the
+  terminal and the HTML.
+- **Repository Maintenance summary is clickable** (#56, HTML): every summary
+  row and part carries a stable category key, published per repository as
+  `storageRepositories.items[].categories` (and as `key` on each summary row).
+  The summary counts are now counted from those same keys, so a count and the
+  rows behind it cannot drift. Clicking a row filters the repository table
+  (the parent "Lost their owner" is the union of its parts), shows a removable
+  "Filtered: ..." chip, and composes with the search box, issues-only, the
+  pager and column sort; print shows every row and names the filter. Terminal
+  output is unchanged. New harness `kdl-repo-maint-test.sh`.
+
 ## [2.7.0] - 2026-09-28
 
 Four reported defects, one pull request, and the fixes that came out of
