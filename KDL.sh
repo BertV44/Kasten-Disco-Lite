@@ -8436,6 +8436,39 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
             else "info" end) as $lvl
             | if (.idleStranded == true) and ($lvl == "ok") then "warn" else $lvl end)
         })
+  # EIGHTH stage: the summary categories each repository falls under, the ONE
+  # definition of every row and part of the section summary (issue #56). The
+  # summary counts are COUNTED from these keys (SR_CAT_COUNTS below) and the
+  # HTML tags each table row with them, so a count and the rows behind it
+  # cannot drift. Status keys partition the repositories (each in exactly one);
+  # context keys overlap them and each other (an inactive repository can also
+  # have lost its owner). "orphaned" is the parent of the four orphan-* parts.
+  # Predicates are the ones the summary counters always used; they are
+  # evaluated on the finished item, so no sibling-key trap applies.
+  | map(. + {categories: [
+      (if (.status == "FAILING_STALE") and (.severityGate != "quiet") then "failing-stale-active" else empty end),
+      (if (.status == "FAILING_STALE") and (.severityGate == "quiet") then "failing-stale-quiet" else empty end),
+      (if .status == "FAILING" then "failing-recent" else empty end),
+      (if .status == "STALE" then "stale" else empty end),
+      (if .status == "OVERDUE" then "overdue" else empty end),
+      (if (.status == "NEVER_RAN") and (.firstRunDue != false) and (.severityGate != "quiet") then "never-ran-active" else empty end),
+      (if (.status == "NEVER_RAN") and (.firstRunDue != false) and (.severityGate == "quiet") then "never-ran-quiet" else empty end),
+      (if (.status == "NEVER_RAN") and (.firstRunDue == false) then "never-ran-not-due" else empty end),
+      (if .status == "DISABLED" then "disabled" else empty end),
+      (if (.status == "IDLE") and (.idleStranded == true) then "idle-stranded" else empty end),
+      (if (.status == "IDLE") and (.idleStranded != true) then "idle-parked" else empty end),
+      (if .status == "UNKNOWN" then "not-assessed" else empty end),
+      (if .status == "OK" then "ok" else empty end),
+      (if .status == "READ_ONLY" then "read-only" else empty end),
+      (if .inactive == true then "inactive" else empty end),
+      (if .neverWritten == true then "never-written" else empty end),
+      (if .profileMismatch == true then "profile-mismatch" else empty end),
+      (if .orphaned == true then "orphaned" else empty end),
+      (if (.orphaned == true) and ((.orphanReason == "profile-deleted") or (.orphanReason == "policy-deleted")) then "orphan-owner-deleted" else empty end),
+      (if (.orphaned == true) and (.orphanReason == "policy-stopped-exporting") then "orphan-policy-stopped" else empty end),
+      (if (.orphaned == true) and (.orphanReason == "namespace-deleted") then "orphan-namespace-deleted" else empty end),
+      (if (.orphaned == true) and (.orphanReason == "namespace-recreated") then "orphan-namespace-recreated" else empty end)
+    ]})
 ' 2>/dev/null) || { _jq_fail "storage repository maintenance"; STORAGE_REPO_MAINTENANCE='[]'; }
 
 if ! _ep "$STORAGE_REPO_MAINTENANCE" | jq -e '.' >/dev/null 2>&1; then
@@ -8443,6 +8476,11 @@ if ! _ep "$STORAGE_REPO_MAINTENANCE" | jq -e '.' >/dev/null 2>&1; then
 fi
 
 STORAGE_REPO_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq 'length // 0')
+# Category -> repository count, counted from the per-repository keys; the
+# summary rows read these, so a summary count IS the number of rows carrying
+# its key. Small object, safe as an argument.
+SR_CAT_COUNTS=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '[.[].categories[]?] | group_by(.) | map({key: .[0], value: length}) | from_entries' 2>/dev/null)
+_ep "$SR_CAT_COUNTS" | jq -e 'type == "object"' >/dev/null 2>&1 || SR_CAT_COUNTS='{}'
 STORAGE_REPO_UNKNOWN_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "UNKNOWN")] | length // 0')
 STORAGE_REPO_STALE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "STALE")] | length // 0')
 STORAGE_REPO_FAILING_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "FAILING")] | length // 0')
@@ -8523,6 +8561,16 @@ STORAGE_REPO_FAILSET=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '
       activeRetained:   ([ $active[] | select(.activeReason == "retained") ] | length),
       activeRetainedUncounted: ([ $active[] | select(.activeReason == "retained-uncounted") ] | length),
       activeUnverified: ([ $active[] | select(.activeReason == "unverified") ] | length),
+      # The remainder, COUNTED rather than subtracted: every active repository
+      # whose reason is none of the three above (written, undated, or a reason
+      # added later that falls through). Published so no renderer has to
+      # compute active - retained - unverified, which is how a fourth reason
+      # silently landed in "still being written to" (issue #57). By
+      # construction written + retained + retainedUncounted + unverified
+      # == active.
+      activeWritten: ([ $active[] | select((.activeReason != "retained")
+                                           and (.activeReason != "retained-uncounted")
+                                           and (.activeReason != "unverified")) ] | length),
       quiet:    ($quiet | length),
       quietNeverWritten:       ([ $quiet[] | select(.quietReason == "never-written") ] | length),
       quietCountZero:          ([ $quiet[] | select(.quietReason == "count-zero") ] | length),
@@ -8533,13 +8581,15 @@ STORAGE_REPO_FAILSET=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '
       quietMaintenanceFeatureOff: ([ $quiet[] | select(.quietReason == "maintenance-feature-off") ] | length),
       quietIdle:   ([ $quiet[] | select(.inactive == true) ] | length),
       quietOrphan: ([ $quiet[] | select(.orphaned == true) ] | length) }' 2>/dev/null) \
-  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeUnverified":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
+  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeRetainedUncounted":0,"activeUnverified":0,"activeWritten":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
 _ep "$STORAGE_REPO_FAILSET" | jq -e 'type == "object"' >/dev/null 2>&1 \
-  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeUnverified":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
+  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeRetainedUncounted":0,"activeUnverified":0,"activeWritten":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
 STORAGE_REPO_ACTIVE_FAILING_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.active')
 STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeNeverRan // 0')
 STORAGE_REPO_ACTIVE_RETAINED_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeRetained // 0')
+STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeRetainedUncounted // 0')
 STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeUnverified // 0')
+STORAGE_REPO_ACTIVE_WRITTEN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeWritten // 0')
 STORAGE_REPO_QUIET_COUNT_ZERO_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietCountZero // 0')
 STORAGE_REPO_QUIET_UNREACHABLE_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietProfileUnreachable // 0')
 STORAGE_REPO_QUIET_NO_RETAINER_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietNoRetainer // 0')
@@ -8607,7 +8657,9 @@ STORAGE_REPO_LISTED=$(safe_int "$REPO_NAMES_COUNT")
 [ -z "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" ] && STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT=0
 case "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT=0 ;; esac
 case "$STORAGE_REPO_ACTIVE_RETAINED_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_RETAINED_COUNT=0 ;; esac
+case "$STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT=0 ;; esac
 case "$STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT=0 ;; esac
+case "$STORAGE_REPO_ACTIVE_WRITTEN_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_WRITTEN_COUNT=0 ;; esac
 case "$STORAGE_REPO_QUIET_COUNT_ZERO_COUNT" in ''|*[!0-9]*) STORAGE_REPO_QUIET_COUNT_ZERO_COUNT=0 ;; esac
 case "$STORAGE_REPO_QUIET_UNREACHABLE_COUNT" in ''|*[!0-9]*) STORAGE_REPO_QUIET_UNREACHABLE_COUNT=0 ;; esac
 case "$STORAGE_REPO_QUIET_NO_RETAINER_COUNT" in ''|*[!0-9]*) STORAGE_REPO_QUIET_NO_RETAINER_COUNT=0 ;; esac
@@ -8828,17 +8880,22 @@ case "$BP_STORAGE_REPO_STATUS" in
       # whose last write cannot be dated (an unknown must not quieten a
       # finding on its own), and quiet ones the gate keeps -- a live policy
       # still retires restore points in them, or nothing proves they stopped.
-      _srv_w=$((STORAGE_REPO_ACTIVE_FAILING_COUNT - STORAGE_REPO_ACTIVE_RETAINED_COUNT - STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT))
+      # Read from the published counts, never subtracted. The retained clause
+      # covers both retained and retained-uncounted (a live policy retires
+      # restore points in it either way; whether the snapshot count is known is
+      # said on the row).
+      _srv_w=$STORAGE_REPO_ACTIVE_WRITTEN_COUNT
+      _srv_ret=$((STORAGE_REPO_ACTIVE_RETAINED_COUNT + STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT))
       _srv_why=""
       if [ "$_srv_w" -gt 0 ] 2>/dev/null; then
         _srv_why="$_srv_w still being written to, or with no write date to say otherwise"
       fi
-      if [ "$STORAGE_REPO_ACTIVE_RETAINED_COUNT" -gt 0 ] 2>/dev/null; then
+      if [ "$_srv_ret" -gt 0 ] 2>/dev/null; then
         if [ -n "$_srv_why" ]; then _srv_why="$_srv_why; "; fi
-        if [ "$STORAGE_REPO_ACTIVE_RETAINED_COUNT" -eq 1 ]; then
+        if [ "$_srv_ret" -eq 1 ]; then
           _srv_why="${_srv_why}1 quiet, but a live policy still retires restore points in it"
         else
-          _srv_why="${_srv_why}$STORAGE_REPO_ACTIVE_RETAINED_COUNT quiet, but a live policy still retires restore points in them"
+          _srv_why="${_srv_why}$_srv_ret quiet, but a live policy still retires restore points in them"
         fi
       fi
       if [ "$STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT" -gt 0 ] 2>/dev/null; then
@@ -9003,14 +9060,6 @@ case "$BP_STORAGE_REPO_STATUS" in
     ;;
 esac
 
-# The part of the two statuses that can earn the section critical which does,
-# and the part that is quiet: the summary lists them apart, coloured as the
-# verdict counts them.
-STORAGE_REPO_FS_ACTIVE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "FAILING_STALE" and .severityGate != "quiet")] | length // 0' 2>/dev/null)
-STORAGE_REPO_FS_QUIET_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "FAILING_STALE" and .severityGate == "quiet")] | length // 0' 2>/dev/null)
-STORAGE_REPO_NRD_ACTIVE_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "NEVER_RAN" and (.firstRunDue != false) and .severityGate != "quiet")] | length // 0' 2>/dev/null)
-STORAGE_REPO_NRD_QUIET_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | select(.status == "NEVER_RAN" and (.firstRunDue != false) and .severityGate == "quiet")] | length // 0' 2>/dev/null)
-
 # The section summary, written once as well: the total, the status rows (every
 # repository counted once) and the context rows (already counted by status),
 # with the labels both outputs print. They had labelled 13 of 16 rows
@@ -9020,23 +9069,19 @@ STORAGE_REPO_NRD_QUIET_COUNT=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq '[.[] | sele
 SR_SUMMARY_JSON=$(jq -cn \
   --argjson listed "${STORAGE_REPO_LISTED:-0}" --argjson total "${STORAGE_REPO_COUNT:-0}" \
   --argjson thr "${STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS:-7}" --argjson ithr "${STORAGE_REPO_INACTIVE_THRESHOLD_DAYS:-30}" \
-  --argjson fsA "${STORAGE_REPO_FS_ACTIVE_COUNT:-0}" --argjson fsQ "${STORAGE_REPO_FS_QUIET_COUNT:-0}" \
-  --argjson fl "${STORAGE_REPO_FAILING_COUNT:-0}" \
-  --argjson st "${STORAGE_REPO_STALE_COUNT:-0}" --argjson od "${STORAGE_REPO_OVERDUE_COUNT:-0}" \
-  --argjson nrdA "${STORAGE_REPO_NRD_ACTIVE_COUNT:-0}" --argjson nrdQ "${STORAGE_REPO_NRD_QUIET_COUNT:-0}" \
-  --argjson nrn "${STORAGE_REPO_NEVER_RAN_NEW_COUNT:-0}" \
-  --argjson dis "${STORAGE_REPO_DISABLED_COUNT:-0}" --argjson idle "${STORAGE_REPO_IDLE_COUNT:-0}" \
-  --argjson idles "${STORAGE_REPO_IDLE_STRANDED_COUNT:-0}" --argjson unk "${STORAGE_REPO_UNKNOWN_COUNT:-0}" \
-  --argjson ok "${STORAGE_REPO_OK_COUNT:-0}" --argjson ro "${STORAGE_REPO_READONLY_COUNT:-0}" \
-  --argjson inact "${STORAGE_REPO_INACTIVE_COUNT:-0}" --argjson unused "${STORAGE_REPO_UNUSED_COUNT:-0}" \
-  --argjson unusedro "${STORAGE_REPO_UNUSED_READONLY_COUNT:-0}" --argjson pm "${STORAGE_REPO_PROFILE_MISMATCH_COUNT:-0}" \
-  --argjson orph "${STORAGE_REPO_ORPHANED_COUNT:-0}" --argjson ow1 "${STORAGE_REPO_ORPHANED_OWNER_DELETED_COUNT:-0}" \
-  --argjson ow2 "${STORAGE_REPO_ORPHANED_STOPPED_COUNT:-0}" --argjson ow3 "${STORAGE_REPO_ORPHANED_NS_DELETED_COUNT:-0}" \
-  --argjson ow4 "${STORAGE_REPO_ORPHANED_NS_RECREATED_COUNT:-0}" \
+  --argjson cat "$SR_CAT_COUNTS" \
+  --argjson unusedro "${STORAGE_REPO_UNUSED_READONLY_COUNT:-0}" \
   --argjson blk "$SR_DRBLOCK_PRESENT" --arg blkReason "$SR_DRBLOCK_REASON" --arg blkSentence "$SR_BLOCK_SENTENCE" \
   --argjson feat "$SR_FEAT_PRESENT" --argjson featCm "$SR_FEAT_CM_FOUND" --arg featValue "$SR_FEAT_VALUE" \
   --arg featReason "$SR_FEAT_REASON" --arg featSentence "$SR_FEAT_SENTENCE" '
-  def row(l; n; lv): if n > 0 then [{label: l, count: n, level: lv}] else [] end;
+  # Every row names its category key and takes its count from $cat -- the
+  # per-repository categories counted once (SR_CAT_COUNTS) -- so the number a
+  # row prints is, by construction, the number of repositories carrying the
+  # key the HTML filters on (issue #56). Rows at zero are left out.
+  def c(k): ($cat[k] // 0);
+  def row(k; l; lv): c(k) as $n | if $n > 0 then [{key: k, label: l, count: $n, level: lv}] else [] end;
+  ($cat["never-written"] // 0) as $unused
+  |
   # The preconditions, printed at the top of the section by both outputs,
   # whatever the verdict and whether or not any repository exists. A value in
   # k10-features that reads as off is called out because K10 does not read
@@ -9074,33 +9119,33 @@ SR_SUMMARY_JSON=$(jq -cn \
                value: (if $listed > $total then "\($total) of \($listed) listed - \($listed - $total) unreadable"
                        else ($total | tostring) end)},
        statusNote: "Every repository counted once - adds up to the total.",
-       status: (row("Run failed, no success in \($t)+ days"; $fsA; "error")
-                + row("Run failed, no success in \($t)+ days, not critical - the reason is under each repository"; $fsQ; "warn")
-                + row("Last run failed, success still recent"; $fl; "warn")
-                + row("Stale, last success over \($t) days ago"; $st; "warn")
-                + row("Past due by a full cycle, no maintenance running"; $od; "warn")
-                + row("Never ran, first run overdue"; $nrdA; "error")
-                + row("Never ran, first run overdue, not critical - the reason is under each repository"; $nrdQ; "warn")
-                + row("Never ran, first run not yet overdue"; $nrn; "info")
-                + row("Maintenance disabled"; $dis; "warn")
-                + row("Idle, stranded content - nothing reclaims it until the next write"; $idles; "warn")
-                + row("Idle, parked by K10 after five clean cycles - not a fault"; ($idle - $idles); "info")
-                + row("Not assessed"; $unk; "info")
-                + row("OK, maintained within \($t) days"; $ok; "ok")
-                + row("Read-only (import), maintained by the source cluster"; $ro; "info")),
+       status: (row("failing-stale-active"; "Run failed, no success in \($t)+ days"; "error")
+                + row("failing-stale-quiet"; "Run failed, no success in \($t)+ days, not critical - the reason is under each repository"; "warn")
+                + row("failing-recent"; "Last run failed, success still recent"; "warn")
+                + row("stale"; "Stale, last success over \($t) days ago"; "warn")
+                + row("overdue"; "Past due by a full cycle, no maintenance running"; "warn")
+                + row("never-ran-active"; "Never ran, first run overdue"; "error")
+                + row("never-ran-quiet"; "Never ran, first run overdue, not critical - the reason is under each repository"; "warn")
+                + row("never-ran-not-due"; "Never ran, first run not yet overdue"; "info")
+                + row("disabled"; "Maintenance disabled"; "warn")
+                + row("idle-stranded"; "Idle, stranded content - nothing reclaims it until the next write"; "warn")
+                + row("idle-parked"; "Idle, parked by K10 after five clean cycles - not a fault"; "info")
+                + row("not-assessed"; "Not assessed"; "info")
+                + row("ok"; "OK, maintained within \($t) days"; "ok")
+                + row("read-only"; "Read-only (import), maintained by the source cluster"; "info")),
        contextNote: "Already counted by status - not extra repositories.",
-       context: (row("No data written for \($ithr)+ days"; $inact; "info")
-                 + row("Never written to since creation"
+       context: (row("inactive"; "No data written for \($ithr)+ days"; "info")
+                 + row("never-written"; "Never written to since creation"
                        + (if $unusedro <= 0 then ""
                           elif $unusedro == $unused then " (all read-only imports, nothing received yet)"
-                          else " (\($unusedro) read-only imports)" end); $unused; "info")
-                 + (row("Profile no longer points here (repointed, older repositories left behind)"; $pm; "warn")
+                          else " (\($unusedro) read-only imports)" end); "info")
+                 + (row("profile-mismatch"; "Profile no longer points here (repointed, older repositories left behind)"; "warn")
                     | map(. + {note: "Maintenance through that profile cannot succeed. Check whether the old target is still needed before deleting them, or open a support case - these hold backup data."}))
-                 + (row("Lost their owner"; $orph; "info")
-                    | map(. + {parts: (row("Profile/policy deleted"; $ow1; "info")
-                                       + row("Policy no longer exports to this profile"; $ow2; "info")
-                                       + row("Namespace deleted"; $ow3; "info")
-                                       + row("Namespace deleted and recreated with the same name (UID changed)"; $ow4; "info"))})))}
+                 + (row("orphaned"; "Lost their owner"; "info")
+                    | map(. + {parts: (row("orphan-owner-deleted"; "Profile/policy deleted"; "info")
+                                       + row("orphan-policy-stopped"; "Policy no longer exports to this profile"; "info")
+                                       + row("orphan-namespace-deleted"; "Namespace deleted"; "info")
+                                       + row("orphan-namespace-recreated"; "Namespace deleted and recreated with the same name (UID changed)"; "info"))})))}
     end' 2>/dev/null)
 [ -n "$SR_SUMMARY_JSON" ] || SR_SUMMARY_JSON='null'
 
@@ -9709,7 +9754,9 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoUnusedReadOnlyCount "$STORAGE_REPO_UNUSED_READONLY_COUNT" \
     --argjson storageRepoActiveFailingCount "$STORAGE_REPO_ACTIVE_FAILING_COUNT" \
     --argjson storageRepoActiveRetainedCount "$STORAGE_REPO_ACTIVE_RETAINED_COUNT" \
+    --argjson storageRepoActiveRetainedUncountedCount "$STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT" \
     --argjson storageRepoActiveUnverifiedCount "$STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT" \
+    --argjson storageRepoActiveWrittenCount "$STORAGE_REPO_ACTIVE_WRITTEN_COUNT" \
     --argjson storageRepoQuietCountZeroCount "$STORAGE_REPO_QUIET_COUNT_ZERO_COUNT" \
     --argjson storageRepoQuietUnreachableCount "$STORAGE_REPO_QUIET_UNREACHABLE_COUNT" \
     --argjson storageRepoQuietNoRetainerCount "$STORAGE_REPO_QUIET_NO_RETAINER_COUNT" \
@@ -10457,10 +10504,20 @@ if [ "$MODE" = "json" ]; then
         # looser predicate, and told the reader "each of them is idle" about a
         # set three times larger than the one the downgrade was computed over.
         quietFailingCount: $storageRepoQuietFailingCount,
-        # The partition, by reason. activeRetained are quiet repositories kept
-        # critical because a live policy still retires restore points in them; activeUnverified
-        # are quiet ones the gate could not settle, kept critical for that.
+        # The partition of activeFailingCount, by reason, and it sums to it by
+        # construction: activeWrittenCount + activeRetainedCount +
+        # activeRetainedUncountedCount + activeUnverifiedCount.
+        # activeWrittenCount: written inside the threshold, or last write
+        # undated (the remainder, counted, never derived by a renderer).
+        # activeRetainedCount: quiet repositories kept critical because a live
+        # policy still retires restore points in them, snapshot count known.
+        # activeRetainedUncountedCount: the same, but no storage scan has
+        # reported a snapshot count; the verdict folds it into the retained
+        # clause, the row says the count is unknown.
+        # activeUnverifiedCount: quiet ones the gate could not settle.
+        activeWrittenCount: $storageRepoActiveWrittenCount,
         activeRetainedCount: $storageRepoActiveRetainedCount,
+        activeRetainedUncountedCount: $storageRepoActiveRetainedUncountedCount,
         activeUnverifiedCount: $storageRepoActiveUnverifiedCount,
         quietCountZeroCount: $storageRepoQuietCountZeroCount,
         quietProfileUnreachableCount: $storageRepoQuietUnreachableCount,
