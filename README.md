@@ -787,6 +787,22 @@ The verdict keys on the subset that nothing retains —
 | `policy-retained` | Past the threshold and still within what the policy retains — reported as context, never as a finding |
 | `policy-unverifiable` | Names a policy that could not be checked because the policy list was empty or unreadable — never reported as deleted |
 | `policy-retention-unknown` | Live policy declaring no snapshot retention at all — the window is unknown, so neither retained nor residual |
+| `manual-no-expiry` | Manual run (`k10.kasten.io/isRunNow=true`) with no `k10.kasten.io/expiresAt` label — the Kasten UI's "No expiration": nothing ever retires it. A finding |
+| `manual-expired` | Manual run whose `expiresAt` is past by more than the 2-day retirement grace: Kasten should already have retired it. A finding |
+| `manual-expires` | Manual run still inside its `expiresAt` date (or the grace) — Kasten retires it; context, never a finding |
+| `manual-expiry-unknown` | Manual run whose `expiresAt` could not be parsed — gates the verdict to `NOT_ASSESSED` |
+| `k10-dr` | Manual run of Kasten's own `k10-disaster-recovery-policy` — managed by Kasten, never reported as an anomaly |
+
+Manual runs are **never ranked** against their policy's retention (the policy
+name they carry does not retire them); they are judged on their `expiresAt`
+label alone. `residualSnapshots.expiry` is an information-only overview over
+every non-imported RestorePointContent, local **and exported**: scheduled
+`N/A`, manual "No expiration" (with the oldest ones listed, flagged local or
+exported), manual with an expiry date, expired, unparsable, and Kasten DR
+snapshots counted apart. An export with no expiration sits in the export
+repository, not in the cluster, so it is not a residual snapshot and never
+changes the best-practice verdict. The label semantics (`expiresAt` with the
+time colons replaced by hyphens, `isRunNow`) were verified on Kasten 9.0.x only.
 
 Reported sizes come from `status.physicalSizeBytes`, which is absent on plenty
 of clusters. Absent, non-numeric and negative all count as **unknown**, never as
