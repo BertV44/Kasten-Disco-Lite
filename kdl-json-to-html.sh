@@ -478,6 +478,8 @@ h3 { font-size:1rem; margin:1.5rem 0 0.5rem; color:var(--text-muted); }
 
 /* ===== badges (new + legacy names) ===== */
 .new-badge, .tuned-badge { background:var(--brand-dim); color:var(--brand); font-size:0.65rem; padding:0.15rem 0.45rem; border-radius:6px; margin-left:0.5rem; font-weight:600; letter-spacing:0.3px; }
+/* a header that explains itself on hover (native title tooltip) */
+.hint { text-decoration:underline dotted; text-underline-offset:3px; cursor:help; }
 .badge { display:inline-flex; align-items:center; gap:0.3rem; padding:0.16rem 0.55rem; border-radius:999px; font-size:0.74rem; font-weight:600; white-space:nowrap; border:1px solid; }
 .badge.ok, .ok { background:var(--ok-bg); color:var(--ok-fg); border-color:var(--ok-bd); }
 .badge.warn, .warn { background:var(--warn-bg); color:var(--warn-fg); border-color:var(--warn-bd); }
@@ -2159,7 +2161,7 @@ else "" end) + "
             ] | join(" &middot; "))
           + "</div>
       <table>
-      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th>Rank / retained</th><th>Physical size</th></tr></thead>
+      <thead><tr><th>RestorePointContent</th><th>Namespace</th><th>Application</th><th>Age</th><th>Why residual</th><th><span class=\"hint\" title=\"Rank: where this snapshot sits among the local snapshots of the same application and policy, newest first (1 = newest).&#10;Retained: how many snapshots the declared retention of that policy can hold at most, the sum of its counts (hourly 24 + daily 7 = 31). That overstates what is kept, since one snapshot can fill a daily and a weekly slot, so a rank past it is residual for certain.&#10;&#10;A dash is the usual case: the row is residual for a reason that does not depend on retention, so rank decides nothing. Either the snapshot was taken on demand (no policy), its policy was deleted, or it is Unbound: its RestorePoint is gone, typically with the namespace, and only the content is left. Only a past-retention row (policy-over-retention) shows a rank. The Why residual column gives the reason.\">Rank / retained</span></th><th>Physical size</th></tr></thead>
       <tbody>" +
         ([.residualSnapshots.items[:10][]? |
           "<tr>
