@@ -463,8 +463,61 @@ assert_eq "f4: ... score flagged as a lower bound" "$(jf "$WORK/c5.json" '.ranso
 assert_eq "f4: ... and not named the biggest gap" "$(jf "$WORK/c5.json" '.ransomwareReadiness.biggestGap.pillar // "none"' | grep -c 'Off-cluster export')" "0"
 assert_has "f4: terminal says why" "$WORK/c5.txt" "the policy set is partial, so an exporting policy may be unseen"
 assert_has "f4: html says why" "$WORK/c5.html" "Score is a lower bound."
+assert_has "f4: terminal grade line says lower bound" "$WORK/c5.txt" "lower bound)"
 assert_eq "f4: complete set keeps the pillar assessed" "$(jf "$WORK/a.json" '.ransomwareReadiness.pillars.offClusterExport.assessed')" "true"
 assert_eq "f4: partial set WITH a visible export policy stays assessed" "$(jf "$WORK/c1.json" '.ransomwareReadiness.pillars.offClusterExport.assessed')" "true"
+
+
+# ============================================================================
+echo "== (g1) an app-scoped policy's NotIn is not a K10-wide exception"
+G1="$WORK/ov-g1"; mkdir -p "$G1"
+add_items "$NS_FILE" "$(ns_item tenant-a)" > "$WORK/g1-ns.json"
+put "$G1" 0 "$WORK/g1-ns.json" "" get namespaces -o json
+jq -n -c --argjson gaps "$(jf "$WORK/a.json" '.coverage.unprotectedNamespaces.items')" \
+  '{apiVersion:"config.kio.kasten.io/v1alpha1", kind:"Policy", metadata:{name:"hides-gaps", namespace:"tenant-a"},
+    spec:{frequency:"@daily", retention:{daily:7}, actions:[{action:"backup"}],
+          selector:{matchExpressions:[{key:"k10.kasten.io/appNamespace", operator:"NotIn", values:$gaps}]}}}' > "$WORK/g1-p.json"
+add_items "$POLICIES_K10" "$(cat "$WORK/g1-p.json")" > "$WORK/g1-all.json"
+put "$G1" 0 "$WORK/g1-all.json" "" get "$POLKEY" -A -o json
+run g1 "$G1"
+assert_eq "g1: no policy exclusion recorded for the app-scoped policy" "$(jf "$WORK/g1.json" '[.k10Configuration.policyExclusions.byPolicy[]? | select(.policy == "hides-gaps")] | length')" "0"
+assert_eq "g1: excludedByPolicy unchanged" "$(jf "$WORK/g1.json" '.coverage.unprotectedBreakdown.excludedByPolicy')" "$(jf "$WORK/a.json" '.coverage.unprotectedBreakdown.excludedByPolicy')"
+assert_eq "g1: actionable gaps unchanged" "$(jf "$WORK/g1.json" '.coverage.unprotectedBreakdown.actionable')" "$(jf "$WORK/a.json" '.coverage.unprotectedBreakdown.actionable')"
+assert_eq "g1: namespace protection not COMPLETE" "$(jf "$WORK/g1.json" '.bestPractices.namespaceProtection')" "$(jf "$WORK/a.json" '.bestPractices.namespaceProtection')"
+assert_eq "g1: the policy still appears in the inventory (it exists), only as a policy" "$(jf "$WORK/g1.json" '[.policies.items[] | select(.name == "hides-gaps") | .namespace] | first')" "tenant-a"
+assert_eq "g1: terminal and html agree with the JSON on the gap count" "$(grep -c 'deliberately excluded' "$WORK/g1.txt")" "$(grep -c 'deliberately excluded' "$WORK/a.txt")"
+
+# ============================================================================
+echo "== (g2) an app-scoped VM policy that can reach no VM is not a VM policy"
+G2="$WORK/ov-g2"; mkdir -p "$G2"
+: > "$G2/$(kdl_key get customresourcedefinitions.apiextensions.k8s.io virtualmachines.kubevirt.io).out"
+echo 0 > "$G2/$(kdl_key get customresourcedefinitions.apiextensions.k8s.io virtualmachines.kubevirt.io).rc"
+printf '%s\n' '{"items":[{"apiVersion":"kubevirt.io/v1","kind":"VirtualMachine","metadata":{"name":"vm1","namespace":"k10-restore-test","labels":{}},"status":{"printableStatus":"Running","ready":true}}]}' > "$WORK/g2-vms.json"
+put "$G2" 0 "$WORK/g2-vms.json" "" get virtualmachines.kubevirt.io -A -o json
+jq -n -c '{apiVersion:"config.kio.kasten.io/v1alpha1", kind:"Policy", metadata:{name:"tenant-vm", namespace:"kdrill-demo"},
+           spec:{frequency:"@daily", retention:{daily:7}, actions:[{action:"backup"}],
+                 selector:{matchExpressions:[{key:"k10.kasten.io/virtualMachineRef", operator:"In", values:["k10-restore-test/vm1"]}]}}}' > "$WORK/g2-p.json"
+add_items "$POLICIES_K10" "$(cat "$WORK/g2-p.json")" > "$WORK/g2-all.json"
+put "$G2" 0 "$WORK/g2-all.json" "" get "$POLKEY" -A -o json
+run g2 "$G2"
+assert_eq "g2: VM policies counted: none can reach a VM" "$(jf "$WORK/g2.json" '.virtualization.vmPolicies.count')" "0"
+assert_eq "g2: no explicit VM refs / wildcards claimed" "$(jf "$WORK/g2.json" '(.virtualization.protection.explicitVmRefs | tostring) + "/" + (.virtualization.protection.hasWildcardPatterns | tostring)')" "0/false"
+assert_eq "g2: the VM is unprotected" "$(jf "$WORK/g2.json" '.virtualization.protection.protectedVMs')" "0"
+assert_eq "g2: verdict is NOT_CONFIGURED (FAIL), not PARTIAL" "$(jf "$WORK/g2.json" '.bestPractices.vmProtection')" "NOT_CONFIGURED"
+assert_has "g2: terminal says NOT CONFIGURED" "$WORK/g2.txt" "NOT CONFIGURED"
+assert_lacks "g2: terminal does not say PARTIAL for VMs" "$WORK/g2.txt" "VM Protection:        PARTIAL"
+assert_has "g2: html VM protection badge" "$WORK/g2.html" "NOT CONFIGURED</span>"
+
+# ============================================================================
+echo "== (g3) a numeric error message does not break the report"
+G3="$WORK/ov-g3"; mkdir -p "$G3"
+add_items "$BA_FILE" "$(fa fa-num '{"message":5}')" > "$WORK/g3-ba.json"
+put "$G3" 0 "$WORK/g3-ba.json" "" get backupactions.actions.kio.kasten.io -A -o json
+run g3 "$G3"
+assert_eq "g3: message coerced to a string" "$(jf "$WORK/g3.json" '[.failedActionsTop5.items[] | select(.name == "fa-num") | .message] | first')" "5"
+assert_eq "g3: status OK" "$(jf "$WORK/g3.json" '.failedActionsTop5.status')" "OK"
+if [ -s "$WORK/g3.html" ]; then ok "g3: html rendered (not empty)"; else bad "g3: html empty"; fi
+assert_has "g3: html shows the coerced message" "$WORK/g3.html" "<code>5</code>"
 
 echo "== (e) gate-style empty run: fake kubectl answers {\"items\":[]} to everything"
 E="$WORK/ebin"; mkdir -p "$E"

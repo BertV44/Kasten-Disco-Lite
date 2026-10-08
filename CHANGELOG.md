@@ -98,6 +98,14 @@ Manual runs and snapshot expiry (issue #63).
   - Policy names carry their namespace outside the K10 namespace in every
     HTML table too (`displayName`, published once, read by both renderers).
   - Terminal redundant-pair separator is ASCII (`<->`).
+  - Second audit round: an app-scoped policy's `NotIn` no longer counts as a
+    K10-wide "deliberate exclusion" (it hid real gaps behind COMPLETE); app-scoped
+    VM policies that can reach no VM are not counted as VM policies (verdict
+    NOT_CONFIGURED, not PARTIAL; explicit refs and wildcards filtered the same
+    way); app-scoped policies no longer count toward the cluster-scoped-resources
+    check; a numeric `status.error.message` is coerced to a string (it made the
+    HTML renderer exit empty); the terminal grade line says "lower bound" like
+    the HTML; a duplicated jq `--arg` is removed.
 
 ## [2.7.0] - 2026-09-28
 
