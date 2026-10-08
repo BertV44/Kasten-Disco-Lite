@@ -15,6 +15,7 @@ set -eu
 
 ROOT=$(cd "$(dirname "$0")" && pwd)
 KDL_HARNESS=${KDL_HARNESS:-/private/tmp/claude-502/-Users-bertrand-castagnet-Kasten-Disco-Lite/e02d74d7-3eac-4533-bb00-787b69de5098/scratchpad/harness}
+KDL_SH=${KDL_SH:-$ROOT/KDL.sh}   # override to test another KDL.sh
 RPC_KEY="get_restorepointcontents.apps.kio.kasten.io_-o_json"
 POLICY="kdrill-demo-backup-export"   # declares retention {daily: 2} in the corpus
 ESC=$(printf '\033')
@@ -70,9 +71,9 @@ runkdl() {
   _d="$T/$1/ovr"
   mkdir -p "$T/$1"
   [ -d "$_d" ] || mkdir -p "$_d"
-  PATH="$KDL_HARNESS/bin:$PATH" KDL_OVERRIDE="$_d" sh "$ROOT/KDL.sh" kasten-io --json > "$T/$1/out.json" 2> "$T/$1/err.txt" \
+  PATH="$KDL_HARNESS/bin:$PATH" KDL_OVERRIDE="$_d" sh "$KDL_SH" kasten-io --json > "$T/$1/out.json" 2> "$T/$1/err.txt" \
     || { bad "$1: KDL.sh --json failed"; return 1; }
-  PATH="$KDL_HARNESS/bin:$PATH" KDL_OVERRIDE="$_d" sh "$ROOT/KDL.sh" kasten-io > "$T/$1/term.raw" 2> /dev/null \
+  PATH="$KDL_HARNESS/bin:$PATH" KDL_OVERRIDE="$_d" sh "$KDL_SH" kasten-io > "$T/$1/term.raw" 2> /dev/null \
     || { bad "$1: KDL.sh terminal failed"; return 1; }
   sed "s/${ESC}\[[0-9;]*m//g" "$T/$1/term.raw" > "$T/$1/term.txt"
   sh "$ROOT/kdl-json-to-html.sh" "$T/$1/out.json" "$T/$1/out.html" > /dev/null 2>&1 \
@@ -99,31 +100,36 @@ eq "expiry.status"                          OK "$(j lab .residualSnapshots.expir
 eq "expiry.manualNoExpiration"              5 "$(j lab .residualSnapshots.expiry.manualNoExpiration)"
 eq "expiry.manualNoExpirationExported"      5 "$(j lab .residualSnapshots.expiry.manualNoExpirationExported)"
 eq "expiry.manualNoExpirationLocal"         0 "$(j lab .residualSnapshots.expiry.manualNoExpirationLocal)"
-eq "expiry.manualWithExpiry (DR excluded)"  2 "$(j lab .residualSnapshots.expiry.manualWithExpiry)"
-eq "manual DR run counted apart (k10Dr)"    1 "$(j lab .residualSnapshots.breakdown.k10Dr)"
-eq "2 + 1 DR = the 3 manual runs with expiry" 3 "$(( $(j lab .residualSnapshots.expiry.manualWithExpiry) + $(j lab .residualSnapshots.breakdown.k10Dr) ))"
-eq "expiry.manualExpiryPassed (lab expiry 2026-09-30)" 2 "$(j lab .residualSnapshots.expiry.manualExpiryPassed)"
+eq "expiry.manualWithExpiry (the 3 corpus runs, DR one included)" 3 "$(j lab .residualSnapshots.expiry.manualWithExpiry)"
+eq "DR manual run with an expiry is NOT exempt (k10Dr counts no-expiry ones only)" 0 "$(j lab .residualSnapshots.breakdown.k10Dr)"
+eq "expiry.manualExpiryPassed (lab expiry 2026-09-30)" 3 "$(j lab .residualSnapshots.expiry.manualExpiryPassed)"
+eq "lab: unretained = etcd over-retention + DR manual-expired" 2 "$(j lab .residualSnapshots.unretained)"
+eq "lab: policyRetained"                    6 "$(j lab .residualSnapshots.breakdown.policyRetained)"
+eq "lab: policyOverRetention"               1 "$(j lab .residualSnapshots.breakdown.policyOverRetention)"
+eq "lab: manualExpired is the Unbound DR leftover" "kasten-io-scheduled-4wswx" "$(j lab '[.residualSnapshots.items[] | select(.reason == "manual-expired")][0].name')"
+has "lab terminal: Unbound leftover noted"  "$T/lab/term.txt" "(manual-expired; RestorePoint already removed, content left Unbound)"
+has "lab html: Kasten already removed the RestorePoint" "$T/lab/html.txt" "Kasten has already removed the RestorePoint (state Unbound"
 eq "expiry.unparseable"                     0 "$(j lab .residualSnapshots.expiry.unparseable)"
 eq "expiry.items length"                    5 "$(j lab '.residualSnapshots.expiry.items | length')"
 eq "expiry.items all exported"              true "$(j lab '[.residualSnapshots.expiry.items[].exported] | all')"
 eq "expiry.items all policy kdrill-demo-backup-export" true "$(j lab '[.residualSnapshots.expiry.items[].policy] | all(. == "kdrill-demo-backup-export")')"
 eq "expiry.total = non-imported RPCs (65)"  65 "$(j lab .residualSnapshots.expiry.total)"
 eq "every RPC is in exactly one bucket"     65 "$(j lab '.residualSnapshots.expiry | .scheduledNA + .scheduledWithExpiry + .manualNoExpiration + .manualWithExpiry + .drPolicy')"
-eq "DR snapshots never in residual items"   0 "$(j lab '[.residualSnapshots.items[] | select(.policyName == "k10-disaster-recovery-policy")] | length')"
+eq "scheduled DR snapshots are not residual items" 0 "$(j lab '[.residualSnapshots.items[] | select(.policyName == "k10-disaster-recovery-policy" and .reason != "manual-expired")] | length')"
 eq "exports are not residual findings"      0 "$(j lab '[.residualSnapshots.items[] | select(.policyName == "kdrill-demo-backup-export")] | length')"
 eq "manual no-expiry counted as finding?"   0 "$(j lab .residualSnapshots.breakdown.manualNoExpiry)"
 # Terminal and HTML agree with the data
 has "terminal: no-expiration line"   "$T/lab/term.txt" "manual runs with no expiration: 5 (0 local, 5 exported)"
-has "terminal: expiry-date line"     "$T/lab/term.txt" "manual runs with an expiry date: 2 (2 past it by more than 2 days, 0 unparsable)"
-has "terminal: DR excluded line"     "$T/lab/term.txt" "5 Kasten disaster-recovery snapshot(s) excluded"
+has "terminal: expiry-date line"     "$T/lab/term.txt" "manual runs with an expiry date: 3 (3 past it by more than 2 days, 0 unparsable)"
+has "terminal: DR excluded line"     "$T/lab/term.txt" "4 Kasten disaster-recovery snapshot(s) excluded"
 has "terminal: 9.0.x caveat"         "$T/lab/term.txt" "verified on Kasten 9.0.x only"
 has "terminal: info subsection title" "$T/lab/term.txt" "Snapshots with no expiry"
 has "html: no-expiration row"        "$T/lab/html.txt" "Manual runs, no expiration 5 (0 local, 5 exported)"
-has "html: expiry-date row"          "$T/lab/html.txt" "Manual runs, with an expiry date 2 (2 past it by more than 2 days, 0 unparsable)"
+has "html: expiry-date row"          "$T/lab/html.txt" "Manual runs, with an expiry date 3 (3 past it by more than 2 days, 0 unparsable)"
 has "html: subsection title"         "$T/lab/html.txt" "Snapshots with no expiry"
 has "html: information-not-finding"  "$T/lab/html.txt" "This is information, not a finding"
 has "html: 9.0.x caveat"             "$T/lab/html.txt" "verified on Kasten 9.0.x only"
-has "html: DR snapshots row"         "$T/lab/html.txt" "Kasten DR snapshots (excluded above) 5"
+has "html: DR snapshots row"         "$T/lab/html.txt" "Kasten DR snapshots (excluded above) 4"
 # Exports with no expiration must not move the best practice: same verdict as
 # the same catalogue without those five exports.
 jq '.items |= map(select((.metadata.labels["k10.kasten.io/isRunNow"] == "true" and (.metadata.labels | has("k10.kasten.io/expiresAt") | not)) | not))' "$CORPUS" > "$T/lab_noexp.out"
@@ -229,19 +235,27 @@ has "html: not a clean pass"                "$T/s5/html.txt" "not a clean pass"
 hasnt "html: no green all-clear"            "$T/s5/html.txt" "No residual snapshots"
 
 # ---------------------------------------------------------------------------
-echo "== 6. Kasten DR policy snapshots are not anomalies"
+echo "== 6. Kasten DR policy: exempt from the no-expiry anomaly only"
 scenario s6 '[ rpc("dr-man"; "k10-disaster-recovery-policy"; 30; man),
-               rpc("dr-man-exp"; "k10-disaster-recovery-policy"; 30; man + expl(hy(-9))) ]'
+               (rpc("dr-man-exp"; "k10-disaster-recovery-policy"; 30; man + expl(hy(-9))) | .status.state = "Unbound"),
+               rpc("dr-man-fut"; "k10-disaster-recovery-policy"; 30; man + expl(hy(3))),
+               rpc("dr-sched"; "k10-disaster-recovery-policy"; 1; {}) ]'
 runkdl s6
-eq "no residual finding"                    0 "$(j s6 .residualSnapshots.unretained)"
-eq "breakdown.k10Dr"                        2 "$(j s6 .residualSnapshots.breakdown.k10Dr)"
-eq "expiry.drPolicy"                        2 "$(j s6 .residualSnapshots.expiry.drPolicy)"
-eq "not in manualNoExpiration"              0 "$(j s6 .residualSnapshots.expiry.manualNoExpiration)"
-eq "not in manualWithExpiry"                0 "$(j s6 .residualSnapshots.expiry.manualWithExpiry)"
+eq "findings = the expired DR manual run only" 1 "$(j s6 .residualSnapshots.unretained)"
+eq "...reason"                              manual-expired "$(j s6 '.residualSnapshots.items[0].reason')"
+eq "...name"                                dr-man-exp "$(j s6 '.residualSnapshots.items[0].name')"
+eq "breakdown.k10Dr = the no-expiry DR run only" 1 "$(j s6 .residualSnapshots.breakdown.k10Dr)"
+eq "DR manual run within its expiry stays context" 1 "$(j s6 .residualSnapshots.breakdown.manualExpires)"
+eq "expiry.drPolicy = no-expiry manual + scheduled" 2 "$(j s6 .residualSnapshots.expiry.drPolicy)"
+eq "DR no-expiry run not in manualNoExpiration" 0 "$(j s6 .residualSnapshots.expiry.manualNoExpiration)"
 eq "not in expiry.items"                    0 "$(j s6 '.residualSnapshots.expiry.items | length')"
-eq "BP residualSnapshots = OK"              OK "$(j s6 .bestPractices.residualSnapshots)"
-has "terminal: DR line"                     "$T/s6/term.txt" "2 Kasten disaster-recovery manual run(s) not assessed"
-has "html: DR box"                          "$T/s6/html.txt" "2 manual run(s) of Kasten&rsquo;s own disaster-recovery policy are not assessed"
+eq "expiry.manualWithExpiry counts the DR runs with a date" 2 "$(j s6 .residualSnapshots.expiry.manualWithExpiry)"
+eq "expiry.manualExpiryPassed"              1 "$(j s6 .residualSnapshots.expiry.manualExpiryPassed)"
+eq "BP residualSnapshots = PARTIAL"         PARTIAL "$(j s6 .bestPractices.residualSnapshots)"
+has "terminal: DR no-expiry line"           "$T/s6/term.txt" "1 Kasten disaster-recovery manual run(s) with no expiry not assessed"
+has "terminal: Unbound note"                "$T/s6/term.txt" "dr-man-exp [demo] 30d (manual-expired; RestorePoint already removed, content left Unbound)"
+has "html: DR box"                          "$T/s6/html.txt" "1 manual run(s) of Kasten&rsquo;s own disaster-recovery policy with no expiry are not assessed"
+has "html: Unbound explanation"             "$T/s6/html.txt" "Kasten has already removed the RestorePoint (state Unbound"
 
 # ---------------------------------------------------------------------------
 echo "== 7. imported content is excluded everywhere"

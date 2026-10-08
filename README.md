@@ -791,7 +791,7 @@ The verdict keys on the subset that nothing retains —
 | `manual-expired` | Manual run whose `expiresAt` is past by more than the 2-day retirement grace: Kasten should already have retired it. A finding |
 | `manual-expires` | Manual run still inside its `expiresAt` date (or the grace) — Kasten retires it; context, never a finding |
 | `manual-expiry-unknown` | Manual run whose `expiresAt` could not be parsed — gates the verdict to `NOT_ASSESSED` |
-| `k10-dr` | Manual run of Kasten's own `k10-disaster-recovery-policy` — managed by Kasten, never reported as an anomaly |
+| `k10-dr` | Manual run of Kasten's own `k10-disaster-recovery-policy` with **no** `expiresAt` — managed by Kasten, not reported. A DR manual run with an expiry is judged like any other (past it: `manual-expired`; the RestorePoint is typically already removed and the content left `Unbound`, observed on 9.0.6) |
 
 Manual runs are **never ranked** against their policy's retention (the policy
 name they carry does not retire them); they are judged on their `expiresAt`

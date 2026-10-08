@@ -18,8 +18,11 @@ Manual runs and snapshot expiry (issue #63).
   ahead, or past by no more than a 2-day retirement grace -> `manual-expires`
   (context); past by more -> `manual-expired` (finding); unparsable ->
   `manual-expiry-unknown` (`NOT_ASSESSED`, never a pass). Kasten's own
-  `k10-disaster-recovery-policy` manual runs are `k10-dr`: not assessed, never an
-  anomaly.
+  `k10-disaster-recovery-policy` is exempt from the **no-expiry** anomaly only
+  (`k10-dr`: a DR manual run without `expiresAt`). A DR manual run past its
+  expiry is `manual-expired` like any other: on the lab Kasten removed the
+  RestorePoint at expiry yet left the content Unbound for 8 days, a real
+  leftover that an exemption would have hidden.
 - **New `residualSnapshots.expiry` overview** (terminal, JSON, HTML "Snapshots
   with no expiry"): over every non-imported RestorePointContent, local and
   exported, how many are scheduled `N/A`, manual "No expiration", manual with an

@@ -3354,7 +3354,13 @@ else
           expiresAt: (if $hasExp then ($l["k10.kasten.io/expiresAt"] | tostring) else null end),
           expiryUnparsable: ($hasExp and ($expEpoch == null)),
           expiryState: (
-            if $pol == $drPolicy then "k10-dr"
+            # The DR exemption covers ONLY the "no expiry" anomaly: Kasten own
+            # DR snapshots are managed by Kasten, so a DR manual run without
+            # expiresAt, and every scheduled DR snapshot, are not reported.
+            # A DR manual run WITH an expiresAt is judged like any other: on
+            # the lab Kasten removed the RestorePoint at expiry but left the
+            # content Unbound for days, and exempting it hid that leftover.
+            if $pol == $drPolicy and (($manual | not) or ($hasExp | not)) then "k10-dr"
             elif $manual then
               ( if ($hasExp | not) then "manual-no-expiry"
                 elif $expEpoch == null then "manual-expiry-unknown"
@@ -3442,7 +3448,9 @@ else
       | .reason = (
           if .ageDays == null then "unknown-age"
           elif (.beyond | not) then "within-threshold"
-          # Kasten own DR snapshots: managed by Kasten, never an anomaly here.
+          # Kasten own DR manual runs WITHOUT an expiry: managed by Kasten, not
+          # reported. A DR manual run with an expiry falls through to the
+          # manual-* reasons below, like any other.
           elif .expiryState == "k10-dr" and .manual then "k10-dr"
           # Manual runs are judged on their expiry label, before any policy
           # reasoning: the policy name they carry does not retire them.
@@ -11852,7 +11860,7 @@ else
   if [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}[WARN]  $RESIDUAL_SNAP_UNRETAINED_COUNT residual snapshot(s) no live policy retains${COLOR_RESET}\n"
     printf "  ${COLOR_CYAN}    on demand: $RESIDUAL_SNAP_ONDEMAND_COUNT | policy deleted: $RESIDUAL_SNAP_POLICY_DELETED_COUNT | application gone: $RESIDUAL_SNAP_UNBOUND_COUNT | past declared retention: $RESIDUAL_SNAP_OVER_RETENTION_COUNT | manual run, no expiration: $RESIDUAL_SNAP_MANUAL_NOEXP_COUNT | manual run, expiry passed: $RESIDUAL_SNAP_MANUAL_EXPIRED_COUNT${COLOR_RESET}\n"
-    _ep "$RESIDUAL_SNAPSHOTS" | jq -r '.[:5][] | "    - \(.name) [\(if .appNamespace == "" then "unknown" else .appNamespace end)] \(((.ageDays * 10 | floor) / 10) as $a | if ($a | floor) == $a then ($a | floor) else $a end)d (\(.reason))"' 2>/dev/null
+    _ep "$RESIDUAL_SNAPSHOTS" | jq -r '.[:5][] | "    - \(.name) [\(if .appNamespace == "" then "unknown" else .appNamespace end)] \(((.ageDays * 10 | floor) / 10) as $a | if ($a | floor) == $a then ($a | floor) else $a end)d (\(.reason)\(if .reason == "manual-expired" and .state == "Unbound" then "; RestorePoint already removed, content left Unbound" else "" end))"' 2>/dev/null
   elif [ "$RESIDUAL_SNAP_LOCAL_COUNT" -eq 0 ]; then
     printf "  ${COLOR_GREEN}[OK] No local snapshots in the catalog${COLOR_RESET}\n"
   elif [ $((RESIDUAL_SNAP_UNKNOWN_AGE_COUNT + RESIDUAL_SNAP_UNVERIFIABLE_COUNT + RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT + RESIDUAL_SNAP_MANUAL_UNKNOWN_COUNT)) -gt 0 ]; then
@@ -11875,7 +11883,7 @@ else
     printf "  ${COLOR_CYAN}    $RESIDUAL_SNAP_MANUAL_EXPIRES_COUNT manual run(s) past the threshold but still inside their expiry date (Kasten retires them; not counted as residual)${COLOR_RESET}\n"
   fi
   if [ "$RESIDUAL_SNAP_K10_DR_COUNT" -gt 0 ]; then
-    printf "  ${COLOR_CYAN}    $RESIDUAL_SNAP_K10_DR_COUNT Kasten disaster-recovery manual run(s) not assessed (managed by Kasten)${COLOR_RESET}\n"
+    printf "  ${COLOR_CYAN}    $RESIDUAL_SNAP_K10_DR_COUNT Kasten disaster-recovery manual run(s) with no expiry not assessed (managed by Kasten)${COLOR_RESET}\n"
   fi
   if [ "$RESIDUAL_SNAP_MANUAL_UNKNOWN_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}    $RESIDUAL_SNAP_MANUAL_UNKNOWN_COUNT manual run(s) carry an expiresAt label that could not be parsed (expiry unknown, not counted either way)${COLOR_RESET}\n"
