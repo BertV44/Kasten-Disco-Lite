@@ -1217,6 +1217,108 @@ set_policies gate-dr-exported ".items |= map(if .metadata.name == \"$DRPOL\" the
 mk_gate_case gate-paused
 set_policies gate-paused ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {paused: true, actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
 
+# gate-ondemand: the owner still backs up here but runs on demand only. An
+# on-demand policy has no retention, so it retires nothing: quiet, like a
+# paused owner, and the row names it (#64).
+mk_gate_case gate-ondemand
+set_policies gate-ondemand ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+
+# gate-ondemand-paused: paused AND on demand. Paused wins; the policy is
+# named once, as paused.
+mk_gate_case gate-ondemand-paused
+set_policies gate-ondemand-paused ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {paused: true, frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+
+# A restore point with an expiry date. The garbage collector retires it when
+# the date passes, with no policy run, so space still builds up whatever the
+# policy state (#64). One restore point covers metadata and volume data.
+# The date is 30 days after the fixture clock, so the residual-snapshot
+# section reads it the same way whenever the cases are built.
+EXP_AT=$(jq -rn --argjson n "$GEN_NOW" '$n + 30 * 86400 | strftime("%Y-%m-%dT%H-%M-%SZ")')
+RPC_EXPIRING='{metadata: {name: "rpc-manual-1", labels: {"k10.kasten.io/policyName": $pol, "k10.kasten.io/policyNamespace": "kasten-io", "k10.kasten.io/isRunNow": "true", "k10.kasten.io/expiresAt": $exp}}, status: {state: "Bound"}}'
+# rpc_exp <name> <jq object of labels>: a jq expression for one run-once
+# RestorePointContent with an expiry date ($p = profile, $exp = the date).
+rpc_exp() {
+  printf '{metadata: {name: "%s", labels: ({"k10.kasten.io/isRunNow": "true", "k10.kasten.io/runActionName": "run-1", "k10.kasten.io/expiresAt": $exp} + %s)}, status: {state: "Bound"}}' "$1" "$2"
+}
+# write_rpcs <case> <rpc expression>...: the case serves these as its list.
+write_rpcs() {
+  _c=$1; shift
+  _p=$(jq -r '.metadata.labels["k10.kasten.io/exportProfile"]' "$CASES/$_c/$DR")
+  _items=$(printf '%s,' "$@")
+  jq -n --arg p "$_p" --arg exp "$EXP_AT" "{items: [ ${_items%,} ]}" > "$CASES/$_c/rpcs.json"
+}
+# gate-ondemand-expiring: the on-demand owner ran once, with an expiry date.
+mk_gate_case gate-ondemand-expiring
+set_policies gate-ondemand-expiring ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+jq -n --arg pol "$DRPOL" --arg exp "$EXP_AT" "{items: [ $RPC_EXPIRING ]}" > "$CASES/gate-ondemand-expiring/rpcs.json"
+# gate-paused-expiring: the same with a paused owner. Paused stops the policy
+# runs, not the expiry.
+mk_gate_case gate-paused-expiring
+set_policies gate-paused-expiring ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {paused: true, actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+jq -n --arg pol "$DRPOL" --arg exp "$EXP_AT" "{items: [ $RPC_EXPIRING ]}" > "$CASES/gate-paused-expiring/rpcs.json"
+# gate-ondemand-rpc-denied: the on-demand owner, and the RestorePointContents
+# list cannot be read. An expiry date may exist, so the critical stays.
+mk_gate_case gate-ondemand-rpc-denied
+set_policies gate-ondemand-rpc-denied ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+: > "$CASES/gate-ondemand-rpc-denied/deny-rpc"
+# The reasons that prove nothing reaches the repository come before the
+# expiry: every restore point retired, or the profile gone.
+for _c in gate-ondemand-expiring-count-zero gate-ondemand-expiring-profile-gone; do
+  mk_gate_case "$_c"
+  set_policies "$_c" ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+  jq -n --arg pol "$DRPOL" --arg exp "$EXP_AT" "{items: [ $RPC_EXPIRING ]}" > "$CASES/$_c/rpcs.json"
+done
+jq "$LIB .status.details.kopiaMeta.storageUsage.snapshotStats.sizeStat.count = 0" \
+  "$CASES/gate-ondemand-expiring-count-zero/$DR" > "$CASES/gate-ondemand-expiring-count-zero/$DR.t" \
+  && mv "$CASES/gate-ondemand-expiring-count-zero/$DR.t" "$CASES/gate-ondemand-expiring-count-zero/$DR"
+printf '{"items":[]}\n' > "$CASES/gate-ondemand-expiring-profile-gone/profiles.json"
+# A live retainer and an expiring restore point: retained wins.
+mk_gate_case gate-retained-expiring
+set_policies gate-retained-expiring "$DR_BACKUP_ONLY"
+jq -n --arg pol "$DRPOL" --arg exp "$EXP_AT" "{items: [ $RPC_EXPIRING ]}" > "$CASES/gate-retained-expiring/rpcs.json"
+# An empty frequency is not on demand: the owner stays a retainer.
+mk_gate_case gate-frequency-empty
+set_policies gate-frequency-empty ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+
+# gate-ondemand-metadata: the #64 report itself. A metadata repository whose
+# owner exports to its profile and runs on demand only.
+mk_gate_case gate-ondemand-metadata
+jq "$LIB .status.contentType = \"metadata\" | .metadata.labels[\"k10.kasten.io/policyName\"] = \"app-backup\"" \
+  "$CASES/gate-ondemand-metadata/$DR" > "$CASES/gate-ondemand-metadata/$DR.t" && mv "$CASES/gate-ondemand-metadata/$DR.t" "$CASES/gate-ondemand-metadata/$DR"
+echo '{}' | jq -c --slurpfile d "$CASES/gate-ondemand-metadata/$DR" \
+  '{apiVersion:"repositories.kio.kasten.io/v1alpha1", kind:"StorageRepositoryList",
+     items:[ $d[0] | del(.status.details) ]}' > "$CASES/gate-ondemand-metadata/list.json"
+set_policies gate-ondemand-metadata ".items += [{metadata: {name: \"app-backup\", namespace: \"kasten-io\"},
+    spec: {frequency: \"@onDemand\", actions: [{action: \"backup\"}, {action: \"export\", exportParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]}}]"
+# The same metadata repository, its owner on demand, with expiring restore
+# points (#64). A metadata repository holds only exported entries of its own
+# policy and profile; a local entry never writes here.
+META_LBL='{"k10.kasten.io/policyName": "app-backup", "k10.kasten.io/policyNamespace": "kasten-io"}'
+for _c in gate-meta-expiring gate-meta-expiring-other-policy gate-meta-expiring-other-pns gate-meta-expiring-no-pns; do
+  mk_gate_case "$_c"
+  jq "$LIB .status.contentType = \"metadata\" | .metadata.labels[\"k10.kasten.io/policyName\"] = \"app-backup\"
+          | .metadata.labels[\"k10.kasten.io/policyNamespace\"] = \"kasten-io\"" \
+    "$CASES/$_c/$DR" > "$CASES/$_c/$DR.t" && mv "$CASES/$_c/$DR.t" "$CASES/$_c/$DR"
+  echo '{}' | jq -c --slurpfile d "$CASES/$_c/$DR" \
+    '{apiVersion:"repositories.kio.kasten.io/v1alpha1", kind:"StorageRepositoryList",
+       items:[ $d[0] | del(.status.details) ]}' > "$CASES/$_c/list.json"
+  set_policies "$_c" ".items += [{metadata: {name: \"app-backup\", namespace: \"kasten-io\"},
+      spec: {frequency: \"@onDemand\", actions: [{action: \"backup\"}, {action: \"export\", exportParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]}}]"
+done
+# The exported entry (appConfigOnly) and its local twin: counted once.
+# Labels are built in single quotes first: /bin/sh splits a quoted argument
+# with escaped quotes and braces inside "$(...)".
+L_X='{"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "appConfigOnly"}'
+_r1=$(rpc_exp rpc-meta-x "$META_LBL + $L_X"); _r2=$(rpc_exp rpc-meta "$META_LBL")
+write_rpcs gate-meta-expiring "$_r1" "$_r2"
+_r1=$(rpc_exp rpc-meta-x '{"k10.kasten.io/policyName": "other-backup", "k10.kasten.io/policyNamespace": "kasten-io"} + {"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "appConfigOnly"}')
+write_rpcs gate-meta-expiring-other-policy "$_r1"
+_r1=$(rpc_exp rpc-meta-x '{"k10.kasten.io/policyName": "app-backup", "k10.kasten.io/policyNamespace": "other-ns"} + {"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "appConfigOnly"}')
+write_rpcs gate-meta-expiring-other-pns "$_r1"
+# An entry with no policyNamespace label matches the policy by name.
+_r1=$(rpc_exp rpc-meta-x '{"k10.kasten.io/policyName": "app-backup"} + {"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "appConfigOnly"}')
+write_rpcs gate-meta-expiring-no-pns "$_r1"
+
 # gate-stopped-exporting: the owner exists but writes to another profile now.
 mk_gate_case gate-stopped-exporting
 set_policies gate-stopped-exporting ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {actions: [{action: \"backup\", backupParameters: {profile: {name: \"another-profile\", namespace: \"kasten-io\"}}}]} else . end)"
@@ -1293,6 +1395,70 @@ mk_vd_case() {  # $1 case  $2 namespace uid  $3 namespace labels (json)
 mk_vd_case gate-vd-covered "$NS_UID" '{"team":"a"}'
 # Uncovered: the live exporter selects other namespaces. Nothing retires here.
 mk_vd_case gate-vd-uncovered "$NS_UID" '{"team":"b"}'
+# On demand: the covering exporter runs on demand only, so it has no
+# retention and retires nothing here (#64).
+mk_vd_case gate-vd-ondemand "$NS_UID" '{"team":"a"}'
+jq '.items[0].spec.frequency = "@onDemand"' "$CASES/gate-vd-ondemand/policies.json" > "$CASES/gate-vd-ondemand/policies.json.t" \
+  && mv "$CASES/gate-vd-ondemand/policies.json.t" "$CASES/gate-vd-ondemand/policies.json"
+# The first writer exports here and runs on demand only. Alone, nothing can
+# retire restore points here; next to a scheduled coverer, the coverer keeps
+# the critical and the first writer is named as on demand (#64).
+for _fw in "gate-vd-ondemand-writer:b" "gate-vd-ondemand-writer-covered:a"; do
+  _name=${_fw%%:*}; _team=${_fw#*:}
+  mk_vd_case "$_name" "$NS_UID" "{\"team\":\"$_team\"}"
+  jq '.items += [.items[0] | .metadata.name = "first-writer" | .spec.selector = {matchLabels: {team: "c"}} | .spec.frequency = "@onDemand"]' \
+    "$CASES/$_name/policies.json" > "$CASES/$_name/policies.json.t" && mv "$CASES/$_name/policies.json.t" "$CASES/$_name/policies.json"
+done
+# Paused and on demand on volumedata: paused wins, named once.
+mk_vd_case gate-vd-ondemand-paused "$NS_UID" '{"team":"a"}'
+jq '.items[0].spec.frequency = "@onDemand" | .items[0].spec.paused = true' "$CASES/gate-vd-ondemand-paused/policies.json" \
+  > "$CASES/gate-vd-ondemand-paused/policies.json.t" && mv "$CASES/gate-vd-ondemand-paused/policies.json.t" "$CASES/gate-vd-ondemand-paused/policies.json"
+
+# Expiring restore points for a volumedata repository that no live policy
+# covers (#64). Which entries write here:
+#   local  - only through the backup profile of its policy (Kanister, GVS);
+#   exported - its namespace and profile, unless appConfigOnly;
+#   imported - never.
+VD_LBL='{"k10.kasten.io/appNamespace": "app-ns", "k10.kasten.io/appName": "app-ns", "k10.kasten.io/policyNamespace": "kasten-io"}'
+for _c in gate-vd-expiring-local gate-vd-expiring-local-nobp gate-vd-expiring-exported gate-vd-expiring-appconfig \
+          gate-vd-expiring-other-profile gate-vd-expiring-imported gate-vd-expiring-twins; do
+  mk_vd_case "$_c" "$NS_UID" '{"team":"b"}'
+done
+# A backup-only policy with a backup profile (Kanister writes through it),
+# and one without.
+for _c in gate-vd-expiring-local gate-vd-expiring-twins; do
+  set_policies "$_c" '.items += [{metadata: {name: "app-kanister", namespace: "kasten-io"},
+      spec: {selector: {matchLabels: {team: "c"}}, actions: [{action: "backup", backupParameters: {profile: {name: $p, namespace: "kasten-io"}}}]}}]'
+done
+set_policies gate-vd-expiring-local-nobp '.items += [{metadata: {name: "app-snap", namespace: "kasten-io"},
+    spec: {selector: {matchLabels: {team: "c"}}, actions: [{action: "backup"}]}}]'
+P_KAN='{"k10.kasten.io/policyName": "app-kanister"}'
+P_SNAP='{"k10.kasten.io/policyName": "app-snap"}'
+P_TEAM='{"k10.kasten.io/policyName": "team-a-export"}'
+X_PORT='{"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "portableAppData"}'
+X_CONF='{"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "appConfigOnly"}'
+X_OTHER='{"k10.kasten.io/exportProfile": "another-profile", "k10.kasten.io/exportType": "portableAppData"}'
+X_IMP='{"k10.kasten.io/importProfile": $p, "k10.kasten.io/exportType": "portableAppData"}'
+_r1=$(rpc_exp rpc-vd "$VD_LBL + $P_KAN");           write_rpcs gate-vd-expiring-local "$_r1"
+_r1=$(rpc_exp rpc-vd "$VD_LBL + $P_SNAP");          write_rpcs gate-vd-expiring-local-nobp "$_r1"
+_r1=$(rpc_exp rpc-vd-x "$VD_LBL + $P_TEAM + $X_PORT");  write_rpcs gate-vd-expiring-exported "$_r1"
+_r1=$(rpc_exp rpc-vd-x "$VD_LBL + $P_TEAM + $X_CONF");  write_rpcs gate-vd-expiring-appconfig "$_r1"
+_r1=$(rpc_exp rpc-vd-x "$VD_LBL + $P_TEAM + $X_OTHER"); write_rpcs gate-vd-expiring-other-profile "$_r1"
+_r1=$(rpc_exp rpc-vd-i "$VD_LBL + $P_TEAM + $X_IMP");   write_rpcs gate-vd-expiring-imported "$_r1"
+# The local entry and its exported twin both write here: counted once.
+_r1=$(rpc_exp rpc-vd "$VD_LBL + $P_KAN"); _r2=$(rpc_exp rpc-vd-x "$VD_LBL + $P_KAN + $X_PORT")
+write_rpcs gate-vd-expiring-twins "$_r1" "$_r2"
+# A manual snapshot names no policy and no run, and the user sets its expiry.
+# It writes through a profile that the list does not name, so it counts here.
+# Two of them with the same expiry are two restore points.
+rpc_man() {
+  printf '{metadata: {name: "%s", labels: {"k10.kasten.io/appNamespace": "app-ns", "k10.kasten.io/appName": "app-ns", "k10.kasten.io/expiresAt": $exp}}, status: {state: "Bound"}}' "$1"
+}
+for _c in gate-vd-expiring-manual gate-vd-expiring-manual-two; do
+  mk_vd_case "$_c" "$NS_UID" '{"team":"b"}'
+done
+write_rpcs gate-vd-expiring-manual "$(rpc_man rpc-manual-a)"
+write_rpcs gate-vd-expiring-manual-two "$(rpc_man rpc-manual-a)" "$(rpc_man rpc-manual-b)"
 # Recreated: a namespace of that name exists with a different UID, so this
 # repository belongs to the old one. Orphaned under an identical label; the
 # live policy still retires the old runs, so the critical stays.
@@ -1687,6 +1853,162 @@ and (.storageRepositories.items[0].quietReason == "no-retainer")
 and (.storageRepositories.items[0].retainerPausedPolicies == ["k10-disaster-recovery-policy"])
 and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
 and ((.storageRepositories.items[0].rowNotes // []) | any(test("Paused: k10-disaster-recovery-policy")))
+EOF
+cat > "$CASES/gate-ondemand/expect.jq" <<'EOF'
+# an on-demand owner has no retention and retires nothing: quiet, and named
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].severityGate == "quiet")
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+and (.storageRepositories.items[0].retainerPolicies == [])
+and (.storageRepositories.items[0].retainerOnDemandPolicies == ["k10-disaster-recovery-policy"])
+and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
+and ((.storageRepositories.items[0].rowNotes // []) | any(test("On demand: k10-disaster-recovery-policy")))
+and (.storageRepositories.items[0].expiringRestorePoints == 0)
+EOF
+cat > "$CASES/gate-ondemand-paused/expect.jq" <<'EOF'
+# paused and on demand: paused wins, and the policy is named once
+(.storageRepositories.items[0].quietReason == "no-retainer")
+and (.storageRepositories.items[0].retainerPausedPolicies == ["k10-disaster-recovery-policy"])
+and (.storageRepositories.items[0].retainerOnDemandPolicies == [])
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("On demand:")) | not)
+EOF
+cat > "$CASES/gate-ondemand-expiring/expect.jq" <<'EOF'
+# an on-demand run with an expiry date: K10 retires it when the date passes,
+# so the failure stays critical, and the row says why
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].severityGate == "active")
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.storageRepositories.items[0].statusLevel == "error")
+and (.storageRepositories.activeExpiringCount == 1)
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("1 restore point that uses this repository has an expiry date. K10 retires each one when it expires, with no policy run.")))
+and ((.storageRepositories.verdictNotes // []) | any(contains("1 quiet, but restore points in it have an expiry date")))
+EOF
+cat > "$CASES/gate-paused-expiring/expect.jq" <<'EOF'
+# a paused owner stops policy runs, not expiry: critical
+(.storageRepositories.items[0].retainerPausedPolicies == ["k10-disaster-recovery-policy"])
+and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+EOF
+cat > "$CASES/gate-ondemand-rpc-denied/expect.jq" <<'EOF'
+# the restore-point list cannot be read: an expiry date may exist, so the
+# failure stays critical, never quiet
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].expiringRestorePoints == null)
+and (.storageRepositories.items[0].severityGate == "active")
+and (.storageRepositories.items[0].activeReason == "unverified")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("KDL could not read the RestorePointContents list")))
+EOF
+cat > "$CASES/gate-ondemand-expiring-count-zero/expect.jq" <<'EOF'
+# every restore point retired: that proof comes before the expiry
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].quietReason == "count-zero")
+EOF
+cat > "$CASES/gate-ondemand-expiring-profile-gone/expect.jq" <<'EOF'
+# the profile is gone, so retirement cannot reach the repository: that comes first
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].quietReason == "profile-unreachable")
+EOF
+cat > "$CASES/gate-retained-expiring/expect.jq" <<'EOF'
+# a live retainer and an expiring restore point: retained wins
+(.storageRepositories.items[0].retainer == true)
+and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "retained")
+EOF
+cat > "$CASES/gate-frequency-empty/expect.jq" <<'EOF'
+# an empty frequency is not on demand: the owner stays a retainer
+(.storageRepositories.items[0].retainer == true)
+and (.storageRepositories.items[0].retainerOnDemandPolicies == [])
+and (.storageRepositories.items[0].activeReason == "retained")
+EOF
+cat > "$CASES/gate-meta-expiring/expect.jq" <<'EOF'
+# the exported entry and its local twin are one restore point; only the
+# exported one writes to a metadata repository
+(.storageRepositories.items[0].contentType == "metadata")
+and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+EOF
+for _c in gate-meta-expiring-other-policy gate-meta-expiring-other-pns; do
+cat > "$CASES/$_c/expect.jq" <<'EOF'
+# the expiring entry belongs to another policy: nothing expires here
+(.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+EOF
+done
+cat > "$CASES/gate-meta-expiring-no-pns/expect.jq" <<'EOF'
+# an entry with no policyNamespace label matches the policy by name
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+EOF
+cat > "$CASES/gate-ondemand-metadata/expect.jq" <<'EOF'
+# the #64 report: a metadata repository whose owner runs on demand only
+(.storageRepositories.items[0].contentType == "metadata")
+and (.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+and (.storageRepositories.items[0].retainerOnDemandPolicies == ["app-backup"])
+and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
+EOF
+cat > "$CASES/gate-vd-ondemand-paused/expect.jq" <<'EOF'
+# paused and on demand on volumedata: paused wins, named once
+(.storageRepositories.items[0].quietReason == "no-retainer")
+and (.storageRepositories.items[0].retainerPausedPolicies == ["team-a-export"])
+and (.storageRepositories.items[0].retainerOnDemandPolicies == [])
+EOF
+for _c in gate-vd-expiring-local gate-vd-expiring-exported gate-vd-expiring-twins gate-vd-expiring-manual; do
+cat > "$CASES/$_c/expect.jq" <<'EOF'
+# one restore point that writes here has an expiry date: critical, and the row says why
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("1 restore point that uses this repository has an expiry date")))
+EOF
+done
+cat > "$CASES/gate-vd-expiring-manual-two/expect.jq" <<'EOF'
+# two manual snapshots with the same expiry are two restore points
+(.storageRepositories.items[0].expiringRestorePoints == 2)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("2 restore points that use this repository have an expiry date")))
+EOF
+for _c in gate-vd-expiring-local-nobp gate-vd-expiring-appconfig gate-vd-expiring-imported; do
+cat > "$CASES/$_c/expect.jq" <<'EOF'
+# the expiring entry writes elsewhere, or nowhere: nothing expires here, so quiet
+(.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
+EOF
+done
+cat > "$CASES/gate-vd-expiring-other-profile/expect.jq" <<'EOF'
+# the only restore point names another profile: none refers to this
+# repository, and that proof comes before the expiry
+(.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].restorePointRefs == 0)
+and (.storageRepositories.items[0].quietReason == "no-restore-points")
+EOF
+cat > "$CASES/gate-vd-ondemand-writer/expect.jq" <<'EOF'
+# an on-demand first writer alone retires nothing here: quiet, and named
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+and (.storageRepositories.items[0].retainerOnDemandPolicies == ["first-writer"])
+EOF
+cat > "$CASES/gate-vd-ondemand-writer-covered/expect.jq" <<'EOF'
+# a scheduled coverer keeps the critical; the on-demand first writer is not a retainer
+(.storageRepositories.items[0].retainerPolicies == ["team-a-export"])
+and (.storageRepositories.items[0].retainerOnDemandPolicies == ["first-writer"])
+and (.storageRepositories.items[0].activeReason == "retained")
+EOF
+cat > "$CASES/gate-vd-ondemand/expect.jq" <<'EOF'
+# the covering exporter runs on demand only: nothing retires here, and it is named
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+and (.storageRepositories.items[0].retainerPolicies == [])
+and (.storageRepositories.items[0].retainerOnDemandPolicies == ["team-a-export"])
+and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
+and ((.storageRepositories.items[0].rowNotes // []) | any(test("On demand: team-a-export")))
 EOF
 cat > "$CASES/gate-stopped-exporting/expect.jq" <<'EOF'
 # the owner writes to another profile now: orphaned by that, and quiet

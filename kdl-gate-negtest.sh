@@ -376,6 +376,18 @@ run "orphaned asserted without resolving the owner" \
      | .storageRepositories.items[0].policyMissing = null
      | .storageRepositories.orphanedCount = 1'
 
+run "an expiring repository counted twice" \
+    "the active reasons add up to activeFailingCount" \
+    '.storageRepositories.activeExpiringCount = ((.storageRepositories.activeExpiringCount // 0) + 1)'
+
+run "a quiet no-retainer row that still has an expiring restore point" \
+    "the expiry rule holds on every row" \
+    '.storageRepositories.items[0] |= (.quietReason = "no-retainer" | .expiringRestorePoints = 1)'
+
+run "a build that drops activeExpiringCount" \
+    "the active reasons add up to activeFailingCount" \
+    'del(.storageRepositories.activeExpiringCount)'
+
 run "activeFailingCount disagreeing with the items" \
     "activeFailingCount reconciles" \
     '.storageRepositories.activeFailingCount = 7'

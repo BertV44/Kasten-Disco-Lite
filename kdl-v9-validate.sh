@@ -1065,6 +1065,21 @@ if jq -e '(.storageRepositories.total // 0) > 0' "$J" >/dev/null 2>&1; then
     '[.storageRepositories.items[]? | select(has("statusLevel"))
       | select((.status == "FAILING_STALE") or ((.status == "NEVER_RAN") and (.firstRunDue != false)))
       | select((.statusLevel == "error") != (.severityGate != "quiet"))] | length == 0'
+  # Each active reason is counted once, and the counts add up (#64 added
+  # expiring). A reason left out lands in no count, or in the written one.
+  aq "the active reasons add up to activeFailingCount" \
+    '([.storageRepositories.items[]? | has("expiringRestorePoints")] | any | not)
+     or (.storageRepositories
+         | (.activeExpiringCount == ([.items[]? | select(.severityGate == "active" and .activeReason == "expiring")] | length))
+           and ((.activeWrittenCount + .activeRetainedCount + .activeRetainedUncountedCount
+                 + .activeUnverifiedCount + .activeExpiringCount) == .activeFailingCount))'
+  # #64: no-retainer needs no expiring restore point; expiring needs one,
+  # and no live retainer (retained comes first).
+  aq "the expiry rule holds on every row" \
+    '[.storageRepositories.items[]? | select(has("expiringRestorePoints"))
+      | select(((.quietReason == "no-retainer") and (.expiringRestorePoints != 0))
+               or ((.activeReason == "expiring")
+                   and (((.expiringRestorePoints // 0) <= 0) or (.retainer == true))))] | length == 0'
   # A part is a breakdown of the row above it and hangs off that row, with no
   # badge when it is informational. The row opening and the whole block of
   # parts are asserted, not each part alone, or parts laid out flat beside the
