@@ -1922,9 +1922,14 @@ else "" end) + "
                     + (if .profileMismatch == true then " <span class=\"badge warn\">profile mismatch</span>" else "" end)
                   elif .profile != "N/A" then (.profile | @html)
                   else "\u2014" end) + "</td>" +
+        # A volumedata label names only the first writer, and other policies
+        # can share the repository (#66), so its deletion is no lost owner.
         "<td>" + (if .policyName then
                     (.policyName | @html)
-                    + (if .policyMissing == true then " <span class=\"badge warn\">deleted</span>" else "" end)
+                    + (if .contentType == "volumedata" then
+                         (if .policyMissing == true then " <span class=\"badge info\" title=\"The policy label names only the first policy that wrote here. Other policies can share this repository.\">first writer, deleted</span>" else "" end)
+                       elif .policyMissing == true then " <span class=\"badge warn\">deleted</span>"
+                       else "" end)
                   else "\u2014" end) + "</td>" +
         # @html mandatory: cluster-supplied.
         # "Bucket/Share", because a FileStore repository names a PVC backing an
