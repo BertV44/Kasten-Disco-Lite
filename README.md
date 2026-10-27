@@ -699,7 +699,9 @@ Added since:
 
 - `storageRepositories` *(v2.4, rebuilt v2.6 and v2.7)* — per-repository maintenance
   status and evidence, `k10SchedulerState` and its inputs, the severity gate
-  (`severityGate`, `quietReason`, `activeReason`, `retainerPolicies`), stranded
+  (`severityGate`, `quietReason`, `activeReason`, `retainerPolicies`,
+  `retainerPausedPolicies`, `retainerOnDemandPolicies`,
+  `expiringRestorePoints`), stranded
   content, `rowNotes`, `statusLabel` / `statusLevel`, the section `summary`, and
   `k10MaintenancePreconditions`
 - `residualSnapshots` *(v2.5)* — local snapshots past the threshold, split into
