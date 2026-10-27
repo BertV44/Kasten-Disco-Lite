@@ -1002,6 +1002,11 @@ if jq -e '(.storageRepositories.total // 0) > 0' "$J" >/dev/null 2>&1; then
     done
     hn "no single orphaned label claims every lost owner was a deletion" 'Profile or policy since deleted'
   fi
+  # KDL reads the policy spec and never sees a retirement happen, so no
+  # output may claim one (#65).
+  aq "no published sentence claims a policy still retires restore points" \
+    '[.storageRepositories | .. | strings | select(test("still retires"))] | length == 0'
+  hn "the HTML claims no policy still retires restore points" 'still retires'
   # Every sentence KDL.sh published for a row is printed in the HTML, verbatim.
   # They are written once so the three outputs cannot word them differently;
   # this holds the HTML to that, and run.sh holds the terminal.

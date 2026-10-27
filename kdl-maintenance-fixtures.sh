@@ -1173,8 +1173,8 @@ single_repo scan-retry-within-episode "$DR" 1 "
 
 # --- the severity gate (2.7.0) -----------------------------------------------
 # One FAILING_STALE repository, idle for 200 days, so it is a candidate for the
-# downgrade; each case varies only what the gate reads -- who still retires
-# into it, how many snapshots remain, and whether its profile still reaches
+# downgrade; each case varies only what the gate reads -- who can retire
+# restore points in it, how many snapshots remain, and whether its profile still reaches
 # it. The cases where the downgrade must NOT fire are the ones that matter.
 mk_gate_case() {  # $1 case
   new_case "$1"
@@ -1201,7 +1201,7 @@ DRPOL=k10-disaster-recovery-policy
 DR_BACKUP_ONLY=".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
 
 # gate-dr-backup-only: Quick DR backs up to backupParameters.profile with no
-# export action at all. The live DR policy still retires into the repository,
+# export action at all. The live DR policy can retire restore points in it,
 # so the critical stays -- an export-only rule would miss it.
 mk_gate_case gate-dr-backup-only
 set_policies gate-dr-backup-only "$DR_BACKUP_ONLY"
@@ -1390,7 +1390,7 @@ mk_vd_case() {  # $1 case  $2 namespace uid  $3 namespace labels (json)
       {metadata: {name: "kasten-io", uid: "00000000-0000-0000-0000-0000000000aa", labels: {}}}]}' \
     > "$CASES/$1/namespaces.json"
 }
-# Covered: the live policy still retires into it, so it stays critical --
+# Covered: the live policy can retire restore points in it, so it stays critical --
 # although its first writer is gone and the label reads orphaned.
 mk_vd_case gate-vd-covered "$NS_UID" '{"team":"a"}'
 # Uncovered: the live exporter selects other namespaces. Nothing retires here.
@@ -1398,6 +1398,20 @@ mk_vd_case gate-vd-uncovered "$NS_UID" '{"team":"b"}'
 # On demand: the covering exporter runs on demand only, so it has no
 # retention and retires nothing here (#64).
 mk_vd_case gate-vd-ondemand "$NS_UID" '{"team":"a"}'
+# A metadata repository whose live, scheduled owner exports to its profile:
+# the metadata form of the retained sentence (#65).
+mk_gate_case gate-meta-retained
+jq "$LIB .status.contentType = \"metadata\" | .metadata.labels[\"k10.kasten.io/policyName\"] = \"app-backup\"" \
+  "$CASES/gate-meta-retained/$DR" > "$CASES/gate-meta-retained/$DR.t" && mv "$CASES/gate-meta-retained/$DR.t" "$CASES/gate-meta-retained/$DR"
+echo '{}' | jq -c --slurpfile d "$CASES/gate-meta-retained/$DR" \
+  '{apiVersion:"repositories.kio.kasten.io/v1alpha1", kind:"StorageRepositoryList",
+     items:[ $d[0] | del(.status.details) ]}' > "$CASES/gate-meta-retained/list.json"
+set_policies gate-meta-retained ".items += [{metadata: {name: \"app-backup\", namespace: \"kasten-io\"},
+    spec: {frequency: \"@daily\", actions: [{action: \"backup\"}, {action: \"export\", exportParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]}}]"
+# Two live exporters cover the namespace: the row names both (#65).
+mk_vd_case gate-vd-two-retainers "$NS_UID" '{"team":"a"}'
+jq '.items += [.items[0] | .metadata.name = "team-a-second"]' "$CASES/gate-vd-two-retainers/policies.json" > "$CASES/gate-vd-two-retainers/policies.json.t" \
+  && mv "$CASES/gate-vd-two-retainers/policies.json.t" "$CASES/gate-vd-two-retainers/policies.json"
 jq '.items[0].spec.frequency = "@onDemand"' "$CASES/gate-vd-ondemand/policies.json" > "$CASES/gate-vd-ondemand/policies.json.t" \
   && mv "$CASES/gate-vd-ondemand/policies.json.t" "$CASES/gate-vd-ondemand/policies.json"
 # The first writer exports here and runs on demand only. Alone, nothing can
@@ -1461,7 +1475,7 @@ write_rpcs gate-vd-expiring-manual "$(rpc_man rpc-manual-a)"
 write_rpcs gate-vd-expiring-manual-two "$(rpc_man rpc-manual-a)" "$(rpc_man rpc-manual-b)"
 # Recreated: a namespace of that name exists with a different UID, so this
 # repository belongs to the old one. Orphaned under an identical label; the
-# live policy still retires the old runs, so the critical stays.
+# live policy can retire the old runs, so the critical stays.
 mk_vd_case ns-recreated "99999999-8888-7777-6666-555555555555" '{"team":"a"}'
 # Its first writer is the live policy here, so the orphan reason can only be
 # the namespace -- a deleted first writer would outrank it.
@@ -1831,13 +1845,13 @@ and (.storageRepositories.items[] | select(.name | endswith("vpgshq4grz"))
      | (.severityGate == "active") and (.activeReason == "undated"))
 EOF
 cat > "$CASES/gate-dr-backup-only/expect.jq" <<'EOF'
-# a backup-only DR policy still retires into the repository: the critical stays
+# a backup-only DR policy can retire restore points in it: the critical stays
 (.storageRepositories.items[0].status == "FAILING_STALE")
 and (.storageRepositories.items[0].retainer == true)
 and (.storageRepositories.items[0].severityGate == "active")
 and (.storageRepositories.items[0].activeReason == "retained")
 and (.bestPractices.storageRepositoryMaintenance == "FAILING")
-and ((.storageRepositories.items[0].rowNotes // []) | any(test("still retires restore points in it")))
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("days. A scheduled policy that is not paused backs up or exports to this profile: k10-disaster-recovery-policy. It can retire restore points here, and each retirement leaves space that only maintenance reclaims.")))
 EOF
 cat > "$CASES/gate-dr-exported/expect.jq" <<'EOF'
 # the exported DR variant retains through either action
@@ -2057,6 +2071,20 @@ and (.storageRepositories.items[0].retainerPolicies == ["team-a-export"])
 and (.storageRepositories.items[0].severityGate == "active")
 and (.storageRepositories.items[0].appNamespaceState == "live")
 and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("days. A scheduled policy that is not paused exports to this profile and covers this namespace or wrote here first: team-a-export. It can retire restore points here")))
+EOF
+cat > "$CASES/gate-meta-retained/expect.jq" <<'EOF'
+# a live scheduled owner exports to the profile: critical, and the row says what KDL checked (#65)
+(.storageRepositories.items[0].contentType == "metadata")
+and (.storageRepositories.items[0].retainerPolicies == ["app-backup"])
+and (.storageRepositories.items[0].activeReason == "retained")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("days. A scheduled policy that is not paused exports to this profile: app-backup. It can retire restore points here, and each retirement leaves space that only maintenance reclaims.")))
+EOF
+cat > "$CASES/gate-vd-two-retainers/expect.jq" <<'EOF'
+# two live policies cover the namespace: both named, and the sentence is plural (#65)
+(.storageRepositories.items[0].retainerPolicies == ["team-a-export", "team-a-second"])
+and (.storageRepositories.items[0].activeReason == "retained")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("days. Scheduled policies that are not paused export to this profile and cover this namespace or wrote here first: team-a-export, team-a-second. They can retire restore points here")))
 EOF
 cat > "$CASES/gate-vd-uncovered/expect.jq" <<'EOF'
 # the live exporter selects other namespaces: nothing retires here
@@ -2072,7 +2100,7 @@ and (.storageRepositories.items[0].quietReason == "no-retainer")
 and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
 EOF
 cat > "$CASES/gate-vd-malformed-covering/expect.jq" <<'EOF'
-# the same policy selecting this namespace may be retiring into it: unknown,
+# the same policy selecting this namespace may retire restore points in it: unknown,
 # and an unknown keeps the critical
 (.storageRepositories.items[0].retainer == null)
 and (.storageRepositories.items[0].severityGate == "active")
@@ -2081,7 +2109,7 @@ and (.bestPractices.storageRepositoryMaintenance == "FAILING")
 EOF
 cat > "$CASES/ns-recreated/expect.jq" <<'EOF'
 # a namespace of that name exists with another UID: orphaned under an
-# identical label, while the live first writer still retires the old runs
+# identical label, while the live first writer can retire the old runs
 (.storageRepositories.items[0].appNamespaceState == "recreated")
 and (.storageRepositories.items[0].orphaned == true)
 and (.storageRepositories.items[0].orphanReason == "namespace-recreated")
@@ -2542,7 +2570,7 @@ for f in "$CASES"/never-ran-not-due-dropped/details-*.json; do
   jq 'del(.status.details.nextProessTime)' "$f" > "$f.t" && mv "$f.t" "$f"
 done
 
-# gate-retained-uncounted: a live DR policy still retires restore points in
+# gate-retained-uncounted: a live DR policy can retire restore points in
 # the repository, and no storage scan has ever reported a snapshot count. The
 # critical stays and the row says why, and what is not known -- never
 # "unverified", which means the gate could not establish either way.
@@ -2584,7 +2612,7 @@ cat > "$CASES/gate-retained-uncounted/expect.jq" <<'EOF'
 # a live retainer and no snapshot count: active for retained-uncounted, critical, and the row says what is and is not known
 (.storageRepositories.items[0] | (.status == "FAILING_STALE") and (.snapshotCount == null) and (.retainer == true)
    and (.severityGate == "active") and (.activeReason == "retained-uncounted") and (.statusLevel == "error")
-   and ((.rowNotes // []) | any(endswith("How many restore points remain is not known: no storage scan has reported a snapshot count for this repository."))))
+   and ((.rowNotes // []) | any(endswith("to this profile: k10-disaster-recovery-policy. It can retire restore points here, and each retirement leaves space that only maintenance reclaims. How many restore points remain is not known: no storage scan has reported a snapshot count for this repository."))))
 and (.bestPractices.storageRepositoryMaintenance == "FAILING")
 EOF
 
