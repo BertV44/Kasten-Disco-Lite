@@ -1390,9 +1390,24 @@ mk_vd_case() {  # $1 case  $2 namespace uid  $3 namespace labels (json)
       {metadata: {name: "kasten-io", uid: "00000000-0000-0000-0000-0000000000aa", labels: {}}}]}' \
     > "$CASES/$1/namespaces.json"
 }
-# Covered: the live policy can retire restore points in it, so it stays critical --
-# although its first writer is gone and the label reads orphaned.
+# Covered: the live policy can retire restore points in it, so it stays
+# critical. Its first writer is gone, but a volumedata label names only the
+# first writer, so the repository is not orphaned (#66).
 mk_vd_case gate-vd-covered "$NS_UID" '{"team":"a"}'
+# The first writer is gone, nothing covers the namespace, and the last write
+# cannot be dated. The namespace is live, so no owner is known to be gone, and
+# an undated write alone never quietens a finding: critical (#66).
+mk_vd_case gate-vd-undated-writer-gone "$NS_UID" '{"team":"b"}'
+set_modified gate-vd-undated-writer-gone "$DR" absent
+# The same, but a live policy covers the namespace: critical, and still no
+# lost owner (#66).
+mk_vd_case gate-vd-undated-writer-gone-covered "$NS_UID" '{"team":"a"}'
+set_modified gate-vd-undated-writer-gone-covered "$DR" absent
+# A deleted first writer, and the namespace list cannot be read (no
+# namespaces.json: the fake kubectl fails the read). The owner is the
+# namespace, so whether the repository lost it is not known (#66).
+mk_vd_case gate-vd-ns-unknown-writer-gone "$NS_UID" '{"team":"a"}'
+rm -f "$CASES/gate-vd-ns-unknown-writer-gone/namespaces.json"
 # Uncovered: the live exporter selects other namespaces. Nothing retires here.
 mk_vd_case gate-vd-uncovered "$NS_UID" '{"team":"b"}'
 # On demand: the covering exporter runs on demand only, so it has no
@@ -1478,7 +1493,7 @@ write_rpcs gate-vd-expiring-manual-two "$(rpc_man rpc-manual-a)" "$(rpc_man rpc-
 # live policy can retire the old runs, so the critical stays.
 mk_vd_case ns-recreated "99999999-8888-7777-6666-555555555555" '{"team":"a"}'
 # Its first writer is the live policy here, so the orphan reason can only be
-# the namespace -- a deleted first writer would outrank it.
+# the namespace. ns-deleted-writer-gone covers a deleted first writer.
 jq '.items[0].metadata.name = "first-writer"' "$CASES/ns-recreated/policies.json" > "$CASES/ns-recreated/policies.json.t" \
   && mv "$CASES/ns-recreated/policies.json.t" "$CASES/ns-recreated/policies.json"
 
@@ -1506,6 +1521,10 @@ jq '.items[0].metadata.name = "first-writer"' "$CASES/ns-deleted/policies.json" 
   && mv "$CASES/ns-deleted/policies.json.t" "$CASES/ns-deleted/policies.json"
 jq '.items |= map(select(.metadata.name != "app-ns"))' "$CASES/ns-deleted/namespaces.json" > "$CASES/ns-deleted/namespaces.json.t" \
   && mv "$CASES/ns-deleted/namespaces.json.t" "$CASES/ns-deleted/namespaces.json"
+# The same, with the first writer deleted too. The namespace is the owner, so
+# it is the reason; the label never outranks it (#66).
+mk_vd_case ns-deleted-writer-gone "$NS_UID" '{"team":"a"}'
+cp "$CASES/ns-deleted/namespaces.json" "$CASES/ns-deleted-writer-gone/namespaces.json"
 
 # --- the restore-point cross-check (2.7.0) -----------------------------------
 # The covered volumedata case again -- a live policy covers the namespace, so
@@ -2064,9 +2083,13 @@ and (.storageRepositories.items[0].severityGate == "active")
 and (.bestPractices.storageRepositoryMaintenance == "FAILING")
 EOF
 cat > "$CASES/gate-vd-covered/expect.jq" <<'EOF'
-# a live policy covers the namespace through a label selector: critical,
-# although the first writer is gone
-(.storageRepositories.items[0].orphaned == true)
+# a live policy covers the namespace through a label selector: critical. The
+# first writer is gone, but that is a fact about the label, not a lost owner
+(.storageRepositories.items[0].policyMissing == true)
+and (.storageRepositories.items[0].orphaned == false)
+and (.storageRepositories.items[0].orphanReason == null)
+and ((.storageRepositories.items[0].categories // []) | index("orphan-owner-deleted") == null)
+and (.storageRepositories.orphanedOwnerDeletedCount == 0)
 and (.storageRepositories.items[0].retainerPolicies == ["team-a-export"])
 and (.storageRepositories.items[0].severityGate == "active")
 and (.storageRepositories.items[0].appNamespaceState == "live")
@@ -2087,8 +2110,10 @@ and (.storageRepositories.items[0].activeReason == "retained")
 and ((.storageRepositories.items[0].rowNotes // []) | any(contains("days. Scheduled policies that are not paused export to this profile and cover this namespace or wrote here first: team-a-export, team-a-second. They can retire restore points here")))
 EOF
 cat > "$CASES/gate-vd-uncovered/expect.jq" <<'EOF'
-# the live exporter selects other namespaces: nothing retires here
+# the live exporter selects other namespaces: nothing retires here. The first
+# writer is gone, but the namespace is live, so no owner is lost (#66)
 (.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].orphaned == false)
 and (.storageRepositories.items[0].quietReason == "no-retainer")
 and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
 EOF
@@ -2116,6 +2141,42 @@ and (.storageRepositories.items[0].orphanReason == "namespace-recreated")
 and (.storageRepositories.items[0].retainer == true)
 and (.storageRepositories.orphanedNamespaceRecreatedCount == 1)
 and (.storageRepositories.orphanedNamespaceDeletedCount == 0)
+EOF
+cat > "$CASES/gate-vd-undated-writer-gone/expect.jq" <<'EOF'
+# a deleted first writer is no lost owner, so an undated write keeps the critical
+(.storageRepositories.items[0].policyMissing == true)
+and (.storageRepositories.items[0].appNamespaceState == "live")
+and (.storageRepositories.items[0].inactive == null)
+and (.storageRepositories.items[0].orphaned == false)
+and (.storageRepositories.items[0].severityGate == "active")
+and (.storageRepositories.items[0].activeReason == "undated")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+EOF
+cat > "$CASES/gate-vd-undated-writer-gone-covered/expect.jq" <<'EOF'
+# a deleted first writer and an undated write, but a live policy covers the
+# namespace: critical, and the repository is not called orphaned. The reason
+# is the undated write: no lost owner makes it a candidate any more
+(.storageRepositories.items[0].policyMissing == true)
+and (.storageRepositories.items[0].orphaned == false)
+and (.storageRepositories.items[0].severityGate == "active")
+and (.storageRepositories.items[0].activeReason == "undated")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+EOF
+cat > "$CASES/gate-vd-ns-unknown-writer-gone/expect.jq" <<'EOF'
+# the namespace state is unknown: no owner is claimed either way
+(.storageRepositories.items[0].policyMissing == true)
+and (.storageRepositories.items[0].appNamespaceState == null)
+and (.storageRepositories.items[0].orphaned == null)
+and (.storageRepositories.items[0].orphanReason == null)
+and (.storageRepositories.orphanedOwnerDeletedCount == 0)
+EOF
+cat > "$CASES/ns-deleted-writer-gone/expect.jq" <<'EOF'
+# namespace and first writer both gone: the namespace is the reason
+(.storageRepositories.items[0].policyMissing == true)
+and (.storageRepositories.items[0].appNamespaceState == "absent")
+and (.storageRepositories.items[0].orphanReason == "namespace-deleted")
+and (.storageRepositories.orphanedNamespaceDeletedCount == 1)
+and (.storageRepositories.orphanedOwnerDeletedCount == 0)
 EOF
 cat > "$CASES/ns-deleted/expect.jq" <<'EOF'
 # no namespace of that name any more: orphaned by the namespace, counted as

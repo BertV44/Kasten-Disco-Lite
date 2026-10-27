@@ -827,10 +827,12 @@ if jq -e '.storageRepositories != null' "$J" >/dev/null 2>&1; then
   # which would mark every repository orphaned and quieten the whole section.
   # 2.7.0 adds three positive readings of a lost owner, each resting on its own
   # input: a policy that no longer backs up or exports to the profile, read in
-  # full, and a namespace deleted or recreated, read from its UID.
+  # full, and a namespace deleted or recreated, read from its UID. A volumedata
+  # policy label names only the first writer, so it never proves a lost owner.
   aq "orphaned is never claimed without a resolved owner" \
     '[.storageRepositories.items[]?
-      | select(.orphaned == true and .profileMissing != true and .policyMissing != true)
+      | select(.orphaned == true and .profileMissing != true
+               and ((.policyMissing != true) or (.contentType == "volumedata")))
       | select(((.orphanReason == "policy-stopped-exporting") and (.ownerStopped == "no-longer-exports")) | not)
       | select(((.orphanReason == "namespace-recreated") and (.appNamespaceState == "recreated")) | not)
       | select(((.orphanReason == "namespace-deleted") and (.appNamespaceState == "absent")) | not)] | length == 0'
@@ -1007,6 +1009,13 @@ if jq -e '(.storageRepositories.total // 0) > 0' "$J" >/dev/null 2>&1; then
   aq "no published sentence claims a policy still retires restore points" \
     '[.storageRepositories | .. | strings | select(test("still retires"))] | length == 0'
   hn "the HTML claims no policy still retires restore points" 'still retires'
+  # A volumedata label names only the first writer (#66): its Policy cell says
+  # so, and a deleted first writer is never a warning badge.
+  if jq -e '[.storageRepositories.items[]? | select(.contentType == "volumedata" and .policyMissing == true)] | length > 0' "$J" >/dev/null 2>&1; then
+    hj "a deleted volumedata first writer is shown as the first writer" \
+      '[.storageRepositories.items[] | select(.contentType == "volumedata" and .policyMissing == true)][0]
+       | "<td>" + (.policyName | @html) + " <span class=\"badge info\" title=\"The policy label names only the first policy that wrote here. Other policies can share this repository.\">first writer, deleted</span></td>"'
+  fi
   # Every sentence KDL.sh published for a row is printed in the HTML, verbatim.
   # They are written once so the three outputs cannot word them differently;
   # this holds the HTML to that, and run.sh holds the terminal.

@@ -388,6 +388,14 @@ run "a build that drops activeExpiringCount" \
     "the active reasons add up to activeFailingCount" \
     'del(.storageRepositories.activeExpiringCount)'
 
+# #66: a volumedata label names only the first writer. Its deletion with the
+# profile and namespace still there is no lost owner.
+run "a volumedata repository orphaned by its first writer alone" \
+    "orphaned is never claimed without a resolved owner" \
+    '(.storageRepositories.items | map(.contentType == "volumedata") | index(true)) as $i
+     | .storageRepositories.items[$i] |= (.orphaned = true | .orphanReason = "policy-deleted"
+         | .profileMissing = false | .policyMissing = true | .appNamespaceState = "live")'
+
 run "activeFailingCount disagreeing with the items" \
     "activeFailingCount reconciles" \
     '.storageRepositories.activeFailingCount = 7'
