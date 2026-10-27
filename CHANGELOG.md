@@ -35,6 +35,23 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   or wrote here first".
   The section line, `severityGateNote` and the HTML legend use "can retire"
   too. No verdict or severity changes.
+- **A deleted first writer no longer orphans a `volumedata` repository**
+  (#66). K10 sets the policy label once, when the repository is created, so
+  on a `volumedata` repository it names only the first policy that wrote to
+  it. Other policies can share the repository. KDL treated the label as the
+  owner, so a deleted first writer made the repository "Profile/policy
+  deleted", even while another live policy used it. A reader cleaning up
+  orphans could delete backup data that is in use. Now the owner of a
+  `volumedata` repository is its namespace: it is orphaned only when its
+  profile or namespace is gone. If KDL cannot read the namespace state, it
+  does not claim an owner either way. `policyMissing` still reports the
+  label. In the HTML Policy column, a deleted first writer shows "first
+  writer, deleted" (info, not a warning), and its tooltip says what the
+  label means. Severity can rise. A `volumedata` repository with no
+  datable write and a deleted first writer was quiet only because KDL took
+  it as orphaned. It is now critical (`undated`) unless its namespace or
+  profile is known to be gone. Some rows that were already critical change
+  their reason to `undated`, so the counts per reason move.
 
 ## [2.7.1] - 2026-10-08
 
