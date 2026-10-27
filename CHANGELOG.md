@@ -26,6 +26,15 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   remain, a repository with no live policy stays critical (`activeReason:
   expiring`), and the row says why. If KDL cannot read the
   RestorePointContents list, it stays critical too, and the row says so.
+- **The report says a policy can retire restore points, not that it does**
+  (#65). KDL reads the policy spec and never sees a retirement happen. A
+  critical row now says what KDL checked: "A scheduled policy that is not
+  paused exports to this profile: <policy>. It can retire restore points
+  here." For `dr` it says "backs up or exports to this profile". For
+  `volumedata` it says "exports to this profile and covers this namespace
+  or wrote here first".
+  The section line, `severityGateNote` and the HTML legend use "can retire"
+  too. No verdict or severity changes.
 
 ## [2.7.1] - 2026-10-08
 
