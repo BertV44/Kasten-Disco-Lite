@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.7.1
+# Kasten Discovery Lite v2.7.2
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -57,7 +57,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0; on-demand policies, expiry dates and shared volumedata repositories v2.7.2)*. Developer guide: [docs/maintenance-checks.md](docs/maintenance-checks.md)
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*; manual runs judged on their expiry, imported restore points left out, and an overview of snapshots with no expiry *(v2.7.1)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 

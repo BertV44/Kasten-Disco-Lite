@@ -3,7 +3,13 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.7.2] - 2026-10-30
+
+One contributed pull request (#68, Jaiganesh J K) closing #64, #65 and #66,
+its developer guide to the maintenance checks, and one correction from the
+release review. All three change who KDL says can still retire restore
+points in a failing repository, which decides whether the failure is a
+critical or a warning.
 
 - **An on-demand policy no longer keeps a failing repository critical**
   (#64). An on-demand policy (`spec.frequency: '@onDemand'`) has no
@@ -52,6 +58,17 @@ Format loosely follows [Keep a Changelog]; this is a community, non-official too
   it as orphaned. It is now critical (`undated`) unless its namespace or
   profile is known to be gone. Some rows that were already critical change
   their reason to `undated`, so the counts per reason move.
+- **An expiry date long past no longer keeps a repository critical**
+  (release review). `expiringRestorePoints` counted every
+  RestorePointContent with an `expiresAt` label, whatever the date. On
+  9.0.6 Kasten deletes the RestorePoint at expiry and leaves the
+  RestorePointContent `Unbound`, still labelled, for weeks: the lab held
+  three 30 days past expiry, and two were counted. An expiry past by more
+  than the 2-day grace of the residual-snapshots section is a retirement
+  already made and is no longer counted. An unparsable date still counts.
+- **Developer guide** `docs/maintenance-checks.md`: how the repository
+  maintenance checks decide each status, the scheduler state and the
+  severity gate, updated to this release.
 
 ## [2.7.1] - 2026-10-08
 
