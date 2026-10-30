@@ -7782,6 +7782,7 @@ while read -r _art_n; do
       | jq -c --arg n "$_art_n" '
           [ (.status.restorePointContentDetails.artifacts // [])[]? | (.meta // {}) ] as $m
           | { name: $n,
+              artifacts: ($m | length),
               kinds: ([ $m[] | keys[] ] | unique),
               profiles: ([ $m[] | .kanister.meta.profileRef.name? | select(type == "string") ] | unique),
               unnamedKanister: ([ $m[] | select(has("kanister"))
@@ -8170,7 +8171,8 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
           # Not read: the policy rule above.
           def local_writes_here($e):
             ($rpcArt[$e.name // ""] // null) as $a
-            | if $a == null then backs_up_here($e)
+            # No artifact at all is no evidence of where it wrote: old rule.
+            | if ($a == null) or (($a.artifacts // 0) == 0) then backs_up_here($e)
               elif (($a.profiles // []) | index($r.exportProfile)) != null then true
               elif (($a.unnamedKanister // 0) > 0) then true
               elif ([ ($a.kinds // [])[] | select(. != "snapshot" and . != "spec" and . != "kanister") ] | length) > 0 then true
