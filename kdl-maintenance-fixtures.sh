@@ -1334,6 +1334,52 @@ write_rpcs gate-meta-expiring-other-pns "$_r1"
 _r1=$(rpc_exp rpc-meta-x '{"k10.kasten.io/policyName": "app-backup"} + {"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "appConfigOnly"}')
 write_rpcs gate-meta-expiring-no-pns "$_r1"
 
+# --- ClusterRestorePoints (#67) ----------------------------------------------
+# A ClusterRestorePoint is the restore point of the cluster-scoped resources a
+# run captured. Real shape (9.0.6): no status.state, no appName/appNamespace;
+# an exported one adds exportProfile and exportType appConfigOnly. The metadata
+# repository of its policy and profile receives the exported ones.
+mk_crp_meta_case() {  # $1 case: a metadata repository, its owner on demand
+  mk_gate_case "$1"
+  jq "$LIB .status.contentType = \"metadata\" | .metadata.labels[\"k10.kasten.io/policyName\"] = \"app-backup\"
+          | .metadata.labels[\"k10.kasten.io/policyNamespace\"] = \"kasten-io\"" \
+    "$CASES/$1/$DR" > "$CASES/$1/$DR.t" && mv "$CASES/$1/$DR.t" "$CASES/$1/$DR"
+  echo '{}' | jq -c --slurpfile d "$CASES/$1/$DR" \
+    '{apiVersion:"repositories.kio.kasten.io/v1alpha1", kind:"StorageRepositoryList",
+       items:[ $d[0] | del(.status.details) ]}' > "$CASES/$1/list.json"
+  set_policies "$1" ".items += [{metadata: {name: \"app-backup\", namespace: \"kasten-io\"},
+      spec: {frequency: \"@onDemand\", actions: [{action: \"backup\"}, {action: \"export\", exportParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]}}]"
+}
+# write_crps <case> <labels jq object>: one ClusterRestorePoint with those
+# labels on top of the run labels ($p = profile, $exp = the expiry date).
+write_crps() {
+  _p=$(jq -r '.metadata.labels["k10.kasten.io/exportProfile"]' "$CASES/$1/$DR")
+  jq -n --arg p "$_p" --arg exp "$EXP_AT" --arg now "$GEN_NOW_ISO" "{items: [ {kind: \"ClusterRestorePoint\",
+      metadata: {name: \"manual-crp1\", creationTimestamp: \$now,
+        labels: ({\"k10.kasten.io/runActionName\": \"run-x\", \"k10.kasten.io/runActionNamespace\": \"kasten-io\"} + $2)},
+      status: {actionTime: \$now, scheduledTime: \$now}} ]}" > "$CASES/$1/crps.json"
+}
+CRP_META='{"k10.kasten.io/policyName": "app-backup", "k10.kasten.io/policyNamespace": "kasten-io"}'
+CRP_X='{"k10.kasten.io/exportProfile": $p, "k10.kasten.io/exportType": "appConfigOnly", "k10.kasten.io/isRunNow": "true", "k10.kasten.io/expiresAt": $exp}'
+# a: an exported CRP with a future expiry is the only thing that retires here.
+mk_crp_meta_case gate-crp-expiring
+write_crps gate-crp-expiring "$CRP_META + $CRP_X"
+# b: the control, the CRP list readable and empty.
+mk_crp_meta_case gate-crp-none
+# c: the CRP list cannot be read.
+mk_crp_meta_case gate-crp-denied
+: > "$CASES/gate-crp-denied/deny-crp"
+# d: an imported one belongs to the source cluster.
+mk_crp_meta_case gate-crp-imported
+write_crps gate-crp-imported "$CRP_META + $CRP_X + {\"k10.kasten.io/importProfile\": \"src\"}"
+# e: a DR repository never counts a CRP.
+mk_gate_case gate-crp-dr
+set_policies gate-crp-dr ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+write_crps gate-crp-dr "{\"k10.kasten.io/policyName\": \"$DRPOL\", \"k10.kasten.io/policyNamespace\": \"kasten-io\"} + $CRP_X"
+# f: a local CRP whose policy is gone from a complete policy list.
+mk_gate_case gate-crp-orphan
+write_crps gate-crp-orphan '{"k10.kasten.io/policyName": "deleted-pol", "k10.kasten.io/policyNamespace": "kasten-io"}'
+
 # gate-stopped-exporting: the owner exists but writes to another profile now.
 mk_gate_case gate-stopped-exporting
 set_policies gate-stopped-exporting ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {actions: [{action: \"backup\", backupParameters: {profile: {name: \"another-profile\", namespace: \"kasten-io\"}}}]} else . end)"
@@ -2711,6 +2757,48 @@ cat > "$CASES/gate-retained-uncounted/expect.jq" <<'EOF'
    and ((.rowNotes // []) | any(endswith("to this profile: k10-disaster-recovery-policy. It can retire restore points here, and each retirement leaves space that only maintenance reclaims. How many restore points remain is not known: no storage scan has reported a snapshot count for this repository."))))
 and (.bestPractices.storageRepositoryMaintenance == "FAILING")
 EOF
+
+# --- ClusterRestorePoints (#67) ---
+cat > "$CASES/gate-crp-expiring/expect.jq" <<'XEOF'
+# an exported ClusterRestorePoint with a future expiry writes to the metadata
+# repository of its policy and profile: it counts, critical
+(.storageRepositories.items[0].contentType == "metadata")
+and (.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+XEOF
+cat > "$CASES/gate-crp-none/expect.jq" <<'XEOF'
+# control: the list is readable and empty, nothing retires here, quiet
+(.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+XEOF
+cat > "$CASES/gate-crp-denied/expect.jq" <<'XEOF'
+# the CRP list cannot be read: the count is unknown, critical, and the
+# orphan and residual sections say they did not see it
+(.storageRepositories.items[0].expiringRestorePoints == null)
+and (.storageRepositories.items[0].activeReason == "unverified")
+and ((.storageRepositories.items[0].rowNotes // []) | any(contains("could not read the ClusterRestorePoints list")))
+and (.orphanedRestorePoints.status == "PARTIAL")
+and (.orphanedRestorePoints.clusterRestorePointsRead == false)
+and (.residualSnapshots.clusterRestorePointsRead == false)
+XEOF
+cat > "$CASES/gate-crp-imported/expect.jq" <<'XEOF'
+# an imported ClusterRestorePoint is retired by the source cluster: not counted
+(.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+XEOF
+cat > "$CASES/gate-crp-dr/expect.jq" <<'XEOF'
+# a ClusterRestorePoint never writes to a dr repository
+(.storageRepositories.items[0].contentType == "dr")
+and (.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+XEOF
+cat > "$CASES/gate-crp-orphan/expect.jq" <<'XEOF'
+# a local ClusterRestorePoint of a policy that no longer exists is an orphan
+(.orphanedRestorePoints.count >= 1)
+and ([.orphanedRestorePoints.items[] | select(.kind == "ClusterRestorePoint" and .namespace == "(cluster-scoped)")] | length >= 1)
+XEOF
 
 # The instant every case was built against; run.sh passes it to KDL as KDL_NOW.
 printf '%s\n' "$GEN_NOW_ISO" > "$CASES/.generated_at"

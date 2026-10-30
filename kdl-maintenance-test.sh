@@ -139,6 +139,12 @@ case "$ARGS" in
     fi
     if [ -f "$CASE/rpcs.json" ]; then cat "$CASE/rpcs.json"; else printf '{"items":[]}\n'; fi
     exit 0 ;;
+  *"get clusterrestorepoints"*)
+    if [ -f "$CASE/deny-crp" ]; then
+      echo "Error from server (Forbidden): clusterrestorepoints.apps.kio.kasten.io is forbidden" >&2; exit 1
+    fi
+    if [ -f "$CASE/crps.json" ]; then cat "$CASE/crps.json"; else printf '{"items":[]}\n'; fi
+    exit 0 ;;
 esac
 
 # The two ConfigMaps above every repository decision: the Kasten DR ownership
