@@ -823,8 +823,10 @@ so it is reported rather than guessed.
 
 - **Exported restore points.** Out of scope by design (see above): they sit in
   an export repository under its own retention.
-- **`ClusterRestorePoint` objects.** Only namespaced `RestorePointContent` is
-  read, so cluster-scoped resource backups are not inventoried here.
+- **`ClusterRestorePoint` objects** are read since v2.7.3 (#67): a local one
+  is ranked among the local restore points of its policy like any other, and
+  shown with "(cluster-scoped)". When their list cannot be read the best
+  practice is *not assessed* unless a finding outranks it.
 - **Orphaned CSI `VolumeSnapshot` objects at the storage layer.** A snapshot
   that Kasten no longer references, but that the storage backend still holds,
   is invisible to this section: it reads Kasten's own objects, not the CSI
@@ -1074,7 +1076,9 @@ rules:
 - apiGroups: ["apps.kio.kasten.io"]
   # Cluster-scoped, served by the aggregated APIService rather than a CRD.
   # Without it the Residual Snapshots section reports NOT_ASSESSED, not zero.
-  resources: ["restorepointcontents"]
+  # clusterrestorepoints (v2.7.3, #67) and restorepointcontents/details
+  # (v2.7.3, #69, read only for local restore points with an expiry date).
+  resources: ["restorepointcontents", "clusterrestorepoints", "restorepointcontents/details"]
   verbs: ["get", "list"]
 - apiGroups: ["cr.kanister.io"]
   resources: ["blueprints"]

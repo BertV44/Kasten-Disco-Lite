@@ -3,6 +3,35 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+- **ClusterRestorePoints are read** (#67). A policy that selects
+  cluster-scoped resources makes a ClusterRestorePoint per run, local and
+  exported. KDL read only RestorePointContents, so three checks missed them.
+  - *Repository maintenance:* an exported ClusterRestorePoint with an expiry
+    date writes to the metadata repository of its policy and profile, and
+    K10 retires it at expiry. It now counts in `expiringRestorePoints`, so a
+    failing metadata repository it alone keeps active is no longer quiet.
+  - *Orphaned RestorePoints:* a ClusterRestorePoint whose policy is gone is
+    an orphan, listed with "(cluster-scoped)".
+  - *Residual Snapshots:* a local ClusterRestorePoint is ranked among the
+    local restore points of its policy. On the oc11 lab 15 of 20 sit past
+    their policy's declared retention, the same verdict as the
+    RestorePointContents of the same runs.
+  - **New RBAC:** `list` on `clusterrestorepoints`. Without it the orphan
+    check is PARTIAL, Residual Snapshots is *not assessed* unless a finding
+    outranks it, and a failing metadata repository with no live policy
+    stays critical (`unverified`) instead of quiet. Update `kdl-rbac.yaml`.
+- **A local restore point with an expiry date counts where its artifacts
+  wrote** (#69). The expiry count inferred its repository from the backup
+  profile of its policy, which over-counts when the policy writes nothing
+  there, and misses the repository when the profile changed after the run
+  (seen on the lab: Quick DR restore points in `storj`, the policy now on
+  `storj-new`). KDL reads `/details` for those restore points only: a
+  Kanister artifact names the profile, a CSI snapshot or resource specs
+  alone write nowhere, anything else keeps the old rule. **New RBAC:** `get`
+  on `restorepointcontents/details`; without it the old rule applies.
+
 ## [2.7.2] - 2026-10-30
 
 One contributed pull request (#68, Jaiganesh J K) closing #64, #65 and #66,

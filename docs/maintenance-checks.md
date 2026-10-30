@@ -429,10 +429,22 @@ date KDL cannot parse still counts. Matching:
   the labelled policy and that profile, and `volumedata` through the namespace
   and its `exportProfile` or `blockModeExportProfile`, unless it is
   `appConfigOnly`.
-- A local entry (no profile label) matches only through the policy's
-  `backupParameters.profile`, for `dr` and `volumedata`, never `metadata`. An
-  entry with no policy, such as a manual snapshot, counts for every
-  `volumedata` repository of its namespace.
+- A local entry (no profile label) never matches `metadata`. For `dr` and
+  `volumedata` KDL reads its `/details` artifacts (#69, only for local
+  entries with an expiry date): it matches where a Kanister artifact names
+  the repository profile (`meta.kanister.meta.profileRef.name`), not where
+  its only artifacts are a CSI `snapshot` or resource `spec`, which write to
+  no repository. Any other artifact kind (GVS included: no sample has been
+  seen), a Kanister artifact with no profile name, no artifact at all, or a
+  read that fails keeps the old rule: the policy's `backupParameters.profile`,
+  and an entry with no policy (a manual snapshot) counts for every
+  `volumedata` repository of its namespace. `expiryArtifactsRequested` and
+  `expiryArtifactsRead` say how many were read.
+- An exported ClusterRestorePoint (#67: the cluster-scoped resources of a
+  run, `exportType: appConfigOnly`) matches the `metadata` repository of its
+  policy and `exportProfile`, never `volumedata` or `dr`. A local one matches
+  no repository. While the ClusterRestorePoints list cannot be read, a
+  `metadata` repository's count is null.
 - An entry is counted once, though its local entry and its exported twin can
   both match. The key is the run, namespace, application and expiry date. A
   manual entry has no run, so its key is its own name.
