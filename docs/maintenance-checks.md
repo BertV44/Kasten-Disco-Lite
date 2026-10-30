@@ -5,7 +5,7 @@ StorageRepository, and why. Read it before you change the
 `storageRepositories` section of `KDL.sh` or its rendering in
 `kdl-json-to-html.sh`.
 
-It describes KDL 2.7.1 on Kasten 9.0. KDL is read-only: it never writes to,
+It describes KDL 2.7.2 on Kasten 9.0. KDL is read-only: it never writes to,
 deletes or starts anything on the cluster.
 
 ## The question KDL answers
@@ -48,7 +48,7 @@ reads under the ConfigMap permission KDL already has. No extra RBAC is needed.
 | Pods in the Kasten namespace | Maintenance, upgrade and scan pods, with phase and start time |
 | Policies (all namespaces) | `spec.paused`, the profile of every export and backup action, the selector |
 | Namespaces | Name to UID, to find a namespace that was deleted and created again |
-| RestorePointContents | `appNamespace`, `exportProfile` and `blockModeExportProfile` labels |
+| RestorePointContents | `appNamespace`, `exportProfile`, `blockModeExportProfile`, `importProfile`, `exportType`, `policyName`, `policyNamespace`, `runActionName` and `expiresAt` labels |
 | ConfigMaps | `k10-dr-remove-to-get-ownership` and `k10-features` |
 
 Three payload facts catch people out:
@@ -134,8 +134,8 @@ Each repository gets one state. The first match wins.
 | `maintenance-off` | `backgroundMaintenanceRun` is absent | Scans only. Below `running` because scans still run. |
 | `scheduled` | `nextProessTime` is set | K10 holds a timer. |
 | `parked` | No timer, and the park rule holds | Healthy by design (see below). |
-| `dropped` | No timer, not parked, pod list readable | K10 gave up on it, or never armed it. |
-| null | KDL cannot tell | The pod list or a park-rule input could not be read. Null, never `dropped`. |
+| `dropped` | No timer, not parked, details and pod list readable | K10 gave up on it, or never armed it. |
+| null | KDL cannot tell | The details, the pod list or a park-rule input could not be read. Null, never `dropped`. |
 
 ```mermaid
 flowchart TD
@@ -356,9 +356,11 @@ flowchart TD
     rpc -- none --> Q2["Quiet: nothing left to retire"]
     rpc -- "yes, unknown, or not volumedata" --> prof{"Profile still reaches the repository?"}
     prof -- "gone or repointed" --> Q3["Quiet: retirement cannot reach it"]
-    prof -- "yes, or unknown" --> ret{"A live, unpaused policy retires restore points in it?"}
-    ret -- no --> Q4["Quiet: frozen until retired by hand"]
+    prof -- "yes, or unknown" --> ret{"A live, scheduled, unpaused policy can retire restore points in it?"}
     ret -- "yes, or cannot tell" --> C2["Critical: space keeps growing"]
+    ret -- no --> exp{"Restore points in it with an expiry date?"}
+    exp -- none --> Q4["Quiet: frozen until retired by hand"]
+    exp -- "some, or unknown" --> C3["Critical: expiring"]
 ```
 
 **Quiet reasons** (`quietReason`):
@@ -370,14 +372,15 @@ flowchart TD
 | `count-zero` | A storage scan counted 0 snapshots at least 1 hour after the last write. The two times come from different writers; the hour absorbs clock skew. An earlier zero proves nothing, because it can miss what an export added since. |
 | `no-restore-points` | `volumedata` only. The RestorePointContents list was read, is not empty cluster-wide, and no entry references the namespace. |
 | `profile-unreachable` | The profile is gone, or points somewhere else. |
-| `no-retainer` | No live, unpaused policy retires restore points in it. |
+| `no-retainer` | No live, scheduled, unpaused policy can retire restore points in it, and `expiringRestorePoints` is 0. An unknown count keeps the critical. |
 
 **Active reasons** (`activeReason`) say why a failure stays critical:
 `written`, `undated`, `retained`, `retained-uncounted` (a live retainer, but
-no scan has counted the snapshots), and `unverified`. KDL publishes one count
-for each, and `activeWrittenCount + activeRetainedCount +
-activeRetainedUncountedCount + activeUnverifiedCount` equals
-`activeFailingCount`.
+no scan has counted the snapshots), `expiring` (no live retainer, but a restore
+point in the repository has an expiry date still to come, or an unknown one),
+and `unverified`. KDL publishes one count for each, and `activeWrittenCount +
+activeRetainedCount + activeRetainedUncountedCount + activeExpiringCount +
+activeUnverifiedCount` equals `activeFailingCount`.
 
 A failure's `statusLevel` follows the gate: `error` when active, `warn` when
 quiet. Each quiet reason has its own sentence on the row.
@@ -386,16 +389,21 @@ quiet. Each quiet reason has its own sentence on the row.
 
 Retirement is a phase of a policy run: a policy retires its own expired runs.
 A deleted policy has no runs, and a paused policy does not run, so neither
-retires anything.
+retires anything. An on-demand policy (`@onDemand`) runs, but it has no
+retention, so it retires nothing either. KDL lists those in
+`retainerOnDemandPolicies`. A policy with no `frequency` counts as scheduled,
+which keeps the critical.
 
 | Content type | One repository per | Retained by |
 | --- | --- | --- |
-| `metadata` | (policy, profile). A 9.0 policy with an extra export has one per export profile. | The labelled policy, if it exists, is not paused, and still exports to this profile. KDL checks every export action. |
+| `metadata` | (policy, profile). A 9.0 policy with an extra export has one per export profile. | The labelled policy, if it exists, is scheduled, is not paused, and still exports to this profile. KDL checks every export action. |
 | `dr` | (policy, profile) | The labelled policy, if it backs up or exports to this profile. Quick DR backs up to `backupParameters.profile` with no export action, so both count. |
-| `volumedata` | (namespace UID, profile). The path ends in `.../repo/<namespace UID>/`. Every policy that protects the namespace with that profile shares it. | A live, unpaused policy that exports to the profile and covers the namespace, or the labelled first writer. A policy outside the Kasten namespace is app-scoped and covers only its own namespace. |
+| `volumedata` | (namespace UID, profile). The path ends in `.../repo/<namespace UID>/`. Every policy that protects the namespace with that profile shares it. | A live, scheduled, unpaused policy that exports to the profile and covers the namespace, or the labelled first writer. A policy outside the Kasten namespace is app-scoped and covers only its own namespace. |
 
 KDL finds the owner policy by namespace and name
-(`k10.kasten.io/policyNamespace` and `policyName`), never by name alone.
+(`k10.kasten.io/policyNamespace` and `policyName`), never by name alone. For
+`volumedata` the policy label names only the first writer: other policies
+share the repository, and the namespace is its owner.
 
 If a policy could cover the namespace but KDL could not read all its export
 profiles, the repository stays critical.
@@ -408,9 +416,36 @@ matches and its `exportProfile` or `blockModeExportProfile` is the
 repository's profile. An entry with neither profile label counts for the
 namespace alone. Count entries, not entry-profile pairs.
 
-**Orphaned** means the owner is gone: the profile or the policy was deleted,
-the policy no longer backs up or exports to this profile, or (for
-`volumedata`) the namespace was deleted or created again under the same name.
+**The expiry check.** K10 retires a restore point when its expiry date passes,
+with no policy run, so a repository with no live retainer can still receive
+retirements. `expiringRestorePoints` counts them, and `no-retainer` needs it to
+be 0. An entry counts when it has the `k10.kasten.io/expiresAt` label and no
+`importProfile` label (an imported entry belongs to another cluster). An entry
+whose date passed more than `RESIDUAL_EXPIRY_GRACE_DAYS` (2) days ago does not
+count: Kasten has already retired it and left the Unbound content behind. A
+date KDL cannot parse still counts. Matching:
+
+- An exported entry (`exportProfile` set) matches `metadata` and `dr` through
+  the labelled policy and that profile, and `volumedata` through the namespace
+  and its `exportProfile` or `blockModeExportProfile`, unless it is
+  `appConfigOnly`.
+- A local entry (no profile label) matches only through the policy's
+  `backupParameters.profile`, for `dr` and `volumedata`, never `metadata`. An
+  entry with no policy, such as a manual snapshot, counts for every
+  `volumedata` repository of its namespace.
+- An entry is counted once, though its local entry and its exported twin can
+  both match. The key is the run, namespace, application and expiry date. A
+  manual entry has no run, so its key is its own name.
+
+The count is 0 for a list that was read and is empty, and null when the list
+was not read or the repository cannot be matched. Null keeps the critical.
+
+**Orphaned** means the owner is gone: the profile was deleted, the policy was
+deleted or no longer backs up or exports to this profile (`metadata` and `dr`
+only), or (for `volumedata`) the namespace was deleted or created again under
+the same name. A deleted first writer does not orphan a `volumedata`
+repository, and the HTML row shows "first writer, deleted". For `volumedata`,
+`orphaned` is null unless the profile is present and the namespace is live.
 KDL compares namespaces by UID. `orphanReason` names which.
 
 `spec.overrideLocation` repoints a repository to a profile's new location,
@@ -451,8 +486,8 @@ these rules when you change it:
   Never end it in a branch that means "fine".
 - **Name findings, never commands.**
 - **Say "unreclaimed space" in prose,** not "garbage". (The `strandedSignal`
-  values keep their names.) A policy retires restore points *in* a
-  repository.
+  values keep their names.) A policy *can* retire restore points in
+  a repository; KDL reads the spec and never sees a retirement happen.
 
 The section summary counts each repository once, by status, and adds up to
 the total. Context rows (no write for 30+ days, never written, profile
