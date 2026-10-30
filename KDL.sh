@@ -7633,6 +7633,7 @@ if [ -f "$TEMP_DIR/rpc_read.ok" ] && _sr_list_readable "$TEMP_DIR/rpc_raw.json";
                          ep: ($l["k10.kasten.io/exportProfile"] // null),
                          bp: ($l["k10.kasten.io/blockModeExportProfile"] // null),
                          type: ($l["k10.kasten.io/exportType"] // null),
+                         exp: ($l["k10.kasten.io/expiresAt"] // null),
                          key: (if $l["k10.kasten.io/runActionName"] == null
                                then "name|" + (.metadata.name | tostring)
                                else ([ $l["k10.kasten.io/runActionName"], $l["k10.kasten.io/appNamespace"],
@@ -7725,6 +7726,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   --slurpfile ownersF "$TEMP_DIR/sr_policy_owners.json" \
   --slurpfile pcScopeF "$TEMP_DIR/pc_scope.json" \
   --slurpfile rpcIndexF "$TEMP_DIR/sr_rpc_index.json" \
+  --argjson expiryGrace "$RESIDUAL_EXPIRY_GRACE_DAYS" \
   --argjson strandedFloor "$STORAGE_REPO_STRANDED_FLOOR" \
   --arg threshold "$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS" \
   --arg inactiveThreshold "$STORAGE_REPO_INACTIVE_THRESHOLD_DAYS" \
@@ -7764,6 +7766,21 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
 
   (if ($ownersF | length) > 0 then $ownersF[0] else null end) as $owners |
   (if ($rpcIndexF | length) > 0 then $rpcIndexF[0] else null end) as $rpcIndex |
+  # An expiry date already past by more than the grace of the residual-snapshots
+  # section has had its retirement: on 9.0.6 Kasten deletes the RestorePoint and
+  # leaves the RestorePointContent Unbound, still labelled, for weeks (three on
+  # the lab, 30 days after expiry). Counting those kept a repository with no
+  # live policy critical for a retirement that is already behind it. Same
+  # hyphenated-time parse as exp_epoch there; an unparsable value is not past,
+  # so it still counts (an unknown keeps the critical).
+  def expiry_passed($e):
+    ($e.exp | if type == "string"
+              then (if test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z$")
+                    then (.[0:13] + ":" + .[14:16] + ":" + .[17:19] + "Z") else . end)
+              else null end) as $iso
+    | if $iso == null then false
+      else (days_ago($now; $iso)) as $d
+           | ($d != null) and ($d > $expiryGrace) end;
   (if ($pcScopeF | length) > 0 then $pcScopeF[0] else {complete: true, read: []} end) as $pcScope |
 
   # #58: find the policy a repository names. Owners are keyed (namespace/name)
@@ -7983,6 +8000,8 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       #     An entry with no policy, such as a manual snapshot, writes
       #     through a profile that the list does not name, so it counts for
       #     every volumedata repository of its namespace.
+      # An expiry past by more than the grace is a retirement already made
+      # and does not count (expiry_passed).
       # A restore point is counted once, though its local entry and its
       # exported twin can both match. 0 when the list was read and nothing
       # matches; null when it was not, or this repository cannot be matched.
@@ -8009,6 +8028,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
             (if $r.appName == null then null
              else [ ($rpcIndex.expiring // [])[] as $e
                     | select($e.ns == $r.appName)
+                    | select(expiry_passed($e) | not)
                     | select(if $e.ep != null
                              then ($e.type != "appConfigOnly")
                                   and (($e.ep == $r.exportProfile) or ($e.bp == $r.exportProfile))
@@ -8018,6 +8038,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
             (if $r.policyName == null then null
              else [ ($rpcIndex.expiring // [])[] as $e
                     | select(same_policy($e))
+                    | select(expiry_passed($e) | not)
                     | select(if $e.ep != null then $e.ep == $r.exportProfile
                              elif $r.contentType == "dr" then backs_up_here($e)
                              else false end)
