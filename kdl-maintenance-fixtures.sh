@@ -1380,6 +1380,36 @@ write_crps gate-crp-dr "{\"k10.kasten.io/policyName\": \"$DRPOL\", \"k10.kasten.
 mk_gate_case gate-crp-orphan
 write_crps gate-crp-orphan '{"k10.kasten.io/policyName": "deleted-pol", "k10.kasten.io/policyNamespace": "kasten-io"}'
 
+# --- local expiring restore points matched by their artifacts (#69) -----------
+# A local entry (no exportProfile label) has no profile of its own. KDL reads
+# its /details and counts it where a Kanister artifact names the repository
+# profile; a CSI snapshot and resource specs write to no repository. The shim
+# serves rpcdetails-<name>.json; a case without one gets a failed read.
+ART_SNAP='{"meta": {"snapshot": {"type": "CSI", "id": "snap-1", "volume": "pvc-1"}}}'
+ART_SPEC='{"meta": {"spec": {"kind": "Deployment"}}}'
+ART_KAN='{"meta": {"kanister": {"meta": {"type": "Snapshot", "profileRef": {"kind": "Profile", "name": $p, "namespace": "kasten-io"}, "location": {"type": "ObjectStore"}}, "values": [{"key": "objectStorePath", "value": "x"}]}}}'
+ART_KAN_NOREF='{"meta": {"kanister": {"meta": {"type": "Snapshot", "location": {"type": "ObjectStore"}}, "values": []}}}'
+ART_GVS='{"meta": {"gvs": {"id": "g-1"}}}'
+# mk_art_case <case> <policy profile expr: "\$p" or a literal> <artifacts jq array, or "none">
+mk_art_case() {
+  mk_gate_case "$1"
+  set_policies "$1" ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: $2, namespace: \"kasten-io\"}}}]} else . end)"
+  _r1=$(rpc_exp rpc-art "{\"k10.kasten.io/policyName\": \"$DRPOL\", \"k10.kasten.io/policyNamespace\": \"kasten-io\"}")
+  write_rpcs "$1" "$_r1"
+  if [ "$3" != none ]; then
+    _p=$(jq -r '.metadata.labels["k10.kasten.io/exportProfile"]' "$CASES/$1/$DR")
+    jq -n --arg p "$_p" "{kind: \"RestorePointContent\", status: {restorePointContentDetails: {artifacts: $3,
+        originatingPolicies: [{name: \"$DRPOL\", namespace: \"kasten-io\"}]}}}" > "$CASES/$1/rpcdetails-rpc-art.json"
+  fi
+}
+mk_art_case gate-art-snapshot-only '$p' "[ $ART_SNAP, $ART_SPEC ]"
+mk_art_case gate-art-kanister '$p' "[ $ART_SNAP, $ART_KAN, $ART_SPEC ]"
+mk_art_case gate-art-unread '$p' none
+mk_art_case gate-art-unknown-kind '$p' "[ $ART_SNAP, $ART_GVS ]"
+mk_art_case gate-art-kanister-noref '$p' "[ $ART_SNAP, $ART_KAN_NOREF ]"
+mk_art_case gate-art-profile-changed '"another-profile"' "[ $ART_SNAP, $ART_KAN ]"
+mk_art_case gate-art-empty '$p' "[]"
+
 # gate-stopped-exporting: the owner exists but writes to another profile now.
 mk_gate_case gate-stopped-exporting
 set_policies gate-stopped-exporting ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {actions: [{action: \"backup\", backupParameters: {profile: {name: \"another-profile\", namespace: \"kasten-io\"}}}]} else . end)"
@@ -2798,6 +2828,54 @@ cat > "$CASES/gate-crp-orphan/expect.jq" <<'XEOF'
 # a local ClusterRestorePoint of a policy that no longer exists is an orphan
 (.orphanedRestorePoints.count >= 1)
 and ([.orphanedRestorePoints.items[] | select(.kind == "ClusterRestorePoint" and .namespace == "(cluster-scoped)")] | length >= 1)
+XEOF
+
+# --- local expiring restore points matched by artifacts (#69) ---
+cat > "$CASES/gate-art-snapshot-only/expect.jq" <<'XEOF'
+# a CSI snapshot and resource specs write to no repository: not counted, quiet
+(.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+and (.storageRepositories.expiryArtifactsRequested == 1)
+and (.storageRepositories.expiryArtifactsRead == 1)
+XEOF
+cat > "$CASES/gate-art-kanister/expect.jq" <<'XEOF'
+# a Kanister artifact naming the repository profile wrote here: counted
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+and (.storageRepositories.expiryArtifactsRead == 1)
+XEOF
+cat > "$CASES/gate-art-unread/expect.jq" <<'XEOF'
+# /details cannot be read: the policy backup profile rule, counted
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.storageRepositories.expiryArtifactsRequested == 1)
+and (.storageRepositories.expiryArtifactsRead == 0)
+XEOF
+cat > "$CASES/gate-art-unknown-kind/expect.jq" <<'XEOF'
+# an artifact kind KDL does not know keeps the count
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.storageRepositories.expiryArtifactsRead == 1)
+XEOF
+cat > "$CASES/gate-art-kanister-noref/expect.jq" <<'XEOF'
+# a Kanister artifact with no profile name keeps the count
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+XEOF
+cat > "$CASES/gate-art-profile-changed/expect.jq" <<'XEOF'
+# the policy now backs up to another profile, but the artifact wrote to this
+# repository: counted, never quiet (the direction that hides a finding)
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+XEOF
+cat > "$CASES/gate-art-empty/expect.jq" <<'XEOF'
+# an answer with no artifact is no evidence: the policy rule, counted
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.storageRepositories.expiryArtifactsRead == 1)
 XEOF
 
 # The instant every case was built against; run.sh passes it to KDL as KDL_NOW.

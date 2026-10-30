@@ -186,6 +186,13 @@ case "$ARGS" in
     fi
     echo "Error from server (NotFound): the server could not find the requested resource" >&2
     exit 1 ;;
+  *--raw*restorepointcontents*details*)
+    _rpc=$(printf '%s' "$ARGS" | sed -n 's|.*/restorepointcontents/\([^/]*\)/details.*|\1|p')
+    if [ -n "$_rpc" ] && [ -f "$CASE/rpcdetails-$_rpc.json" ]; then
+      cat "$CASE/rpcdetails-$_rpc.json"; exit 0
+    fi
+    echo "Error from server (Forbidden): restorepointcontents.apps.kio.kasten.io is forbidden" >&2
+    exit 1 ;;
   *--raw*)
     printf '{}\n'; exit 0 ;;
 esac
