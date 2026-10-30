@@ -173,6 +173,11 @@ rules:
       # NOT_ASSESSED (unless a finding outranks it), and a failing metadata
       # repository with no live policy stays critical, never quiet.
       - clusterrestorepoints
+      # restorepointcontents/details: the artifacts of a local restore point
+      # with an expiry date, to tell which repository it wrote to (#69). Read
+      # only for those. Without it the expiry count falls back to the backup
+      # profile of the policy, which can only over-count.
+      - restorepointcontents/details
     verbs: ["get", "list"]
   - apiGroups: ["repositories.kio.kasten.io"]
     resources:
