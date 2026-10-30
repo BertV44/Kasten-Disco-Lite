@@ -3504,8 +3504,8 @@ RP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile impo
 ' 2>/dev/null || echo 0)")
 
 # RestorePoints that carry no actionName at all — not orphaned, not attributable.
-RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile crps "$TEMP_DIR/crp_items.json" '
-  [((.items // []) + (($crps[0] // {}).items // []))[]?
+RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq '
+  [(.items // [])[]?
    | select((((.spec.source.actionName // "") | tostring) == "")
             and ((((.metadata.labels // {})["k10.kasten.io/policyName"] // "") | tostring) == ""))]
   | length // 0
@@ -3515,10 +3515,8 @@ RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfil
 # on any RestorePoint — orphan detection is not possible and a count of 0 is
 # meaningless. Report it as unassessed rather than as a clean zero, which is the
 # same rule applied to a jq failure above.
-# Against RestorePoints AND ClusterRestorePoints, since both are counted.
-_orp_total=$((RESTORE_POINTS_COUNT + CRP_LISTED))
-if [ "$_orp_total" -gt 0 ] 2>/dev/null \
-   && [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -ge "$_orp_total" ] 2>/dev/null; then
+if [ "${RESTORE_POINTS_COUNT:-0}" -gt 0 ] 2>/dev/null \
+   && [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -ge "${RESTORE_POINTS_COUNT:-0}" ] 2>/dev/null; then
   ORPHANED_RP_STATUS="NOT_ASSESSED"
   warn "None of the $RESTORE_POINTS_COUNT RestorePoint(s) carry a policy label or a source action name."
   warn "Orphan detection is not possible on this catalog; the count is reported as not assessed."
@@ -3836,11 +3834,11 @@ else
       | group_by([.appNamespace, .appName, .policyName, (.policyNamespace // $k10ns)])
       | map( sort_by(.refEpoch) | reverse | to_entries | map(.value + {rank: .key}) )
       | flatten
-      | map({key: .name, value: .rank})
+      | map({key: (.kind + "|" + .name), value: .rank})
       | from_entries ) as $rankMap |
     [ $snaps0[]
       | . as $s
-      | . + { rank: (if ($rankMap[$s.name]) == null then -1 else $rankMap[$s.name] end) }
+      | . + { rank: (if ($rankMap[$s.kind + "|" + $s.name]) == null then -1 else $rankMap[$s.kind + "|" + $s.name] end) }
       | .beyond = (.ageDays != null and .ageDays > $threshold)
       | .reason = (
           if .ageDays == null then "unknown-age"
@@ -3873,7 +3871,6 @@ else
     {
       # RestorePointContents only, as before; ClusterRestorePoints apart.
       listed: ([ $all[]? | select(.kdlKind != "ClusterRestorePoint") ] | length),
-      clusterListed: ([ $all[]? | select(.kdlKind == "ClusterRestorePoint") ] | length),
       localSnapshots: ($snaps | length),
       imported: ([ $all[]? | select(((.metadata.labels // {}) | has("k10.kasten.io/exportProfile")) | not) | select(imported) ] | length),
       residual: ($residual | length),
@@ -7753,6 +7750,21 @@ jq -e 'type == "object" or type == "null"' "$TEMP_DIR/sr_rpc_index.json" >/dev/n
   || printf 'null\n' > "$TEMP_DIR/sr_rpc_index.json"
 debug "Storage repository: restore point index $(jq -r 'if . == null then "unreadable" else "\(.total) listed, \(.byNamespace | length) volumedata namespace(s) referenced" end' "$TEMP_DIR/sr_rpc_index.json" 2>/dev/null)"
 
+# The clock every maintenance age is measured against. KDL_NOW is a test hook:
+# the fixtures are built relative to the instant they were generated, and read
+# against the wall clock they aged a day at a time until `healthy` reported
+# every repository OVERDUE. Honoured only when set, and only as an RFC3339 UTC
+# instant -- anything else is ignored with a warning rather than failing the
+# run, the same rule KDL_PARALLEL follows.
+STORAGE_REPO_NOW=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+if [ -n "${KDL_NOW:-}" ]; then
+  case "$KDL_NOW" in
+    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
+      STORAGE_REPO_NOW=$KDL_NOW ;;
+    *) warn "KDL_NOW ignored: '$KDL_NOW' is not an RFC3339 UTC instant (YYYY-MM-DDTHH:MM:SSZ)" ;;
+  esac
+fi
+
 # #69: WHERE A LOCAL RESTORE POINT WITH AN EXPIRY DATE ACTUALLY WROTE. Its
 # labels name no profile, so the expiry count could only infer the
 # repository from the backup profile of its policy, which is wrong both ways:
@@ -7773,20 +7785,47 @@ debug "Storage repository: restore point index $(jq -r 'if . == null then "unrea
 # entry keeps the old rule: an unknown never quietens a finding.
 SR_RPC_ART_DIR="$TEMP_DIR/sr-rpc-art"
 mkdir -p "$SR_RPC_ART_DIR"
-jq -r 'if . == null then empty else (.expiring // [])[] | select(.ep == null and (.crp != true) and (.name | type) == "string") | .name end' \
-  "$TEMP_DIR/sr_rpc_index.json" 2>/dev/null | sort -u > "$TEMP_DIR/sr-rpc-art-names.txt" || : > "$TEMP_DIR/sr-rpc-art-names.txt"
+# Candidates are only the entries that can change a count: local, an expiry
+# not yet past the grace, and in the namespace of a volumedata repository or
+# of the policy of a dr repository. A metadata repository never takes a local
+# entry, and scheduled runs carry no expiry, so this stays a handful.
+_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '[ .[]? | select(.status.contentType? == "dr")
+    | (.metadata.labels // {})["k10.kasten.io/policyName"] | select(type == "string") ] | unique' \
+  > "$TEMP_DIR/sr_dr_pols.json" 2>/dev/null || printf '[]\n' > "$TEMP_DIR/sr_dr_pols.json"
+jq -e 'type == "array"' "$TEMP_DIR/sr_dr_pols.json" >/dev/null 2>&1 || printf '[]\n' > "$TEMP_DIR/sr_dr_pols.json"
+jq -r --slurpfile vdF "$TEMP_DIR/sr_vd_apps.json" --slurpfile drF "$TEMP_DIR/sr_dr_pols.json" \
+    --arg now "$STORAGE_REPO_NOW" --argjson grace "$RESIDUAL_EXPIRY_GRACE_DAYS" '
+  def iso_epoch: try (strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) catch null;
+  ($now | iso_epoch) as $n
+  | ($vdF[0] // []) as $vd | ($drF[0] // []) as $dr
+  | if . == null then empty else (.expiring // [])[]
+    | select(.ep == null and (.crp != true) and (.name | type) == "string")
+    | . as $c
+    | select((($c.ns | type) == "string" and (($vd | index($c.ns)) != null))
+             or (($c.pname | type) == "string" and (($dr | index($c.pname)) != null)))
+    | ((.exp // null) | if type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2}Z$")
+                        then (.[0:13] + ":" + .[14:16] + ":" + .[17:19] + "Z") | iso_epoch
+                        elif type == "string" then iso_epoch else null end) as $x
+    | select(($x == null) or ($n == null) or ($x + ($grace * 86400) >= $n))
+    | .name end' "$TEMP_DIR/sr_rpc_index.json" 2>/dev/null \
+  | sort -u > "$TEMP_DIR/sr-rpc-art-names.txt" || : > "$TEMP_DIR/sr-rpc-art-names.txt"
 _art_i=0
 while read -r _art_n; do
   [ -z "$_art_n" ] && continue
   ( $CLI get --raw "/apis/apps.kio.kasten.io/v1alpha1/restorepointcontents/$_art_n/details" 2>/dev/null \
       | jq -c --arg n "$_art_n" '
-          [ (.status.restorePointContentDetails.artifacts // [])[]? | (.meta // {}) ] as $m
+          [ (.status.restorePointContentDetails.artifacts // [])[]? | (if type == "object" then .meta else null end) ] as $m
           | { name: $n,
               artifacts: ($m | length),
-              kinds: ([ $m[] | keys[] ] | unique),
-              profiles: ([ $m[] | .kanister.meta.profileRef.name? | select(type == "string") ] | unique),
-              unnamedKanister: ([ $m[] | select(has("kanister"))
-                                  | select((.kanister.meta.profileRef.name? | type) != "string") ] | length) }' \
+              kinds: ([ $m[] | select(type == "object") | keys[] ] | unique),
+              profiles: ([ $m[] | select(type == "object") | .kanister.meta.profileRef.name? | select(type == "string") ] | unique),
+              unnamedKanister: ([ $m[] | select(type == "object") | select(has("kanister"))
+                                  | select((.kanister.meta.profileRef.name? | type) != "string") ] | length),
+              # An artifact with no meta, an empty one, or none of the known
+              # kinds is not evidence that it wrote nowhere.
+              unrecognised: ([ $m[] | select((type != "object")
+                                 or (([ keys[] | select(. == "snapshot" or . == "spec" or . == "kanister") ] | length) == 0)) ]
+                             | length) }' \
       > "$SR_RPC_ART_DIR/$(printf '%05d' "$_art_i").json" 2>/dev/null ) &
   _art_i=$((_art_i + 1))
   if [ $((_art_i % STORAGE_REPO_PARALLEL)) -eq 0 ]; then wait; fi
@@ -7800,21 +7839,6 @@ SR_RPC_ART_REQUESTED=$_art_i
 SR_RPC_ART_READ=$(jq 'length' "$TEMP_DIR/sr_rpc_art.json" 2>/dev/null || echo 0)
 case "$SR_RPC_ART_READ" in ''|*[!0-9]*) SR_RPC_ART_READ=0 ;; esac
 debug "Storage repository: local expiring restore point artifacts read $SR_RPC_ART_READ of $SR_RPC_ART_REQUESTED"
-
-# The clock every maintenance age is measured against. KDL_NOW is a test hook:
-# the fixtures are built relative to the instant they were generated, and read
-# against the wall clock they aged a day at a time until `healthy` reported
-# every repository OVERDUE. Honoured only when set, and only as an RFC3339 UTC
-# instant -- anything else is ignored with a warning rather than failing the
-# run, the same rule KDL_PARALLEL follows.
-STORAGE_REPO_NOW=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-if [ -n "${KDL_NOW:-}" ]; then
-  case "$KDL_NOW" in
-    [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z)
-      STORAGE_REPO_NOW=$KDL_NOW ;;
-    *) warn "KDL_NOW ignored: '$KDL_NOW' is not an RFC3339 UTC instant (YYYY-MM-DDTHH:MM:SSZ)" ;;
-  esac
-fi
 
 # The two preconditions as published, measured on the same clock as every
 # other age here.
@@ -8175,6 +8199,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
             | if ($a == null) or (($a.artifacts // 0) == 0) then backs_up_here($e)
               elif (($a.profiles // []) | index($r.exportProfile)) != null then true
               elif (($a.unnamedKanister // 0) > 0) then true
+              elif (($a.unrecognised // 0) > 0) then true
               elif ([ ($a.kinds // [])[] | select(. != "snapshot" and . != "spec" and . != "kanister") ] | length) > 0 then true
               else false end;
           if $rpcIndex == null then null
@@ -8190,9 +8215,6 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                                   and (($e.ep == $r.exportProfile) or ($e.bp == $r.exportProfile))
                              else local_writes_here($e) end)
                     | $e.key ] | unique | length end)
-          # #67: a metadata repository also receives exported
-          # ClusterRestorePoints, so its count is unknown while they are unread.
-          elif ($r.contentType == "metadata") and ($rpcIndex.crpRead != true) then null
           elif ($r.contentType == "metadata") or ($r.contentType == "dr") then
             (if $r.policyName == null then null
              else [ ($rpcIndex.expiring // [])[] as $e
@@ -8202,7 +8224,12 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                     | select(if $e.ep != null then $e.ep == $r.exportProfile
                              elif $r.contentType == "dr" then local_writes_here($e)
                              else false end)
-                    | $e.key ] | unique | length end)
+                    | $e.key ] | unique | length
+                  # #67: a metadata repository also receives exported
+                  # ClusterRestorePoints. While they are unread a zero is
+                  # unknown; a count found in the RestorePointContents stands.
+                  | if (. == 0) and ($r.contentType == "metadata") and ($rpcIndex.crpRead != true) then null else . end
+             end)
           else null end
       ),
       # Age of the storage scan the snapshot count and sizes came from. Same
@@ -12754,7 +12781,7 @@ if [ "$ORPHANED_RP_STATUS" = "NOT_ASSESSED" ]; then
 elif [ "$ORPHANED_RP_COUNT" -eq 0 ] && [ "$ORPHANED_RP_STATUS" = "PARTIAL" ]; then
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} No orphan confirmed, but this is NOT a clean verdict (see below)\n"
   if [ "$CRP_READ" != true ]; then
-    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints'): an orphan among them cannot be ruled out${COLOR_RESET}\n"
+    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints', or not served): an orphan among them cannot be ruled out${COLOR_RESET}\n"
   fi
 elif [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
   printf "  ${COLOR_GREEN}[OK] No orphaned RestorePoints detected${COLOR_RESET}\n"
@@ -12762,7 +12789,7 @@ else
   printf "  ${COLOR_YELLOW}[WARN]  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
   _ep "$ORPHANED_RP" | jq -r '.[:5][] | "    - \(.name) [\(.namespace)]"' 2>/dev/null
   if [ "$CRP_READ" != true ]; then
-    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints'): the list above may be incomplete${COLOR_RESET}\n"
+    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints', or not served): the list above may be incomplete${COLOR_RESET}\n"
   fi
 fi
 if [ "${ORPHANED_RP_UNVERIFIABLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
@@ -12785,7 +12812,7 @@ else
     printf "  RestorePointContents listed: $RESIDUAL_SNAP_LISTED, ClusterRestorePoints: $CRP_LISTED ($RESIDUAL_SNAP_LOCAL_COUNT local snapshot(s))\n"
   else
     printf "  RestorePointContents listed: $RESIDUAL_SNAP_LISTED ($RESIDUAL_SNAP_LOCAL_COUNT local snapshot(s))\n"
-    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints'): a residual one cannot be ruled out${COLOR_RESET}\n"
+    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints', or not served): a residual one cannot be ruled out${COLOR_RESET}\n"
   fi
   if [ "$RESIDUAL_SNAP_IMPORTED_COUNT" -gt 0 ]; then
     printf "  ${COLOR_CYAN}    $RESIDUAL_SNAP_IMPORTED_COUNT imported restore point(s) not assessed (retired by the source cluster)${COLOR_RESET}\n"
