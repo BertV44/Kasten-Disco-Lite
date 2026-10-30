@@ -946,6 +946,7 @@ $CLI auth can-i list nodes                                        >/dev/null 2>&
 $CLI auth can-i list storageclasses.storage.k8s.io                >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list storageclasses"
 $CLI auth can-i list volumesnapshotclasses.snapshot.storage.k8s.io >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list volumesnapshotclasses"
 $CLI auth can-i list restorepointcontents.apps.kio.kasten.io    >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list restorepointcontents (residual snapshots)"
+$CLI auth can-i list clusterrestorepoints.apps.kio.kasten.io    >/dev/null 2>&1 || RBAC_MISSING="$RBAC_MISSING;list clusterrestorepoints (cluster-scoped restore points)"
 # Policies live in the K10 namespace AND in application namespaces (#58). The
 # probe is advisory only: it can lie (aggregated RBAC, impersonation, a custom
 # authorizer), so the verdict -- and the RBAC_MISSING entry -- comes from the
@@ -1139,6 +1140,12 @@ $CLI get restorepoints.apps.kio.kasten.io -A -o json > "$TEMP_DIR/restorepoints_
 # apart from "could not list them" - an empty file alone cannot.
 ( $CLI get restorepointcontents.apps.kio.kasten.io -o json > "$TEMP_DIR/rpc_raw.json" 2>/dev/null \
     && : > "$TEMP_DIR/rpc_read.ok" ) &
+# ClusterRestorePoints (#67): the restore points of the cluster-scoped
+# resources a policy selects. Cluster-scoped and served by the same aggregated
+# APIService, with the same labels as a RestorePointContent except the
+# application ones. Same marker-file rule: a refused read is not an empty one.
+( $CLI get clusterrestorepoints.apps.kio.kasten.io -o json > "$TEMP_DIR/crp_raw.json" 2>/dev/null \
+    && : > "$TEMP_DIR/crp_read.ok" ) &
 $CLI -n "$NAMESPACE" get policypresets.config.kio.kasten.io -o json > "$TEMP_DIR/presets_raw.json" 2>/dev/null &
 $CLI -n "$NAMESPACE" get transformsets.config.kio.kasten.io -o json > "$TEMP_DIR/transformsets_raw.json" 2>/dev/null &
 $CLI -n "$NAMESPACE" get reports.reporting.kio.kasten.io -o json > "$TEMP_DIR/reports_raw.json" 2>/dev/null &
@@ -1172,6 +1179,36 @@ $CLI get storagerepositories.repositories.kio.kasten.io -n "$NAMESPACE" -o json 
 wait
 
 debug "Parallel fetch complete"
+
+# One list of restore-point contents for the three sections that read it --
+# orphaned restore points, residual snapshots and the repository expiry count
+# (#67). A ClusterRestorePoint is both the catalog entry and the content for
+# the cluster-scoped resources of a run: it carries policyName,
+# policyNamespace, runActionName, and when exported exportProfile and
+# exportType appConfigOnly (no volume data), but never appName or
+# appNamespace. Each is tagged kdlKind so a section can tell it apart. CRP_READ
+# says whether the list was READ: when it was not, every section that would
+# have counted one says so, and none reports a clean zero (seen as "none").
+CRP_READ=false
+if [ -f "$TEMP_DIR/crp_read.ok" ] && [ -s "$TEMP_DIR/crp_raw.json" ] \
+   && jq -e 'has("items")' "$TEMP_DIR/crp_raw.json" >/dev/null 2>&1; then
+  CRP_READ=true
+fi
+if [ "$CRP_READ" = true ]; then
+  jq -c '{items: [ (.items // [])[]? | . + {kdlKind: "ClusterRestorePoint"} ]}' "$TEMP_DIR/crp_raw.json" \
+    > "$TEMP_DIR/crp_items.json" 2>/dev/null || CRP_READ=false
+fi
+[ "$CRP_READ" = true ] || printf '{"items":[]}\n' > "$TEMP_DIR/crp_items.json"
+CRP_LISTED=$(jq '.items | length' "$TEMP_DIR/crp_items.json" 2>/dev/null || echo 0)
+case "$CRP_LISTED" in ''|*[!0-9]*) CRP_LISTED=0 ;; esac
+# The union, only where the RestorePointContents list itself was read: a
+# section with no RPC list is NOT_ASSESSED whatever the CRP list says.
+if [ -f "$TEMP_DIR/rpc_read.ok" ]; then
+  jq -c -s '{items: ((.[0].items // []) + (.[1].items // []))}' \
+    "$TEMP_DIR/rpc_raw.json" "$TEMP_DIR/crp_items.json" > "$TEMP_DIR/rpc_all.json" 2>/dev/null \
+    || { cp "$TEMP_DIR/rpc_raw.json" "$TEMP_DIR/rpc_all.json" 2>/dev/null || :; CRP_READ=false; }
+fi
+debug "ClusterRestorePoints: read=$CRP_READ listed=$CRP_LISTED"
 
 ### -------------------------
 ### Policy collection scope (#58)
@@ -3372,13 +3409,19 @@ printf '%s' "${POLICY_NAMES:-[]}" > "$TEMP_DIR/orp_policies.json"
 # a namespace nobody read, the RestorePoint is UNVERIFIABLE -- counted apart,
 # never called an orphan (a false alarm) and never called attached.
 ORPHANED_RP_UNVERIFIABLE_COUNT=0
+# #67: ClusterRestorePoints are restore points too -- the catalog entry AND the
+# content of the cluster-scoped resources a run captured -- and one whose
+# policy is gone is just as orphaned. They are judged by the same rule, shown
+# with "(cluster-scoped)" for a namespace, and when their list could not be
+# read the section is PARTIAL: a zero is then not a clean verdict.
 ORPHANED_RP_RESULT=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$TEMP_DIR/orp_policies.json" \
     --slurpfile importPolicies "$TEMP_DIR/import_policies.json" \
+    --slurpfile crps "$TEMP_DIR/crp_items.json" \
     --slurpfile scope "$TEMP_DIR/pc_scope.json" "$JQ_POLICY_KEY_LIB"'
   ( $policies[0] // [] ) as $policies |
   ( $importPolicies[0] // [] ) as $importPolicies |
   ( $scope[0] // {complete: true, read: []} ) as $scope |
-  [(.items // [])[]? |
+  [((.items // []) + (($crps[0] // {}).items // []))[]? |
     . as $rp |
     # Imported: owned by the source cluster, never an orphan here.
     select(
@@ -3416,7 +3459,9 @@ ORPHANED_RP_RESULT=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$T
     select($state != "active") |
     {
       name: ($rp.metadata.name // "unknown"),
-      namespace: (($rp.metadata.labels // {})["k10.kasten.io/appNamespace"] // $rp.metadata.namespace // "unknown"),
+      namespace: (if $rp.kdlKind == "ClusterRestorePoint" then "(cluster-scoped)"
+                  else (($rp.metadata.labels // {})["k10.kasten.io/appNamespace"] // $rp.metadata.namespace // "unknown") end),
+      kind: (if $rp.kdlKind == "ClusterRestorePoint" then "ClusterRestorePoint" else "RestorePoint" end),
       created: ($rp.metadata.creationTimestamp // null),
       actions: [$action],
       # "label" is exact; "actionName" is the heuristic fallback above.
@@ -3424,8 +3469,10 @@ ORPHANED_RP_RESULT=$(_ep "$RESTORE_POINTS_JSON" | jq -c --slurpfile policies "$T
       state: $state
     }
   ] as $cand |
-  { orphans: ([ $cand[] | select(.state == "deleted") | del(.state) ] | unique_by(.name)),
-    unverifiable: ([ $cand[] | select(.state == "unknown") ] | unique_by(.name) | length) }
+  # Keyed by kind as well as name: a ClusterRestorePoint and a RestorePoint can
+  # share a name. For RestorePoints alone this is the old name key.
+  { orphans: ([ $cand[] | select(.state == "deleted") | del(.state) ] | unique_by([.kind, .name])),
+    unverifiable: ([ $cand[] | select(.state == "unknown") ] | unique_by([.kind, .name]) | length) }
 ' 2>/dev/null) || { _jq_fail "orphaned restore points"; ORPHANED_RP_RESULT=""; ORPHANED_RP_STATUS="NOT_ASSESSED"; }
 if [ -n "$ORPHANED_RP_RESULT" ] && _ep "$ORPHANED_RP_RESULT" | jq -e '.orphans' >/dev/null 2>&1; then
   ORPHANED_RP=$(_ep "$ORPHANED_RP_RESULT" | jq -c '.orphans // []')
@@ -3445,9 +3492,10 @@ ORPHANED_RP_COUNT=$(_ep "$ORPHANED_RP" | jq 'length // 0')
 
 # Imported RestorePoints the orphan check left out, counted so the report can
 # say so rather than shrink silently.
-RP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile importPolicies "$TEMP_DIR/import_policies.json" "$JQ_POLICY_KEY_LIB"'
+RP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile importPolicies "$TEMP_DIR/import_policies.json" \
+    --slurpfile crps "$TEMP_DIR/crp_items.json" "$JQ_POLICY_KEY_LIB"'
   ( $importPolicies[0] // [] ) as $importPolicies |
-  [(.items // [])[]?
+  [((.items // []) + (($crps[0] // {}).items // []))[]?
    | . as $rp
    | (.metadata.labels // {}) as $l
    | select(($l | has("k10.kasten.io/importProfile"))
@@ -3456,8 +3504,8 @@ RP_IMPORTED_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile impo
 ' 2>/dev/null || echo 0)")
 
 # RestorePoints that carry no actionName at all — not orphaned, not attributable.
-RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq '
-  [(.items // [])[]?
+RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq --slurpfile crps "$TEMP_DIR/crp_items.json" '
+  [((.items // []) + (($crps[0] // {}).items // []))[]?
    | select((((.spec.source.actionName // "") | tostring) == "")
             and ((((.metadata.labels // {})["k10.kasten.io/policyName"] // "") | tostring) == ""))]
   | length // 0
@@ -3467,8 +3515,10 @@ RP_UNATTRIBUTABLE_COUNT=$(safe_int "$(_ep "$RESTORE_POINTS_JSON" | jq '
 # on any RestorePoint — orphan detection is not possible and a count of 0 is
 # meaningless. Report it as unassessed rather than as a clean zero, which is the
 # same rule applied to a jq failure above.
-if [ "${RESTORE_POINTS_COUNT:-0}" -gt 0 ] 2>/dev/null \
-   && [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -ge "${RESTORE_POINTS_COUNT:-0}" ] 2>/dev/null; then
+# Against RestorePoints AND ClusterRestorePoints, since both are counted.
+_orp_total=$((RESTORE_POINTS_COUNT + CRP_LISTED))
+if [ "$_orp_total" -gt 0 ] 2>/dev/null \
+   && [ "${RP_UNATTRIBUTABLE_COUNT:-0}" -ge "$_orp_total" ] 2>/dev/null; then
   ORPHANED_RP_STATUS="NOT_ASSESSED"
   warn "None of the $RESTORE_POINTS_COUNT RestorePoint(s) carry a policy label or a source action name."
   warn "Orphan detection is not possible on this catalog; the count is reported as not assessed."
@@ -3478,6 +3528,11 @@ fi
 # is the middle state: the confirmed orphans stay listed, but a zero or a short
 # list must not read as a clean verdict.
 if [ "$ORPHANED_RP_STATUS" = "OK" ] && [ "$ORPHANED_RP_UNVERIFIABLE_COUNT" -gt 0 ] 2>/dev/null; then
+  ORPHANED_RP_STATUS="PARTIAL"
+fi
+# #67: the ClusterRestorePoints could not be read, so an orphan among them
+# cannot be ruled out. Same middle state.
+if [ "$ORPHANED_RP_STATUS" = "OK" ] && [ "$CRP_READ" != true ]; then
   ORPHANED_RP_STATUS="PARTIAL"
 fi
 
@@ -3621,7 +3676,12 @@ else
 
   # One pass over the inventory: it can hold tens of thousands of objects, so
   # every counter comes out of a single jq run and `items` is capped below.
-  RESIDUAL_SNAP_SUMMARY=$(cat "$TEMP_DIR/rpc_raw.json" 2>/dev/null | jq -c \
+  # #67: the union with the ClusterRestorePoints when it was built. A local
+  # ClusterRestorePoint is a local restore point like any other, ranked among
+  # those of its own policy (it has no application labels).
+  _rs_src="$TEMP_DIR/rpc_all.json"
+  [ -s "$_rs_src" ] || _rs_src="$TEMP_DIR/rpc_raw.json"
+  RESIDUAL_SNAP_SUMMARY=$(cat "$_rs_src" 2>/dev/null | jq -c \
     --slurpfile policies "$TEMP_DIR/orp_policies.json" \
     --slurpfile retention "$TEMP_DIR/residual_retention.json" \
     --slurpfile importPolicies "$TEMP_DIR/import_policies.json" \
@@ -3717,7 +3777,9 @@ else
           expiryState: $ex.expiryState,
           appName: (($l["k10.kasten.io/appName"] // "") | tostring),
           appNamespace: (($l["k10.kasten.io/appNamespace"] // .status.restorePointRef.namespace // "") | tostring),
-          appType: (($l["k10.kasten.io/appType"] // "namespace") | tostring),
+          appType: (if .kdlKind == "ClusterRestorePoint" then "cluster"
+                    else (($l["k10.kasten.io/appType"] // "namespace") | tostring) end),
+          kind: (if .kdlKind == "ClusterRestorePoint" then "ClusterRestorePoint" else "RestorePointContent" end),
           policyName: $policyName,
           policyNamespace: $policyNs,
           refTime: ($refTime | ts_clean),
@@ -3809,7 +3871,9 @@ else
     ( ["on-demand","policy-deleted","unbound","policy-over-retention","manual-no-expiry","manual-expired"] ) as $unretainedReasons |
     ( [ $residual[] | select(.reason as $r | $unretainedReasons | index($r) != null) ] ) as $unretained |
     {
-      listed: ($all | length),
+      # RestorePointContents only, as before; ClusterRestorePoints apart.
+      listed: ([ $all[]? | select(.kdlKind != "ClusterRestorePoint") ] | length),
+      clusterListed: ([ $all[]? | select(.kdlKind == "ClusterRestorePoint") ] | length),
       localSnapshots: ($snaps | length),
       imported: ([ $all[]? | select(((.metadata.labels // {}) | has("k10.kasten.io/exportProfile")) | not) | select(imported) ] | length),
       residual: ($residual | length),
@@ -3872,7 +3936,8 @@ else
               appName: (($l["k10.kasten.io/appName"] // "") | tostring),
               policy: (($l["k10.kasten.io/policyName"] // "") | tostring),
               ageDays: (if $e == null then null else ((($now - $e) / 86400 * 100) | floor) / 100 end),
-              exported: ($l | has("k10.kasten.io/exportProfile"))
+              exported: ($l | has("k10.kasten.io/exportProfile")),
+              kind: (if .kdlKind == "ClusterRestorePoint" then "ClusterRestorePoint" else "RestorePointContent" end)
             }
         ] as $ex |
         {
@@ -3889,7 +3954,7 @@ else
           unparseable: ([ $ex[] | select(.expiryUnparsable and (.expiryState != "k10-dr")) ] | length),
           drPolicy: ([ $ex[] | select(.expiryState == "k10-dr") ] | length),
           items: ( [ $ex[] | select(.expiryState == "manual-no-expiry")
-                     | {name, appNamespace, appName, policy, ageDays, exported} ]
+                     | {name, appNamespace, appName, policy, ageDays, exported, kind} ]
                    | sort_by(.ageDays) | reverse | .[0:25] )
         } )
     }
@@ -3938,6 +4003,10 @@ if [ "$RESIDUAL_SNAP_STATUS" = "NOT_ASSESSED" ]; then
   BP_RESIDUAL_SNAPSHOTS_STATUS="NOT_ASSESSED"
 elif [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ]; then
   BP_RESIDUAL_SNAPSHOTS_STATUS="PARTIAL"
+elif [ "$CRP_READ" != true ]; then
+  # #67: the ClusterRestorePoints could not be read, so a residual one cannot
+  # be ruled out. A finding above still outranks it.
+  BP_RESIDUAL_SNAPSHOTS_STATUS="NOT_ASSESSED"
 elif [ "$RESIDUAL_SNAP_UNKNOWN_AGE_COUNT" -gt 0 ] || [ "$RESIDUAL_SNAP_UNVERIFIABLE_COUNT" -gt 0 ] \
      || [ "$RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT" -gt 0 ] || [ "$RESIDUAL_SNAP_MANUAL_UNKNOWN_COUNT" -gt 0 ]; then
   # At least one snapshot whose age, whose owning policy, or whose retention
@@ -7613,9 +7682,13 @@ debug "Storage repository: policy owners $(jq -r 'if . == null then "unreadable"
 # StorageRepository is ever made for it -- so it simply never matches. Only
 # vSphere estates carry a non-VBR block-mode profile.
 if [ -f "$TEMP_DIR/rpc_read.ok" ] && _sr_list_readable "$TEMP_DIR/rpc_raw.json"; then
-  jq -c --slurpfile vdAppsF "$TEMP_DIR/sr_vd_apps.json" '
+  jq -c --slurpfile vdAppsF "$TEMP_DIR/sr_vd_apps.json" \
+      --slurpfile crpF "$TEMP_DIR/crp_items.json" --argjson crpRead "$CRP_READ" '
     (if ($vdAppsF | length) > 0 then $vdAppsF[0] else [] end) as $vd
     | { total: ((.items // []) | length),
+        # #67: whether the ClusterRestorePoints were read. They feed only the
+        # metadata expiry count, which is unknown (null) when they were not.
+        crpRead: $crpRead,
         # #64: entries with an expiry date, for every namespace and policy.
         # The garbage collector retires an expired restore point with no
         # policy run, whatever the state of its policy. An imported entry
@@ -7637,7 +7710,26 @@ if [ -f "$TEMP_DIR/rpc_read.ok" ] && _sr_list_readable "$TEMP_DIR/rpc_raw.json";
                          key: (if $l["k10.kasten.io/runActionName"] == null
                                then "name|" + (.metadata.name | tostring)
                                else ([ $l["k10.kasten.io/runActionName"], $l["k10.kasten.io/appNamespace"],
-                                       $l["k10.kasten.io/appName"], $l["k10.kasten.io/expiresAt"] ] | map(tostring) | join("|")) end) } ]),
+                                       $l["k10.kasten.io/appName"], $l["k10.kasten.io/expiresAt"] ] | map(tostring) | join("|")) end) } ]
+                   # #67: an exported ClusterRestorePoint (appConfigOnly, the
+                   # cluster-scoped resources of a run) writes to the metadata
+                   # repository of its policy and exportProfile, never to a
+                   # volumedata one, even with a blockModeExportProfile. A
+                   # local one writes to no repository. crp marks them.
+                   + [ ((($crpF[0] // {}).items // [])[]?) | (.metadata.labels // {}) as $l
+                       | select($l | has("k10.kasten.io/expiresAt"))
+                       | select($l | has("k10.kasten.io/importProfile") | not)
+                       | select($l | has("k10.kasten.io/exportProfile"))
+                       | { crp: true, ns: null,
+                           pname: ($l["k10.kasten.io/policyName"] // null),
+                           pns: ($l["k10.kasten.io/policyNamespace"] // null),
+                           ep: ($l["k10.kasten.io/exportProfile"] // null),
+                           bp: null,
+                           type: ($l["k10.kasten.io/exportType"] // null),
+                           exp: ($l["k10.kasten.io/expiresAt"] // null),
+                           key: ("crp|" + (if $l["k10.kasten.io/runActionName"] == null
+                                           then "name|" + (.metadata.name | tostring)
+                                           else ([ $l["k10.kasten.io/runActionName"], $l["k10.kasten.io/expiresAt"] ] | map(tostring) | join("|")) end)) } ]),
         byNamespace: ([ (.items // [])[]? | (.metadata.labels // {}) as $l
                         | ($l["k10.kasten.io/appNamespace"] // null) as $ns
                         | select(($ns | type) == "string")
@@ -8027,6 +8119,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
           elif $r.contentType == "volumedata" then
             (if $r.appName == null then null
              else [ ($rpcIndex.expiring // [])[] as $e
+                    | select($e.crp != true)
                     | select($e.ns == $r.appName)
                     | select(expiry_passed($e) | not)
                     | select(if $e.ep != null
@@ -8034,9 +8127,13 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                                   and (($e.ep == $r.exportProfile) or ($e.bp == $r.exportProfile))
                              else backs_up_here($e) end)
                     | $e.key ] | unique | length end)
+          # #67: a metadata repository also receives exported
+          # ClusterRestorePoints, so its count is unknown while they are unread.
+          elif ($r.contentType == "metadata") and ($rpcIndex.crpRead != true) then null
           elif ($r.contentType == "metadata") or ($r.contentType == "dr") then
             (if $r.policyName == null then null
              else [ ($rpcIndex.expiring // [])[] as $e
+                    | select(($e.crp != true) or ($r.contentType == "metadata"))
                     | select(same_policy($e))
                     | select(expiry_passed($e) | not)
                     | select(if $e.ep != null then $e.ep == $r.exportProfile
@@ -9061,6 +9158,8 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
         elif (.severityGate == "active") and (.activeReason == "unverified") then
           (if (.retainer == false) and ($rpcIndex == null)
            then "No live policy retires restore points in it, but KDL could not read the RestorePointContents list, so it cannot tell if a restore point with an expiry date remains. The failure stays critical until that is known."
+           elif (.retainer == false) and (.contentType == "metadata") and ($rpcIndex.crpRead != true)
+           then "No live policy retires restore points in it, but KDL could not read the ClusterRestorePoints list, so it cannot tell if an exported one with an expiry date remains. The failure stays critical until that is known."
            else "KDL could not tell if anything will retire restore points in this repository, so the failure stays critical until that is known." end)
         else null end
       )
@@ -10301,6 +10400,8 @@ if [ "$MODE" = "json" ]; then
     --slurpfile orphanedRp "$TEMP_DIR/orphanedRp.json" \
     --argjson orphanedRpCount "$ORPHANED_RP_COUNT" \
     --arg orphanedRpStatus "$ORPHANED_RP_STATUS" \
+    --argjson crpRead "$CRP_READ" \
+    --argjson crpListed "$CRP_LISTED" \
     --argjson rpUnattributableCount "$RP_UNATTRIBUTABLE_COUNT" \
     --argjson rpImportedCount "$RP_IMPORTED_COUNT" \
     --argjson rpUnverifiableCount "$ORPHANED_RP_UNVERIFIABLE_COUNT" \
@@ -10882,7 +10983,12 @@ if [ "$MODE" = "json" ]; then
         # run could not read: neither orphaned nor confirmed attached. status
         # is PARTIAL when this is non-zero (a zero count is then not a clean
         # verdict).
-        unverifiable: $rpUnverifiableCount
+        unverifiable: $rpUnverifiableCount,
+        # #67: ClusterRestorePoints are judged with the RestorePoints (items
+        # carry kind). false = their list could not be read: status is then
+        # PARTIAL at best, and a zero is not a clean verdict.
+        clusterRestorePointsRead: $crpRead,
+        clusterRestorePointsListed: $crpListed
       },
 
       # Local Kasten snapshots (RestorePointContents with NO exportProfile
@@ -10897,6 +11003,11 @@ if [ "$MODE" = "json" ]; then
         # RestorePointContents the cluster returned, exports included. The gap
         # with localSnapshots is how many were exports or imports.
         listed: $residualSnapListed,
+        # #67: ClusterRestorePoints listed, judged with the RestorePointContents
+        # (items carry kind). false = their list could not be read: the best
+        # practice is then NOT_ASSESSED unless a finding outranks it.
+        clusterRestorePointsRead: $crpRead,
+        clusterRestorePointsListed: $crpListed,
         localSnapshots: $residualSnapLocal,
         # Imported content left out of localSnapshots: it lives in the
         # repository of the source cluster, which retires it.
@@ -12572,11 +12683,17 @@ if [ "$ORPHANED_RP_STATUS" = "NOT_ASSESSED" ]; then
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} Not assessed - the computation failed; this is NOT a verified zero\n"
 elif [ "$ORPHANED_RP_COUNT" -eq 0 ] && [ "$ORPHANED_RP_STATUS" = "PARTIAL" ]; then
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} No orphan confirmed, but this is NOT a clean verdict (see below)\n"
+  if [ "$CRP_READ" != true ]; then
+    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints'): an orphan among them cannot be ruled out${COLOR_RESET}\n"
+  fi
 elif [ "$ORPHANED_RP_COUNT" -eq 0 ]; then
   printf "  ${COLOR_GREEN}[OK] No orphaned RestorePoints detected${COLOR_RESET}\n"
 else
   printf "  ${COLOR_YELLOW}[WARN]  $ORPHANED_RP_COUNT orphaned RestorePoint(s) found${COLOR_RESET}\n"
   _ep "$ORPHANED_RP" | jq -r '.[:5][] | "    - \(.name) [\(.namespace)]"' 2>/dev/null
+  if [ "$CRP_READ" != true ]; then
+    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints'): the list above may be incomplete${COLOR_RESET}\n"
+  fi
 fi
 if [ "${ORPHANED_RP_UNVERIFIABLE_COUNT:-0}" -gt 0 ] 2>/dev/null; then
   printf "  ${COLOR_YELLOW}    $ORPHANED_RP_UNVERIFIABLE_COUNT RestorePoint(s) name a policy in a namespace that could not be read: orphan status unknown (partial policy set)${COLOR_RESET}\n"
@@ -12594,14 +12711,21 @@ printf "  Local snapshots older than $RESIDUAL_SNAPSHOT_THRESHOLD_DAYS days (Res
 if [ "$RESIDUAL_SNAP_STATUS" = "NOT_ASSESSED" ]; then
   printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} Not assessed - RestorePointContents could not be listed or parsed; this is NOT a verified zero\n"
 else
-  printf "  RestorePointContents listed: $RESIDUAL_SNAP_LISTED ($RESIDUAL_SNAP_LOCAL_COUNT local snapshot(s))\n"
+  if [ "$CRP_READ" = true ]; then
+    printf "  RestorePointContents listed: $RESIDUAL_SNAP_LISTED, ClusterRestorePoints: $CRP_LISTED ($RESIDUAL_SNAP_LOCAL_COUNT local snapshot(s))\n"
+  else
+    printf "  RestorePointContents listed: $RESIDUAL_SNAP_LISTED ($RESIDUAL_SNAP_LOCAL_COUNT local snapshot(s))\n"
+    printf "  ${COLOR_YELLOW}    ClusterRestorePoints could not be listed (RBAC on 'clusterrestorepoints'): a residual one cannot be ruled out${COLOR_RESET}\n"
+  fi
   if [ "$RESIDUAL_SNAP_IMPORTED_COUNT" -gt 0 ]; then
     printf "  ${COLOR_CYAN}    $RESIDUAL_SNAP_IMPORTED_COUNT imported restore point(s) not assessed (retired by the source cluster)${COLOR_RESET}\n"
   fi
   if [ "$RESIDUAL_SNAP_UNRETAINED_COUNT" -gt 0 ]; then
     printf "  ${COLOR_YELLOW}[WARN]  $RESIDUAL_SNAP_UNRETAINED_COUNT residual snapshot(s) no live policy retains${COLOR_RESET}\n"
     printf "  ${COLOR_CYAN}    on demand: $RESIDUAL_SNAP_ONDEMAND_COUNT | policy deleted: $RESIDUAL_SNAP_POLICY_DELETED_COUNT | application gone: $RESIDUAL_SNAP_UNBOUND_COUNT | past declared retention: $RESIDUAL_SNAP_OVER_RETENTION_COUNT | manual run, no expiration: $RESIDUAL_SNAP_MANUAL_NOEXP_COUNT | manual run, expiry passed: $RESIDUAL_SNAP_MANUAL_EXPIRED_COUNT${COLOR_RESET}\n"
-    _ep "$RESIDUAL_SNAPSHOTS" | jq -r '.[:5][] | "    - \(.name) [\(if .appNamespace == "" then "unknown" else .appNamespace end)] \(((.ageDays * 10 | floor) / 10) as $a | if ($a | floor) == $a then ($a | floor) else $a end)d (\(.reason)\(if .reason == "manual-expired" and .state == "Unbound" then "; RestorePoint already removed, content left Unbound" else "" end))"' 2>/dev/null
+    _ep "$RESIDUAL_SNAPSHOTS" | jq -r '.[:5][] | "    - \(.name) [\(if .kind == "ClusterRestorePoint" then "(cluster-scoped)" elif .appNamespace == "" then "unknown" else .appNamespace end)] \(((.ageDays * 10 | floor) / 10) as $a | if ($a | floor) == $a then ($a | floor) else $a end)d (\(.reason)\(if .reason == "manual-expired" and .state == "Unbound" then "; RestorePoint already removed, content left Unbound" else "" end))"' 2>/dev/null
+  elif [ "$CRP_READ" != true ]; then
+    printf "  ${COLOR_YELLOW}[INFO]${COLOR_RESET} No residual snapshot identified among the RestorePointContents, but this is NOT a clean pass (ClusterRestorePoints not read)\n"
   elif [ "$RESIDUAL_SNAP_LOCAL_COUNT" -eq 0 ]; then
     printf "  ${COLOR_GREEN}[OK] No local snapshots in the catalog${COLOR_RESET}\n"
   elif [ $((RESIDUAL_SNAP_UNKNOWN_AGE_COUNT + RESIDUAL_SNAP_UNVERIFIABLE_COUNT + RESIDUAL_SNAP_RETENTION_UNKNOWN_COUNT + RESIDUAL_SNAP_MANUAL_UNKNOWN_COUNT)) -gt 0 ]; then

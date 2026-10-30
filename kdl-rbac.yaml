@@ -166,6 +166,13 @@ rules:
       # here in Part A and cannot be covered by the namespaced Role. Without
       # it KDL reports residual snapshots as NOT_ASSESSED, never as zero.
       - restorepointcontents
+      # clusterrestorepoints: the restore points of the cluster-scoped
+      # resources a policy selects (#67). Cluster-scoped, same aggregated
+      # APIService. Read by the orphaned-restore-point, residual-snapshot and
+      # repository-expiry checks; without it the first is PARTIAL, the second
+      # NOT_ASSESSED (unless a finding outranks it), and a failing metadata
+      # repository with no live policy stays critical, never quiet.
+      - clusterrestorepoints
     verbs: ["get", "list"]
   - apiGroups: ["repositories.kio.kasten.io"]
     resources:
