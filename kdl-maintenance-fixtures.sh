@@ -1256,6 +1256,21 @@ jq -n --arg pol "$DRPOL" --arg exp "$EXP_AT" "{items: [ $RPC_EXPIRING ]}" > "$CA
 mk_gate_case gate-paused-expiring
 set_policies gate-paused-expiring ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {paused: true, actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
 jq -n --arg pol "$DRPOL" --arg exp "$EXP_AT" "{items: [ $RPC_EXPIRING ]}" > "$CASES/gate-paused-expiring/rpcs.json"
+# gate-ondemand-expired: the expiry date passed 30 days ago. Kasten has
+# retired it and left the RestorePointContent Unbound, still labelled (seen on
+# 9.0.6). A retirement already made is no reason to stay critical: quiet.
+# gate-ondemand-expiry-in-grace: passed 1 day ago, inside the 2-day grace of
+# the residual-snapshots section, so its retirement may still be to come.
+# gate-ondemand-expiry-unparsable: a date KDL cannot read is never "past".
+EXP_PAST=$(jq -rn --argjson n "$GEN_NOW" '$n - 30 * 86400 | strftime("%Y-%m-%dT%H-%M-%SZ")')
+EXP_GRACE=$(jq -rn --argjson n "$GEN_NOW" '$n - 1 * 86400 | strftime("%Y-%m-%dT%H-%M-%SZ")')
+for _c in gate-ondemand-expired gate-ondemand-expiry-in-grace gate-ondemand-expiry-unparsable; do
+  mk_gate_case "$_c"
+  set_policies "$_c" ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {frequency: \"@onDemand\", actions: [{action: \"backup\", backupParameters: {profile: {name: \$p, namespace: \"kasten-io\"}}}]} else . end)"
+done
+jq -n --arg pol "$DRPOL" --arg exp "$EXP_PAST" "{items: [ $RPC_EXPIRING | .status.state = \"Unbound\" ]}" > "$CASES/gate-ondemand-expired/rpcs.json"
+jq -n --arg pol "$DRPOL" --arg exp "$EXP_GRACE" "{items: [ $RPC_EXPIRING ]}" > "$CASES/gate-ondemand-expiry-in-grace/rpcs.json"
+jq -n --arg pol "$DRPOL" --arg exp "not-a-date" "{items: [ $RPC_EXPIRING ]}" > "$CASES/gate-ondemand-expiry-unparsable/rpcs.json"
 # gate-ondemand-rpc-denied: the on-demand owner, and the RestorePointContents
 # list cannot be read. An expiry date may exist, so the critical stays.
 mk_gate_case gate-ondemand-rpc-denied
@@ -1922,6 +1937,26 @@ cat > "$CASES/gate-paused-expiring/expect.jq" <<'EOF'
 # a paused owner stops policy runs, not expiry: critical
 (.storageRepositories.items[0].retainerPausedPolicies == ["k10-disaster-recovery-policy"])
 and (.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+EOF
+cat > "$CASES/gate-ondemand-expired/expect.jq" <<'EOF'
+# an expiry date past the grace is a retirement already made: quiet
+(.storageRepositories.items[0].retainer == false)
+and (.storageRepositories.items[0].expiringRestorePoints == 0)
+and (.storageRepositories.items[0].severityGate == "quiet")
+and (.storageRepositories.items[0].quietReason == "no-retainer")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING_INACTIVE")
+EOF
+cat > "$CASES/gate-ondemand-expiry-in-grace/expect.jq" <<'EOF'
+# past by less than the grace: the retirement may still come, critical
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+and (.bestPractices.storageRepositoryMaintenance == "FAILING")
+EOF
+cat > "$CASES/gate-ondemand-expiry-unparsable/expect.jq" <<'EOF'
+# an unreadable expiry date is never past: it counts, critical
+(.storageRepositories.items[0].expiringRestorePoints == 1)
 and (.storageRepositories.items[0].activeReason == "expiring")
 and (.bestPractices.storageRepositoryMaintenance == "FAILING")
 EOF
