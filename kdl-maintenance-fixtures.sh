@@ -1410,6 +1410,28 @@ mk_art_case gate-art-kanister-noref '$p' "[ $ART_SNAP, $ART_KAN_NOREF ]"
 mk_art_case gate-art-profile-changed '"another-profile"' "[ $ART_SNAP, $ART_KAN ]"
 mk_art_case gate-art-empty '$p' "[]"
 
+# --- regression cases from the 2.7.3 audit -----------------------------------
+mk_art_case gate-art-no-meta '$p' '[ {"meta": {}} ]'
+mk_art_case gate-art-null-meta '$p' '[ null, {"meta": null} ]'
+# A candidate whose expiry passed beyond the grace is not read at all.
+mk_art_case gate-art-expired-not-read '$p' "[ $ART_SNAP, $ART_SPEC ]"
+jq --arg x "$EXP_PAST" '.items[0].metadata.labels["k10.kasten.io/expiresAt"] = $x' "$CASES/gate-art-expired-not-read/rpcs.json" > "$CASES/gate-art-expired-not-read/rpcs.json.t" \
+  && mv "$CASES/gate-art-expired-not-read/rpcs.json.t" "$CASES/gate-art-expired-not-read/rpcs.json"
+# A local entry no repository can take: another namespace, another policy.
+mk_art_case gate-art-no-owner '$p' "[ $ART_SNAP, $ART_SPEC ]"
+jq '.items[0].metadata.labels += {"k10.kasten.io/policyName": "other-pol", "k10.kasten.io/appNamespace": "other-ns"}' "$CASES/gate-art-no-owner/rpcs.json" > "$CASES/gate-art-no-owner/rpcs.json.t" \
+  && mv "$CASES/gate-art-no-owner/rpcs.json.t" "$CASES/gate-art-no-owner/rpcs.json"
+# A count found in the RestorePointContents stands when the CRP list is denied.
+cp -R "$CASES/gate-meta-expiring" "$CASES/gate-meta-expiring-crp-denied"
+: > "$CASES/gate-meta-expiring-crp-denied/deny-crp"
+# Orphan attribution: all RestorePoints unattributable, a CRP attributable.
+mk_gate_case gate-orp-rp-unlabelled
+jq -n '{items: [ {metadata: {name: "rp-1", namespace: "app-ns", labels: {}}}, {metadata: {name: "rp-2", namespace: "app-ns", labels: {}}} ]}' > "$CASES/gate-orp-rp-unlabelled/restorepoints.json"
+jq -n --arg pol "$DRPOL" '{items: [ {kind: "ClusterRestorePoint", metadata: {name: "crp-1", labels: {"k10.kasten.io/policyName": $pol, "k10.kasten.io/policyNamespace": "kasten-io"}}} ]}' > "$CASES/gate-orp-rp-unlabelled/crps.json"
+# No RestorePoint at all and one CRP without a policy label: not a verdict on RestorePoints.
+mk_gate_case gate-orp-crp-unlabelled
+jq -n '{items: [ {kind: "ClusterRestorePoint", metadata: {name: "crp-1", labels: {}}} ]}' > "$CASES/gate-orp-crp-unlabelled/crps.json"
+
 # gate-stopped-exporting: the owner exists but writes to another profile now.
 mk_gate_case gate-stopped-exporting
 set_policies gate-stopped-exporting ".items |= map(if .metadata.name == \"$DRPOL\" then .spec = {actions: [{action: \"backup\", backupParameters: {profile: {name: \"another-profile\", namespace: \"kasten-io\"}}}]} else . end)"
@@ -2876,6 +2898,36 @@ cat > "$CASES/gate-art-empty/expect.jq" <<'XEOF'
 (.storageRepositories.items[0].expiringRestorePoints == 1)
 and (.storageRepositories.items[0].activeReason == "expiring")
 and (.storageRepositories.expiryArtifactsRead == 1)
+XEOF
+
+# --- regression cases from the 2.7.3 audit ---
+cat > "$CASES/gate-art-no-meta/expect.jq" <<'XEOF'
+# an artifact with an empty meta is no evidence it wrote nowhere: counted
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+XEOF
+cp "$CASES/gate-art-no-meta/expect.jq" "$CASES/gate-art-null-meta/expect.jq"
+cat > "$CASES/gate-art-expired-not-read/expect.jq" <<'XEOF'
+# an expiry past the grace cannot change a count: its /details is not read
+(.storageRepositories.expiryArtifactsRequested == 0)
+and (.storageRepositories.items[0].expiringRestorePoints == 0)
+XEOF
+cat > "$CASES/gate-art-no-owner/expect.jq" <<'XEOF'
+# no volumedata repository in the namespace and no dr repository of the policy: not read
+(.storageRepositories.expiryArtifactsRequested == 0)
+XEOF
+cat > "$CASES/gate-meta-expiring-crp-denied/expect.jq" <<'XEOF'
+# a count found in the RestorePointContents stands when the CRP list is denied
+(.storageRepositories.items[0].expiringRestorePoints == 1)
+and (.storageRepositories.items[0].activeReason == "expiring")
+XEOF
+cat > "$CASES/gate-orp-rp-unlabelled/expect.jq" <<'XEOF'
+# every RestorePoint is unattributable: not assessed, whatever the CRPs say
+(.orphanedRestorePoints.status == "NOT_ASSESSED")
+XEOF
+cat > "$CASES/gate-orp-crp-unlabelled/expect.jq" <<'XEOF'
+# no RestorePoint at all: an unlabelled CRP does not make the section not assessed
+(.orphanedRestorePoints.status == "OK")
 XEOF
 
 # The instant every case was built against; run.sh passes it to KDL as KDL_NOW.

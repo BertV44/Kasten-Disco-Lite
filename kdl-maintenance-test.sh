@@ -139,6 +139,9 @@ case "$ARGS" in
     fi
     if [ -f "$CASE/rpcs.json" ]; then cat "$CASE/rpcs.json"; else printf '{"items":[]}\n'; fi
     exit 0 ;;
+  *"get restorepoints"*)
+    if [ -f "$CASE/restorepoints.json" ]; then cat "$CASE/restorepoints.json"; else printf '{"items":[]}\n'; fi
+    exit 0 ;;
   *"get clusterrestorepoints"*)
     if [ -f "$CASE/deny-crp" ]; then
       echo "Error from server (Forbidden): clusterrestorepoints.apps.kio.kasten.io is forbidden" >&2; exit 1
