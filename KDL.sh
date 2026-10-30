@@ -7496,7 +7496,7 @@ debug "Storage repository: profile names $(_ep "$STORAGE_REPO_PROFILE_NAMES" | j
 
 # What each policy is doing NOW, for the repositories it owns. A surviving
 # policy NAME says the owner exists. It does not say the owner is running, still
-# exports here, or still retires restore points in here:
+# exports here, or can retire restore points in it:
 #
 #   paused          - spec.paused. A paused policy neither writes nor retires.
 #                     Three-state: absent on a policy that WAS read is false,
@@ -7545,6 +7545,10 @@ if _sr_list_readable "$TEMP_DIR/policies_raw.json"; then
                      elif (.spec.paused == false) then false
                      elif (((.spec // {}) | has("paused")) | not) then false
                      else null end),
+            # #64: an on-demand policy has no retention, so it retires nothing.
+            # An absent frequency counts as scheduled, on purpose: it keeps
+            # the critical. Other sections show such a policy as manual.
+            onDemand: (.spec.frequency? == "@onDemand"),
             exportProfiles: ([ .spec.actions[]? | select(.action == "export")
                                | .exportParameters.profile.name? | select(type == "string") ] | unique),
             backupProfiles: ([ .spec.actions[]? | select(.action == "backup")
@@ -7565,6 +7569,11 @@ if _sr_list_readable "$TEMP_DIR/policies_raw.json"; then
                                        | (.exportParameters.profile.name? | type) == "string" ] | all),
             backupProfilesComplete: ([ .spec.actions[]? | select(.action == "backup")
                                        | (.backupParameters.profile.name? | type) == "string" ] | all),
+            # Every backup action that sets a profile names it. A backup
+            # action with no profile is a full answer: it backs up nowhere.
+            backupProfilesNamed: ([ .spec.actions[]? | select(.action == "backup")
+                                    | select((.backupParameters.profile? // null) != null)
+                                    | (.backupParameters.profile.name? | type) == "string" ] | all),
             coverageResolvable: ($nsReadable and ($t.resolvable == true)),
             covers: ([ $t.namespaces[]? | . as $n | select(($vd | index($n)) != null) ] | unique)
           } } ]
@@ -7579,7 +7588,7 @@ debug "Storage repository: policy owners $(jq -r 'if . == null then "unreadable"
 
 # Restore points that still reference each volumedata namespace, for the
 # severity gate. A quiet volumedata failure is kept critical because something
-# may still retire into it -- and retirement acts on restore points, which
+# can retire restore points in it -- and retirement acts on restore points, which
 # live in RestorePointContents. They are cluster-scoped and survive the
 # namespace, so a deleted namespace can still have them, and then the critical
 # is earned. When NONE references the namespace, nothing is left for any policy
@@ -7607,6 +7616,27 @@ if [ -f "$TEMP_DIR/rpc_read.ok" ] && _sr_list_readable "$TEMP_DIR/rpc_raw.json";
   jq -c --slurpfile vdAppsF "$TEMP_DIR/sr_vd_apps.json" '
     (if ($vdAppsF | length) > 0 then $vdAppsF[0] else [] end) as $vd
     | { total: ((.items // []) | length),
+        # #64: entries with an expiry date, for every namespace and policy.
+        # The garbage collector retires an expired restore point with no
+        # policy run, whatever the state of its policy. An imported entry
+        # belongs to another cluster, and its retirement is catalog-only.
+        # key joins the local entry of a run and its exported twin, so one
+        # restore point is counted once. A manual restore point has no
+        # runActionName, and the user sets its expiry, so two of them can
+        # share every other label: its key is its own name.
+        expiring: ([ (.items // [])[]? | (.metadata.labels // {}) as $l
+                     | select($l | has("k10.kasten.io/expiresAt"))
+                     | select($l | has("k10.kasten.io/importProfile") | not)
+                     | { ns: ($l["k10.kasten.io/appNamespace"] // null),
+                         pname: ($l["k10.kasten.io/policyName"] // null),
+                         pns: ($l["k10.kasten.io/policyNamespace"] // null),
+                         ep: ($l["k10.kasten.io/exportProfile"] // null),
+                         bp: ($l["k10.kasten.io/blockModeExportProfile"] // null),
+                         type: ($l["k10.kasten.io/exportType"] // null),
+                         key: (if $l["k10.kasten.io/runActionName"] == null
+                               then "name|" + (.metadata.name | tostring)
+                               else ([ $l["k10.kasten.io/runActionName"], $l["k10.kasten.io/appNamespace"],
+                                       $l["k10.kasten.io/appName"], $l["k10.kasten.io/expiresAt"] ] | map(tostring) | join("|")) end) } ]),
         byNamespace: ([ (.items // [])[]? | (.metadata.labels // {}) as $l
                         | ($l["k10.kasten.io/appNamespace"] // null) as $ns
                         | select(($ns | type) == "string")
@@ -7761,7 +7791,8 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   # WHO STILL RETIRES RESTORE POINTS INTO A REPOSITORY. Retirement is a phase
   # of a policy run (retire_policy.go:78-140): the policy retires its OWN
   # expired runs, so no run means no retirement -- a deleted policy has no
-  # runs and a paused one does not run. Keyed by content type, because the
+  # runs and a paused one does not run. An on-demand policy runs, but it has
+  # no retention, so it retires nothing either (#64). Keyed by content type, because the
   # three are owned differently:
   #   metadata   - one per (policy, profile). The label names the owner, and
   #                it retains only while it still exports to THIS profile.
@@ -7804,6 +7835,8 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
               | if (($ps | index($prof)) == null) and ($complete | not) then {state: null, live: [], paused: [], stopped: null}
                 elif ($ps | index($prof)) == null then {state: false, live: [], paused: [], stopped: "no-longer-exports"}
                 elif $o.paused == true then {state: false, live: [], paused: [$lp], stopped: null}
+                elif ($o.paused == false) and ($o.onDemand == true)
+                  then {state: false, live: [], paused: [], onDemand: [$lp], stopped: null}
                 elif $o.paused == false then {state: true, live: [$lp], paused: [], stopped: null}
                 else {state: null, live: [], paused: [], stopped: null} end
          end)
@@ -7815,15 +7848,16 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
               # The first writer counts whatever its selector says now: retirement
               # acts on past runs. A former exporter would too, and is NOT SEEN (above).
               | [ $exp[] | select((((.value.covers // []) | index($r.appName)) != null) or (.key == $lk)) ] as $cov
-              | [ $cov[] | select(.value.paused == false) | .value.name ] as $live
+              | [ $cov[] | select((.value.paused == false) and (.value.onDemand != true)) | .value.name ] as $live
               | [ $cov[] | select(.value.paused == true) | .value.name ] as $pz
-              | if ($live | length) > 0 then {state: true, live: $live, paused: $pz, stopped: null}
-                elif ([ $cov[] | select(.value.paused == null) ] | length) > 0 then {state: null, live: [], paused: $pz, stopped: null}
+              | [ $cov[] | select((.value.paused == false) and (.value.onDemand == true)) | .value.name ] as $od
+              | if ($live | length) > 0 then {state: true, live: $live, paused: $pz, onDemand: $od, stopped: null}
+                elif ([ $cov[] | select(.value.paused == null) ] | length) > 0 then {state: null, live: [], paused: $pz, onDemand: $od, stopped: null}
                 elif ([ $exp[] | select((.value.coverageResolvable != true) and (.key != $lk)) ] | length) > 0
-                  then {state: null, live: [], paused: $pz, stopped: null}
+                  then {state: null, live: [], paused: $pz, onDemand: $od, stopped: null}
                 # #58: the policy set is partial, so a retainer may live in a
                 # namespace that was not read -- no retainer cannot be claimed.
-                elif ($pcScope.complete != true) then {state: null, live: [], paused: $pz, stopped: null}
+                elif ($pcScope.complete != true) then {state: null, live: [], paused: $pz, onDemand: $od, stopped: null}
                 # A policy whose export profiles could not be read in full
                 # might export here, so no retainer cannot be claimed past it
                 # -- but only past one that could cover this namespace: its
@@ -7837,13 +7871,14 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                         | select((.value.actionsReadable != true) or (.value.exportProfilesComplete != true))
                         | select((((.value.covers // []) | index($r.appName)) != null)
                                  or (.value.coverageResolvable != true) or (.key == $lk)) ] | length) > 0
-                  then {state: null, live: [], paused: $pz, stopped: null}
-                else {state: false, live: [], paused: $pz, stopped: null} end
+                  then {state: null, live: [], paused: $pz, onDemand: $od, stopped: null}
+                else {state: false, live: [], paused: $pz, onDemand: $od, stopped: null} end
          end)
       else {state: null, live: [], paused: [], stopped: null} end;
 
   map(
-    . + {
+    retention(.) as $ret
+    | . + {
       # null, not -1. The sentinel meant "never ran" and collided with a
       # clock-skewed future timestamp, which a live cluster produced: a
       # repository 29 days ahead of the operator floored to a negative age and
@@ -7932,6 +7967,63 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                else ($e.unlabelled // 0) + (($e.byProfile // {})[.exportProfile] // 0) end
         end
       ),
+      # #64: restore points that write to this repository and carry an
+      # expiry date. K10 retires each one when it expires, with no policy
+      # run, so unreclaimed space can still grow whatever the policy state.
+      # Where an entry writes:
+      #   exported (exportProfile set) - metadata and dr: the repository of
+      #     its policy and that profile. volumedata: the repository of its
+      #     namespace and its exportProfile or blockModeExportProfile, unless
+      #     it is appConfigOnly (configuration, no volume data).
+      #   local (no profile label) - only through backupParameters.profile
+      #     of its policy: Kanister, GVS and Quick DR write there. A policy
+      #     can set that profile and write nothing through it; such an entry
+      #     still counts, which can keep a repository critical with nothing
+      #     to retire. Accepted: it never hides a finding. Never metadata.
+      #     An entry with no policy, such as a manual snapshot, writes
+      #     through a profile that the list does not name, so it counts for
+      #     every volumedata repository of its namespace.
+      # A restore point is counted once, though its local entry and its
+      # exported twin can both match. 0 when the list was read and nothing
+      # matches; null when it was not, or this repository cannot be matched.
+      # An empty list that was read counts as 0, unlike restorePointRefs: no
+      # expiry date means nothing to retire on its own.
+      expiringRestorePoints: (
+        . as $r
+        | def same_policy($e):
+            ($e.pname == $r.policyName)
+            and (($e.pns == null) or ($r.policyNamespace == null) or ($e.pns == $r.policyNamespace));
+          # Unknown counts: a policy not found, or with a backup profile it
+          # does not name, may back up here.
+          def backs_up_here($e):
+            owner_find($e.pname; $e.pns) as $f
+            | if $f.st != "found" then true
+              else $owners[$f.k] as $o
+                   | if ($o.actionsReadable == true) and ($o.backupProfilesNamed == true)
+                     then (($o.backupProfiles // []) | index($r.exportProfile)) != null
+                     else true end
+              end;
+          if $rpcIndex == null then null
+          elif $r.exportProfile == null then null
+          elif $r.contentType == "volumedata" then
+            (if $r.appName == null then null
+             else [ ($rpcIndex.expiring // [])[] as $e
+                    | select($e.ns == $r.appName)
+                    | select(if $e.ep != null
+                             then ($e.type != "appConfigOnly")
+                                  and (($e.ep == $r.exportProfile) or ($e.bp == $r.exportProfile))
+                             else backs_up_here($e) end)
+                    | $e.key ] | unique | length end)
+          elif ($r.contentType == "metadata") or ($r.contentType == "dr") then
+            (if $r.policyName == null then null
+             else [ ($rpcIndex.expiring // [])[] as $e
+                    | select(same_policy($e))
+                    | select(if $e.ep != null then $e.ep == $r.exportProfile
+                             elif $r.contentType == "dr" then backs_up_here($e)
+                             else false end)
+                    | $e.key ] | unique | length end)
+          else null end
+      ),
       # Age of the storage scan the snapshot count and sizes came from. Same
       # null-not-sentinel and future-clamp rules as its siblings.
       daysSinceStorageScan: (
@@ -7958,12 +8050,13 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
               catch null)
         end
       ),
-      retainer: (retention(.) | .state),
-      retainerPolicies: (retention(.) | .live),
-      retainerPausedPolicies: (retention(.) | .paused),
+      retainer: $ret.state,
+      retainerPolicies: $ret.live,
+      retainerPausedPolicies: $ret.paused,
+      retainerOnDemandPolicies: ($ret.onDemand // []),
       # metadata and dr only: the labelled owner is gone (deleted), or exists
       # and no longer backs up or exports to this profile (no-longer-exports).
-      ownerStopped: (retention(.) | .stopped),
+      ownerStopped: $ret.stopped,
       ownerPolicyPaused: (
         (.policyName) as $p
         | if ($owners == null) or ($p == null) then null
@@ -8427,17 +8520,25 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       #                 gets a new repository, and an identical appName label
       #                 hides that. For volumedata the policy label is only the
       #                 FIRST writer; retainerPolicies lists who retains now.
+      #                 So a deleted first writer is not a lost owner: other
+      #                 policies can share the repository (#66). policyMissing
+      #                 stays published as a fact about the label.
       orphaned: (
-        if (.profileMissing == true) or (.policyMissing == true) then true
+        if (.profileMissing == true) or ((.policyMissing == true) and (.contentType != "volumedata")) then true
         elif ((.contentType == "metadata") or (.contentType == "dr")) and (.ownerStopped == "no-longer-exports") then true
         elif (.contentType == "volumedata") and ((.appNamespaceState == "recreated") or (.appNamespaceState == "absent")) then true
+        # The namespace is the owner of a volumedata repository (#66), so only
+        # a live namespace and a present profile prove the owner is there. An
+        # unknown namespace state is no answer, never an owner.
+        elif .contentType == "volumedata" then
+          (if (.profileMissing == false) and (.appNamespaceState == "live") then false else null end)
         elif (.profileMissing == false) or (.policyMissing == false) then false
         else null
         end
       ),
       orphanReason: (
         if .profileMissing == true then "profile-deleted"
-        elif .policyMissing == true then "policy-deleted"
+        elif (.policyMissing == true) and (.contentType != "volumedata") then "policy-deleted"
         elif ((.contentType == "metadata") or (.contentType == "dr")) and (.ownerStopped == "no-longer-exports") then "policy-stopped-exporting"
         elif (.contentType == "volumedata") and (.appNamespaceState == "recreated") then "namespace-recreated"
         elif (.contentType == "volumedata") and (.appNamespaceState == "absent") then "namespace-deleted"
@@ -8452,7 +8553,9 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       #                         (countZeroAfterWrite)
       #   profile-unreachable - the profile is gone or points elsewhere, so
       #                         retirement cannot reach the repository
-      #   no-retainer         - no live policy retires restore points in it
+      #   no-retainer         - no live policy retires restore points in it,
+      #                         and none of its restore points has an expiry
+      #                         date (an unknown count keeps the critical)
       # The snapshot count is refreshed only by a successful scan, so on a
       # failing repository it can be stale-HIGH, which only ever keeps a
       # critical -- and stale-LOW when an export after the scan added
@@ -8468,7 +8571,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
         if (.snapshotCount == 0) and (.countZeroAfterWrite == true) then "count-zero"
         elif (.contentType == "volumedata") and (.restorePointRefs == 0) then "no-restore-points"
         elif (.profileMissing == true) or (.profileMismatch == true) then "profile-unreachable"
-        elif .retainer == false then "no-retainer"
+        elif (.retainer == false) and (.expiringRestorePoints == 0) then "no-retainer"
         else null end
       ),
       # A held timer more than five minutes in the past with no pod. Not seen
@@ -8770,7 +8873,9 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
       #   written    - data written inside the inactivity threshold, and no
       #                zero snapshot count taken since
       #   undated    - the last write cannot be dated, and no owner is gone
-      #   retained   - quiet, but a live policy still retires restore points in it
+      #   retained   - quiet, but a live policy can retire restore points in it
+      #   expiring   - quiet, no live policy, but restore points in it have an
+      #                expiry date, and K10 retires each one when it expires
       #   unverified - quiet, and the gate could not establish either way
       activeReason: (
         ((.status == "FAILING_STALE") or ((.status == "NEVER_RAN") and (.firstRunDue != false))) as $eligible
@@ -8781,13 +8886,14 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
           # `(.snapshotCount // 0) > 0` collapsed "not counted" into "zero".
           # snapshotCount is null until a storage scan populates storageUsage,
           # which on a failing repository may never have happened -- so a
-          # repository a live policy IS still retiring restore points in fell
+          # repository a live policy can retire restore points in fell
           # through to "unverified", which this code defines as "the gate could
           # not establish either way". The severity was right either way, but
           # the row lost its only explanation while the best-practices line
           # told the reader to check the reason under each status.
           elif (.retainer == true) and (.snapshotCount != null) and (.snapshotCount > 0) then "retained"
           elif (.retainer == true) and (.snapshotCount == null) then "retained-uncounted"
+          elif (.expiringRestorePoints // 0) > 0 then "expiring"
           else "unverified" end
       ),
       # A parked repository holding stranded content. null for any other
@@ -8888,6 +8994,9 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
              + (if ((.retainerPausedPolicies // []) | length) > 0
                 then " Paused: " + (.retainerPausedPolicies | join(", ")) + ". Unpausing re-arms the accumulation."
                 else "" end)
+             + (if ((.retainerOnDemandPolicies // []) | length) > 0
+                then " On demand: " + (.retainerOnDemandPolicies | join(", ")) + ". An on-demand policy has no retention, so it retires nothing."
+                else "" end)
            # Every quiet row says why under the repository. The flag sentence
            # already rides on a scans-only row; any other row quiet for the flag
            # names it here, or it would sit quiet with no reason under it. Under
@@ -8901,18 +9010,37 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
              (if .maintenanceInfoCause == "scans-only" then null
               else "Background maintenance is disabled by configuration: the backgroundMaintenanceRun key is absent from ConfigMap k10-features, so K10 runs storage scans only. See the section note." end)
            else null end)
-        elif (.severityGate == "active") and (.activeReason == "retained-uncounted") then
+        # #65: KDL sees what a policy CAN do, never a retirement, so the
+        # sentence says what was checked: the same checks as retention().
+        elif (.severityGate == "active") and ((.activeReason == "retained") or (.activeReason == "retained-uncounted")) then
+          (((.retainerPolicies // []) | length) > 1) as $pl
+          | (if .daysSinceLastWrite != null
+             then "No data written for " + (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + " days. "
+             else "The last write cannot be dated. " end)
+          + (if $pl then "Scheduled policies that are not paused " else "A scheduled policy that is not paused " end)
+          + (if .contentType == "dr" then (if $pl then "back up or export" else "backs up or exports" end) + " to this profile"
+             elif .contentType == "volumedata" then (if $pl then "export to this profile and cover" else "exports to this profile and covers" end)
+                  + " this namespace or wrote here first"
+             else (if $pl then "export" else "exports" end) + " to this profile" end)
+          + ": " + ((.retainerPolicies // []) | join(", ")) + ". "
+          + (if $pl then "They" else "It" end)
+          + " can retire restore points here, and each retirement leaves space that only maintenance reclaims."
+          + (if .activeReason == "retained-uncounted"
+             then " How many restore points remain is not known: no storage scan has reported a snapshot count for this repository."
+             else "" end)
+        elif (.severityGate == "active") and (.activeReason == "expiring") then
           (if .daysSinceLastWrite != null
            then "No data written for " + (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + " days, but "
            else "The last write cannot be dated, but " end)
-          + ((.retainerPolicies // []) | join(", "))
-          + " still retires restore points in it, and every retirement leaves space that only maintenance reclaims. How many restore points remain is not known: no storage scan has reported a snapshot count for this repository."
-        elif (.severityGate == "active") and (.activeReason == "retained") then
-          (if .daysSinceLastWrite != null
-           then "No data written for " + (((.daysSinceLastWrite * 10) | round) / 10 | tostring) + " days, but "
-           else "The last write cannot be dated, but " end)
-          + ((.retainerPolicies // []) | join(", "))
-          + " still retires restore points in it, and every retirement leaves space that only maintenance reclaims."
+          + (if .expiringRestorePoints == 1 then "1 restore point that uses this repository has an expiry date"
+             else (.expiringRestorePoints | tostring) + " restore points that use this repository have an expiry date" end)
+          + ". K10 retires each one when it expires, with no policy run. Each retirement leaves space that only maintenance reclaims."
+        # The gate could not settle it. Say which input was missing, so the
+        # reader knows why it is critical.
+        elif (.severityGate == "active") and (.activeReason == "unverified") then
+          (if (.retainer == false) and ($rpcIndex == null)
+           then "No live policy retires restore points in it, but KDL could not read the RestorePointContents list, so it cannot tell if a restore point with an expiry date remains. The failure stays critical until that is known."
+           else "KDL could not tell if anything will retire restore points in this repository, so the failure stays critical until that is known." end)
         else null end
       )
     })
@@ -9133,16 +9261,18 @@ STORAGE_REPO_FAILSET=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '
       activeRetained:   ([ $active[] | select(.activeReason == "retained") ] | length),
       activeRetainedUncounted: ([ $active[] | select(.activeReason == "retained-uncounted") ] | length),
       activeUnverified: ([ $active[] | select(.activeReason == "unverified") ] | length),
+      activeExpiring:   ([ $active[] | select(.activeReason == "expiring") ] | length),
       # The remainder, COUNTED rather than subtracted: every active repository
-      # whose reason is none of the three above (written, undated, or a reason
+      # whose reason is none of the four above (written, undated, or a reason
       # added later that falls through). Published so no renderer has to
       # compute active - retained - unverified, which is how a fourth reason
       # silently landed in "still being written to" (issue #57). By
       # construction written + retained + retainedUncounted + unverified
-      # == active.
+      # + expiring == active.
       activeWritten: ([ $active[] | select((.activeReason != "retained")
                                            and (.activeReason != "retained-uncounted")
-                                           and (.activeReason != "unverified")) ] | length),
+                                           and (.activeReason != "unverified")
+                                           and (.activeReason != "expiring")) ] | length),
       quiet:    ($quiet | length),
       quietNeverWritten:       ([ $quiet[] | select(.quietReason == "never-written") ] | length),
       quietCountZero:          ([ $quiet[] | select(.quietReason == "count-zero") ] | length),
@@ -9153,14 +9283,15 @@ STORAGE_REPO_FAILSET=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '
       quietMaintenanceFeatureOff: ([ $quiet[] | select(.quietReason == "maintenance-feature-off") ] | length),
       quietIdle:   ([ $quiet[] | select(.inactive == true) ] | length),
       quietOrphan: ([ $quiet[] | select(.orphaned == true) ] | length) }' 2>/dev/null) \
-  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeRetainedUncounted":0,"activeUnverified":0,"activeWritten":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
+  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeRetainedUncounted":0,"activeUnverified":0,"activeExpiring":0,"activeWritten":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
 _ep "$STORAGE_REPO_FAILSET" | jq -e 'type == "object"' >/dev/null 2>&1 \
-  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeRetainedUncounted":0,"activeUnverified":0,"activeWritten":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
+  || STORAGE_REPO_FAILSET='{"eligible":0,"active":0,"activeNeverRan":0,"activeRetained":0,"activeRetainedUncounted":0,"activeUnverified":0,"activeExpiring":0,"activeWritten":0,"quiet":0,"quietNeverWritten":0,"quietCountZero":0,"quietProfileUnreachable":0,"quietNoRetainer":0,"quietNoRestorePoints":0,"quietDrOwnershipBlock":0,"quietMaintenanceFeatureOff":0,"quietIdle":0,"quietOrphan":0}'
 STORAGE_REPO_ACTIVE_FAILING_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.active')
 STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeNeverRan // 0')
 STORAGE_REPO_ACTIVE_RETAINED_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeRetained // 0')
 STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeRetainedUncounted // 0')
 STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeUnverified // 0')
+STORAGE_REPO_ACTIVE_EXPIRING_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeExpiring // 0')
 STORAGE_REPO_ACTIVE_WRITTEN_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.activeWritten // 0')
 STORAGE_REPO_QUIET_COUNT_ZERO_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietCountZero // 0')
 STORAGE_REPO_QUIET_UNREACHABLE_COUNT=$(_ep "$STORAGE_REPO_FAILSET" | jq -r '.quietProfileUnreachable // 0')
@@ -9231,6 +9362,7 @@ case "$STORAGE_REPO_ACTIVE_NEVER_RAN_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_
 case "$STORAGE_REPO_ACTIVE_RETAINED_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_RETAINED_COUNT=0 ;; esac
 case "$STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT=0 ;; esac
 case "$STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT=0 ;; esac
+case "$STORAGE_REPO_ACTIVE_EXPIRING_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_EXPIRING_COUNT=0 ;; esac
 case "$STORAGE_REPO_ACTIVE_WRITTEN_COUNT" in ''|*[!0-9]*) STORAGE_REPO_ACTIVE_WRITTEN_COUNT=0 ;; esac
 case "$STORAGE_REPO_QUIET_COUNT_ZERO_COUNT" in ''|*[!0-9]*) STORAGE_REPO_QUIET_COUNT_ZERO_COUNT=0 ;; esac
 case "$STORAGE_REPO_QUIET_UNREACHABLE_COUNT" in ''|*[!0-9]*) STORAGE_REPO_QUIET_UNREACHABLE_COUNT=0 ;; esac
@@ -9451,9 +9583,9 @@ case "$BP_STORAGE_REPO_STATUS" in
       # written to" is not the whole of it: the count includes repositories
       # whose last write cannot be dated (an unknown must not quieten a
       # finding on its own), and quiet ones the gate keeps -- a live policy
-      # still retires restore points in them, or nothing proves they stopped.
+      # can retire restore points in them, or nothing proves they stopped.
       # Read from the published counts, never subtracted. The retained clause
-      # covers both retained and retained-uncounted (a live policy retires
+      # covers both retained and retained-uncounted (a live policy can retire
       # restore points in it either way; whether the snapshot count is known is
       # said on the row).
       _srv_w=$STORAGE_REPO_ACTIVE_WRITTEN_COUNT
@@ -9465,9 +9597,17 @@ case "$BP_STORAGE_REPO_STATUS" in
       if [ "$_srv_ret" -gt 0 ] 2>/dev/null; then
         if [ -n "$_srv_why" ]; then _srv_why="$_srv_why; "; fi
         if [ "$_srv_ret" -eq 1 ]; then
-          _srv_why="${_srv_why}1 quiet, but a live policy still retires restore points in it"
+          _srv_why="${_srv_why}1 quiet, but a live policy can retire restore points in it"
         else
-          _srv_why="${_srv_why}$_srv_ret quiet, but a live policy still retires restore points in them"
+          _srv_why="${_srv_why}$_srv_ret quiet, but a live policy can retire restore points in them"
+        fi
+      fi
+      if [ "$STORAGE_REPO_ACTIVE_EXPIRING_COUNT" -gt 0 ] 2>/dev/null; then
+        if [ -n "$_srv_why" ]; then _srv_why="$_srv_why; "; fi
+        if [ "$STORAGE_REPO_ACTIVE_EXPIRING_COUNT" -eq 1 ]; then
+          _srv_why="${_srv_why}1 quiet, but restore points in it have an expiry date"
+        else
+          _srv_why="${_srv_why}$STORAGE_REPO_ACTIVE_EXPIRING_COUNT quiet, but restore points in them have an expiry date"
         fi
       fi
       if [ "$STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT" -gt 0 ] 2>/dev/null; then
@@ -10352,6 +10492,7 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoActiveRetainedCount "$STORAGE_REPO_ACTIVE_RETAINED_COUNT" \
     --argjson storageRepoActiveRetainedUncountedCount "$STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT" \
     --argjson storageRepoActiveUnverifiedCount "$STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT" \
+    --argjson storageRepoActiveExpiringCount "$STORAGE_REPO_ACTIVE_EXPIRING_COUNT" \
     --argjson storageRepoActiveWrittenCount "$STORAGE_REPO_ACTIVE_WRITTEN_COUNT" \
     --argjson storageRepoQuietCountZeroCount "$STORAGE_REPO_QUIET_COUNT_ZERO_COUNT" \
     --argjson storageRepoQuietUnreachableCount "$STORAGE_REPO_QUIET_UNREACHABLE_COUNT" \
@@ -11141,19 +11282,23 @@ if [ "$MODE" = "json" ]; then
         quietFailingCount: $storageRepoQuietFailingCount,
         # The partition of activeFailingCount, by reason, and it sums to it by
         # construction: activeWrittenCount + activeRetainedCount +
-        # activeRetainedUncountedCount + activeUnverifiedCount.
+        # activeRetainedUncountedCount + activeUnverifiedCount +
+        # activeExpiringCount.
         # activeWrittenCount: written inside the threshold, or last write
         # undated (the remainder, counted, never derived by a renderer).
         # activeRetainedCount: quiet repositories kept critical because a live
-        # policy still retires restore points in them, snapshot count known.
+        # policy can retire restore points in them, snapshot count known.
         # activeRetainedUncountedCount: the same, but no storage scan has
         # reported a snapshot count; the verdict folds it into the retained
         # clause, the row says the count is unknown.
         # activeUnverifiedCount: quiet ones the gate could not settle.
+        # activeExpiringCount: quiet ones with no live policy, kept critical
+        # because restore points in them have an expiry date (#64).
         activeWrittenCount: $storageRepoActiveWrittenCount,
         activeRetainedCount: $storageRepoActiveRetainedCount,
         activeRetainedUncountedCount: $storageRepoActiveRetainedUncountedCount,
         activeUnverifiedCount: $storageRepoActiveUnverifiedCount,
+        activeExpiringCount: $storageRepoActiveExpiringCount,
         quietCountZeroCount: $storageRepoQuietCountZeroCount,
         quietProfileUnreachableCount: $storageRepoQuietUnreachableCount,
         quietNoRetainerCount: $storageRepoQuietNoRetainerCount,
@@ -11187,11 +11332,11 @@ if [ "$MODE" = "json" ]; then
         items: $storageRepoMaintenance,
         note: "Kopia repositories used for exports and imports. Maintenance should run regularly to keep the repository compact and avoid performance degradation. Status is derived from evidence that a run SUCCEEDED, not from the newest recorded timestamp: a failed run records nothing, so the previous success keeps its timestamp and reads as fresh. FAILING_STALE means the last run failed and none has succeeded within the threshold; FAILING means it failed but a success is still recent; STALE means the last success is older than the threshold; OVERDUE means a whole cycle passed with no maintenance running and nothing recorded (a storage scan does not count); NEVER_RAN means readable history with no run in it; UNKNOWN means the outcome could not be established: neither the procedure record nor the task history answered, or a success cannot be dated, or the repository is past due and the pod list could not be read so whether a run is in flight is unknown - that last case DOES have a recent success behind it. None of them is the same as healthy.",
         profileMismatchNote: "profileMismatch = the profile named by the repository label still exists, but its current locationSpec no longer points where the repository sits: a different objectStore bucket, or a FileStore path outside the current prefix. Compared against ITS OWN profile, deliberately, not against every profile: a repository is reached only through the profile it refers to, so another profile pointing at the same bucket does not make it reachable. It will not be processed and maintenance on it can never succeed again. Measured on a 162-repository cluster: 5 mismatched, all FAILING_STALE, no healthy repository mismatched. Confirmed on FileStore separately: 3 of 5 repositories sat outside their profile current path prefix, all three FAILING_STALE and all three reporting a failure to fetch the profile and the location, while the two inside the prefix reported none. It feeds the severity gate for a quiet failure only: retirement cannot reach a repository whose profile points elsewhere, which is one of the proofs that nothing more accumulates there. It does not set orphaned, never quietens a repository written to recently, and the row prints the profile remedy (profileNote). Whether the old bucket or share still exists is NOT checked, so this is not authority to delete: confirm nothing in it is needed, or open a support case. The FileStore path is read for the comparison and never published, because it carries the K10 cluster UUID.",
-        inactivityNote: "inactive = no data written for longer than inactiveThresholdDays, from status.details.modifiedTime, which neither maintenance nor a storage scan advances. Inactivity NEVER changes a repository status or a count. It only makes a failure a candidate for a warning instead of a critical, and severityGateNote says when the downgrade is made. A failing repository is quiet for one of FOUR reasons - idle past the threshold, never written to at all, ONLY where the last write date is unknown - orphaned, or, however recent the write, every restore point retired since it (countZeroAfterWrite). orphaned = the owner is gone: the profile or policy was deleted, the policy no longer exports or backs up to the profile, or, for volumedata, the namespace the repository was created for was deleted, or deleted and recreated with the same name (compared by UID). orphanReason names which, and orphanedOwnerDeletedCount, orphanedStoppedExportingCount, orphanedNamespaceDeletedCount and orphanedNamespaceRecreatedCount split orphanedCount by it. A known write date always wins over a lost owner: a repository written to yesterday is never quietened by one. Idle and orphaned are typically cleanup after a profile migration; never-written is not, because its first export has produced nothing and that is worth investigating. No repository is ever deleted or acted on by this tool, and none of these is authority to delete one. A repository whose last write cannot be dated counts as active, so an unknown ON ITS OWN never downgrades a finding - it takes a lost owner alongside it, which is the third reason above. unusedCount counts repositories that have NEVER BEEN WRITTEN TO - neverWritten, which compares modifiedTime against creationTimestamp. It used to count storageUsage present-and-empty, which only means no storage scan has measured the repository: the scan populates that field, so an unprocessed repository reads empty whatever it holds, and on a 547-repository estate 191 of the 364 reading empty had been written to. repositoryEmpty still reports the scan-derived value and is null for a read-only repository, which Kasten never scans at all.",
+        inactivityNote: "inactive = no data written for longer than inactiveThresholdDays, from status.details.modifiedTime, which neither maintenance nor a storage scan advances. Inactivity NEVER changes a repository status or a count. It only makes a failure a candidate for a warning instead of a critical, and severityGateNote says when the downgrade is made. A failing repository is quiet for one of FOUR reasons - idle past the threshold, never written to at all, ONLY where the last write date is unknown - orphaned, or, however recent the write, every restore point retired since it (countZeroAfterWrite). orphaned = the owner is gone: the profile was deleted; for metadata and dr, the labelled policy was deleted or no longer exports or backs up to the profile; for volumedata, the namespace the repository was created for was deleted, or deleted and recreated with the same name (compared by UID). The policy label of a volumedata repository names only its first writer, and other policies can share the repository, so policyMissing alone does not make it orphaned, and orphaned is null while the namespace state is not known. orphanReason names which, and orphanedOwnerDeletedCount, orphanedStoppedExportingCount, orphanedNamespaceDeletedCount and orphanedNamespaceRecreatedCount split orphanedCount by it. A known write date always wins over a lost owner: a repository written to yesterday is never quietened by one. Idle and orphaned are typically cleanup after a profile migration; never-written is not, because its first export has produced nothing and that is worth investigating. No repository is ever deleted or acted on by this tool, and none of these is authority to delete one. A repository whose last write cannot be dated counts as active, so an unknown ON ITS OWN never downgrades a finding - it takes a lost owner alongside it, which is the third reason above. unusedCount counts repositories that have NEVER BEEN WRITTEN TO - neverWritten, which compares modifiedTime against creationTimestamp. It used to count storageUsage present-and-empty, which only means no storage scan has measured the repository: the scan populates that field, so an unprocessed repository reads empty whatever it holds, and on a 547-repository estate 191 of the 364 reading empty had been written to. repositoryEmpty still reports the scan-derived value and is null for a read-only repository, which Kasten never scans at all.",
         readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten). The best practice then reports NOT_ASSESSED - UNLESS a verdict from the repositories that WERE read outranks it - any of FAILING, FAILING_INACTIVE or PARTIAL - in which case that verdict stands and the unread count is printed beside it. Ordering it that way is deliberate: one unreadable repository must not hide repositories that are definitively failing, and a partial read must never render as clean.",
         durationNote: "lastRunDurationSeconds is the inner MaintenanceRun command window (endTime - startTime of one record, so immune to clock skew between writers); lastRunSpanSeconds is the first task start to the last task end of the newest observed run. BOTH exclude time spent queued, and the renderers prefer the first and fall back to the second, because the procedure record the first comes from is evicted within hours on a busy repository. lastFullMaintenanceDurationSeconds is the legacy completedTime - scheduledTime figure: it ABSORBS queue time, overstated by 4-5x on measured clusters, and goes negative on a hand-triggered run. It is retained for continuity and is not what the reports show.",
         redactionNote: "procedureError and lastRunError are cluster-supplied text, published verbatim except that scheme://host, UUIDs and IPv4 addresses are masked and the string is truncated at 300 characters. Collected FIELDS carry names only - an object-store bucket or a FileStore claim - never an endpoint, region or path, because a repository path is k10/<cluster-uuid>/... .",
-        severityGateNote: "An eligible failure (FAILING_STALE, or NEVER_RAN once due) is active - the section critical - while unreclaimed space can still grow: written inside inactiveThresholdDays, a last write that cannot be dated with no owner known to be gone, or quiet but kept by the gate. One thing outranks a recent write: a zero snapshot count taken after it (countZeroAfterWrite, from a storage scan ending at least an hour after modifiedTime), because nothing is left to retire and the next export moves the write past the scan. A quiet one (idle, or orphaned with no datable write) drops to a warning only when the record proves nothing more accumulates: every restore point has retired (snapshotCount 0, counted after the last write - an earlier count can miss snapshots written since), retirement cannot reach it (profile gone or profileMismatch), or no live policy retires restore points in it (retainer false: a deleted or paused policy retires nothing, since retirement is a phase of a policy run). For volumedata, no RestorePointContents referencing the namespace (restorePointRefs 0, read from a list that was readable and not empty) proves it directly and outranks an inferred retainer: the snapshot count is refreshed only by a successful scan, so on a failing repository it can be weeks old. A never-written repository is quiet, and so is every eligible failure while the Kasten DR ownership block is in place (dr-ownership-block) or background maintenance is switched off in k10-features (maintenance-feature-off): the cause is cluster-wide, and the section verdict names it. Anything unknown keeps the critical. severityGate, quietReason and activeReason carry the decision per repository; retainerPolicies names who still retires restore points in it - for volumedata a live policy exporting to the profile whose selector covers the namespace, or the labelled first writer.",
+        severityGateNote: "An eligible failure (FAILING_STALE, or NEVER_RAN once due) is active - the section critical - while unreclaimed space can still grow: written inside inactiveThresholdDays, a last write that cannot be dated with no owner known to be gone, or quiet but kept by the gate. One thing outranks a recent write: a zero snapshot count taken after it (countZeroAfterWrite, from a storage scan ending at least an hour after modifiedTime), because nothing is left to retire and the next export moves the write past the scan. A quiet one (idle, or orphaned with no datable write) drops to a warning only when the record proves nothing more accumulates: every restore point has retired (snapshotCount 0, counted after the last write - an earlier count can miss snapshots written since), retirement cannot reach it (profile gone or profileMismatch), or no live policy retires restore points in it (retainer false: a deleted or paused policy retires nothing, since retirement is a phase of a policy run, and an on-demand policy has no retention) and none of its restore points has an expiry date (expiringRestorePoints 0: K10 retires an expired restore point with no policy run, so a count above 0 keeps the critical as activeReason expiring, and an unknown count keeps it too). For volumedata, no RestorePointContents referencing the namespace (restorePointRefs 0, read from a list that was readable and not empty) proves it directly and outranks an inferred retainer: the snapshot count is refreshed only by a successful scan, so on a failing repository it can be weeks old. A never-written repository is quiet, and so is every eligible failure while the Kasten DR ownership block is in place (dr-ownership-block) or background maintenance is switched off in k10-features (maintenance-feature-off): the cause is cluster-wide, and the section verdict names it. Anything unknown keeps the critical. severityGate, quietReason and activeReason carry the decision per repository; retainerPolicies names the policies that can retire restore points in it: scheduled, not paused and exporting to the profile (for dr, backing up to it also counts); for volumedata, also covering the namespace or being the labelled first writer. KDL checks the policy spec and does not see a retirement happen.",
         idleStatusNote: "IDLE = K10 has parked the repository: five maintenance results scheduled since the last write, every task since succeeded, so the service stopped scheduling it until the next write (k10SchedulerState parked). Not a fault, and above STALE and OVERDUE because the lapsed schedule is what parking looks like. Stricter than the K10 rule: the newest procedure must not have failed. strandedSignal names what a parked repository still holds - pure-garbage (no snapshot left, blobs above the floor), mostly-garbage (stored above three times in use, the difference above the floor), index-garbage (the smaller of unused content and stored minus in use above the floor) - each bounded by physical bytes, because content can be marked unused after its blobs are deleted. strandedFloorBytes is 1 GB or a quarter of estateStoredBytes, whichever is smaller. A stranded IDLE (idleStranded) rolls up to PARTIAL; a plain one is not a finding.",
         schedulerNote: "k10SchedulerState is what the K10 repositories service is doing with the repository, first match wins: read-only (status.readOnly; never processed here), blocked (the Kasten DR ownership block is in place; K10 processes no repository until ConfigMap k10-dr-remove-to-get-ownership is removed), running (an owner or repo-access pod is present, Pending included; k10SchedulerPodType names it, and a scan pod is never full maintenance), maintenance-off (background maintenance is switched off in k10-features; below running because scans still run, above the next three because none of them describes a service that is not maintaining at all), scheduled (the service holds a timer: status.details.nextProessTime, misspelled in Kasten, published as nextProcessTime), parked (no timer, and the service idle rule holds - five maintenance results scheduled since the last write and every task since succeeded; healthy by design), dropped (no timer, not parked, pod list readable), null (not determinable). k10TimerOverdueSeconds is set only when a held timer is more than 300 seconds in the past with no pod. k10RestartWontHelp is true when the ten retained process results are all failures started at or after the last write, so a crypto-svc restart skips the repository until it is next written to; null, never false, otherwise. ownerPodRunning (an owner pod of any kind running, upgrades included) is what excuses an overdue run; maintenanceRunning counts full-maintenance pods only. k10SchedulerNote, failureCauseNote and profileNote are row sentences; rowNotes collects every sentence for the row, and every output prints it verbatim.",
         maintenanceTypeNote: "recentResults holds only runs Kopia exited 0 on: Kasten appends an entry only after kopia maintenance run --full exits 0. The newest entry is chosen by completedTime, not by position; the list was observed newest-first on a live Kasten 9.0.5 cluster, but nothing in the payload states it. The entries carry no full/quick discriminator, but they are spaced one per day against a configured full interval of 24h and a quick interval of 1h (maintenanceInfo.full.interval / .quick.interval), and quick runs would produce roughly 24x more entries than observed - so recentResults holds full runs. runsTotal exceeds the number of entries kept, so the list is truncated to the most recent.",

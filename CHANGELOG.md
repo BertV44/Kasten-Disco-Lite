@@ -3,6 +3,56 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+- **An on-demand policy no longer keeps a failing repository critical**
+  (#64). An on-demand policy (`spec.frequency: '@onDemand'`) has no
+  retention, so it retires nothing. KDL now treats it like a paused policy.
+  If the only policy that could retire restore points in the repository runs
+  on demand, the failure drops to a warning (`no-retainer`). The row names
+  the policy, and the JSON lists it in `retainerOnDemandPolicies`.
+- **A restore point with an expiry date keeps a failing repository
+  critical** (#64). A manual run can set an expiry date. When it passes,
+  K10 retires the restore point with no policy run, so space still builds
+  up, whatever the state of the policy: scheduled, on demand, paused or
+  deleted. KDL now counts these restore points for each repository
+  (`expiringRestorePoints`). An exported restore point counts for the
+  repository of its profile. A local one counts only for a `volumedata` or
+  `dr` repository whose profile its policy backs up to, because Kanister,
+  GVS and Quick DR write there. A local one with no policy, such as a
+  manual snapshot, counts for every `volumedata` repository of its
+  namespace, because KDL cannot tell which profile it used. An imported
+  one never counts. If any
+  remain, a repository with no live policy stays critical (`activeReason:
+  expiring`), and the row says why. If KDL cannot read the
+  RestorePointContents list, it stays critical too, and the row says so.
+- **The report says a policy can retire restore points, not that it does**
+  (#65). KDL reads the policy spec and never sees a retirement happen. A
+  critical row now says what KDL checked: "A scheduled policy that is not
+  paused exports to this profile: <policy>. It can retire restore points
+  here." For `dr` it says "backs up or exports to this profile". For
+  `volumedata` it says "exports to this profile and covers this namespace
+  or wrote here first".
+  The section line, `severityGateNote` and the HTML legend use "can retire"
+  too. No verdict or severity changes.
+- **A deleted first writer no longer orphans a `volumedata` repository**
+  (#66). K10 sets the policy label once, when the repository is created, so
+  on a `volumedata` repository it names only the first policy that wrote to
+  it. Other policies can share the repository. KDL treated the label as the
+  owner, so a deleted first writer made the repository "Profile/policy
+  deleted", even while another live policy used it. A reader cleaning up
+  orphans could delete backup data that is in use. Now the owner of a
+  `volumedata` repository is its namespace: it is orphaned only when its
+  profile or namespace is gone. If KDL cannot read the namespace state, it
+  does not claim an owner either way. `policyMissing` still reports the
+  label. In the HTML Policy column, a deleted first writer shows "first
+  writer, deleted" (info, not a warning), and its tooltip says what the
+  label means. Severity can rise. A `volumedata` repository with no
+  datable write and a deleted first writer was quiet only because KDL took
+  it as orphaned. It is now critical (`undated`) unless its namespace or
+  profile is known to be gone. Some rows that were already critical change
+  their reason to `undated`, so the counts per reason move.
+
 ## [2.7.1] - 2026-10-08
 
 Four contributed pull requests (#59-#62, Michael Courcy) and four issues
