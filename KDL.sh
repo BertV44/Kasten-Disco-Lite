@@ -7700,7 +7700,8 @@ if [ -f "$TEMP_DIR/rpc_read.ok" ] && _sr_list_readable "$TEMP_DIR/rpc_raw.json";
         expiring: ([ (.items // [])[]? | (.metadata.labels // {}) as $l
                      | select($l | has("k10.kasten.io/expiresAt"))
                      | select($l | has("k10.kasten.io/importProfile") | not)
-                     | { ns: ($l["k10.kasten.io/appNamespace"] // null),
+                     | { name: (.metadata.name // null),
+                         ns: ($l["k10.kasten.io/appNamespace"] // null),
                          pname: ($l["k10.kasten.io/policyName"] // null),
                          pns: ($l["k10.kasten.io/policyNamespace"] // null),
                          ep: ($l["k10.kasten.io/exportProfile"] // null),
@@ -7751,6 +7752,54 @@ fi
 jq -e 'type == "object" or type == "null"' "$TEMP_DIR/sr_rpc_index.json" >/dev/null 2>&1 \
   || printf 'null\n' > "$TEMP_DIR/sr_rpc_index.json"
 debug "Storage repository: restore point index $(jq -r 'if . == null then "unreadable" else "\(.total) listed, \(.byNamespace | length) volumedata namespace(s) referenced" end' "$TEMP_DIR/sr_rpc_index.json" 2>/dev/null)"
+
+# #69: WHERE A LOCAL RESTORE POINT WITH AN EXPIRY DATE ACTUALLY WROTE. Its
+# labels name no profile, so the expiry count could only infer the
+# repository from the backup profile of its policy, which is wrong both ways:
+# a policy can set that profile and write nothing through it (a configuration-
+# only restore point: a critical with nothing to retire), and a profile can
+# change after the run (on the oc11 lab the Quick DR restore points carry
+# profileRef "storj" while the policy now backs up to "storj-new": the
+# repository that holds the data was not counted -- the direction that hides a
+# finding). The artifacts on the /details subresource say it: a Kanister
+# artifact names its profile at meta.kanister.meta.profileRef.name (Quick DR,
+# Kanister blueprints). Read on 9.0.6: a CSI snapshot is a "snapshot" artifact
+# (type CSI) and the resource specs are "spec" artifacts; neither writes to a
+# repository. Any other artifact kind -- GVS included, for which no sample has
+# been seen -- or a Kanister artifact with no profile name is unknown and keeps
+# the old rule. Only the local expiring entries are read (about 30-500 KB
+# each), with the /details fan-out width, and each is reduced on arrival to
+# what the count needs. A denied or failed read leaves no summary, and that
+# entry keeps the old rule: an unknown never quietens a finding.
+SR_RPC_ART_DIR="$TEMP_DIR/sr-rpc-art"
+mkdir -p "$SR_RPC_ART_DIR"
+jq -r 'if . == null then empty else (.expiring // [])[] | select(.ep == null and (.crp != true) and (.name | type) == "string") | .name end' \
+  "$TEMP_DIR/sr_rpc_index.json" 2>/dev/null | sort -u > "$TEMP_DIR/sr-rpc-art-names.txt" || : > "$TEMP_DIR/sr-rpc-art-names.txt"
+_art_i=0
+while read -r _art_n; do
+  [ -z "$_art_n" ] && continue
+  ( $CLI get --raw "/apis/apps.kio.kasten.io/v1alpha1/restorepointcontents/$_art_n/details" 2>/dev/null \
+      | jq -c --arg n "$_art_n" '
+          [ (.status.restorePointContentDetails.artifacts // [])[]? | (.meta // {}) ] as $m
+          | { name: $n,
+              artifacts: ($m | length),
+              kinds: ([ $m[] | keys[] ] | unique),
+              profiles: ([ $m[] | .kanister.meta.profileRef.name? | select(type == "string") ] | unique),
+              unnamedKanister: ([ $m[] | select(has("kanister"))
+                                  | select((.kanister.meta.profileRef.name? | type) != "string") ] | length) }' \
+      > "$SR_RPC_ART_DIR/$(printf '%05d' "$_art_i").json" 2>/dev/null ) &
+  _art_i=$((_art_i + 1))
+  if [ $((_art_i % STORAGE_REPO_PARALLEL)) -eq 0 ]; then wait; fi
+done < "$TEMP_DIR/sr-rpc-art-names.txt"
+wait
+cat "$SR_RPC_ART_DIR"/*.json 2>/dev/null \
+  | jq -s -c 'map(select(type == "object" and (.name | type) == "string")) | map({key: .name, value: .}) | from_entries' \
+    > "$TEMP_DIR/sr_rpc_art.json" 2>/dev/null || printf '{}\n' > "$TEMP_DIR/sr_rpc_art.json"
+jq -e 'type == "object"' "$TEMP_DIR/sr_rpc_art.json" >/dev/null 2>&1 || printf '{}\n' > "$TEMP_DIR/sr_rpc_art.json"
+SR_RPC_ART_REQUESTED=$_art_i
+SR_RPC_ART_READ=$(jq 'length' "$TEMP_DIR/sr_rpc_art.json" 2>/dev/null || echo 0)
+case "$SR_RPC_ART_READ" in ''|*[!0-9]*) SR_RPC_ART_READ=0 ;; esac
+debug "Storage repository: local expiring restore point artifacts read $SR_RPC_ART_READ of $SR_RPC_ART_REQUESTED"
 
 # The clock every maintenance age is measured against. KDL_NOW is a test hook:
 # the fixtures are built relative to the instant they were generated, and read
@@ -7818,6 +7867,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
   --slurpfile ownersF "$TEMP_DIR/sr_policy_owners.json" \
   --slurpfile pcScopeF "$TEMP_DIR/pc_scope.json" \
   --slurpfile rpcIndexF "$TEMP_DIR/sr_rpc_index.json" \
+  --slurpfile rpcArtF "$TEMP_DIR/sr_rpc_art.json" \
   --argjson expiryGrace "$RESIDUAL_EXPIRY_GRACE_DAYS" \
   --argjson strandedFloor "$STORAGE_REPO_STRANDED_FLOOR" \
   --arg threshold "$STORAGE_REPO_MAINTENANCE_THRESHOLD_DAYS" \
@@ -7858,6 +7908,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
 
   (if ($ownersF | length) > 0 then $ownersF[0] else null end) as $owners |
   (if ($rpcIndexF | length) > 0 then $rpcIndexF[0] else null end) as $rpcIndex |
+  (if ($rpcArtF | length) > 0 then $rpcArtF[0] else {} end) as $rpcArt |
   # An expiry date already past by more than the grace of the residual-snapshots
   # section has had its retirement: on 9.0.6 Kasten deletes the RestorePoint and
   # leaves the RestorePointContent Unbound, still labelled, for weeks (three on
@@ -8114,6 +8165,18 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                      then (($o.backupProfiles // []) | index($r.exportProfile)) != null
                      else true end
               end;
+          # #69: a local entry whose artifacts were read writes here only when
+          # a Kanister artifact names this profile. An artifact kind other than
+          # snapshot (CSI), spec and a named Kanister one is unknown and counts.
+          # Not read: the policy rule above.
+          def local_writes_here($e):
+            ($rpcArt[$e.name // ""] // null) as $a
+            # No artifact at all is no evidence of where it wrote: old rule.
+            | if ($a == null) or (($a.artifacts // 0) == 0) then backs_up_here($e)
+              elif (($a.profiles // []) | index($r.exportProfile)) != null then true
+              elif (($a.unnamedKanister // 0) > 0) then true
+              elif ([ ($a.kinds // [])[] | select(. != "snapshot" and . != "spec" and . != "kanister") ] | length) > 0 then true
+              else false end;
           if $rpcIndex == null then null
           elif $r.exportProfile == null then null
           elif $r.contentType == "volumedata" then
@@ -8125,7 +8188,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                     | select(if $e.ep != null
                              then ($e.type != "appConfigOnly")
                                   and (($e.ep == $r.exportProfile) or ($e.bp == $r.exportProfile))
-                             else backs_up_here($e) end)
+                             else local_writes_here($e) end)
                     | $e.key ] | unique | length end)
           # #67: a metadata repository also receives exported
           # ClusterRestorePoints, so its count is unknown while they are unread.
@@ -8137,7 +8200,7 @@ STORAGE_REPO_MAINTENANCE=$(_ep "$STORAGE_REPO_MAINTENANCE" | jq -c \
                     | select(same_policy($e))
                     | select(expiry_passed($e) | not)
                     | select(if $e.ep != null then $e.ep == $r.exportProfile
-                             elif $r.contentType == "dr" then backs_up_here($e)
+                             elif $r.contentType == "dr" then local_writes_here($e)
                              else false end)
                     | $e.key ] | unique | length end)
           else null end
@@ -10615,6 +10678,8 @@ if [ "$MODE" = "json" ]; then
     --argjson storageRepoActiveRetainedUncountedCount "$STORAGE_REPO_ACTIVE_RETAINED_UNCOUNTED_COUNT" \
     --argjson storageRepoActiveUnverifiedCount "$STORAGE_REPO_ACTIVE_UNVERIFIED_COUNT" \
     --argjson storageRepoActiveExpiringCount "$STORAGE_REPO_ACTIVE_EXPIRING_COUNT" \
+    --argjson srRpcArtRequested "$SR_RPC_ART_REQUESTED" \
+    --argjson srRpcArtRead "$SR_RPC_ART_READ" \
     --argjson storageRepoActiveWrittenCount "$STORAGE_REPO_ACTIVE_WRITTEN_COUNT" \
     --argjson storageRepoQuietCountZeroCount "$STORAGE_REPO_QUIET_COUNT_ZERO_COUNT" \
     --argjson storageRepoQuietUnreachableCount "$STORAGE_REPO_QUIET_UNREACHABLE_COUNT" \
@@ -11431,6 +11496,11 @@ if [ "$MODE" = "json" ]; then
         activeRetainedUncountedCount: $storageRepoActiveRetainedUncountedCount,
         activeUnverifiedCount: $storageRepoActiveUnverifiedCount,
         activeExpiringCount: $storageRepoActiveExpiringCount,
+        # #69: local restore points with an expiry date whose /details
+        # artifacts were requested, and how many answered. An unread one is
+        # matched by its policy backup profile, as before.
+        expiryArtifactsRequested: $srRpcArtRequested,
+        expiryArtifactsRead: $srRpcArtRead,
         quietCountZeroCount: $storageRepoQuietCountZeroCount,
         quietProfileUnreachableCount: $storageRepoQuietUnreachableCount,
         quietNoRetainerCount: $storageRepoQuietNoRetainerCount,
@@ -11468,7 +11538,7 @@ if [ "$MODE" = "json" ]; then
         readNote: "listed = repositories the cluster returned; total = those whose /details subresource could be read. When total is lower than listed the difference was not assessed (RBAC on storagerepositories/details, or an older Kasten). The best practice then reports NOT_ASSESSED - UNLESS a verdict from the repositories that WERE read outranks it - any of FAILING, FAILING_INACTIVE or PARTIAL - in which case that verdict stands and the unread count is printed beside it. Ordering it that way is deliberate: one unreadable repository must not hide repositories that are definitively failing, and a partial read must never render as clean.",
         durationNote: "lastRunDurationSeconds is the inner MaintenanceRun command window (endTime - startTime of one record, so immune to clock skew between writers); lastRunSpanSeconds is the first task start to the last task end of the newest observed run. BOTH exclude time spent queued, and the renderers prefer the first and fall back to the second, because the procedure record the first comes from is evicted within hours on a busy repository. lastFullMaintenanceDurationSeconds is the legacy completedTime - scheduledTime figure: it ABSORBS queue time, overstated by 4-5x on measured clusters, and goes negative on a hand-triggered run. It is retained for continuity and is not what the reports show.",
         redactionNote: "procedureError and lastRunError are cluster-supplied text, published verbatim except that scheme://host, UUIDs and IPv4 addresses are masked and the string is truncated at 300 characters. Collected FIELDS carry names only - an object-store bucket or a FileStore claim - never an endpoint, region or path, because a repository path is k10/<cluster-uuid>/... .",
-        severityGateNote: "An eligible failure (FAILING_STALE, or NEVER_RAN once due) is active - the section critical - while unreclaimed space can still grow: written inside inactiveThresholdDays, a last write that cannot be dated with no owner known to be gone, or quiet but kept by the gate. One thing outranks a recent write: a zero snapshot count taken after it (countZeroAfterWrite, from a storage scan ending at least an hour after modifiedTime), because nothing is left to retire and the next export moves the write past the scan. A quiet one (idle, or orphaned with no datable write) drops to a warning only when the record proves nothing more accumulates: every restore point has retired (snapshotCount 0, counted after the last write - an earlier count can miss snapshots written since), retirement cannot reach it (profile gone or profileMismatch), or no live policy retires restore points in it (retainer false: a deleted or paused policy retires nothing, since retirement is a phase of a policy run, and an on-demand policy has no retention) and none of its restore points has an expiry date (expiringRestorePoints 0: K10 retires an expired restore point with no policy run, so a count above 0 keeps the critical as activeReason expiring, and an unknown count keeps it too). For volumedata, no RestorePointContents referencing the namespace (restorePointRefs 0, read from a list that was readable and not empty) proves it directly and outranks an inferred retainer: the snapshot count is refreshed only by a successful scan, so on a failing repository it can be weeks old. A never-written repository is quiet, and so is every eligible failure while the Kasten DR ownership block is in place (dr-ownership-block) or background maintenance is switched off in k10-features (maintenance-feature-off): the cause is cluster-wide, and the section verdict names it. Anything unknown keeps the critical. severityGate, quietReason and activeReason carry the decision per repository; retainerPolicies names the policies that can retire restore points in it: scheduled, not paused and exporting to the profile (for dr, backing up to it also counts); for volumedata, also covering the namespace or being the labelled first writer. KDL checks the policy spec and does not see a retirement happen.",
+        severityGateNote: "An eligible failure (FAILING_STALE, or NEVER_RAN once due) is active - the section critical - while unreclaimed space can still grow: written inside inactiveThresholdDays, a last write that cannot be dated with no owner known to be gone, or quiet but kept by the gate. One thing outranks a recent write: a zero snapshot count taken after it (countZeroAfterWrite, from a storage scan ending at least an hour after modifiedTime), because nothing is left to retire and the next export moves the write past the scan. A quiet one (idle, or orphaned with no datable write) drops to a warning only when the record proves nothing more accumulates: every restore point has retired (snapshotCount 0, counted after the last write - an earlier count can miss snapshots written since), retirement cannot reach it (profile gone or profileMismatch), or no live policy retires restore points in it (retainer false: a deleted or paused policy retires nothing, since retirement is a phase of a policy run, and an on-demand policy has no retention) and none of its restore points has an expiry date (expiringRestorePoints 0: K10 retires an expired restore point with no policy run, so a count above 0 keeps the critical as activeReason expiring, and an unknown count keeps it too; a local restore point counts where a Kanister artifact on its /details names the profile, a CSI snapshot or resource spec alone writes to no repository, any other artifact counts, and an unread /details falls back to the backup profile of its policy - expiryArtifactsRequested and expiryArtifactsRead). For volumedata, no RestorePointContents referencing the namespace (restorePointRefs 0, read from a list that was readable and not empty) proves it directly and outranks an inferred retainer: the snapshot count is refreshed only by a successful scan, so on a failing repository it can be weeks old. A never-written repository is quiet, and so is every eligible failure while the Kasten DR ownership block is in place (dr-ownership-block) or background maintenance is switched off in k10-features (maintenance-feature-off): the cause is cluster-wide, and the section verdict names it. Anything unknown keeps the critical. severityGate, quietReason and activeReason carry the decision per repository; retainerPolicies names the policies that can retire restore points in it: scheduled, not paused and exporting to the profile (for dr, backing up to it also counts); for volumedata, also covering the namespace or being the labelled first writer. KDL checks the policy spec and does not see a retirement happen.",
         idleStatusNote: "IDLE = K10 has parked the repository: five maintenance results scheduled since the last write, every task since succeeded, so the service stopped scheduling it until the next write (k10SchedulerState parked). Not a fault, and above STALE and OVERDUE because the lapsed schedule is what parking looks like. Stricter than the K10 rule: the newest procedure must not have failed. strandedSignal names what a parked repository still holds - pure-garbage (no snapshot left, blobs above the floor), mostly-garbage (stored above three times in use, the difference above the floor), index-garbage (the smaller of unused content and stored minus in use above the floor) - each bounded by physical bytes, because content can be marked unused after its blobs are deleted. strandedFloorBytes is 1 GB or a quarter of estateStoredBytes, whichever is smaller. A stranded IDLE (idleStranded) rolls up to PARTIAL; a plain one is not a finding.",
         schedulerNote: "k10SchedulerState is what the K10 repositories service is doing with the repository, first match wins: read-only (status.readOnly; never processed here), blocked (the Kasten DR ownership block is in place; K10 processes no repository until ConfigMap k10-dr-remove-to-get-ownership is removed), running (an owner or repo-access pod is present, Pending included; k10SchedulerPodType names it, and a scan pod is never full maintenance), maintenance-off (background maintenance is switched off in k10-features; below running because scans still run, above the next three because none of them describes a service that is not maintaining at all), scheduled (the service holds a timer: status.details.nextProessTime, misspelled in Kasten, published as nextProcessTime), parked (no timer, and the service idle rule holds - five maintenance results scheduled since the last write and every task since succeeded; healthy by design), dropped (no timer, not parked, pod list readable), null (not determinable). k10TimerOverdueSeconds is set only when a held timer is more than 300 seconds in the past with no pod. k10RestartWontHelp is true when the ten retained process results are all failures started at or after the last write, so a crypto-svc restart skips the repository until it is next written to; null, never false, otherwise. ownerPodRunning (an owner pod of any kind running, upgrades included) is what excuses an overdue run; maintenanceRunning counts full-maintenance pods only. k10SchedulerNote, failureCauseNote and profileNote are row sentences; rowNotes collects every sentence for the row, and every output prints it verbatim.",
         maintenanceTypeNote: "recentResults holds only runs Kopia exited 0 on: Kasten appends an entry only after kopia maintenance run --full exits 0. The newest entry is chosen by completedTime, not by position; the list was observed newest-first on a live Kasten 9.0.5 cluster, but nothing in the payload states it. The entries carry no full/quick discriminator, but they are spaced one per day against a configured full interval of 24h and a quick interval of 1h (maintenanceInfo.full.interval / .quick.interval), and quick runs would produce roughly 24x more entries than observed - so recentResults holds full runs. runsTotal exceeds the number of entries kept, so the list is truncated to the most recent.",
