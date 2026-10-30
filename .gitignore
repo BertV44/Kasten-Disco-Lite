@@ -30,3 +30,7 @@ kdl-policy-state-test.sh
 kdl-repo-maint-test.sh
 kdl-policy-ns-test.sh
 kdl-expiry-test.sh
+kdl-maintenance-test.sh
+kdl-maintenance-fixtures.sh
+kdl-gate-negtest.sh
+kdl-v9-validate.sh
