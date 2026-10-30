@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.7.1
+# Kasten Discovery Lite v2.7.2
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 
@@ -57,7 +57,7 @@ These join the existing v1.9 features:
 - **Kanister Blueprints & BlueprintBindings** (cluster-wide detection)
 - **TransformSets** inventory
 - **Prometheus** monitoring status and remote write configuration *(NEW v2.4)*
-- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0)*
+- **Storage Repository Maintenance Status** — reports whether maintenance actually *succeeded*, not just when it last left a timestamp, and what the K10 scheduler is doing with each repository *(NEW v2.4, rebuilt v2.6, scheduler state NEW v2.7.0; on-demand policies, expiry dates and shared volumedata repositories v2.7.2)*. Developer guide: [docs/maintenance-checks.md](docs/maintenance-checks.md)
 - **Residual Snapshots** — local Kasten snapshots past a 7-day threshold that no live policy retains *(NEW v2.5)*; manual runs judged on their expiry, imported restore points left out, and an overview of snapshots with no expiry *(v2.7.1)*
 - **Best Practices compliance** summary (19 checks with severity levels)
 
@@ -122,7 +122,7 @@ v2.7.0 closes #49, #51, #53 and #54, and merges PR #52.
   restart can deliver.
 
 - **Severity is earned by accumulation, not by writes.** An idle repository in
-  which a live policy still retires restore points keeps its critical: each
+  which a live policy can retire restore points keeps its critical: each
   retirement leaves space that only maintenance reclaims. A quiet failure
   drops to a warning only when the record proves nothing more accumulates —
   every restore point has retired, the profile is gone or points elsewhere, or
@@ -699,7 +699,9 @@ Added since:
 
 - `storageRepositories` *(v2.4, rebuilt v2.6 and v2.7)* — per-repository maintenance
   status and evidence, `k10SchedulerState` and its inputs, the severity gate
-  (`severityGate`, `quietReason`, `activeReason`, `retainerPolicies`), stranded
+  (`severityGate`, `quietReason`, `activeReason`, `retainerPolicies`,
+  `retainerPausedPolicies`, `retainerOnDemandPolicies`,
+  `expiringRestorePoints`), stranded
   content, `rowNotes`, `statusLabel` / `statusLevel`, the section `summary`, and
   `k10MaintenancePreconditions`
 - `residualSnapshots` *(v2.5)* — local snapshots past the threshold, split into
@@ -734,7 +736,7 @@ New in v2.7.0:
 | Export retention       | Warning  | Explicit `.retention` on export actions           | Implicit / inherited                               |
 | Export coverage        | Warning  | All policies export                               | Snapshot-only policies present                     |
 | K10 infra volumes      | Warning  | Helm-created K10 PVCs are RWO on block storage    | RWX, or a shared-filesystem backend (CephFS, NFS…) |
-| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when a run failed but a success is still recent, when repositories are stale, overdue, never run, disabled or parked with stranded content, when every failure is quiet and proven not to accumulate, or when the Kasten DR ownership block is in place or background maintenance is disabled in `k10-features`; **critical** when a repository still gaining unreclaimed space — written to, undated, or holding restore points a live policy still retires — has no recent success, or has never run and its first run is overdue |
+| Repository maintenance | Warning / **Critical** | Maintenance succeeded within 7 days      | Warning when a run failed but a success is still recent, when repositories are stale, overdue, never run, disabled or parked with stranded content, when every failure is quiet and proven not to accumulate, or when the Kasten DR ownership block is in place or background maintenance is disabled in `k10-features`; **critical** when a repository still gaining unreclaimed space — written to, undated, or holding restore points a live policy can retire — has no recent success, or has never run and its first run is overdue |
 | Residual snapshots     | Warning  | No local snapshot past 7 days that no policy retains | On-demand, policy-deleted or unbound snapshots left behind |
 | Policy Presets         | Info     | Presets used for SLA standardisation              | Optional                                           |
 | KMS Encryption         | Info     | AWS KMS / Azure KV / Vault configured             | Optional                                           |
