@@ -1,4 +1,4 @@
-# Kasten Discovery Lite v2.7.2
+# Kasten Discovery Lite v2.7.3
 
 A lightweight, read-only discovery script for Veeam Kasten (K10) backup infrastructure analysis.
 

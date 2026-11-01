@@ -3,7 +3,12 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
-## [Unreleased]
+## [2.7.3] - 2026-11-01
+
+Closes #67 and #69, the two follow-ups Jaiganesh J K opened on #68. An
+independent audit of the change found four defects before release, each
+fixed with a regression case. **Two new RBAC rules** (see below): apply the
+updated `kdl-rbac.yaml`.
 
 - **ClusterRestorePoints are read** (#67). A policy that selects
   cluster-scoped resources makes a ClusterRestorePoint per run, local and
