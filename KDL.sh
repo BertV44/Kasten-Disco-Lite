@@ -7789,8 +7789,10 @@ mkdir -p "$SR_RPC_ART_DIR"
 # not yet past the grace, and in the namespace of a volumedata repository or
 # of the policy of a dr repository. A metadata repository never takes a local
 # entry, and scheduled runs carry no expiry, so this stays a handful.
-_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '[ .[]? | select(.status.contentType? == "dr")
-    | (.metadata.labels // {})["k10.kasten.io/policyName"] | select(type == "string") ] | unique' \
+# STORAGE_REPO_MAINTENANCE holds the per-repository summaries here
+# (contentType, policyName), not the StorageRepository objects.
+_ep "$STORAGE_REPO_MAINTENANCE" | jq -c '[ .[]? | select(type == "object") | select(.contentType == "dr")
+    | .policyName | select(type == "string") ] | unique' \
   > "$TEMP_DIR/sr_dr_pols.json" 2>/dev/null || printf '[]\n' > "$TEMP_DIR/sr_dr_pols.json"
 jq -e 'type == "array"' "$TEMP_DIR/sr_dr_pols.json" >/dev/null 2>&1 || printf '[]\n' > "$TEMP_DIR/sr_dr_pols.json"
 jq -r --slurpfile vdF "$TEMP_DIR/sr_vd_apps.json" --slurpfile drF "$TEMP_DIR/sr_dr_pols.json" \
