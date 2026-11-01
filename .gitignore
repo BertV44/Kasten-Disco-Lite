@@ -34,3 +34,5 @@ kdl-maintenance-test.sh
 kdl-maintenance-fixtures.sh
 kdl-gate-negtest.sh
 kdl-v9-validate.sh
+RELEASING.md
+kdl-residual-test.sh

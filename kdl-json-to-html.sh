@@ -2157,7 +2157,14 @@ else "" end) + "
     (if .orphanedRestorePoints.status == "NOT_ASSESSED" then
       "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The orphaned-RestorePoint computation failed, so this section could not be evaluated &mdash; this is <em>not</em> the same as \"no orphans\". Re-run with <code>--debug</code> to surface the underlying error.</div>"
     elif (.orphanedRestorePoints.status == "PARTIAL") and (.orphanedRestorePoints.count == 0) then
-      "<div class=\"info-box\">\u2139 <strong>No orphan confirmed &mdash; not a clean verdict.</strong> The policy set is partial (see the policy scope notice under Backup Policies), so " + ((.orphanedRestorePoints.unverifiable // 0) | tostring) + " RestorePoint(s) naming a policy in an unreadable namespace could not be checked.</div>"
+      "<div class=\"info-box\">\u2139 <strong>No orphan confirmed &mdash; not a clean verdict.</strong> "
+      + ([ (if (.orphanedRestorePoints.unverifiable // 0) > 0 then
+              "The policy set is partial (see the policy scope notice under Backup Policies), so " + ((.orphanedRestorePoints.unverifiable // 0) | tostring) + " RestorePoint(s) naming a policy in an unreadable namespace could not be checked."
+            else empty end),
+           (if .orphanedRestorePoints.clusterRestorePointsRead == false then
+              "ClusterRestorePoints could not be listed (RBAC on <code>clusterrestorepoints</code>, or not served), so an orphan among them cannot be ruled out."
+            else empty end) ] | join(" "))
+      + "</div>"
     elif .orphanedRestorePoints.count == 0 then
       "<div class=\"success-box\">\u2713 <strong>No orphaned RestorePoints detected</strong></div>"
     else
@@ -2176,6 +2183,9 @@ else "" end) + "
     end)
     + (if ((.orphanedRestorePoints.unverifiable // 0) > 0) and (.orphanedRestorePoints.count > 0) then
         "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unverifiable) | tostring) + " more RestorePoint(s) name a policy in a namespace that could not be read: their orphan status is unknown (partial policy set), so the list above may be incomplete.</div>"
+      else "" end)
+    + (if (.orphanedRestorePoints.clusterRestorePointsRead == false) and (.orphanedRestorePoints.count > 0) then
+        "<div class=\"info-box\">\u2139 ClusterRestorePoints could not be listed (RBAC on <code>clusterrestorepoints</code>, or not served): an orphan among them cannot be ruled out, so the list above may be incomplete.</div>"
       else "" end)
     + (if ((.orphanedRestorePoints.unattributable // 0) > 0) then
         "<div class=\"info-box\">\u2139 " + ((.orphanedRestorePoints.unattributable) | tostring) + " RestorePoint(s) carry no source action name and cannot be attributed to a policy &mdash; they are counted neither as orphaned nor as attached.</div>"
@@ -2196,6 +2206,10 @@ else "" end) + "
       + " days. Exported restore points are out of scope: they sit in an export repository under its own retention, covered by Storage Repository Maintenance above. So are imported ones: they sit in another cluster&rsquo;s repository, and that cluster retires them. <strong>Age alone is not a finding</strong> &mdash; a GFS policy legitimately retains monthly and yearly points, so only snapshots that no live policy retains are counted as residual. A live policy is not proof of retention either: each snapshot is ranked among those of the same application and policy, newest first, and counted as residual when its rank is at or past everything the declared retention could hold. <strong>Manual runs</strong> (<code>k10.kasten.io/isRunNow</code>) are never ranked: policy retention does not retire them, so they are judged on their <code>k10.kasten.io/expiresAt</code> label instead &mdash; none means nothing retires them, a date in the past (beyond a " + ((.residualSnapshots.expiry.graceDays // 2) | tostring) + "-day retirement grace) means Kasten should already have. Kasten&rsquo;s own disaster-recovery snapshots are exempt from the no-expiry finding only.</p>"
     + (if .residualSnapshots.status == "NOT_ASSESSED" then
         "<div class=\"info-box\">\u2139 <strong>Not assessed.</strong> The <code>RestorePointContent</code> list could not be read (RBAC on <code>restorepointcontents</code>, or the aggregated API is unavailable) or the computation failed. This is <em>not</em> the same as \"no residual snapshots\". Grant <code>list</code> on <code>restorepointcontents.apps.kio.kasten.io</code> (see <code>kdl-rbac.yaml</code>) and re-run with <code>--debug</code>.</div>"
+      # #67: no finding, but the ClusterRestorePoints were not read, so no
+      # green box: the best practice says not assessed for this reason.
+      elif ((.residualSnapshots.unretained // 0) == 0) and (.residualSnapshots.clusterRestorePointsRead == false) then
+        "<div class=\"info-box\">\u2139 <strong>No residual snapshot identified among the RestorePointContents, but this is not a clean pass.</strong> ClusterRestorePoints could not be listed (RBAC on <code>clusterrestorepoints</code>, or not served), so a residual one cannot be ruled out. The best-practice check reports <em>not assessed</em> for this reason.</div>"
       elif ((.residualSnapshots.localSnapshots // 0) == 0) then
         "<div class=\"success-box\">\u2713 <strong>No local snapshots in the catalog</strong> ("
           + ((.residualSnapshots.listed // 0) | tostring) + " RestorePointContent(s) listed, all exports)</div>"
@@ -2225,7 +2239,10 @@ else "" end) + "
         "<div class=\"warning-box\">\u26a0 <strong>" + ((.residualSnapshots.unretained) | tostring)
           + " residual snapshot(s)</strong> that no live policy retains, out of "
           + ((.residualSnapshots.beyondThreshold // 0) | tostring) + " past the threshold ("
-          + ((.residualSnapshots.localSnapshots // 0) | tostring) + " local snapshot(s) in total)<br>"
+          + ((.residualSnapshots.localSnapshots // 0) | tostring) + " local snapshot(s) in total)"
+          + (if .residualSnapshots.clusterRestorePointsRead == false
+             then " &mdash; ClusterRestorePoints could not be listed, so there may be more"
+             else "" end) + "<br>"
           + ([
               (if (.residualSnapshots.breakdown.onDemand // 0) > 0 then (.residualSnapshots.breakdown.onDemand | tostring) + " taken on demand (no policy)" else empty end),
               (if (.residualSnapshots.breakdown.policyDeleted // 0) > 0 then (.residualSnapshots.breakdown.policyDeleted | tostring) + " whose policy was deleted" else empty end),
@@ -2241,7 +2258,8 @@ else "" end) + "
         ([.residualSnapshots.items[:10][]? |
           "<tr>
             <td><code>" + (.name // "unknown") + "</code></td>
-            <td>" + (if (.appNamespace // "") == "" then "\u2014" else .appNamespace end) + "</td>
+            <td>" + (if .kind == "ClusterRestorePoint" then "(cluster-scoped)"
+                     elif (.appNamespace // "") == "" then "\u2014" else .appNamespace end) + "</td>
             <td>" + (if (.appName // "") == "" then "\u2014" else .appName end) + "</td>
             <td>" + (if .ageDays == null then "unknown"
                      else ((.ageDays * 10 | floor) / 10) as $a
