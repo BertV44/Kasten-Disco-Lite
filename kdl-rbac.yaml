@@ -46,14 +46,31 @@
 # See README.md "RBAC Requirements" for the full explanation and commands.
 # ============================================================================
 #
+# WHO GETS THE ACCESS:
+#   This file grants access; it does not authenticate anyone. By default it
+#   CREATES a dedicated ServiceAccount "kdl" in kasten-io (object just below)
+#   and binds both roles to it. Applying the file does NOT change what your
+#   own kubeconfig can do — you then run KDL with a kubeconfig that uses the
+#   "kdl" ServiceAccount token (see README.md "Run KDL as the kdl
+#   ServiceAccount"). No User or password is created.
+#
+#   To grant the access to an existing person or group instead (e.g. the
+#   user who will run KDL with their own kubeconfig): delete the
+#   ServiceAccount object below and replace the subjects of BOTH bindings
+#   with that User/Group (commented example in the ClusterRoleBinding).
+#
 # Usage:
-#   1. Edit the two *Binding* objects at the bottom to point at your principal
-#      (ServiceAccount, User or Group) and the K10 namespace (default kasten-io).
+#   1. Optional: change the binding subjects (see above) and the K10
+#      namespace (default kasten-io) in the ServiceAccount, Role and both
+#      Bindings.
 #   2. kubectl apply -f kdl-rbac.yaml   (or: oc apply -f kdl-rbac.yaml)
 #      - Cluster-admin: applies both Part A and Part B in one shot.
-#      - K10-admin only: Part B applies; Part A objects are rejected with the
-#        Forbidden error above — expected, safe to ignore, or hand this file
-#        to a cluster-admin to apply Part A separately.
+#      - K10-admin only: the ServiceAccount and Part B apply; Part A objects
+#        are rejected with the Forbidden error above — expected, safe to
+#        ignore, or hand this file to a cluster-admin to apply Part A
+#        separately.
+#   3. Run KDL as the principal you bound (README.md "Run KDL as the kdl
+#      ServiceAccount").
 #
 # Notes:
 #   - The namespaced Role covers `secrets` (k10-license, Helm release secret).
@@ -62,6 +79,19 @@
 #   - Some resources are optional and only read on the matching platform
 #     (OpenShift routes/scc, KubeVirt/Harvester virtualization, Kanister
 #     blueprints). They are harmless to grant on clusters that lack the CRDs.
+---
+# ============================================================================
+# The identity KDL runs as. Namespaced, so a K10-admin can create it too.
+# Delete this object if you bind the roles to an existing User/Group instead.
+# ============================================================================
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kdl
+  namespace: kasten-io          # <-- change if your K10 namespace differs
+  labels:
+    app.kubernetes.io/name: kasten-discovery-lite
+    app.kubernetes.io/component: rbac
 ---
 # ============================================================================
 # PART A — CLUSTER-SCOPED (apply ONCE, by a CLUSTER-ADMIN)
@@ -247,8 +277,8 @@ rules:
     verbs: ["get", "list"]
 ---
 # ---------------------------------------------------------------------------
-# Bindings — EDIT the subjects to match your principal before applying.
-# Examples below bind a ServiceAccount named "kdl" in namespace "kasten-io".
+# Bindings — both bind the "kdl" ServiceAccount created at the top of this
+# file. To use an existing User/Group instead, replace the subjects here.
 # ---------------------------------------------------------------------------
 # --- PART A binding (cluster-scoped — CLUSTER-ADMIN only) ------------------
 apiVersion: rbac.authorization.k8s.io/v1

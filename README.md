@@ -917,8 +917,24 @@ kubeconfig that lacks Part A below, not an error.
 ### Quick start: bundled manifest — two-part / two-persona model
 
 A ready-to-apply, least-privilege manifest ships with the repo:
-[`kdl-rbac.yaml`](kdl-rbac.yaml). It bundles **two independent RBAC scopes**
-in one file, because in practice they are applied by two different people:
+[`kdl-rbac.yaml`](kdl-rbac.yaml).
+
+**Who gets the access.** By default the manifest **creates a ServiceAccount
+`kdl` in `kasten-io`** and binds both roles to it. No user, password or
+storage is created. Applying the manifest does **not** change what your own
+kubeconfig can do: you then run KDL *as* that ServiceAccount (see
+[Run KDL as the `kdl` ServiceAccount](#run-kdl-as-the-kdl-serviceaccount)).
+To give the access to an existing person or group instead (for example, the
+user who will run KDL with their own kubeconfig), delete the `ServiceAccount`
+object from the file and replace the `subjects` of **both** bindings with
+that `User`/`Group` before applying.
+
+If your K10 namespace is not `kasten-io`, change `namespace:` on the
+`ServiceAccount`, the `Role`, the `RoleBinding` and the ClusterRoleBinding
+subject before applying.
+
+The manifest bundles **two independent RBAC scopes** in one file, because in
+practice they are applied by two different people:
 
 - **Part A — cluster-scoped** (`ClusterRole` + `ClusterRoleBinding`, both
   named `kasten-discovery-reader`): the cluster-scoped **read** access KDL
@@ -943,14 +959,14 @@ in one file, because in practice they are applied by two different people:
 Commands:
 
 ```
-# Cluster-admin, once — applies both Part A and Part B:
+# Cluster-admin, once — creates the kdl ServiceAccount and applies Part A and Part B:
 oc apply -f kdl-rbac.yaml          # OpenShift
 kubectl apply -f kdl-rbac.yaml     # plain Kubernetes
 ```
 
 ```
 # K10-admin only (no cluster-admin available) — same command, run as
-# yourself. The namespaced Part B objects apply successfully; the
+# yourself. The ServiceAccount and the namespaced Part B objects apply; the
 # cluster-scoped Part A objects (ClusterRole/ClusterRoleBinding) are
 # rejected with:
 #   Error from server (Forbidden): ... is forbidden: User cannot create
@@ -966,11 +982,32 @@ KDL still runs end-to-end. The report will simply show the cluster-scoped
 sections as RBAC-limited/empty (see the graceful-degradation note above)
 until Part A is applied. This is expected, not a bug.
 
-If your K10 namespace is not `kasten-io`, edit the `namespace:` field on
-the `Role` and `RoleBinding` (Part B) in `kdl-rbac.yaml` before applying.
+### Run KDL as the `kdl` ServiceAccount
 
-Edit the binding subjects in both Bindings to point at your principal
-(ServiceAccount, User, or Group).
+KDL uses the current context of your kubeconfig. To run it with the
+`kdl` ServiceAccount's permissions, build a separate kubeconfig from a
+short-lived token (Kubernetes 1.24+ / OpenShift 4.11+):
+
+```
+TOKEN=$(kubectl -n kasten-io create token kdl --duration=1h)   # or: oc -n kasten-io create token kdl
+SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+
+export KUBECONFIG=$PWD/kdl.kubeconfig
+kubectl config set-cluster kdl --server="$SERVER"
+# Add --certificate-authority=<ca.crt> --embed-certs, or use
+# --insecure-skip-tls-verify=true only on a lab cluster.
+kubectl config set-credentials kdl --token="$TOKEN"
+kubectl config set-context kdl --cluster=kdl --user=kdl
+kubectl config use-context kdl
+
+kubectl auth can-i list namespaces      # yes once Part A is applied
+./KDL.sh kasten-io
+```
+
+The token expires after the given duration, so there is nothing to clean up
+afterwards. Delete `kdl.kubeconfig` and `unset KUBECONFIG` to return to your
+usual context. If you bound the roles to your own User/Group instead, skip
+this step and run `./KDL.sh` with your usual kubeconfig.
 
 ### Policies outside the K10 namespace: partial reporting
 
