@@ -919,11 +919,25 @@ kubeconfig that lacks Part A below, not an error.
 A ready-to-apply, least-privilege manifest ships with the repo:
 [`kdl-rbac.yaml`](kdl-rbac.yaml).
 
-**Who gets the access.** By default the manifest **creates a ServiceAccount
-`kdl` in `kasten-io`** and binds both roles to it. No user, password or
-storage is created. Applying the manifest does **not** change what your own
-kubeconfig can do: you then run KDL *as* that ServiceAccount (see
-[Run KDL as the `kdl` ServiceAccount](#run-kdl-as-the-kdl-serviceaccount)).
+**Who gets the access.** The manifest grants its permissions to a
+**ServiceAccount named `kdl` in `kasten-io`**, and it creates that
+ServiceAccount too (it is the first object in the file). No user, password
+or storage is created.
+
+> **Important — KDL does not pick an identity.** It runs `oc`/`kubectl`
+> as whoever your current kubeconfig context is logged in as. Applying
+> `kdl-rbac.yaml` changes nothing for you until you **connect as `kdl`**
+> (step 3 below). If you skip that step, KDL runs with your own
+> permissions and the manifest is not used at all.
+
+The three steps, in order:
+
+1. **Create the `kdl` ServiceAccount** — done by `kdl-rbac.yaml` in step 2.
+   To create it on its own: `oc create serviceaccount kdl -n kasten-io`.
+2. **Grant it read access** — `oc apply -f kdl-rbac.yaml` (details below).
+3. **Connect as `kdl`, then run KDL** — see
+   [Run KDL as the `kdl` ServiceAccount](#run-kdl-as-the-kdl-serviceaccount).
+
 To give the access to an existing person or group instead (for example, the
 user who will run KDL with their own kubeconfig), delete the `ServiceAccount`
 object from the file and replace the `subjects` of **both** bindings with
@@ -984,12 +998,31 @@ until Part A is applied. This is expected, not a bug.
 
 ### Run KDL as the `kdl` ServiceAccount
 
-KDL uses the current context of your kubeconfig. To run it with the
-`kdl` ServiceAccount's permissions, build a separate kubeconfig from a
-short-lived token (Kubernetes 1.24+ / OpenShift 4.11+):
+KDL uses the current context of your kubeconfig, so you must log in as the
+`kdl` ServiceAccount before running it. Run these commands while still
+logged in as the admin who applied the manifest; `create token` needs
+that access (Kubernetes 1.24+ / OpenShift 4.11+).
+
+**OpenShift:**
 
 ```
-TOKEN=$(kubectl -n kasten-io create token kdl --duration=1h)   # or: oc -n kasten-io create token kdl
+oc login --token=$(oc create token kdl -n kasten-io) --server=<api server url>
+
+oc whoami                  # system:serviceaccount:kasten-io:kdl
+oc auth can-i list namespaces   # yes once Part A is applied
+./KDL.sh kasten-io
+```
+
+The `<api server url>` is the one `oc whoami --show-server` prints, for
+example `https://api.mycluster.example.com:6443`. `oc login` switches the
+current context, so log back in as yourself when you are done. The token
+expires (one hour by default), so there is nothing else to clean up.
+
+**Plain Kubernetes** (no `oc login`): build a separate kubeconfig from the
+token instead.
+
+```
+TOKEN=$(kubectl -n kasten-io create token kdl --duration=1h)
 SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
 
 export KUBECONFIG=$PWD/kdl.kubeconfig
@@ -1004,10 +1037,11 @@ kubectl auth can-i list namespaces      # yes once Part A is applied
 ./KDL.sh kasten-io
 ```
 
-The token expires after the given duration, so there is nothing to clean up
-afterwards. Delete `kdl.kubeconfig` and `unset KUBECONFIG` to return to your
-usual context. If you bound the roles to your own User/Group instead, skip
-this step and run `./KDL.sh` with your usual kubeconfig.
+Delete `kdl.kubeconfig` and `unset KUBECONFIG` to return to your usual
+context.
+
+If you bound the roles to your own User/Group instead of `kdl`, skip this
+step and run `./KDL.sh` with your usual kubeconfig.
 
 ### Policies outside the K10 namespace: partial reporting
 

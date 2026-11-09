@@ -69,8 +69,11 @@
 #        are rejected with the Forbidden error above — expected, safe to
 #        ignore, or hand this file to a cluster-admin to apply Part A
 #        separately.
-#   3. Run KDL as the principal you bound (README.md "Run KDL as the kdl
-#      ServiceAccount").
+#   3. CONNECT AS kdl before running KDL — KDL runs as your current
+#      kubeconfig context and does not switch identity by itself:
+#        oc login --token=$(oc create token kdl -n kasten-io) --server=<api server url>
+#        ./KDL.sh kasten-io
+#      Plain Kubernetes: see README.md "Run KDL as the kdl ServiceAccount".
 #
 # Notes:
 #   - The namespaced Role covers `secrets` (k10-license, Helm release secret).
