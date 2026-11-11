@@ -1078,6 +1078,12 @@ else
   KASTEN_VERSION=$(_ep "$KASTEN_IMAGE" | sed 's/.*://')
 fi
 [ -z "$KASTEN_VERSION" ] && KASTEN_VERSION="unknown"
+# A read that returned something other than an image reference (an error page,
+# a JSON body) used to surface verbatim, e.g. "Kasten Version: []}". An image
+# tag or label value only ever holds these characters; anything else is unknown.
+case "$KASTEN_VERSION" in
+  *[!A-Za-z0-9._+-]*) KASTEN_VERSION="unknown" ;;
+esac
 debug "Kasten version: $KASTEN_VERSION"
 
 # Kasten major.minor, and whether it is newer than what this KDL build was
@@ -1943,6 +1949,12 @@ ALL_NS_POLICIES="$(_ep "$APP_POLICIES_JSON" | jq '[
 # policies, two of them dual-export, reported 5). Counted via index() instead.
 POLICIES_WITH_EXPORT=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select([.spec.actions[]?.action] | index("export"))] | length // 0')
 [ -z "$POLICIES_WITH_EXPORT" ] && POLICIES_WITH_EXPORT=0
+# #51: the ransomware export pillar is about off-cluster copies being MADE.
+# A paused policy makes none, so it earns no points. POLICIES_WITH_EXPORT stays
+# the spec inventory count; only the pillar reads the active count. `!= true`
+# (not `//`) so `false` and absent both count as active.
+POLICIES_WITH_ACTIVE_EXPORT=$(_ep "$POLICIES_JSON" | jq '[.items[]? | select([.spec.actions[]?.action] | index("export")) | select(.spec.paused != true)] | length // 0')
+[ -z "$POLICIES_WITH_ACTIVE_EXPORT" ] && POLICIES_WITH_ACTIVE_EXPORT=0
 
 # Additional / dual export (Kasten 9.0 Technical Preview, #kasten-v9).
 # A policy may now carry MORE THAN ONE export action, each with its own
@@ -10109,7 +10121,7 @@ fi
 RANSOM_EXPORT=0
 RANSOM_EXPORT_MAX=15
 RANSOM_EXPORT_ASSESSED=true
-if [ "$POLICIES_WITH_EXPORT" -gt 0 ] 2>/dev/null; then
+if [ "$POLICIES_WITH_ACTIVE_EXPORT" -gt 0 ] 2>/dev/null; then
   RANSOM_EXPORT=$RANSOM_EXPORT_MAX
 elif [ "$POLICY_COLLECTION_PARTIAL" = "true" ]; then
   # #58: "no policy exports" is a claim about EVERY policy. On a partial set
@@ -10352,6 +10364,7 @@ if [ "$MODE" = "json" ]; then
     --argjson veeamVaultProfileCount "$VEEAM_VAULT_PROFILE_COUNT" \
     --argjson allNs "$ALL_NS_POLICIES" \
     --argjson policiesWithExport "$POLICIES_WITH_EXPORT" \
+    --argjson policiesWithActiveExport "$POLICIES_WITH_ACTIVE_EXPORT" \
     --argjson multiExportCount "$MULTI_EXPORT_COUNT" \
     --argjson multiExportSameProfileCount "$MULTI_EXPORT_SAME_PROFILE_COUNT" \
     --slurpfile multiExportPolicies "$TEMP_DIR/multiExportPolicies.json" \
@@ -10663,7 +10676,6 @@ if [ "$MODE" = "json" ]; then
     --argjson zeroSnapCount "$ZERO_SNAP_COUNT" \
     --slurpfile exportNoRetentionPolicies "$TEMP_DIR/exportNoRetentionPolicies.json" \
     --argjson exportNoRetentionCount "$EXPORT_NO_RETENTION_COUNT" \
-    --arg hasClusterScopedPolicy "$HAS_CLUSTER_SCOPED_POLICY" \
     --arg skipHelm "$([ "$SKIP_HELM" = true ] && echo true || echo false)" \
     --arg bpSnapRetentionHigh "$BP_SNAP_RETENTION_HIGH_STATUS" \
     --arg bpSnapRetentionZero "$BP_SNAP_RETENTION_ZERO_STATUS" \
@@ -11318,7 +11330,7 @@ if [ "$MODE" = "json" ]; then
           immutability:     {score: $ransomImmut,   max: $ransomImmutMax,   evidence: ($immutability == "true" and $immutableProfiles > 0)},
           # assessed:false = the policy set was partial and no exporting policy
           # was visible: score 0 here means "not seen", not "absent" (#58).
-          offClusterExport: {score: $ransomExport,  max: $ransomExportMax,  evidence: ($policiesWithExport > 0), assessed: $ransomExportAssessed},
+          offClusterExport: {score: $ransomExport,  max: $ransomExportMax,  evidence: ($policiesWithActiveExport > 0), assessed: $ransomExportAssessed},
           authentication:   {score: $ransomAuth,    max: $ransomAuthMax,    evidence: ($authMethod != "none" and $authMethod != "")},
           disasterRecovery: {score: $ransomDr,      max: $ransomDrMax,      evidence: ($kdrStatus == "ENABLED")},
           auditLogging:     {score: $ransomAudit,   max: $ransomAuditMax,   evidence: ($auditEnabled == "true")},
@@ -11355,8 +11367,7 @@ if [ "$MODE" = "json" ]; then
         policiesWithoutExport: $bpNoExport,
         k10InfraVolumeAccessMode: $bpK10PvcAccess,
         storageRepositoryMaintenance: $bpStorageRepo,
-        residualSnapshots: $bpResidualSnapshots,
-        clusterScopedResourcesProtected: ($hasClusterScopedPolicy == "true")
+        residualSnapshots: $bpResidualSnapshots
       },
 
       cluster: {
@@ -13334,7 +13345,7 @@ _pillar_line() {
 
 _pillar_line "Immutability"        "$RANSOM_IMMUT"   "$RANSOM_IMMUT_MAX"   "$([ "$IMMUTABILITY" = "true" ] && [ "$IMMUTABLE_PROFILES" -gt 0 ] && echo "$IMMUTABLE_PROFILES profile(s) with retention lock" || echo "no immutable profile configured")"
 if [ "$RANSOM_EXPORT_ASSESSED" = "true" ]; then
-  _pillar_line "Off-cluster export"  "$RANSOM_EXPORT"  "$RANSOM_EXPORT_MAX"  "$([ "$POLICIES_WITH_EXPORT" -gt 0 ] && echo "$POLICIES_WITH_EXPORT policy/policies export to remote location" || echo "no policy with export action")"
+  _pillar_line "Off-cluster export"  "$RANSOM_EXPORT"  "$RANSOM_EXPORT_MAX"  "$([ "$POLICIES_WITH_ACTIVE_EXPORT" -gt 0 ] && echo "$POLICIES_WITH_ACTIVE_EXPORT active policy/policies export to remote location" || echo "no active policy with export action")"
 else
   printf "    ${COLOR_CYAN}[NOT ASSESSED]${COLOR_RESET} %-22s %2d/%-2d  %s\n" "Off-cluster export" "$RANSOM_EXPORT" "$RANSOM_EXPORT_MAX" "no exporting policy among the policies READ; the policy set is partial, so an exporting policy may be unseen (score is a lower bound)"
 fi

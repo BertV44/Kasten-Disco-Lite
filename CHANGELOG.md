@@ -3,6 +3,20 @@
 All notable changes to Kasten Discovery Lite are documented here.
 Format loosely follows [Keep a Changelog]; this is a community, non-official tool.
 
+## [Unreleased]
+
+- **A paused policy no longer earns the ransomware export pillar** (#51
+  follow-up). `Off-cluster export` scored 15/15 as soon as any policy declared
+  an export action, paused or not; a paused policy makes no off-cluster copy.
+  The pillar now reads the active count. The inventory line `With export:`
+  still counts every policy that declares an export.
+- **Kasten version shows `unknown` when the read returns something that is
+  not an image reference**, instead of printing it verbatim (`[]}` was seen).
+- **Removed `bestPractices.clusterScopedResourcesProtected`** from the JSON.
+  It was read and rendered nowhere and duplicated `clusterScopedResources`;
+  `bestPractices` now holds exactly the 19 checks.
+- **Removed `sample.md`**: it was v2.0 output, seven releases out of date.
+
 ## [2.7.3] - 2026-11-01
 
 Closes #67 and #69, the two follow-ups Jaiganesh J K opened on #68. An

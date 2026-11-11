@@ -42,7 +42,7 @@ This split (50/40/10) reflects an opinionated stance: **even with perfect access
 
 **Why 15**: if the entire cluster is destroyed (volume encryption, control-plane compromise, datacenter loss), local snapshots are unrecoverable. An export to a remote location is the prerequisite for full-cluster DR. It is weighted below immutability because it is necessary-but-not-sufficient (a mutable off-cluster copy is still attackable).
 
-**Evidence rule**: at least one policy with an `export` action. Counts any export, regardless of frequency or retention quality.
+**Evidence rule**: at least one policy with an `export` action that is not paused (`spec.paused: true` excludes it; `false` or absent counts). Counts any export, regardless of frequency or retention quality.
 
 **Known limitation**: KDL does not check whether the export target is in the same failure domain as the cluster. An export from cluster A in AZ-1 to a MinIO bucket also in AZ-1 satisfies the pillar but does not satisfy the design intent. Operators must validate geographic separation manually.
 
