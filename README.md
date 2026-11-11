@@ -244,7 +244,6 @@ The Ransomware Readiness Score is a synthesis indicator intended for executive /
 | `docs/` | Reference documentation (see [Documentation](#documentation)) |
 | `kdl-rbac.yaml` | Least-privilege RBAC manifest |
 | `CHANGELOG.md` | Full record of changes |
-| `sample.md` | Reference output of `./KDL.sh kasten-io` |
 
 ---
 
